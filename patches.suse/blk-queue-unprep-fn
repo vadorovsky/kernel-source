@@ -1,0 +1,167 @@
+From: Mike Anderson <andmike@us.ibm.com>
+Subject: block: Implement unprep_rq_fn()
+References: bnc#527028
+Patch-Mainline: Submitted to scsi-misc
+
+This patchset contains the following changes:
+
+1.) bug_fix: Do not abort in flight requests if the queue is stopped, skip
+aborting requests from the elevator if they are marked REQ_DONTPREP as we may
+leak resources.
+
+blk: Do not abort requests if queue is stopped
+blk: In elv_abort_queue skip requests with REQ_DONTPREP set
+
+2.) bug_fix: Provide a unprep_rq_fn function to be called from elv_abort_queue.
+
+blk: Add a unprep_rq_fn
+blk: Call unprep_fn from elv_abort_queue is available
+scsi: Add a scsi_unprep_fn
+
+Signed-off-by: Mike Anderson <andmike@us.ibm.com>
+Acked-by: Hannes Reinecke <hare@suse.de>
+
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index d5aa886..d30f2b1 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -34,6 +34,23 @@ void blk_queue_prep_rq(struct request_queue *q, prep_rq_fn *pfn)
+ EXPORT_SYMBOL(blk_queue_prep_rq);
+ 
+ /**
++ * blk_queue_unprep_rq - set a unprepare_request function for queue
++ * @q:		queue
++ * @pfn:	unprepare_request function
++ *
++ * It's possible for a queue to register a unprepare_request callback which
++ * may be invoked to unprepare a request that is on a queue. The goal of
++ * the function is to unprepare a request for I/O, it can be used to
++ * release a cdb from the request for instance.
++ *
++ */
++void blk_queue_unprep_rq(struct request_queue *q, unprep_rq_fn *unpfn)
++{
++	q->unprep_rq_fn = unpfn;
++}
++EXPORT_SYMBOL(blk_queue_unprep_rq);
++
++/**
+  * blk_queue_merge_bvec - set a merge_bvec function for queue
+  * @q:		queue
+  * @mbfn:	merge_bvec_fn
+diff --git a/block/blk-timeout.c b/block/blk-timeout.c
+index 1ba7e0a..89fbe0a 100644
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@ -224,7 +224,8 @@ void blk_abort_queue(struct request_queue *q)
+ 	list_splice_init(&q->timeout_list, &list);
+ 
+ 	list_for_each_entry_safe(rq, tmp, &list, timeout_list)
+-		blk_abort_request(rq);
++		if (!blk_queue_stopped(q))
++			blk_abort_request(rq);
+ 
+ 	/*
+ 	 * Occasionally, blk_abort_request() will return without
+diff --git a/block/elevator.c b/block/elevator.c
+index a847046..55822f9 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -804,10 +804,22 @@ int elv_may_queue(struct request_queue *q, int rw)
+ 
+ void elv_abort_queue(struct request_queue *q)
+ {
+-	struct request *rq;
++	struct request *rq, *tmp;
++	LIST_HEAD(list);
+ 
+-	while (!list_empty(&q->queue_head)) {
+-		rq = list_entry_rq(q->queue_head.next);
++	/*
++	 * Splice entries to local list, in case the list contains some
++	 * requests marked REQ_DONTPREP.
++	 */
++	list_splice_init(&q->queue_head, &list);
++
++	list_for_each_entry_safe(rq, tmp, &list, queuelist) {
++		if (rq->cmd_flags & REQ_DONTPREP) {
++			if (q->unprep_rq_fn)
++				q->unprep_rq_fn(q, rq);
++			else
++				continue;
++		}
+ 		rq->cmd_flags |= REQ_QUIET;
+ 		trace_block_rq_abort(q, rq);
+ 		/*
+@@ -817,6 +829,13 @@ void elv_abort_queue(struct request_queue *q)
+ 		blk_start_request(rq);
+ 		__blk_end_request_all(rq, -EIO);
+ 	}
++
++	/*
++	 * In case requests with REQ_DONTPREP where skipped splice the
++	 * local list back.
++	 */
++	list_splice(&list, &q->queue_head);
++
+ }
+ EXPORT_SYMBOL(elv_abort_queue);
+ 
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index f35ca7a..2d356b5 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -91,6 +91,17 @@ static void scsi_unprep_request(struct request *req)
+ 	scsi_put_command(cmd);
+ }
+ 
++static void scsi_unprep_fn(struct request_queue *q, struct request *req)
++{
++	struct scsi_cmnd *cmd = req->special;
++
++	if (cmd) {
++		scsi_release_buffers(cmd);
++		scsi_unprep_request(req);
++	}
++}
++
++
+ /**
+  * __scsi_queue_insert - private queue insertion
+  * @cmd: The SCSI command being requeued
+@@ -1661,6 +1672,7 @@ struct request_queue *scsi_alloc_queue(struct scsi_device *sdev)
+ 		return NULL;
+ 
+ 	blk_queue_prep_rq(q, scsi_prep_fn);
++	blk_queue_unprep_rq(q, scsi_unprep_fn);
+ 	blk_queue_softirq_done(q, scsi_softirq_done);
+ 	blk_queue_rq_timed_out(q, scsi_times_out);
+ 	blk_queue_lld_busy(q, scsi_lld_busy);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index a74bb7b..642ec53 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -259,6 +259,7 @@ struct request_pm_state
+ typedef void (request_fn_proc) (struct request_queue *q);
+ typedef int (make_request_fn) (struct request_queue *q, struct bio *bio);
+ typedef int (prep_rq_fn) (struct request_queue *, struct request *);
++typedef void (unprep_rq_fn) (struct request_queue *, struct request *);
+ typedef void (unplug_fn) (struct request_queue *);
+ 
+ struct bio_vec;
+@@ -338,6 +339,7 @@ struct request_queue
+ 	request_fn_proc		*request_fn;
+ 	make_request_fn		*make_request_fn;
+ 	prep_rq_fn		*prep_rq_fn;
++	unprep_rq_fn		*unprep_rq_fn;
+ 	unplug_fn		*unplug_fn;
+ 	merge_bvec_fn		*merge_bvec_fn;
+ 	prepare_flush_fn	*prepare_flush_fn;
+@@ -955,6 +957,7 @@ extern int blk_queue_dma_drain(struct request_queue *q,
+ extern void blk_queue_lld_busy(struct request_queue *q, lld_busy_fn *fn);
+ extern void blk_queue_segment_boundary(struct request_queue *, unsigned long);
+ extern void blk_queue_prep_rq(struct request_queue *, prep_rq_fn *pfn);
++extern void blk_queue_unprep_rq(struct request_queue *, unprep_rq_fn *unpfn);
+ extern void blk_queue_merge_bvec(struct request_queue *, merge_bvec_fn *);
+ extern void blk_queue_dma_alignment(struct request_queue *, int);
+ extern void blk_queue_update_dma_alignment(struct request_queue *, int);
