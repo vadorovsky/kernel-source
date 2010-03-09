@@ -355,7 +355,7 @@ sub split_into_symsets {
 
     for my $exp (@_) {
         my $set = $exp->{mod};
-        $set =~ s/\/[^\/]+$//;
+        $set =~ s/\/built-in$//;
         $set =~ s/\//_/g;
         $sets{$set} ||= [];
         push(@{$sets{$set}}, $exp);
