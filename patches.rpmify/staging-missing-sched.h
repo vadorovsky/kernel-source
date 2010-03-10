@@ -1,5 +1,6 @@
 From: Jeff Mahoney <jeffm@suse.com>
 Subject: [PATCH] staging: Complete sched.h removal from interrupt.h
+Patch-mainline: No; Driver removed in 2.6.34-rc1
 
  Commit d43c36dc removed sched.h from interrupt.h and distributed sched.h
  to users which needed it. Since make all{mod,yes}config skips staging,
