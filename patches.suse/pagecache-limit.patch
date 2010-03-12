@@ -1,0 +1,381 @@
+From: Markus Guertler <mguertler@novell.com>
+Subject: Introduce (optional) pagecache limit
+References: FATE309111
+Patch-mainline: Never
+
+There are apps that consume lots of memory and touch some of their
+pages very infrequently; yet those pages are very important for the
+overall performance of the app and should not be paged out in favor
+of pagecache. The kernel can't know this and takes the wrong decisions,
+even with low swappiness values.
+
+This sysctl allows to set a limit for the page cache; above this limit,
+the kernel will always consider removing pages from the page cache first.
+
+Signed-off-by: Kurt Garloff <garloff@suse.de>
+
+Index: linux-2.6.27/include/linux/swap.h
+===================================================================
+--- linux-2.6.27.orig/include/linux/swap.h
++++ linux-2.6.27/include/linux/swap.h
+@@ -247,7 +247,11 @@ extern unsigned long mem_cgroup_shrink_n
+ extern int __isolate_lru_page(struct page *page, int mode, int file);
+ extern unsigned long shrink_all_memory(unsigned long nr_pages);
+ extern int vm_swappiness;
++#define FREE_TO_PAGECACHE_RATIO 16
++extern unsigned long pagecache_over_limit(int synch);
++extern void shrink_page_cache(gfp_t mask, struct page *page);
+ extern int remove_mapping(struct address_space *mapping, struct page *page);
++extern unsigned int vm_pagecache_limit_mb;
+ extern long vm_total_pages;
+ 
+ #ifdef CONFIG_NUMA
+Index: linux-2.6.27/kernel/sysctl.c
+===================================================================
+--- linux-2.6.27.orig/kernel/sysctl.c
++++ linux-2.6.27/kernel/sysctl.c
+@@ -1199,6 +1199,14 @@ static struct ctl_table vm_table[] = {
+ 		.extra1		= &zero,
+ 		.extra2		= &one_hundred,
+ 	},
++	{
++		.ctl_name	= CTL_UNNUMBERED,
++		.procname	= "pagecache_limit_mb",
++		.data		= &vm_pagecache_limit_mb,
++		.maxlen		= sizeof(vm_pagecache_limit_mb),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec,
++	},
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	 {
+ 		.procname	= "nr_hugepages",
+Index: linux-2.6.27/mm/vmscan.c
+===================================================================
+--- linux-2.6.27.orig/mm/vmscan.c
++++ linux-2.6.27/mm/vmscan.c
+@@ -127,8 +127,10 @@ struct scan_control {
+ /*
+  * From 0 .. 100.  Higher means more swappy.
+  */
+-int vm_swappiness = 60;
+-long vm_total_pages;	/* The total number of pages which the VM controls */
++int vm_swappiness __read_mostly = 60;
++unsigned int vm_pagecache_limit_mb __read_mostly = 0;
++EXPORT_SYMBOL(vm_pagecache_limit_mb);
++long vm_total_pages __read_mostly;	/* The total number of pages which the VM controls */
+ 
+ static LIST_HEAD(shrinker_list);
+ static DECLARE_RWSEM(shrinker_rwsem);
+@@ -1911,6 +1913,8 @@ unsigned long try_to_free_mem_cgroup_pag
+ }
+ #endif
+ 
++static void __shrink_page_cache(int may_write, gfp_t mask);
++
+ /*
+  * For kswapd, balance_pgdat() will work across all this node's zones until
+  * they are all at high_wmark_pages(zone).
+@@ -1962,6 +1966,10 @@ loop_again:
+ 	sc.may_writepage = !laptop_mode;
+ 	count_vm_event(PAGEOUTRUN);
+ 
++	/* this reclaims from all zones so don't count to sc.nr_reclaimed */
++	if (unlikely(vm_pagecache_limit_mb) && pagecache_over_limit(0) > 0)
++		__shrink_page_cache(0, GFP_KERNEL);
++
+ 	for (i = 0; i < pgdat->nr_zones; i++)
+ 		temp_priority[i] = DEF_PRIORITY;
+ 
+@@ -2104,6 +2112,8 @@ out:
+ 
+ 		zone->prev_priority = temp_priority[i];
+ 	}
++	/* FIXME: Do we need to loop_again also if we have not achieved our
++	 * pagecache target? i.e. && pagecache_over_limit(0) > 0 */
+ 	if (!all_zones_ok) {
+ 		cond_resched();
+ 
+@@ -2219,7 +2229,8 @@ void wakeup_kswapd(struct zone *zone, in
+ 		return;
+ 
+ 	pgdat = zone->zone_pgdat;
+-	if (zone_watermark_ok(zone, order, low_wmark_pages(zone), 0, 0))
++	if (zone_watermark_ok(zone, order, low_wmark_pages(zone), 0, 0) &&
++		(!vm_pagecache_limit_mb || pagecache_over_limit(0) <= 0))
+ 		return;
+ 	if (pgdat->kswapd_max_order < order)
+ 		pgdat->kswapd_max_order = order;
+@@ -2412,6 +2423,149 @@ out:
+ }
+ #endif /* CONFIG_HIBERNATION */
+ 
++#ifdef CONFIG_HIBERNATION
++/*
++ * Function to shrink the page cache
++ *
++ * This function calculates the number of pages (nr_pages) the page
++ * cache is over its limit and shrinks the page cache accordingly.
++ *
++ * The maximum number of pages, the page cache shrinks in one call of
++ * this function is limited to SWAP_CLUSTER_MAX pages. Therefore it may
++ * require a number of calls to actually reach the vm_pagecache_limit_kb.
++ *
++ * The parameter may_write determines whether we should be allowed
++ * to write out (dirty) pages; if we are, we also add vm_pagecache_min_dec
++ * to nr_pages for performance reasons.
++ * This ensures that once we call the (expensive) operation of shrinking
++ * the page cache, we do some reasonable amount of work, so we don't have
++ * to call it directly again.
++ *
++ * This function is similar to shrink_all_memory, except that it may never
++ * swap out mapped pages and only does two passes.
++ *
++ * Note: This function uses shrink_all_zones, which comes curerntly
++ * with CONFIG_HIBERNATION.
++*/
++static void __shrink_page_cache(int may_write, gfp_t mask)
++{
++	unsigned long lru_pages, nr_slab;
++	unsigned long ret = 0;
++	int pass;
++	int passes = may_write? 4: 1;
++	struct reclaim_state reclaim_state;
++	struct scan_control sc = {
++		.gfp_mask = mask,
++		.may_swap = 0,
++		.may_unmap = 0,
++		.swap_cluster_max = SWAP_CLUSTER_MAX,
++		.may_writepage = may_write,
++		.swappiness = vm_swappiness,
++		.isolate_pages = isolate_pages_global,
++	};
++	struct reclaim_state *old_rs = current->reclaim_state;
++	long nr_pages;
++
++	if (may_write) {
++		/* synch reclaim doesn't need to reclaim too many */
++		nr_pages = SWAP_CLUSTER_MAX;
++	} else {
++		/* How many pages are we over the limit?
++		 * But don't enforce limit if there's plenty of free mem */
++		nr_pages = pagecache_over_limit(may_write);
++
++		/* Don't need to go there in one step; as the freed
++		 * pages are counted FREE_TO_PAGECACHE_RATIO, this
++		 * is still 2x as much as minimally needed. */
++		nr_pages /= (FREE_TO_PAGECACHE_RATIO/2);
++
++		/* Return early if there's no work to do */
++		if (nr_pages <= 0)
++			return;
++		/* But do a few at least */
++		nr_pages = max_t(unsigned long, nr_pages, SWAP_CLUSTER_MAX);
++
++	}
++
++	current->reclaim_state = &reclaim_state;
++
++	lru_pages = global_reclaimable_pages();
++	nr_slab = global_page_state(NR_SLAB_RECLAIMABLE);
++
++	/* If slab caches are huge, it's better to hit them first */
++	while (nr_slab >= lru_pages) {
++		reclaim_state.reclaimed_slab = 0;
++		shrink_slab(nr_pages, sc.gfp_mask, lru_pages);
++		if (!reclaim_state.reclaimed_slab)
++			break;
++
++		ret += reclaim_state.reclaimed_slab;
++		if (ret >= nr_pages)
++			goto out;
++
++		nr_slab -= reclaim_state.reclaimed_slab;
++	}
++
++	/*
++	 * Shrink the LRU in 4 passes:
++	 * 0 = Reclaim from inactive_list only (fast)
++	 * 1 = Reclaim from active list but don't reclaim mapped (not that fast)
++	 * Passes 2 -- 3 are only called if may_write == 1:
++	 * 2 = 2nd pass of type 1
++	 * 3 = Reclaim mapped (normal reclaim)
++	 */
++	for (pass = 0; pass < passes; pass++) {
++		int prio;
++		if (pass > 2)
++			sc.may_unmap = 1;
++
++		for (prio = DEF_PRIORITY; prio >= 0; prio--) {
++			unsigned long nr_to_scan = nr_pages - ret;
++
++			sc.nr_scanned = 0;
++			/* sc.swap_cluster_max = nr_to_scan; */
++			shrink_all_zones(nr_to_scan, prio, pass, &sc);
++			ret += sc.nr_reclaimed;
++			if (ret >= nr_pages)
++				goto out;
++
++			reclaim_state.reclaimed_slab = 0;
++			shrink_slab(sc.nr_scanned, sc.gfp_mask,
++					global_reclaimable_pages());
++			ret += reclaim_state.reclaimed_slab;
++
++			if (ret >= nr_pages)
++				goto out;
++
++			 if (may_write && sc.nr_scanned && prio < DEF_PRIORITY - 2)
++			 	congestion_wait(BLK_RW_ASYNC, HZ / 10);
++		}
++
++		if (pass > 1 && !may_write)
++			goto out;
++	}
++
++out:
++	current->reclaim_state = old_rs;
++}
++
++void shrink_page_cache(gfp_t mask, struct page *page)
++{
++	wakeup_kswapd(page_zone(page), 0);
++
++	if (pagecache_over_limit(1) > 0)
++		__shrink_page_cache(1, mask);
++}
++
++#else
++void shrink_page_cache(gfp_t mask, struct page *page)
++{
++	/* OOPS, not implemented */
++	return 0;
++}
++#endif
++EXPORT_SYMBOL(shrink_page_cache);
++
+ /* It's optimal to keep kswapds on the same CPUs as their memory, but
+    not required for correctness.  So if the last cpu in a node goes
+    away, we get changed to run anywhere: as the first one comes back,
+Index: linux-2.6.27/Documentation/vm/pagecache-limit
+===================================================================
+--- /dev/null
++++ linux-2.6.27/Documentation/vm/pagecache-limit
+@@ -0,0 +1,51 @@
++Functionality:
++-------------
++The patch introduces a new tunable in the proc filesystem:
++
++/proc/sys/vm/pagecache_limit_mb
++
++This tunable sets a limit to the pagecache in megabytes.
++If non-zero, it should not be set below 4 (4MB), or the system might behave erratically. In real-life, much larger limits (a few hundred MB to some GBs) will be useful.
++
++Examples:
++echo 1024 >/proc/sys/vm/pagecache_limit_mb
++
++This sets a baseline limits for the page cache (not the buffer cache!) of 1GiB.
++NOTE: The real limit depends on the amount of free memory. Every existing free page allows the page cache to grow 16x the amount of free memory above the set baseline. As soon as the free memory is needed, we free up page cache.
++
++This feature only works if CONFIG_HIBERNATION is configured in, as the
++needed helpers only exist then.
++
++How it works:
++------------
++The heart of this patch is a new function called shrink_page_cache(). It is called from balance_pgdat (which is the worker for kswapd) if the pagecache is above the limit.
++The function is also called in __alloc_pages_slowpath (if we are above a limit calculated with 1.25x the baseline), and add_to_page_cache so we don't exclusively rely on background shrinking from kswapd.
++
++shrink_page_cache() calculates the nr of pages the cache is over its limit. It reduces this number by a factor (so you have to call it several times to get down to the target) adds vm_pagecache_min_dec (2MB) and then shrinks the pagecache (using the Kernel LRUs).
++
++shrink_page_cache has two modes:
++- Just do one pass, reclaiming from inactive pagecache memory.
++  This is fast (but might not find free pages). It's used from the alloc path.
++- Do 4 passes, with moving pages from active to inactive (pass 1, 3) and also allowing pages to be written out (passes 2, 3).
++
++The function returns the nr of reclaimed pages.
++
++
++How it changes memory management:
++--------------------------------
++If the pagecache_limit_mb is set to zero (default), nothing changes.
++
++If set to a positive value, there will be three different operating modes:
++(1) If we still have plenty of free pages, the pagecache limit will NOT be enforced. Memory management decisions are taken as normally.
++(2) However, as soon someone consumes those free pages, we'll start freeing pagecache -- as those are returned to the free page pool, freeing a few pages from pagecache will return us to state (1) -- if however someone consumes these free pages quickly, we'll continue freeing up pages from the pagecache until we reach pagecache_limit_mb.
++(3) Once we are at or below the low watermark, pagecache_limit_mb, the pages in the page cache will be governed by normal paging memory management decisions; if it starts growing above the limit (corrected by the free pages), we'll free some up again.
++
++This feature is useful for machines that have large workloads, carefully sized to eat most of the memory. Depending on the applications page access pattern, the kernel may too easily swap the application memory out in favor of pagecache. This can happen even for low values of swappiness. With this feature, the admin can tell the kernel that only a certain amount of pagecache is really considered useful and that it otherwise should favor the applications memory.
++
++
++Foreground vs. background shrinking:
++-----------------------------------
++
++Usually, the Linux kernel reclaims its memory using the kernel thread kswapd. It reclaims memory in the background. If it can't reclaim memory fast enough, it retries with higher priority and if this still doesn't succeed it uses a direct reclaim path.
++
++For keeping the pagecache below the limit, we mostly rely on the background (kswapd) functionality; workloads that allocate pagecache or memory very quickly might thus temporarily have a higher amount of page cache than they should according to this logic.
+Index: linux-2.6.27/mm/page_alloc.c
+===================================================================
+--- linux-2.6.27.orig/mm/page_alloc.c
++++ linux-2.6.27/mm/page_alloc.c
+@@ -1429,6 +1429,27 @@ int zone_watermark_ok(struct zone *z, in
+ 	return 1;
+ }
+ 
++/* Returns a number that's positive if the pagecache is above
++ * the set limit. Note that we allow the pagecache to grow
++ * larger if there's plenty of free pages.
++ * If high is set we'll apply a 1.25x higher baseline
++ */
++unsigned long pagecache_over_limit(int synch)
++{
++	unsigned long pgcache_pages = global_page_state(NR_FILE_PAGES);
++	unsigned long free_pages = global_page_state(NR_FREE_PAGES);
++	unsigned long limit;
++
++	limit = vm_pagecache_limit_mb * ((1024*1024UL)/PAGE_SIZE) +
++		FREE_TO_PAGECACHE_RATIO * free_pages;
++	if (!synch)
++		limit = limit * 7 / 8UL;
++	if (pgcache_pages > limit)
++		return pgcache_pages - limit;
++	return 0;
++}
++EXPORT_SYMBOL(pagecache_over_limit);
++
+ #ifdef CONFIG_NUMA
+ /*
+  * zlc_setup - Setup for "zonelist cache".  Uses cached zone data to
+Index: linux-2.6.27/include/linux/pagemap.h
+===================================================================
+--- linux-2.6.27.orig/include/linux/pagemap.h
++++ linux-2.6.27/include/linux/pagemap.h
+@@ -12,6 +12,7 @@
+ #include <asm/uaccess.h>
+ #include <linux/gfp.h>
+ #include <linux/bitops.h>
++#include <linux/swap.h>
+ #include <linux/hardirq.h> /* for in_interrupt() */
+ 
+ /*
+@@ -448,6 +449,9 @@ static inline int add_to_page_cache(stru
+ {
+ 	int error;
+ 
++	if (unlikely(vm_pagecache_limit_mb) && pagecache_over_limit(0) > 0)
++		shrink_page_cache(gfp_mask, page);
++
+ 	__set_page_locked(page);
+ 	error = add_to_page_cache_locked(page, mapping, offset, gfp_mask);
+ 	if (unlikely(error))
+Index: linux-2.6.27/mm/shmem.c
+===================================================================
+--- linux-2.6.27.orig/mm/shmem.c
++++ linux-2.6.27/mm/shmem.c
+@@ -943,6 +943,9 @@ found:
+ 	error = 1;
+ 	if (!inode)
+ 		goto out;
++
++	if (unlikely(vm_pagecache_limit_mb) && pagecache_over_limit(0) > 0)
++		shrink_page_cache(GFP_KERNEL, page);
+ 	/*
+ 	 * Charge page using GFP_KERNEL while we can wait.
+ 	 * Charged back to the user(not to caller) when swap account is used.
