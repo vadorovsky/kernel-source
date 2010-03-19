@@ -1,0 +1,244 @@
+From dcca034b2238e040780ccc4663afca1bdbd3eb00 Mon Sep 17 00:00:00 2001
+From: Jan Kiszka <jan.kiszka@siemens.com>
+Date: Fri, 19 Feb 2010 19:38:07 +0100
+Subject: [PATCH 5/5] KVM: x86: Save&restore interrupt shadow mask
+Patch-mainline: 2.6.34
+References: bnc#585490
+
+The interrupt shadow created by STI or MOV-SS-like operations is part of
+the VCPU state and must be preserved across migration. Transfer it in
+the spare padding field of kvm_vcpu_events.interrupt.
+
+As a side effect we now have to make vmx_set_interrupt_shadow robust
+against both shadow types being set. Give MOV SS a higher priority and
+skip STI in that case to avoid that VMX throws a fault on next entry.
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+Signed-off-by: Avi Kivity <avi@redhat.com>
+Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+ Documentation/kvm/api.txt          |   11 ++++++++++-
+ arch/x86/include/asm/kvm.h         |    7 ++++++-
+ arch/x86/include/asm/kvm_emulate.h |    3 ---
+ arch/x86/kvm/emulate.c             |    4 ++--
+ arch/x86/kvm/svm.c                 |    2 +-
+ arch/x86/kvm/vmx.c                 |    8 ++++----
+ arch/x86/kvm/x86.c                 |   12 ++++++++++--
+ include/linux/kvm.h                |    1 +
+ 8 files changed, 34 insertions(+), 14 deletions(-)
+
+diff --git a/Documentation/kvm/api.txt b/Documentation/kvm/api.txt
+index fca2b59..9d3f3a1 100644
+Signed-off-by: Alexander Graf <agraf@suse.de>
+--- a/Documentation/kvm/api.txt
++++ b/Documentation/kvm/api.txt
+@@ -632,6 +632,7 @@ struct kvm_clock_data {
+ 4.29 KVM_GET_VCPU_EVENTS
+ 
+ Capability: KVM_CAP_VCPU_EVENTS
++Extended by: KVM_CAP_INTR_SHADOW
+ Architectures: x86
+ Type: vm ioctl
+ Parameters: struct kvm_vcpu_event (out)
+@@ -652,7 +653,7 @@ struct kvm_vcpu_events {
+ 		__u8 injected;
+ 		__u8 nr;
+ 		__u8 soft;
+-		__u8 pad;
++		__u8 shadow;
+ 	} interrupt;
+ 	struct {
+ 		__u8 injected;
+@@ -664,9 +665,13 @@ struct kvm_vcpu_events {
+ 	__u32 flags;
+ };
+ 
++KVM_VCPUEVENT_VALID_SHADOW may be set in the flags field to signal that
++interrupt.shadow contains a valid state. Otherwise, this field is undefined.
++
+ 4.30 KVM_SET_VCPU_EVENTS
+ 
+ Capability: KVM_CAP_VCPU_EVENTS
++Extended by: KVM_CAP_INTR_SHADOW
+ Architectures: x86
+ Type: vm ioctl
+ Parameters: struct kvm_vcpu_event (in)
+@@ -685,6 +690,10 @@ current in-kernel state. The bits are:
+ KVM_VCPUEVENT_VALID_NMI_PENDING - transfer nmi.pending to the kernel
+ KVM_VCPUEVENT_VALID_SIPI_VECTOR - transfer sipi_vector
+ 
++If KVM_CAP_INTR_SHADOW is available, KVM_VCPUEVENT_VALID_SHADOW can be set in
++the flags field to signal that interrupt.shadow contains a valid state and
++shall be written into the VCPU.
++
+ 
+ 5. The kvm_run structure
+ 
+diff --git a/arch/x86/include/asm/kvm.h b/arch/x86/include/asm/kvm.h
+index d8f3f6f..773c52b 100644
+Signed-off-by: Alexander Graf <agraf@suse.de>
+--- a/arch/x86/include/asm/kvm.h
++++ b/arch/x86/include/asm/kvm.h
+@@ -255,6 +255,11 @@ struct kvm_reinject_control {
+ /* When set in flags, include corresponding fields on KVM_SET_VCPU_EVENTS */
+ #define KVM_VCPUEVENT_VALID_NMI_PENDING	0x00000001
+ #define KVM_VCPUEVENT_VALID_SIPI_VECTOR	0x00000002
++#define KVM_VCPUEVENT_VALID_SHADOW	0x00000004
++
++/* Interrupt shadow states */
++#define KVM_X86_SHADOW_INT_MOV_SS	0x01
++#define KVM_X86_SHADOW_INT_STI		0x02
+ 
+ /* for KVM_GET/SET_VCPU_EVENTS */
+ struct kvm_vcpu_events {
+@@ -269,7 +274,7 @@ struct kvm_vcpu_events {
+ 		__u8 injected;
+ 		__u8 nr;
+ 		__u8 soft;
+-		__u8 pad;
++		__u8 shadow;
+ 	} interrupt;
+ 	struct {
+ 		__u8 injected;
+diff --git a/arch/x86/include/asm/kvm_emulate.h b/arch/x86/include/asm/kvm_emulate.h
+index 7c18e12..95db0f1 100644
+Signed-off-by: Alexander Graf <agraf@suse.de>
+--- a/arch/x86/include/asm/kvm_emulate.h
++++ b/arch/x86/include/asm/kvm_emulate.h
+@@ -143,9 +143,6 @@ struct decode_cache {
+ 	struct fetch_cache fetch;
+ };
+ 
+-#define X86_SHADOW_INT_MOV_SS  1
+-#define X86_SHADOW_INT_STI     2
+-
+ struct x86_emulate_ctxt {
+ 	/* Register state before/after emulation. */
+ 	struct kvm_vcpu *vcpu;
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index 7371e65..3893f20 100644
+Signed-off-by: Alexander Graf <agraf@suse.de>
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -1892,7 +1892,7 @@ special_insn:
+ 		}
+ 
+ 		if (c->modrm_reg == VCPU_SREG_SS)
+-			toggle_interruptibility(ctxt, X86_SHADOW_INT_MOV_SS);
++			toggle_interruptibility(ctxt, KVM_X86_SHADOW_INT_MOV_SS);
+ 
+ 		if (c->modrm_reg <= 5) {
+ 			type_bits = (c->modrm_reg == 1) ? 9 : 1;
+@@ -2123,7 +2123,7 @@ special_insn:
+ 		c->dst.type = OP_NONE;	/* Disable writeback. */
+ 		break;
+ 	case 0xfb: /* sti */
+-		toggle_interruptibility(ctxt, X86_SHADOW_INT_STI);
++		toggle_interruptibility(ctxt, KVM_X86_SHADOW_INT_STI);
+ 		ctxt->eflags |= X86_EFLAGS_IF;
+ 		c->dst.type = OP_NONE;	/* Disable writeback. */
+ 		break;
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 2ec4876..c7c6411 100644
+Signed-off-by: Alexander Graf <agraf@suse.de>
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -267,7 +267,7 @@ static u32 svm_get_interrupt_shadow(struct kvm_vcpu *vcpu, int mask)
+ 	u32 ret = 0;
+ 
+ 	if (svm->vmcb->control.int_state & SVM_INTERRUPT_SHADOW_MASK)
+-		ret |= X86_SHADOW_INT_STI | X86_SHADOW_INT_MOV_SS;
++		ret |= KVM_X86_SHADOW_INT_STI | KVM_X86_SHADOW_INT_MOV_SS;
+ 	return ret & mask;
+ }
+ 
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 5b5c6f3..a6c1ede 100644
+Signed-off-by: Alexander Graf <agraf@suse.de>
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -829,9 +829,9 @@ static u32 vmx_get_interrupt_shadow(struct kvm_vcpu *vcpu, int mask)
+ 	int ret = 0;
+ 
+ 	if (interruptibility & GUEST_INTR_STATE_STI)
+-		ret |= X86_SHADOW_INT_STI;
++		ret |= KVM_X86_SHADOW_INT_STI;
+ 	if (interruptibility & GUEST_INTR_STATE_MOV_SS)
+-		ret |= X86_SHADOW_INT_MOV_SS;
++		ret |= KVM_X86_SHADOW_INT_MOV_SS;
+ 
+ 	return ret & mask;
+ }
+@@ -843,9 +843,9 @@ static void vmx_set_interrupt_shadow(struct kvm_vcpu *vcpu, int mask)
+ 
+ 	interruptibility &= ~(GUEST_INTR_STATE_STI | GUEST_INTR_STATE_MOV_SS);
+ 
+-	if (mask & X86_SHADOW_INT_MOV_SS)
++	if (mask & KVM_X86_SHADOW_INT_MOV_SS)
+ 		interruptibility |= GUEST_INTR_STATE_MOV_SS;
+-	if (mask & X86_SHADOW_INT_STI)
++	else if (mask & KVM_X86_SHADOW_INT_STI)
+ 		interruptibility |= GUEST_INTR_STATE_STI;
+ 
+ 	if ((interruptibility != interruptibility_old))
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 3e259b4..365fef7 100644
+Signed-off-by: Alexander Graf <agraf@suse.de>
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1782,6 +1782,9 @@ static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
+ 		vcpu->arch.interrupt.pending && !vcpu->arch.interrupt.soft;
+ 	events->interrupt.nr = vcpu->arch.interrupt.nr;
+ 	events->interrupt.soft = 0;
++	events->interrupt.shadow =
++		kvm_x86_ops->get_interrupt_shadow(vcpu,
++			KVM_X86_SHADOW_INT_MOV_SS | KVM_X86_SHADOW_INT_STI);
+ 
+ 	events->nmi.injected = vcpu->arch.nmi_injected;
+ 	events->nmi.pending = vcpu->arch.nmi_pending;
+@@ -1790,7 +1793,8 @@ static void kvm_vcpu_ioctl_x86_get_vcpu_events(struct kvm_vcpu *vcpu,
+ 	events->sipi_vector = vcpu->arch.sipi_vector;
+ 
+ 	events->flags = (KVM_VCPUEVENT_VALID_NMI_PENDING
+-			 | KVM_VCPUEVENT_VALID_SIPI_VECTOR);
++			 | KVM_VCPUEVENT_VALID_SIPI_VECTOR
++			 | KVM_VCPUEVENT_VALID_SHADOW);
+ 
+ 	vcpu_put(vcpu);
+ }
+@@ -1799,7 +1803,8 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 					      struct kvm_vcpu_events *events)
+ {
+ 	if (events->flags & ~(KVM_VCPUEVENT_VALID_NMI_PENDING
+-			      | KVM_VCPUEVENT_VALID_SIPI_VECTOR))
++			      | KVM_VCPUEVENT_VALID_SIPI_VECTOR
++			      | KVM_VCPUEVENT_VALID_SHADOW))
+ 		return -EINVAL;
+ 
+ 	vcpu_load(vcpu);
+@@ -1814,6 +1819,9 @@ static int kvm_vcpu_ioctl_x86_set_vcpu_events(struct kvm_vcpu *vcpu,
+ 	vcpu->arch.interrupt.soft = events->interrupt.soft;
+ 	if (vcpu->arch.interrupt.pending && irqchip_in_kernel(vcpu->kvm))
+ 		kvm_pic_clear_isr_ack(vcpu->kvm);
++	if (events->flags & KVM_VCPUEVENT_VALID_SHADOW)
++		kvm_x86_ops->set_interrupt_shadow(vcpu,
++						  events->interrupt.shadow);
+ 
+ 	vcpu->arch.nmi_injected = events->nmi.injected;
+ 	if (events->flags & KVM_VCPUEVENT_VALID_NMI_PENDING)
+diff --git a/include/linux/kvm.h b/include/linux/kvm.h
+index c61e381..f6abd7a 100644
+Signed-off-by: Alexander Graf <agraf@suse.de>
+--- a/include/linux/kvm.h
++++ b/include/linux/kvm.h
+@@ -443,6 +443,7 @@ struct kvm_ioeventfd {
+ #ifdef __KVM_HAVE_VCPU_EVENTS
+ #define KVM_CAP_VCPU_EVENTS 41
+ #endif
++#define KVM_CAP_INTR_SHADOW 49
+ 
+ #ifdef KVM_CAP_IRQ_ROUTING
+ 
+-- 
+1.6.0.2
+
