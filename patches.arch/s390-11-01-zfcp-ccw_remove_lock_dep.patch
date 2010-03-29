@@ -1,0 +1,172 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: zfcp: Remove lock dependency on CCW remove.
+References: bnc#590926
+Patch-mainline: Upstream submission made
+
+Symptom:     Possible dead-lock on ccw removal.
+Problem:     During the removal of a CCW device the config_mutex has to be
+             held to maintain the configuration consistency. However, a few
+             process steps do fetch other locks which might interfere with
+             the already held mutex. 
+Solution:    The double protection is not required, so remove it.
+
+Acked-by: John Jolly <jjolly@suse.de>
+
+---
+ drivers/s390/scsi/zfcp_aux.c  |    8 +-------
+ drivers/s390/scsi/zfcp_ccw.c  |   21 ++++++++++++---------
+ drivers/s390/scsi/zfcp_ext.h  |    1 +
+ drivers/s390/scsi/zfcp_fc.c   |    5 +++++
+ drivers/s390/scsi/zfcp_scsi.c |    9 ---------
+ 5 files changed, 19 insertions(+), 25 deletions(-)
+
+--- a/drivers/s390/scsi/zfcp_aux.c
++++ b/drivers/s390/scsi/zfcp_aux.c
+@@ -492,7 +492,7 @@ static int zfcp_setup_adapter_work_queue
+ 	return -ENOMEM;
+ }
+ 
+-static void zfcp_destroy_adapter_work_queue(struct zfcp_adapter *adapter)
++void zfcp_destroy_adapter_work_queue(struct zfcp_adapter *adapter)
+ {
+ 	if (adapter->work_queue)
+ 		destroy_workqueue(adapter->work_queue);
+@@ -603,18 +603,14 @@ qdio_failed:
+ /**
+  * zfcp_adapter_dequeue - remove the adapter from the resource list
+  * @adapter: pointer to struct zfcp_adapter which should be removed
+- * locks:	adapter list write lock is assumed to be held by caller
+  */
+ void zfcp_adapter_dequeue(struct zfcp_adapter *adapter)
+ {
+ 	int retval = 0;
+ 	unsigned long flags;
+ 
+-	cancel_work_sync(&adapter->stat_work);
+-	zfcp_fc_wka_ports_force_offline(adapter->gs);
+ 	sysfs_remove_group(&adapter->ccw_device->dev.kobj,
+ 			   &zfcp_sysfs_adapter_attrs);
+-	dev_set_drvdata(&adapter->ccw_device->dev, NULL);
+ 	/* sanity check: no pending FSF requests */
+ 	spin_lock_irqsave(&adapter->req_list_lock, flags);
+ 	retval = zfcp_reqlist_isempty(adapter);
+@@ -622,9 +618,7 @@ void zfcp_adapter_dequeue(struct zfcp_ad
+ 	if (!retval)
+ 		return;
+ 
+-	zfcp_fc_gs_destroy(adapter);
+ 	zfcp_erp_thread_kill(adapter);
+-	zfcp_destroy_adapter_work_queue(adapter);
+ 	zfcp_dbf_adapter_unregister(adapter->dbf);
+ 	zfcp_free_low_mem_buffers(adapter);
+ 	zfcp_qdio_destroy(adapter->qdio);
+--- a/drivers/s390/scsi/zfcp_ccw.c
++++ b/drivers/s390/scsi/zfcp_ccw.c
+@@ -100,16 +100,21 @@ static void zfcp_ccw_remove(struct ccw_d
+ 
+ 	mutex_lock(&zfcp_data.config_mutex);
+ 	adapter = dev_get_drvdata(&ccw_device->dev);
+-	if (!adapter)
+-		goto out;
++	dev_set_drvdata(&ccw_device->dev, NULL);
+ 	mutex_unlock(&zfcp_data.config_mutex);
+ 
++	if (!adapter)
++		return;
++
++	zfcp_adapter_scsi_unregister(adapter);
++
+ 	cancel_work_sync(&adapter->scan_work);
++	cancel_work_sync(&adapter->stat_work);
++	zfcp_fc_wka_ports_force_offline(adapter->gs);
++	zfcp_fc_gs_destroy(adapter);
+ 
+ 	mutex_lock(&zfcp_data.config_mutex);
+-
+-	/* this also removes the scsi devices, so call it first */
+-	zfcp_adapter_scsi_unregister(adapter);
++	atomic_set_mask(ZFCP_STATUS_COMMON_REMOVE, &adapter->status);
+ 
+ 	write_lock_irq(&zfcp_data.config_lock);
+ 	list_for_each_entry_safe(port, p, &adapter->port_list_head, list) {
+@@ -121,8 +126,8 @@ static void zfcp_ccw_remove(struct ccw_d
+ 		list_move(&port->list, &port_remove_lh);
+ 		atomic_set_mask(ZFCP_STATUS_COMMON_REMOVE, &port->status);
+ 	}
+-	atomic_set_mask(ZFCP_STATUS_COMMON_REMOVE, &adapter->status);
+ 	write_unlock_irq(&zfcp_data.config_lock);
++	mutex_unlock(&zfcp_data.config_mutex);
+ 
+ 	list_for_each_entry_safe(unit, u, &unit_remove_lh, list)
+ 		zfcp_unit_dequeue(unit);
+@@ -130,11 +135,9 @@ static void zfcp_ccw_remove(struct ccw_d
+ 	list_for_each_entry_safe(port, p, &port_remove_lh, list)
+ 		zfcp_port_dequeue(port);
+ 
++	zfcp_destroy_adapter_work_queue(adapter);
+ 	wait_event(adapter->remove_wq, atomic_read(&adapter->refcount) == 0);
+ 	zfcp_adapter_dequeue(adapter);
+-
+-out:
+-	mutex_unlock(&zfcp_data.config_mutex);
+ }
+ 
+ /**
+--- a/drivers/s390/scsi/zfcp_ext.h
++++ b/drivers/s390/scsi/zfcp_ext.h
+@@ -24,6 +24,7 @@ extern void zfcp_unit_dequeue(struct zfc
+ extern int zfcp_reqlist_isempty(struct zfcp_adapter *);
+ extern void zfcp_sg_free_table(struct scatterlist *, int);
+ extern int zfcp_sg_setup_table(struct scatterlist *, int);
++extern void zfcp_destroy_adapter_work_queue(struct zfcp_adapter *);
+ 
+ /* zfcp_ccw.c */
+ extern int zfcp_ccw_register(void);
+--- a/drivers/s390/scsi/zfcp_fc.c
++++ b/drivers/s390/scsi/zfcp_fc.c
+@@ -624,6 +624,10 @@ static int zfcp_fc_eval_gpn_ft(struct zf
+ 	}
+ 
+ 	mutex_lock(&zfcp_data.config_mutex);
++	if (atomic_read(&adapter->status) & ZFCP_STATUS_COMMON_REMOVE) {
++		ret = -EBUSY;
++		goto out;
++	}
+ 
+ 	/* first entry is the header */
+ 	for (x = 1; x < max_entries && !last; x++) {
+@@ -657,6 +661,7 @@ static int zfcp_fc_eval_gpn_ft(struct zf
+ 	zfcp_erp_wait(adapter);
+ 	list_for_each_entry_safe(port, tmp, &adapter->port_list_head, list)
+ 		zfcp_fc_validate_port(port);
++out:
+ 	mutex_unlock(&zfcp_data.config_mutex);
+ 	return ret;
+ }
+--- a/drivers/s390/scsi/zfcp_scsi.c
++++ b/drivers/s390/scsi/zfcp_scsi.c
+@@ -340,24 +340,15 @@ int zfcp_adapter_scsi_register(struct zf
+ void zfcp_adapter_scsi_unregister(struct zfcp_adapter *adapter)
+ {
+ 	struct Scsi_Host *shost;
+-	struct zfcp_port *port;
+ 
+ 	shost = adapter->scsi_host;
+ 	if (!shost)
+ 		return;
+ 
+-	read_lock_irq(&zfcp_data.config_lock);
+-	list_for_each_entry(port, &adapter->port_list_head, list)
+-		if (port->rport)
+-			port->rport = NULL;
+-
+-	read_unlock_irq(&zfcp_data.config_lock);
+ 	fc_remove_host(shost);
+ 	scsi_remove_host(shost);
+ 	scsi_host_put(shost);
+ 	adapter->scsi_host = NULL;
+-
+-	return;
+ }
+ 
+ static struct fc_host_statistics*
