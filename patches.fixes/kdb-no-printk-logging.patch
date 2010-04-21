@@ -1,0 +1,290 @@
+From f3079f80276f552608736f2c824981dbd1b90f87 Mon Sep 17 00:00:00 2001
+From: Jason Wessel <jason.wessel@windriver.com>
+Date: Sun, 4 Apr 2010 08:53:47 -0500
+Subject: printk,kdb: capture printk() when in kdb shell
+Patch-mainline: no
+References: bnc#598246
+
+Certain calls from the kdb shell will call out to printk(), and any of
+these calls should get vectored back to the kdb_printf() so that the
+kdb pager and processing can be used, as well as to properly channel
+I/O to the polled I/O devices.
+
+CC: Randy Dunlap <rdunlap@xenotime.net>
+Signed-off-by: Jason Wessel <jason.wessel@windriver.com>
+Acked-by: Andrew Morton <akpm@linux-foundation.org>
+Backported-by: Martin Hicks <mort@sgi.com> [added also pager and cmd_interrupt]
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ include/linux/kdb.h        |    3 +++
+ include/linux/kdbprivate.h |    1 +
+ kdb/kdb_bt.c               |    2 ++
+ kdb/kdb_io.c               |   36 +++++++++++++++++++++++-------------
+ kdb/kdbmain.c              |   24 +++++++++++++++++-------
+ kernel/printk.c            |   12 +++++++++++-
+ 6 files changed, 57 insertions(+), 21 deletions(-)
+
+--- a/include/linux/kdb.h
++++ b/include/linux/kdb.h
+@@ -120,11 +120,14 @@ extern int kdb(kdb_reason_t, int, struct
+ #define kdb(reason,error_code,frame) (0)
+ #endif
+ 
++extern int kdb_trap_printk;
+ /* Mainly used by kdb code, but this function is sometimes used
+  * by hacked debug code so make it generally available, not private.
+  */
+ extern void kdb_printf(const char *,...)
+ 	    __attribute__ ((format (printf, 1, 2)));
++extern int vkdb_printf(const char *fmt, va_list args)
++	    __attribute__ ((format (printf, 1, 0)));
+ typedef void (*kdb_printf_t)(const char *, ...)
+ 	     __attribute__ ((format (printf, 1, 2)));
+ extern void kdb_init(void);
+--- a/include/linux/kdbprivate.h
++++ b/include/linux/kdbprivate.h
+@@ -163,6 +163,7 @@ volatile extern int kdb_state[ /*NR_CPUS
+ #define KDB_STATE_GO1		0x00010000	/* go only releases one cpu */
+ #define KDB_STATE_KEYBOARD	0x00020000	/* kdb entered via keyboard on this cpu */
+ #define KDB_STATE_KEXEC		0x00040000	/* kexec issued */
++#define KDB_STATE_PAGER		0x00080000	/* pager is available */
+ #define KDB_STATE_ARCH		0xff000000	/* Reserved for arch specific use */
+ 
+ #define KDB_STATE_CPU(flag,cpu)		(kdb_state[cpu] & KDB_STATE_##flag)
+--- a/kdb/kdb_bt.c
++++ b/kdb/kdb_bt.c
+@@ -61,6 +61,7 @@ static int kdb_show_stack(struct task_st
+ 	/* Use the in-kernel backtraces */
+ 	int old_lvl = console_loglevel;
+ 	console_loglevel = 15;
++	kdb_trap_printk++;
+ 	kdba_set_current_task(p);
+ 	if (addr) {
+ 		show_stack((struct task_struct *)p, addr);
+@@ -74,6 +75,7 @@ static int kdb_show_stack(struct task_st
+ 		show_stack(p, NULL);
+ 	}
+ 	console_loglevel = old_lvl;
++	kdb_trap_printk--;
+ 	return 0;
+ #endif /* CONFIG_IA64 */
+ }
+--- a/kdb/kdb_io.c
++++ b/kdb/kdb_io.c
+@@ -34,6 +34,8 @@ static struct console *kdbcons;
+ #define CMD_BUFLEN 256
+ char kdb_prompt_str[CMD_BUFLEN];
+ 
++int kdb_trap_printk;
++
+ extern int kdb_grepping_flag;
+ extern char kdb_grep_string[];
+ extern int kdb_grep_leading;
+@@ -511,15 +513,15 @@ kdb_search_string(char *searched, char *
+ 	return 0;
+ }
+ 
+-void
+-kdb_printf(const char *fmt, ...)
++int
++vkdb_printf(const char *fmt, va_list ap)
+ {
+-	va_list ap;
+ 	int diag;
+ 	int linecount;
+ 	int logging, saved_loglevel = 0;
+-	int do_longjmp = 0;
++	int saved_trap_printk;
+ 	int got_printf_lock = 0;
++	int retlen = 0;
+ 	int fnd, len;
+ 	char *cp, *cp2, *cphold = NULL, replaced_byte = ' ';
+ 	char *moreprompt = "more> ";
+@@ -528,6 +530,9 @@ kdb_printf(const char *fmt, ...)
+ 	unsigned long uninitialized_var(flags);
+ 
+ 	preempt_disable();
++	saved_trap_printk = kdb_trap_printk;
++	kdb_trap_printk = 0;
++
+ 	/* Serialize kdb_printf if multiple cpus try to write at once.
+ 	 * But if any cpu goes recursive in kdb, just print the output,
+ 	 * even if it is interleaved with any other text.
+@@ -555,9 +560,7 @@ kdb_printf(const char *fmt, ...)
+ 		next_avail = kdb_buffer;
+ 		size_avail = sizeof(kdb_buffer);
+ 	}
+-	va_start(ap, fmt);
+ 	vsnprintf(next_avail, size_avail, fmt, ap);
+-	va_end(ap);
+ 
+ 	/*
+ 	 * If kdb_parse() found that the command was cmd xxx | grep yyy
+@@ -675,7 +678,7 @@ kdb_printit:
+ 		printk("%s", kdb_buffer);
+ 	}
+ 
+-	if (KDB_STATE(LONGJMP) && strchr(kdb_buffer, '\n'))
++	if (KDB_STATE(PAGER) && strchr(kdb_buffer, '\n'))
+ 		kdb_nextline++;
+ 
+ 	/* check for having reached the LINES number of printed lines */
+@@ -739,8 +742,8 @@ kdb_printit:
+ 		size_avail = sizeof(kdb_buffer);
+ 		if ((buf1[0] == 'q') || (buf1[0] == 'Q')) {
+ 			/* user hit q or Q */
+-			do_longjmp = 1;
+ 			KDB_FLAG_SET(CMD_INTERRUPT);	/* command was interrupted */
++			KDB_STATE_CLEAR(PAGER);
+ 			/* end of command output; back to normal mode */
+ 			kdb_grepping_flag = 0;
+ 			kdb_printf("\n");
+@@ -784,12 +787,19 @@ kdb_print_out:
+ 	} else {
+ 		__release(kdb_printf_lock);
+ 	}
++	kdb_trap_printk = saved_trap_printk;
+ 	preempt_enable();
+-	if (do_longjmp)
+-#ifdef kdba_setjmp
+-		kdba_longjmp(&kdbjmpbuf[smp_processor_id()], 1)
+-#endif	/* kdba_setjmp */
+-		;
++	return retlen;
++}
++
++void
++kdb_printf(const char *fmt, ...)
++{
++	va_list ap;
++
++	va_start(ap, fmt);
++	vkdb_printf(fmt, ap);
++	va_end(ap);
+ }
+ 
+ /*
+--- a/kdb/kdbmain.c
++++ b/kdb/kdbmain.c
+@@ -977,6 +977,7 @@ kdb_parse(const char *cmdstr)
+ 	if (KDB_FLAG(CMD_INTERRUPT)) {
+ 		/* Previous command was interrupted, newline must not repeat the command */
+ 		KDB_FLAG_CLEAR(CMD_INTERRUPT);
++		KDB_STATE_SET(PAGER);
+ 		argc = 0;	/* no repeat */
+ 	}
+ 
+@@ -1472,20 +1473,17 @@ kdb_local(kdb_reason_t reason, int error
+ 		kdb_nextline = 1;
+ 		KDB_STATE_CLEAR(SUPPRESS);
+ #ifdef kdba_setjmp
+-		/*
+-		 * Use kdba_setjmp/kdba_longjmp to break out of
+-		 * the pager early and to attempt to recover from kdb errors.
+-		 */
++		/* Use kdba_setjmp/kdba_longjmp to attempt to recover from kdb errors. */
+ 		KDB_STATE_CLEAR(LONGJMP);
+ 		if (kdbjmpbuf) {
+ 			if (kdba_setjmp(&kdbjmpbuf[smp_processor_id()])) {
+-				/* Command aborted (usually in pager) */
++				/* Command aborted */
+ 				continue;
+ 			}
+ 			else
+ 				KDB_STATE_SET(LONGJMP);
+ 		}
+-#endif	/* kdba_setjmp */
++#endif /* kdba_setjmp */
+ 
+ 		cmdbuf = cmd_cur;
+ 		*cmdbuf = '\0';
+@@ -2185,12 +2183,14 @@ kdb(kdb_reason_t reason, int error, stru
+ 		KDB_STATE_CLEAR(GO1);
+ 		reason = KDB_REASON_SILENT;	/* Now silently go */
+ 	}
++	KDB_STATE_SET(PAGER);
+ 
+ 	/* Set up a consistent set of process stacks before talking to the user */
+ 	KDB_DEBUG_STATE("kdb 9", result);
+ 	result = kdba_main_loop(reason, reason2, error, db_result, regs);
+ 	reason = reason2;	/* back to original event type */
+ 
++	KDB_STATE_CLEAR(PAGER);
+ 	KDB_DEBUG_STATE("kdb 10", result);
+ 	kdba_adjust_ip(reason, error, regs);
+ 	KDB_STATE_CLEAR(LONGJMP);
+@@ -2563,6 +2563,8 @@ kdb_md(int argc, const char **argv)
+ 		unsigned long a;
+ 		int n, z, num = (symbolic ? 1 : (16 / bytesperword));
+ 
++		if (KDB_FLAG(CMD_INTERRUPT))
++			return 0;
+ 		for (a = addr, z = 0; z < repeat; a += bytesperword, ++z) {
+ 			if (phys) {
+ 				if (kdb_getphysword(&word, a, bytesperword)
+@@ -3105,7 +3107,9 @@ kdb_dmesg(int argc, const char **argv)
+ 	c = '\n';
+ 	while (start != end) {
+ 		char buf[201];
+-	       	p = buf;
++		p = buf;
++ 		if (KDB_FLAG(CMD_INTERRUPT))
++			return 0;
+ 		while (start < end && (c = *KDB_WRAP(start)) && (p - buf) < sizeof(buf)-1) {
+ 			++start;
+ 			*p++ = c;
+@@ -3332,6 +3336,8 @@ kdb_ps(int argc, const char **argv)
+ 	for (cpu = 0; cpu < NR_CPUS; ++cpu) {
+ 		if (!cpu_online(cpu))
+ 			continue;
++		if (KDB_FLAG(CMD_INTERRUPT))
++			return 0;
+ 		p = kdb_curr_task(cpu);
+ 		if (kdb_task_state(p, mask))
+ 			kdb_ps1(p);
+@@ -3339,6 +3345,8 @@ kdb_ps(int argc, const char **argv)
+ 	kdb_printf("\n");
+ 	/* Now the real tasks */
+ 	kdb_do_each_thread(g, p) {
++		if (KDB_FLAG(CMD_INTERRUPT))
++			return 0;
+ 		if (kdb_task_state(p, mask))
+ 			kdb_ps1(p);
+ 	} kdb_while_each_thread(g, p);
+@@ -3500,6 +3508,8 @@ kdb_help(int argc, const char **argv)
+ 	kdb_printf("%-15.15s %-20.20s %s\n", "Command", "Usage", "Description");
+ 	kdb_printf("----------------------------------------------------------\n");
+ 	for(i=0, kt=kdb_commands; i<kdb_max_commands; i++, kt++) {
++		if (KDB_FLAG(CMD_INTERRUPT))
++			return 0;
+ 		if (kt->cmd_name)
+ 			kdb_printf("%-15.15s %-20.20s %s\n", kt->cmd_name,
+ 				   kt->cmd_usage, kt->cmd_help);
+--- a/kernel/printk.c
++++ b/kernel/printk.c
+@@ -35,6 +35,9 @@
+ #include <linux/kexec.h>
+ #include <linux/jhash.h>
+ #include <linux/device.h>
++#ifdef CONFIG_KDB
++#include <linux/kdb.h>
++#endif
+ 
+ #include <asm/uaccess.h>
+ 
+@@ -607,7 +610,14 @@ asmlinkage int printk(const char *fmt, .
+ {
+ 	va_list args;
+ 	int r;
+-
++#ifdef CONFIG_KDB
++	if (unlikely(kdb_trap_printk)) {
++		va_start(args, fmt);
++		r = vkdb_printf(fmt, args);
++		va_end(args);
++		return r;
++	}
++#endif
+ 	va_start(args, fmt);
+ 	r = vprintk(fmt, args);
+ 	va_end(args);
