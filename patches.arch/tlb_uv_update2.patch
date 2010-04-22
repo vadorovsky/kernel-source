@@ -4,7 +4,7 @@ References: bnc#594131, FATE#306952
 Patch-mainline: no
 
 This patch updates sles11sp1 up to what we've learned about
-BAU handling up to 4/1/2010.   -cpw
+BAU handling up to 4/14/2010.   -cpw
 
 It applies on top of the patch in SLES11SP1 attached to buzilla 586806
 
@@ -13,30 +13,38 @@ It applies on top of the patch in SLES11SP1 attached to buzilla 586806
    is ambiguous.
  - Adds a 'throttle' to keep a uvhub from sending more than a specified number
    of broadcasts concurrently.  This is necessary to work around a hardware
-   issue.
- - Adds a new method to quiesce a hub for that work around.
+   issue. The throttle can be raised or lowered.
+ - Distinguishes more clearly between timeouts caused by destination cpu
+   delays and those caused because destination resources are 'plugged' and
+   a timeout is pending.
+ - Tries to free software acknowledge resources only if they are timed out.
+ - Adds a new method to quiesce a hub when needing to free 'plugged' resources.
+ - Uses IPI's to free 'plugged' resources.
+ - Detects a hardware 'stay-busy' issue and works around it.
  - Splits off new function uv_bau_retry_msg() from uv_bau_process_message()
    per community coding style feedback.
  - Simplifies the argument list to uv_bau_process_message(), per community
    coding style feedback.
- - Falls back to 'nobau' flushing in uv_flush_send_and_wait() if the BAU
-   would hang the system.
- - Adds some new statistics about the scope of broadcasts.
+ - Adds some new statistics about the scope of broadcasts, retries, the
+   hardware issue and the 'throttle'.
 
-Diffed against 2.6.32.9
+Submitted to the community:
+   http://marc.info/?l=linux-kernel&m=127126296530898&w=2
+
+Diffed against 2.6.32.10
 
 Signed-off-by: Cliff Wickman <cpw@sgi.com>
 Signed-off-by: Rafael J. Wysocki <rjw@suse.de>
 ---
- arch/x86/include/asm/uv/uv_bau.h |   63 ++-
- arch/x86/kernel/tlb_uv.c         |  706 ++++++++++++++++++++++-----------------
- 2 files changed, 439 insertions(+), 330 deletions(-)
+ arch/x86/include/asm/uv/uv_bau.h |   93 ++--
+ arch/x86/kernel/tlb_uv.c         |  813 ++++++++++++++++++++++-----------------
+ 2 files changed, 526 insertions(+), 380 deletions(-)
 
-Index: linux-2.6.32-SLE11-SP1/arch/x86/include/asm/uv/uv_bau.h
+Index: linux/arch/x86/include/asm/uv/uv_bau.h
 ===================================================================
---- linux-2.6.32-SLE11-SP1.orig/arch/x86/include/asm/uv/uv_bau.h
-+++ linux-2.6.32-SLE11-SP1/arch/x86/include/asm/uv/uv_bau.h
-@@ -27,7 +27,7 @@
+--- linux.orig/arch/x86/include/asm/uv/uv_bau.h
++++ linux/arch/x86/include/asm/uv/uv_bau.h
+@@ -27,14 +27,14 @@
   * set 2 is at BASE + 2*512, set 3 at BASE + 3*512, and so on.
   *
   * We will use 31 sets, one for sending BAU messages from each of the 32
@@ -45,16 +53,30 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/include/asm/uv/uv_bau.h
   *
   * TLB shootdown will use the first of the 8 descriptors of each set.
   * Each of the descriptors is 64 bytes in size (8*64 = 512 bytes in a set).
-@@ -65,9 +65,17 @@
+  */
+ 
+ #define UV_ITEMS_PER_DESCRIPTOR		8
+-#define MAX_BAU_CONCURRENT		4
++#define MAX_BAU_CONCURRENT		3
+ #define UV_CPUS_PER_ACT_STATUS		32
+ #define UV_ACT_STATUS_MASK		0x3
+ #define UV_ACT_STATUS_SIZE		2
+@@ -65,9 +65,23 @@
  #define DESTINATION_TIMEOUT_LIMIT	20
  
  /*
 + * misc. delays, in microseconds
 + */
 +#define THROTTLE_DELAY			10
-+#define TIMEOUT_DELAY			20
++#define TIMEOUT_DELAY			10
 +#define BIOS_TO				1000
 +/* BIOS is assumed to set the destination timeout to 1003520 nanoseconds */
++
++/*
++ * threshholds at which to use IPI to free resources
++ */
++#define PLUGSB4RESET 100
++#define TIMEOUTSB4RESET 100
 +
 +/*
   * number of entries in the destination side payload queue
@@ -64,7 +86,21 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/include/asm/uv/uv_bau.h
  /*
   * number of destination side software ack resources
   */
-@@ -90,14 +98,14 @@
+@@ -76,9 +90,10 @@
+ /*
+  * completion statuses for sending a TLB flush message
+  */
+-#define	FLUSH_RETRY			1
+-#define	FLUSH_GIVEUP			2
+-#define	FLUSH_COMPLETE			3
++#define FLUSH_RETRY_PLUGGED		1
++#define FLUSH_RETRY_TIMEOUT		2
++#define FLUSH_GIVEUP			3
++#define FLUSH_COMPLETE			4
+ 
+ /*
+  * Distribution: 32 bytes (256 bits) (bytes 0-0x1f of descriptor)
+@@ -90,14 +105,14 @@
   * 'base_dest_nodeid' field of the header corresponds to the
   * destination nodeID associated with that specified bit.
   */
@@ -82,7 +118,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/include/asm/uv/uv_bau.h
   */
  struct bau_local_cpumask {
  	unsigned long bits;
-@@ -139,8 +147,8 @@ struct bau_msg_payload {
+@@ -139,8 +154,8 @@ struct bau_msg_payload {
  struct bau_msg_header {
  	unsigned int dest_subnodeid:6;	/* must be 0x10, for the LB */
  	/* bits 5:0 */
@@ -93,7 +129,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/include/asm/uv/uv_bau.h
  	unsigned int command:8;	/* message type */
  	/* bits 28:21 */
  				/* 0x38: SN3net EndPoint Message */
-@@ -194,7 +202,7 @@ struct bau_msg_header {
+@@ -194,7 +209,7 @@ struct bau_msg_header {
  	/* bits 95:90 */
  	unsigned int rsvd_6:5;	/* must be zero */
  	/* bits 100:96 */
@@ -102,7 +138,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/include/asm/uv/uv_bau.h
  	/* bit 101*/
  	unsigned int fairness:3;/* usually zero */
  	/* bits 104:102 */
-@@ -218,7 +226,7 @@ struct bau_msg_header {
+@@ -218,7 +233,7 @@ struct bau_msg_header {
   * Should be 64 bytes
   */
  struct bau_desc {
@@ -111,7 +147,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/include/asm/uv/uv_bau.h
  	/*
  	 * message template, consisting of header and payload:
  	 */
-@@ -286,31 +294,34 @@ struct bau_payload_queue_entry {
+@@ -286,31 +301,36 @@ struct bau_payload_queue_entry {
  };
  
  /*
@@ -128,18 +164,22 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/include/asm/uv/uv_bau.h
  	struct bau_control *socket_master;
  	unsigned long timeout_interval;
 -	spinlock_t quiesce_lock;
- 	atomic_t active_descripter_count;
+-	atomic_t active_descripter_count;
++	atomic_t active_descriptor_count;
  	int max_concurrent;
++	int max_concurrent_constant;
  	int retry_message_scans;
- 	int retry_message_actions;
- 	int timeout_retry_count;
-+	int consec_resets;
-+	int consec_short_retries;
+-	int retry_message_actions;
+-	int timeout_retry_count;
++	int plugged_tries;
++	int timeout_tries;
++	int ipi_attempts;
++	int conseccompletes;
  	short cpu;
 -	short blade_cpu;
+-	short pnode;
 +	short uvhub_cpu;
 +	short uvhub;
- 	short pnode;
  	short cpus_in_socket;
 -	short cpus_in_blade;
 -	unsigned short pnode_active_count;
@@ -150,24 +190,32 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/include/asm/uv/uv_bau.h
  	short socket_acknowledge_count[DEST_Q_SIZE];
 +	cycles_t send_message;
 +	spinlock_t masks_lock;
++	spinlock_t uvhub_lock;
++	spinlock_t queue_lock;
  };
  
  /*
-@@ -325,7 +336,12 @@ struct ptc_stats {
+@@ -325,9 +345,17 @@ struct ptc_stats {
  	unsigned long s_time; /* time spent in sending side */
  	unsigned long s_retriesok; /* successful retries */
  	unsigned long s_ntargcpu; /* number of cpus targeted */
 -	unsigned long s_ntargpnod; /* number of blades targeted */
+-	unsigned long s_resets; /* ipi-style resets */
 +	unsigned long s_ntarguvhub; /* number of uvhubs targeted */
 +	unsigned long s_ntarguvhub16; /* number of times >= 16 target hubs */
 +	unsigned long s_ntarguvhub8; /* number of times >= 8 target hubs */
 +	unsigned long s_ntarguvhub4; /* number of times >= 4 target hubs */
 +	unsigned long s_ntarguvhub2; /* number of times >= 2 target hubs */
 +	unsigned long s_ntarguvhub1; /* number of times == 1 target hub */
- 	unsigned long s_resets; /* ipi-style resets */
++	unsigned long s_resets_plug; /* ipi-style resets from plug state */
++	unsigned long s_resets_timeout; /* ipi-style resets from timeouts */
  	unsigned long s_busy; /* status stayed busy past s/w timer */
++	unsigned long s_throttles; /* waits in throttle */
++	unsigned long s_retry_messages; /* retry broadcasts */
  	/* destination statistics */
-@@ -342,19 +358,20 @@ struct ptc_stats {
+ 	unsigned long d_alltlb; /* times all tlb's on this cpu were flushed */
+ 	unsigned long d_onetlb; /* times just one tlb on this cpu was flushed */
+@@ -342,19 +370,20 @@ struct ptc_stats {
  	unsigned long d_rcanceled; /* number of messages canceled by resets */
  };
  
@@ -194,10 +242,10 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/include/asm/uv/uv_bau.h
  {
  	return bitmap_weight((unsigned long *)&dstp->bits[0],
  				UV_DISTRIBUTION_SIZE);
-Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
+Index: linux/arch/x86/kernel/tlb_uv.c
 ===================================================================
---- linux-2.6.32-SLE11-SP1.orig/arch/x86/kernel/tlb_uv.c
-+++ linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
+--- linux.orig/arch/x86/kernel/tlb_uv.c
++++ linux/arch/x86/kernel/tlb_uv.c
 @@ -21,6 +21,14 @@
  #include <asm/irq_vectors.h>
  #include <asm/timer.h>
@@ -250,7 +298,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  			return per_cpu(x86_cpu_to_apicid, cpu);
  	return -1;
  }
-@@ -83,12 +92,13 @@ static int __init blade_to_first_apicid(
+@@ -83,43 +92,103 @@ static int __init blade_to_first_apicid(
   * clear of the Timeout bit (as well) will free the resource. No reply will
   * be sent (the hardware will only do one reply per message).
   */
@@ -263,18 +311,24 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  	unsigned long dw;
 +	struct bau_payload_queue_entry *msg;
  
+-	dw = (msg->sw_ack_vector << UV_SW_ACK_NPENDING) | msg->sw_ack_vector;
 +	msg = mdp->msg;
- 	dw = (msg->sw_ack_vector << UV_SW_ACK_NPENDING) | msg->sw_ack_vector;
++	if (!msg->canceled) {
++		dw = (msg->sw_ack_vector << UV_SW_ACK_NPENDING) |
++						msg->sw_ack_vector;
++		uv_write_local_mmr(
++				UVH_LB_BAU_INTD_SOFTWARE_ACKNOWLEDGE_ALIAS, dw);
++	}
  	msg->replied_to = 1;
  	msg->sw_ack_vector = 0;
-@@ -96,30 +106,92 @@ static inline void uv_reply_to_message(i
- }
- 
- /*
+-	uv_write_local_mmr(UVH_LB_BAU_INTD_SOFTWARE_ACKNOWLEDGE_ALIAS, dw);
++}
++
++/*
 + * Process the receipt of a RETRY message
 + */
-+static inline void uv_bau_retry_msg(struct msg_desc *mdp,
-+				    struct bau_control *bcp)
++static inline void uv_bau_process_retry_msg(struct msg_desc *mdp,
++					    struct bau_control *bcp)
 +{
 +	int i;
 +	int cancel_count = 0;
@@ -291,56 +345,49 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
 +	/*
 +	 * cancel any message from msg+1 to the retry itself
 +	 */
-+	bcp->retry_message_scans++;
 +	for (msg2 = msg+1, i = 0; i < DEST_Q_SIZE; msg2++, i++) {
 +		if (msg2 > mdp->va_queue_last)
 +			msg2 = mdp->va_queue_first;
 +		if (msg2 == msg)
 +			break;
 +
-+		/* uv_bau_process_message: same conditions
-+		   for cancellation as uv_do_reset */
++		/* same conditions for cancellation as uv_do_reset */
 +		if ((msg2->replied_to == 0) && (msg2->canceled == 0) &&
 +		    (msg2->sw_ack_vector) && ((msg2->sw_ack_vector &
 +			msg->sw_ack_vector) == 0) &&
 +		    (msg2->sending_cpu == msg->sending_cpu) &&
 +		    (msg2->msg_type != MSG_NOOP)) {
-+			bcp->retry_message_actions++;
 +			slot2 = msg2 - mdp->va_queue_first;
 +			mmr = uv_read_local_mmr
 +				(UVH_LB_BAU_INTD_SOFTWARE_ACKNOWLEDGE);
 +			msg_res = ((msg2->sw_ack_vector << 8) |
 +				   msg2->sw_ack_vector);
 +			/*
-+			 * If this message timed out elsewhere so that a
-+			 * retry was broadcast, it should have timed out
-+			 * here too.
-+			 * It is not 'replied_to' so some local cpu has not
-+			 * seen it.  When it does get around to processing
-+			 * the interrupt it should skip it, as it's going
-+			 * to be marked 'canceled'.
++			 * This is a message retry; clear the resources held
++			 * by the previous message only if they timed out.
++			 * If it has not timed out we have an unexpected
++			 * situation to report.
 +			 */
-+			msg2->canceled = 1;
-+			cancel_count++;
-+			/*
-+			 * this is a message retry; clear the resources
-+			 * held by the previous message or retries even if
-+			 * they did not time out
-+			 */
-+			if (mmr & msg_res) {
++			if (mmr & (msg_res << 8)) {
++				/*
++				 * is the resource timed out?
++				 * make everyone ignore the cancelled message.
++				 */
++				msg2->canceled = 1;
 +				stat->d_canceled++;
++				cancel_count++;
 +				uv_write_local_mmr(
 +				    UVH_LB_BAU_INTD_SOFTWARE_ACKNOWLEDGE_ALIAS,
-+					msg_res);
-+			}
++					(msg_res << 8) | msg_res);
++			} else
++				printk(KERN_INFO "note bau retry: no effect\n");
 +		}
 +	}
 +	if (!cancel_count)
 +		stat->d_nocanceled++;
-+}
-+
-+
-+/*
+ }
+ 
+ /*
   * Do all the things a cpu should do for a TLB shootdown message.
   * Other cpu's may come here at the same time for this message.
   */
@@ -372,7 +419,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  	stat = &per_cpu(ptcstats, bcp->cpu);
  	if (msg->address == TLB_FLUSH_ALL) {
  		local_flush_tlb();
-@@ -131,69 +203,13 @@ static void uv_bau_process_message(struc
+@@ -131,69 +200,13 @@ static void uv_bau_process_message(struc
  	stat->d_requestee++;
  
  	/*
@@ -441,11 +488,11 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
 -			stat->d_nocanceled++;
 -	}
 +	if (msg->msg_type == MSG_RETRY && bcp == bcp->uvhub_master)
-+		uv_bau_retry_msg(mdp, bcp);
++		uv_bau_process_retry_msg(mdp, bcp);
  
  	/*
  	 * This is a sw_ack message, so we have to reply to it.
-@@ -202,21 +218,21 @@ static void uv_bau_process_message(struc
+@@ -202,21 +215,21 @@ static void uv_bau_process_message(struc
  	 * the sockets.
  	 */
  	socket_ack_count = atomic_add_short_return(1, (struct atomic_short *)
@@ -472,7 +519,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  		}
  	}
  
-@@ -224,13 +240,13 @@ static void uv_bau_process_message(struc
+@@ -224,13 +237,13 @@ static void uv_bau_process_message(struc
  }
  
  /*
@@ -489,7 +536,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  			return cpu;
  	return -1;
  }
-@@ -241,8 +257,8 @@ static int blade_to_first_cpu(int blade)
+@@ -241,8 +254,8 @@ static int blade_to_first_cpu(int blade)
   * Do this with IPI so that all messages in the BAU message queue
   * can be identified by their nonzero sw_ack_vector field.
   *
@@ -500,7 +547,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
   * sw_ack resources.
   */
  static void
-@@ -258,7 +274,7 @@ uv_do_reset(void *ptr)
+@@ -258,7 +271,7 @@ uv_do_reset(void *ptr)
  	struct bau_payload_queue_entry *msg;
  	struct ptc_stats *stat;
  
@@ -509,7 +556,36 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  	rap = (struct reset_args *)ptr;
  	stat = &per_cpu(ptcstats, bcp->cpu);
  	stat->d_resets++;
-@@ -308,13 +324,13 @@ uv_do_reset(void *ptr)
+@@ -271,7 +284,7 @@ uv_do_reset(void *ptr)
+ 	 */
+ 	for (msg = bcp->va_queue_first, i = 0; i < DEST_Q_SIZE; msg++, i++) {
+ 		/* uv_do_reset: same conditions for cancellation as
+-		   uv_bau_process_message */
++		   uv_bau_process_retry_msg() */
+ 		if ((msg->replied_to == 0) &&
+ 		    (msg->canceled == 0) &&
+ 		    (msg->sending_cpu == rap->sender) &&
+@@ -284,18 +297,12 @@ uv_do_reset(void *ptr)
+ 			slot = msg - bcp->va_queue_first;
+ 			count++;
+ 			/*
+-			 * only reset the resource if it is still
+-			 * pending
++			 * only reset the resource if it is still pending
+ 			 */
+ 			mmr = uv_read_local_mmr
+ 					(UVH_LB_BAU_INTD_SOFTWARE_ACKNOWLEDGE);
+ 			msg_res = ((msg->sw_ack_vector << 8) |
+ 						   msg->sw_ack_vector);
+-			/*
+-			 * this is an ipi-method reset; clear the resources
+-			 * held by previous message or retries even if they
+-			 * did not time out
+-			 */
+ 			if (mmr & msg_res) {
+ 				stat->d_rcanceled++;
+ 				uv_write_local_mmr(
+@@ -308,13 +315,13 @@ uv_do_reset(void *ptr)
  }
  
  /*
@@ -518,15 +594,16 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
   * a given sending cpu number.
   */
 -static void uv_reset_with_ipi(struct bau_target_nodemask *distribution,
+-		int sender)
 +static void uv_reset_with_ipi(struct bau_target_uvhubmask *distribution,
- 		int sender)
++			      int sender)
  {
 -	int blade;
 +	int uvhub;
  	int cpu;
  	cpumask_t mask;
  	struct reset_args reset_args;
-@@ -322,14 +338,14 @@ static void uv_reset_with_ipi(struct bau
+@@ -322,14 +329,14 @@ static void uv_reset_with_ipi(struct bau
  	reset_args.sender = sender;
  
  	cpus_clear(mask);
@@ -548,7 +625,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  		cpu_set(cpu, mask);
  	}
  	/* IPI all cpus; Preemption is already disabled */
-@@ -337,45 +353,37 @@ static void uv_reset_with_ipi(struct bau
+@@ -337,64 +344,58 @@ static void uv_reset_with_ipi(struct bau
  	return;
  }
  
@@ -621,12 +698,16 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  }
  
  /*
-@@ -386,15 +394,18 @@ static int uv_wait_completion(struct bau
+  * Wait for completion of a broadcast software ack message
+- * return COMPLETE, RETRY or GIVEUP
++ * return COMPLETE, RETRY(PLUGGED or TIMEOUT) or GIVEUP
+  */
+ static int uv_wait_completion(struct bau_desc *bau_desc,
  	unsigned long mmr_offset, int right_shift, int this_cpu,
  	struct bau_control *bcp, struct bau_control *smaster, long try)
  {
 -	long relaxes = 0;
- 	long source_timeouts = 0;
+-	long source_timeouts = 0;
 +	int relaxes = 0;
  	unsigned long descriptor_status;
 -	unsigned long long otime, ntime;
@@ -645,12 +726,20 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  
  	/* spin on the status MMR, waiting for it to go idle */
  	while ((descriptor_status = (((unsigned long)
-@@ -415,23 +426,33 @@ static int uv_wait_completion(struct bau
- 				printk(KERN_INFO
- 			   "uv_wait_completion dest cpus done; FLUSH_RETRY\n");
- 			}
+@@ -408,97 +409,143 @@ static int uv_wait_completion(struct bau
+ 		 * state will stay IDLE.
+ 		 */
+ 		if (descriptor_status == DESC_STATUS_SOURCE_TIMEOUT) {
+-			source_timeouts++;
+ 			stat->s_stimeout++;
+-			if (source_timeouts > SOURCE_TIMEOUT_LIMIT) {
+-				source_timeouts = 0;
+-				printk(KERN_INFO
+-			   "uv_wait_completion dest cpus done; FLUSH_RETRY\n");
+-			}
 -			udelay(1000); /*source side timeouts are long*/
- 			return FLUSH_RETRY;
+-			return FLUSH_RETRY;
++			return FLUSH_GIVEUP;
  		} else if (descriptor_status ==
  					DESC_STATUS_DESTINATION_TIMEOUT) {
  			stat->s_dtimeout++;
@@ -662,34 +751,29 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  			 * swack resources being consumed, and a timeout
  			 * pending.  In that case hardware returns the
  			 * ERROR that looks like a destination timeout.
-+			 */
-+			if (cycles_2_us(ttime - bcp->send_message) < BIOS_TO) {
-+				/* wait for some completions, and stagger
-+				   when each uvhub takes off again */
-+				bcp->consec_short_retries++;
-+				udelay((bcp->uvhub+1) * TIMEOUT_DELAY);
-+				return FLUSH_RETRY;
-+			}
-+
-+			/*
- 			 * After 1000 retries clear this situation
- 			 * with an IPI message.
+-			 * After 1000 retries clear this situation
+-			 * with an IPI message.
  			 */
 -
- 			if (bcp->timeout_retry_count >= 1000) {
- 				bcp->timeout_retry_count = 0;
-+				bcp->consec_resets++;
- 				stat->s_resets++;
- 				uv_reset_with_ipi(&bau_desc->distribution,
- 							this_cpu);
-@@ -443,59 +464,94 @@ static int uv_wait_completion(struct bau
+-			if (bcp->timeout_retry_count >= 1000) {
+-				bcp->timeout_retry_count = 0;
+-				stat->s_resets++;
+-				uv_reset_with_ipi(&bau_desc->distribution,
+-							this_cpu);
++			if (cycles_2_us(ttime - bcp->send_message) < BIOS_TO) {
++				bcp->conseccompletes = 0;
++				return FLUSH_RETRY_PLUGGED;
+ 			}
+-			bcp->timeout_retry_count++;
+-			return FLUSH_RETRY;
++
++			bcp->conseccompletes = 0;
++			return FLUSH_RETRY_TIMEOUT;
+ 		} else {
+ 			/*
  			 * descriptor_status is still BUSY
  			 */
  			cpu_relax();
-+			/*
-+			 * the throttle should eliminate the need for
-+			 * a test for the stay-busy bug
-+			 */
  			relaxes++;
 -			if (relaxes >= 1000000) {
 +			if (relaxes >= 10000) {
@@ -701,14 +785,10 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
 -					 * and completed.  But not for sure.
 -					 * Use an IPI to clear things.
 -					 */
--					return FLUSH_GIVEUP;
 +					quiesce_local_uvhub(hmaster);
 +
 +					/* single-thread the register change */
 +					spin_lock(&hmaster->masks_lock);
-+					printk(KERN_EMERG
-+					"uvhub %d cpu %d (%d) reseting mmr\n",
-+ 					 bcp->uvhub, bcp->uvhub_cpu, bcp->cpu);
 +					mmr = uv_read_local_mmr(mmr_offset);
 +					mask = 0UL;
 +					mask |= (3UL < right_shift);
@@ -716,15 +796,14 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
 +					mmr &= mask;
 +					uv_write_local_mmr(mmr_offset, mmr);
 +					spin_unlock(&hmaster->masks_lock);
-+
 +					end_uvhub_quiesce(hmaster);
-+					return FLUSH_RETRY;
++					stat->s_busy++;
+ 					return FLUSH_GIVEUP;
  				}
  			}
  		}
  	}
-+	bcp->consec_resets=0;
-+	bcp->consec_short_retries=0;
++	bcp->conseccompletes++;
  	return FLUSH_COMPLETE;
  }
  
@@ -737,6 +816,28 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
 +	ns = sec * 1000000000;
 +	cyc = (ns << CYC2NS_SCALE_FACTOR)/(per_cpu(cyc2ns, smp_processor_id()));
 +	return cyc;
++}
++
++/*
++ * conditionally add 1 to *v, unless *v is >= u
++ * return 0 if we cannot add 1 to *v because it is >= u
++ * return 1 if we can add 1 to *v because it is < u
++ * the add is atomic
++ *
++ * This is close to atomic_add_unless(), but this allows the 'u' value
++ * to be lowered below the current 'v'.  atomic_add_unless can only stop
++ * on equal.
++ */
++static inline int atomic_inc_unless_ge(spinlock_t *lock, atomic_t *v, int u)
++{
++	spin_lock(lock);
++	if (atomic_read(v) >= u) {
++		spin_unlock(lock);
++		return 0;
++	}
++	atomic_inc(v);
++	spin_unlock(lock);
++	return 1;
 +}
 +
  /**
@@ -777,50 +878,43 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  	unsigned long index;
  	cycles_t time1;
  	cycles_t time2;
-+	cycles_t while_timeout;
  	struct ptc_stats *stat = &per_cpu(ptcstats, bcp->cpu);
  	struct bau_control *smaster = bcp->socket_master;
 -	struct bau_control *pmaster = bcp->pnode_master;
 +	struct bau_control *hmaster = bcp->uvhub_master;
  
- 	/* spin here while there are bcp->max_concurrent active descriptors */
+-	/* spin here while there are bcp->max_concurrent active descriptors */
 -	while (!atomic_add_unless(&pmaster->active_descripter_count, 1,
 -						pmaster->max_concurrent)) {
-+	while (!atomic_add_unless(&hmaster->active_descripter_count, 1,
-+						hmaster->max_concurrent)) {
-+		udelay(THROTTLE_DELAY);
-+		cpu_relax();
-+	}
-+	while (hmaster->uvhub_quiesce) {
- 		cpu_relax();
+-		cpu_relax();
++	/*
++	 * Spin here while there are hmaster->max_concurrent or more active
++	 * descriptors. This is the per-uvhub 'throttle'.
++	 */
++	if (!atomic_inc_unless_ge(&hmaster->uvhub_lock,
++			&hmaster->active_descriptor_count,
++			hmaster->max_concurrent)) {
++		stat->s_throttles++;
++		do {
++			cpu_relax();
++		} while (!atomic_inc_unless_ge(&hmaster->uvhub_lock,
++			&hmaster->active_descriptor_count,
++			hmaster->max_concurrent));
  	}
  
-@@ -508,11 +564,31 @@ const struct cpumask *uv_flush_send_and_
++	while (hmaster->uvhub_quiesce)
++		cpu_relax();
++
+ 	if (cpu < UV_CPUS_PER_ACT_STATUS) {
+ 		mmr_offset = UVH_LB_BAU_SB_ACTIVATION_STATUS_0;
+ 		right_shift = cpu * UV_ACT_STATUS_SIZE;
+@@ -507,44 +554,96 @@ const struct cpumask *uv_flush_send_and_
+ 		right_shift =
  		    ((cpu - UV_CPUS_PER_ACT_STATUS) * UV_ACT_STATUS_SIZE);
  	}
- 	bcp->timeout_retry_count = 0;
-+	while_timeout = get_cycles() + sec_2_cycles(5);
+-	bcp->timeout_retry_count = 0;
  	time1 = get_cycles();
  	do {
-+		/* in case something unexpected goes wrong and we get
-+		   unending destination timeouts: */
-+		if (get_cycles() > while_timeout) {
-+			completion_status = FLUSH_GIVEUP;
-+			break;
-+		}
-+		if (completion_status == FLUSH_RETRY) {
-+			if (bcp->consec_short_retries > 10) {
-+				completion_status = FLUSH_GIVEUP;
-+				break;
-+			}
-+			if (bcp->consec_resets > 10) {
-+				completion_status = FLUSH_GIVEUP;
-+				printk(KERN_INFO
-+					"Error: disabling use of BAU\n");
-+				nobau = 1;
-+				break;
-+			}
-+		}
  		/*
  		 * Every message from any given cpu gets a unique message
 -		 * number. But retries use that same number.
@@ -828,7 +922,14 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  		 * Our message may have timed out at the destination because
  		 * all sw-ack resources are in use and there is a timeout
  		 * pending there.  In that case, our last send never got
-@@ -527,7 +603,6 @@ const struct cpumask *uv_flush_send_and_
+ 		 * placed into the queue and we need to persist until it
+ 		 * does.
+-		 * The uv_wait_completion() function will take care of
+-		 * sending the occasional reset message to clear this
+-		 * message number and the resource it is using.
+ 		 *
+ 		 * Make any retry a type MSG_RETRY so that the destination will
+ 		 * free any resource held by a previous message from this cpu.
  		 */
  		if (try == 0) {
  			/* use message type set by the caller the first time */
@@ -836,7 +937,8 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  			seq_number = bcp->message_number++;
  		} else {
  			/* use RETRY type on all the rest; same sequence */
-@@ -535,16 +610,24 @@ const struct cpumask *uv_flush_send_and_
+ 			bau_desc->header.msg_type = MSG_RETRY;
++			stat->s_retry_messages++;
  		}
  		bau_desc->header.sequence = seq_number;
  		index = (1UL << UVH_LB_BAU_SB_ACTIVATION_CONTROL_PUSH_SHFT) |
@@ -849,21 +951,70 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  		try++;
  		completion_status = uv_wait_completion(bau_desc, mmr_offset,
  			right_shift, this_cpu, bcp, smaster, try);
+-	} while (completion_status == FLUSH_RETRY);
++
++		if (completion_status == FLUSH_RETRY_PLUGGED) {
++			/*
++			 * Our retries may be blocked by all destination swack
++			 * resources being consumed, and a timeout pending. In
++			 * that case hardware immediately returns the ERROR
++			 * that looks like a destination timeout.
++			 */
++			udelay(TIMEOUT_DELAY);
++			bcp->plugged_tries++;
++			if (bcp->plugged_tries >= PLUGSB4RESET) {
++				bcp->plugged_tries = 0;
++				quiesce_local_uvhub(hmaster);
++				spin_lock(&hmaster->queue_lock);
++				uv_reset_with_ipi(&bau_desc->distribution,
++							this_cpu);
++				spin_unlock(&hmaster->queue_lock);
++				end_uvhub_quiesce(hmaster);
++				bcp->ipi_attempts++;
++				stat->s_resets_plug++;
++			}
++		} else if (completion_status == FLUSH_RETRY_TIMEOUT) {
++			hmaster->max_concurrent = 1;
++			bcp->timeout_tries++;
++			udelay(TIMEOUT_DELAY);
++			if (bcp->timeout_tries >= TIMEOUTSB4RESET) {
++				bcp->timeout_tries = 0;
++				quiesce_local_uvhub(hmaster);
++				spin_lock(&hmaster->queue_lock);
++				uv_reset_with_ipi(&bau_desc->distribution,
++								this_cpu);
++				spin_unlock(&hmaster->queue_lock);
++				end_uvhub_quiesce(hmaster);
++				bcp->ipi_attempts++;
++				stat->s_resets_timeout++;
++			}
++		}
++		if (bcp->ipi_attempts >= 3) {
++			bcp->ipi_attempts = 0;
++			completion_status = FLUSH_GIVEUP;
++			break;
++		}
 +		cpu_relax();
- 	} while (completion_status == FLUSH_RETRY);
++	} while ((completion_status == FLUSH_RETRY_PLUGGED) ||
++		 (completion_status == FLUSH_RETRY_TIMEOUT));
  	time2 = get_cycles();
 -	atomic_dec(&pmaster->active_descripter_count);
-+	atomic_dec(&hmaster->active_descripter_count);
 +
-+	/* hold any cpu not timing out here; no other cpu currently held by
-+	   the 'throttle' should enter the activation code */
-+	while (hmaster->uvhub_quiesce) {
++	if ((completion_status == FLUSH_COMPLETE) && (bcp->conseccompletes > 5)
++	    && (hmaster->max_concurrent < hmaster->max_concurrent_constant))
++			hmaster->max_concurrent++;
++
++	/*
++	 * hold any cpu not timing out here; no other cpu currently held by
++	 * the 'throttle' should enter the activation code
++	 */
++	while (hmaster->uvhub_quiesce)
 +		cpu_relax();
-+	}
++	atomic_dec(&hmaster->active_descriptor_count);
  
  	/* guard against cycles wrap */
  	if (time2 > time1)
-@@ -567,8 +650,8 @@ const struct cpumask *uv_flush_send_and_
+@@ -567,8 +666,8 @@ const struct cpumask *uv_flush_send_and_
  	 * use the IPI method of shootdown on them.
  	 */
  	for_each_cpu(bit, flush_mask) {
@@ -874,7 +1025,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  			continue;
  		cpumask_clear_cpu(bit, flush_mask);
  	}
-@@ -594,8 +677,8 @@ const struct cpumask *uv_flush_send_and_
+@@ -594,8 +693,8 @@ const struct cpumask *uv_flush_send_and_
   * The caller has derived the cpumask from the mm_struct.  This function
   * is called only if there are bits set in the mask. (e.g. flush_tlb_page())
   *
@@ -885,7 +1036,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
   *
   * Note that this function should be called with preemption disabled.
   *
-@@ -607,9 +690,9 @@ const struct cpumask *uv_flush_tlb_other
+@@ -607,9 +706,9 @@ const struct cpumask *uv_flush_tlb_other
  					  struct mm_struct *mm,
  					  unsigned long va, unsigned int cpu)
  {
@@ -898,7 +1049,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  	int locals = 0;
  	struct bau_desc *bau_desc;
  	struct cpumask *flush_mask;
-@@ -621,34 +704,36 @@ const struct cpumask *uv_flush_tlb_other
+@@ -621,34 +720,36 @@ const struct cpumask *uv_flush_tlb_other
  
  	bcp = &per_cpu(bau_control, cpu);
  	/*
@@ -951,7 +1102,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  		 * Return the caller's mask if all were local (the current
  		 * cpu may be in that mask).
  		 */
-@@ -659,8 +744,19 @@ const struct cpumask *uv_flush_tlb_other
+@@ -659,8 +760,19 @@ const struct cpumask *uv_flush_tlb_other
  	}
  	stat = &per_cpu(ptcstats, cpu);
  	stat->s_requestor++;
@@ -973,7 +1124,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  
  	bau_desc->payload.address = va;
  	bau_desc->payload.sending_cpu = cpu;
-@@ -678,92 +774,72 @@ const struct cpumask *uv_flush_tlb_other
+@@ -678,92 +790,70 @@ const struct cpumask *uv_flush_tlb_other
   *
   * We received a broadcast assist message.
   *
@@ -1027,7 +1178,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  	while (msg->sw_ack_vector) {
 -		if (msg->canceled)
 -			goto nextmsg;
--		count++;
+ 		count++;
 -		fw = msg->sw_ack_vector;
 -		msg_slot = msg - va_queue_first;
 -		sw_ack_slot = ffs(fw) - 1;
@@ -1035,13 +1186,10 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
 -		uv_bau_process_message(msg, msg_slot, sw_ack_slot, bcp,
 -					va_queue_first, va_queue_last);
 -nextmsg:
-+		if (!msg->canceled) {
-+			count++;
-+			msgdesc.msg_slot = msg - msgdesc.va_queue_first;
-+			msgdesc.sw_ack_slot = ffs(msg->sw_ack_vector) - 1;
-+			msgdesc.msg = msg;
-+			uv_bau_process_message(&msgdesc, bcp);
-+		}
++		msgdesc.msg_slot = msg - msgdesc.va_queue_first;
++		msgdesc.sw_ack_slot = ffs(msg->sw_ack_vector) - 1;
++		msgdesc.msg = msg;
++		uv_bau_process_message(&msgdesc, bcp);
  		msg++;
 -		if (msg > va_queue_last)
 -			msg = va_queue_first;
@@ -1095,7 +1243,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  		mmr_image =
  		    uv_read_global_mmr64(pnode, UVH_LB_BAU_MISC_CONTROL);
  		/*
-@@ -816,30 +892,14 @@ static void uv_ptc_seq_stop(struct seq_f
+@@ -816,30 +906,14 @@ static void uv_ptc_seq_stop(struct seq_f
  {
  }
  
@@ -1126,7 +1274,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  	return cyc;
  }
  
-@@ -856,17 +916,25 @@ static int uv_ptc_seq_show(struct seq_fi
+@@ -856,18 +930,32 @@ static int uv_ptc_seq_show(struct seq_fi
  
  	if (!cpu) {
  		seq_printf(file,
@@ -1135,29 +1283,44 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
 +		seq_printf(file,
 +			"numuvhubs4 numuvhubs2 numuvhubs1 numcpus dto ");
 +		seq_printf(file,
-+			"retried resets giveup sto bz sw_ack recv rtime all ");
++			"retries rok resetp resett giveup sto bz throt ");
  		seq_printf(file,
 -	   "sw_ack recv rtime all one mult none retry canc nocan reset rcan\n");
-+		 	"one mult none retry canc nocan reset rcan\n");
++			"sw_ack recv rtime all ");
++		seq_printf(file,
++			"one mult none retry canc nocan reset rcan\n");
  	}
  	if (cpu < num_possible_cpus() && cpu_online(cpu)) {
  		stat = &per_cpu(ptcstats, cpu);
++		/* source side statistics */
  		seq_printf(file,
 -			   "cpu %d %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld ",
 +			"cpu %d %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld ",
  			   cpu, stat->s_requestor, cycles_2_us(stat->s_time),
 -			   stat->s_ntargpnod, stat->s_ntargcpu,
 -			   stat->s_dtimeout, stat->s_retriesok, stat->s_resets,
+-			   stat->s_giveup, stat->s_stimeout, stat->s_busy);
 +			   stat->s_ntarguvhub, stat->s_ntarguvhub16,
 +			   stat->s_ntarguvhub8, stat->s_ntarguvhub4,
 +			   stat->s_ntarguvhub2, stat->s_ntarguvhub1,
 +			   stat->s_ntargcpu, stat->s_dtimeout);
-+		seq_printf(file, "%ld %ld %ld %ld %ld ",
-+ 			   stat->s_retriesok, stat->s_resets,
- 			   stat->s_giveup, stat->s_stimeout, stat->s_busy);
++		seq_printf(file, "%ld %ld %ld %ld %ld %ld %ld %ld ",
++			   stat->s_retry_messages, stat->s_retriesok,
++			   stat->s_resets_plug, stat->s_resets_timeout,
++			   stat->s_giveup, stat->s_stimeout,
++			   stat->s_busy, stat->s_throttles);
++		/* destination side statistics */
  		seq_printf(file,
  			   "%lx %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld %ld\n",
-@@ -886,7 +954,7 @@ static int uv_ptc_seq_show(struct seq_fi
+ 			   uv_read_global_mmr64(uv_cpu_to_pnode(cpu),
+@@ -879,14 +967,13 @@ static int uv_ptc_seq_show(struct seq_fi
+ 			   stat->d_rcanceled);
+ 	}
+ 
+-
+ 	return 0;
+ }
+ 
  /*
   * -1: resetf the statistics
   *  0: display meaning of the statistics
@@ -1166,7 +1329,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
   */
  static ssize_t uv_ptc_proc_write(struct file *file, const char __user *user,
  				 size_t count, loff_t *data)
-@@ -915,13 +983,23 @@ static ssize_t uv_ptc_proc_write(struct 
+@@ -915,19 +1002,37 @@ static ssize_t uv_ptc_proc_write(struct 
  		printk(KERN_DEBUG
  		"stime:    time spent sending messages\n");
  		printk(KERN_DEBUG
@@ -1188,11 +1351,26 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  		"dto:      number of destination timeouts\n");
  		printk(KERN_DEBUG
 -		"retried:  destination timeouts sucessfully retried\n");
-+		"retried:  destination timeouts successfully retried\n");
++		"retries:  destination timeout retries sent\n");
  		printk(KERN_DEBUG
- 		"resets:   ipi-style resource resets done\n");
+-		"resets:   ipi-style resource resets done\n");
++		"rok:   :  destination timeouts successfully retried\n");
++		printk(KERN_DEBUG
++		"resetp:   ipi-style resource resets for plugs\n");
++		printk(KERN_DEBUG
++		"resett:   ipi-style resource resets for timeouts\n");
  		printk(KERN_DEBUG
-@@ -960,6 +1038,14 @@ static ssize_t uv_ptc_proc_write(struct 
+ 		"giveup:   fall-backs to ipi-style shootdowns\n");
+ 		printk(KERN_DEBUG
+ 		"sto:      number of source timeouts\n");
++		printk(KERN_DEBUG
++		"bz:       number of stay-busy's\n");
++		printk(KERN_DEBUG
++		"throt:    number times spun in throttle\n");
+ 		printk(KERN_DEBUG "Destination side statistics:\n");
+ 		printk(KERN_DEBUG
+ 		"sw_ack:   image of UVH_LB_BAU_INTD_SOFTWARE_ACKNOWLEDGE\n");
+@@ -960,6 +1065,14 @@ static ssize_t uv_ptc_proc_write(struct 
  		}
  	} else {
  		uv_bau_max_concurrent = input_arg;
@@ -1207,7 +1385,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  		printk(KERN_DEBUG "Set BAU max concurrent:%d\n",
  		       uv_bau_max_concurrent);
  		for_each_present_cpu(cpu) {
-@@ -1025,7 +1111,7 @@ uv_activation_descriptor_init(int node, 
+@@ -1025,7 +1138,7 @@ uv_activation_descriptor_init(int node, 
  
  	/*
  	 * each bau_desc is 64 bytes; there are 8 (UV_ITEMS_PER_DESCRIPTOR)
@@ -1216,7 +1394,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  	 */
  	bau_desc = (struct bau_desc *)kmalloc_node(sizeof(struct bau_desc)*
  		UV_ADP_SIZE*UV_ITEMS_PER_DESCRIPTOR, GFP_KERNEL, node);
-@@ -1041,16 +1127,16 @@ uv_activation_descriptor_init(int node, 
+@@ -1041,16 +1154,16 @@ uv_activation_descriptor_init(int node, 
  	/*
  	 * initializing all 8 (UV_ITEMS_PER_DESCRIPTOR) descriptors for each
  	 * cpu even though we only use the first one; one descriptor can
@@ -1237,7 +1415,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  		 */
  		bd2->header.base_dest_nodeid = uv_partition_base_pnode << 1;
  		bd2->header.dest_subnodeid = 0x10; /* the LB */
-@@ -1071,7 +1157,9 @@ uv_activation_descriptor_init(int node, 
+@@ -1071,7 +1184,9 @@ uv_activation_descriptor_init(int node, 
  
  /*
   * initialize the destination side's receiving buffers
@@ -1248,15 +1426,16 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
   */
  static void
  uv_payload_queue_init(int node, int pnode)
-@@ -1102,7 +1190,6 @@ uv_payload_queue_init(int node, int pnod
+@@ -1101,8 +1216,6 @@ uv_payload_queue_init(int node, int pnod
+ 		bcp->va_queue_first = pqp;
  		bcp->bau_msg_head = pqp;
  		bcp->va_queue_last = pqp + (DEST_Q_SIZE - 1);
- 		bcp->timeout_interval = millisec_2_cycles(1);
+-		bcp->timeout_interval = millisec_2_cycles(1);
 -		spin_lock_init(&bcp->quiesce_lock);
  	}
  	/*
  	 * need the pnode of where the memory was really allocated
-@@ -1123,23 +1210,23 @@ uv_payload_queue_init(int node, int pnod
+@@ -1123,23 +1236,23 @@ uv_payload_queue_init(int node, int pnod
  }
  
  /*
@@ -1285,7 +1464,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  	uv_write_global_mmr64(pnode, UVH_BAU_DATA_CONFIG,
  				      ((apicid << 32) | vector));
  }
-@@ -1147,42 +1234,47 @@ static void __init uv_init_blade(int bla
+@@ -1147,42 +1260,47 @@ static void __init uv_init_blade(int bla
  /*
   * initialize the bau_control structure for each cpu
   */
@@ -1340,11 +1519,11 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
 +		bdp->uvhub = uvhub;
  		bdp->pnode = pnode;
 +		/* time interval to catch a hardware stay-busy bug */
-+		bcp->timeout_interval = millisec_2_cycles(2);
++		bcp->timeout_interval = millisec_2_cycles(3);
  		/* kludge: assume uv_hub.h is constant */
  		socket = (cpu_physical_id(cpu)>>5)&1;
  		if (socket >= bdp->num_sockets)
-@@ -1192,8 +1284,8 @@ static void uv_init_per_cpu(int nblades)
+@@ -1192,8 +1310,8 @@ static void uv_init_per_cpu(int nblades)
  		sdp->num_cpus++;
  	}
  	socket = 0;
@@ -1355,7 +1534,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  		for (i = 0; i < bdp->num_sockets; i++) {
  			sdp = &bdp->socket[i];
  			for (j = 0; j < sdp->num_cpus; j++) {
-@@ -1203,22 +1295,22 @@ static void uv_init_per_cpu(int nblades)
+@@ -1203,22 +1321,21 @@ static void uv_init_per_cpu(int nblades)
  				if (j == 0) {
  					smaster = bcp;
  					if (i == 0)
@@ -1370,7 +1549,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
 +				bcp->uvhub_master = hmaster;
  				for (k = 0; k < DEST_Q_SIZE; k++)
  					bcp->socket_acknowledge_count[k] = 0;
- 				bcp->pnode = bdp->pnode;
+-				bcp->pnode = bdp->pnode;
 -				bcp->blade_cpu =
 +				bcp->uvhub_cpu =
  				  uv_cpu_hub_info(cpu)->blade_processor_id;
@@ -1383,7 +1562,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  }
  
  /*
-@@ -1226,9 +1318,9 @@ static void uv_init_per_cpu(int nblades)
+@@ -1226,9 +1343,9 @@ static void uv_init_per_cpu(int nblades)
   */
  static int __init uv_bau_init(void)
  {
@@ -1395,7 +1574,7 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  	int cur_cpu;
  	int vector;
  	unsigned long mmr;
-@@ -1246,26 +1338,26 @@ static int __init uv_bau_init(void)
+@@ -1246,26 +1363,26 @@ static int __init uv_bau_init(void)
  	uv_bau_max_concurrent = MAX_BAU_CONCURRENT;
  	uv_nshift = uv_hub_info->m_val;
  	uv_mmask = (1UL << uv_hub_info->m_val) - 1;
@@ -1433,3 +1612,11 @@ Index: linux-2.6.32-SLE11-SP1/arch/x86/kernel/tlb_uv.c
  		/* INIT the bau */
  		uv_write_global_mmr64(pnode, UVH_LB_BAU_SB_ACTIVATION_CONTROL,
  				      ((unsigned long)1 << 63));
+@@ -1275,5 +1392,5 @@ static int __init uv_bau_init(void)
+ 
+ 	return 0;
+ }
+-__initcall(uv_bau_init);
+-__initcall(uv_ptc_init);
++core_initcall(uv_bau_init);
++core_initcall(uv_ptc_init);
