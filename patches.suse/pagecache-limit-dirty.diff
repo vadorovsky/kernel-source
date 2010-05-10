@@ -1,0 +1,185 @@
+From: Kurt Garloff <garloff@suse.de>
+Subject: Make pagecache limit behavior w.r.t. dirty pages configurable
+References: FATE309111
+Patch-mainline: Never
+
+The last fixes to this patchset ensured that we don't end up calling
+shrink_page_cache() [from add_to_page_cache()] again and again without
+the ability to actually free something. For this reason we subtracted
+the dirty pages from the list of freeable unmapped pages in the 
+calculation. 
+
+With this additional patch, a new sysctl
+/proc/sys/vm/pagecache_limit_ignore_dirty
+is introduced. With the default setting (1), behavior does not change.
+When setting it to 0, we actually consider all of the dirty pages
+freeable -- we then allow for a third pass in shrink_page_cache, where
+we allow writing out pages (if the gfp_mask allows it).
+The value can be set to values above 1 as well; with the value set to 2,
+we consider half of the dirty pages freeable etc.
+
+Signed-off-by: Kurt Garloff <garloff@suse.de>
+
+Index: linux-2.6.32-SLE11-SP1/include/linux/swap.h
+===================================================================
+--- linux-2.6.32-SLE11-SP1.orig/include/linux/swap.h
++++ linux-2.6.32-SLE11-SP1/include/linux/swap.h
+@@ -250,8 +250,9 @@ extern int vm_swappiness;
+ #define FREE_TO_PAGECACHE_RATIO 8
+ extern unsigned long pagecache_over_limit(void);
+ extern void shrink_page_cache(gfp_t mask, struct page *page);
+ extern unsigned int vm_pagecache_limit_mb;
++extern unsigned int vm_pagecache_ignore_dirty;
+ extern int remove_mapping(struct address_space *mapping, struct page *page);
+ extern long vm_total_pages;
+ 
+ #ifdef CONFIG_NUMA
+Index: linux-2.6.32-SLE11-SP1/kernel/sysctl.c
+===================================================================
+--- linux-2.6.32-SLE11-SP1.orig/kernel/sysctl.c
++++ linux-2.6.32-SLE11-SP1/kernel/sysctl.c
+@@ -1206,8 +1206,16 @@ static struct ctl_table vm_table[] = {
+ 		.maxlen		= sizeof(vm_pagecache_limit_mb),
+ 		.mode		= 0644,
+ 		.proc_handler	= &proc_dointvec,
+ 	},
++	{
++		.ctl_name	= CTL_UNNUMBERED,
++		.procname	= "pagecache_limit_ignore_dirty",
++		.data		= &vm_pagecache_ignore_dirty,
++		.maxlen		= sizeof(vm_pagecache_ignore_dirty),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec,
++	},
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	 {
+ 		.procname	= "nr_hugepages",
+ 		.data		= NULL,
+Index: linux-2.6.32-SLE11-SP1/mm/vmscan.c
+===================================================================
+--- linux-2.6.32-SLE11-SP1.orig/mm/vmscan.c
++++ linux-2.6.32-SLE11-SP1/mm/vmscan.c
+@@ -128,8 +128,9 @@ struct scan_control {
+  * From 0 .. 100.  Higher means more swappy.
+  */
+ int vm_swappiness __read_mostly = 60;
+ unsigned int vm_pagecache_limit_mb __read_mostly = 0;
++unsigned int vm_pagecache_ignore_dirty __read_mostly = 1;
+ long vm_total_pages __read_mostly;	/* The total number of pages which the VM controls */
+ 
+ static LIST_HEAD(shrinker_list);
+ static DECLARE_RWSEM(shrinker_rwsem);
+@@ -2469,11 +2470,11 @@ static void __shrink_page_cache(gfp_t ma
+ 	/*
+ 	 * Shrink the LRU in 2 passes:
+ 	 * 0 = Reclaim from inactive_list only (fast)
+ 	 * 1 = Reclaim from active list but don't reclaim mapped (not that fast)
+-	 * 2 = Reclaim from active list but don't reclaim mapped (2nd pass)
++	 * 2 = Same as 1, but may_writepage = 1 (only done if we can and need it)
+ 	 */
+-	for (pass = 0; pass < 2; pass++) {
++	for (pass = 0; pass < 3; pass++) {
+ 		int prio;
+ 
+ 		for (prio = DEF_PRIORITY; prio >= 0; prio--) {
+ 			unsigned long nr_to_scan = nr_pages - ret;
+@@ -2493,8 +2494,15 @@ static void __shrink_page_cache(gfp_t ma
+ 			if (ret >= nr_pages)
+ 				goto out;
+ 
+ 		}
++		if (pass == 1) {
++			if (vm_pagecache_ignore_dirty == 1 ||
++			    (mask & (__GFP_IO || __GFP_FS) != __GFP_IO | __GFP_FS) )
++				break;
++			else
++				sc.may_writepage = 1;
++		}
+ 	}
+ 
+ out:
+ 	current->reclaim_state = old_rs;
+Index: linux-2.6.32-SLE11-SP1/mm/page_alloc.c
+===================================================================
+--- linux-2.6.32-SLE11-SP1.orig/mm/page_alloc.c
++++ linux-2.6.32-SLE11-SP1/mm/page_alloc.c
+@@ -5107,15 +5107,17 @@ unsigned long pagecache_over_limit()
+ 	/* We certainly can't free more than what's on the LRU lists
+ 	 * minus the dirty ones. (FIXME: pages accounted for in NR_WRITEBACK
+ 	 * are not on the LRU lists  any more, right?) */
+ 	unsigned long pgcache_lru_pages = global_page_state(NR_ACTIVE_FILE)
+-				        + global_page_state(NR_INACTIVE_FILE)
+-					- global_page_state(NR_FILE_DIRTY);
++				        + global_page_state(NR_INACTIVE_FILE);
+ 	unsigned long free_pages = global_page_state(NR_FREE_PAGES);
+ 	/* In theory, we'd need to take the swap lock here ... */
+ 	unsigned long swap_pages = total_swap_pages - nr_swap_pages;
+ 	unsigned long limit;
+ 
++	if (vm_pagecache_ignore_dirty != 0)
++		pgcache_lru_pages -= global_page_state(NR_FILE_DIRTY)
++				     /vm_pagecache_ignore_dirty;
+ 	/* Paranoia */
+ 	if (unlikely(pgcache_lru_pages > LONG_MAX))
+ 		return 0;
+ 	/* We give a bonus for free pages above 6% of total (minus half swap used) */
+Index: linux-2.6.32-SLE11-SP1/Documentation/vm/pagecache-limit
+===================================================================
+--- linux-2.6.32-SLE11-SP1.orig/Documentation/vm/pagecache-limit
++++ linux-2.6.32-SLE11-SP1/Documentation/vm/pagecache-limit
+@@ -1,7 +1,7 @@
+ Functionality:
+ -------------
+-The patch introduces a new tunable in the proc filesystem:
++The patch introduces two new tunables in the proc filesystem:
+ 
+ /proc/sys/vm/pagecache_limit_mb
+ 
+ This tunable sets a limit to the unmapped pages in the pagecache in megabytes.
+@@ -14,8 +14,15 @@ This sets a baseline limits for the page
+ As we only consider pagecache pages that are unmapped, currently mapped pages (files that are mmap'ed such as e.g. binaries and libraries as well as SysV shared memory) are not limited by this.
+ NOTE: The real limit depends on the amount of free memory. Every existing free page allows the page cache to grow 8x the amount of free memory above the set baseline. As soon as the free memory is needed, we free up page cache.
+ 
+ 
++/proc/sys/vm/pagecache_limit_ignore_dirty
++
++The default for this setting is 1; this means that we don't consider dirty memory to be part of the limited pagecache, as we can not easily free up dirty memory (we'd need to do writes for this). By setting this to 0, we actually consider dirty (unampped) memory to be freeable and do a third pass in shrink_page_cache() where we schedule the pages for writeout. Values larger than 1 are also possible and result in a fraction of the dirty pages to be considered non-freeable.
++
++
++
++
+ How it works:
+ ------------
+ The heart of this patch is a new function called shrink_page_cache(). It is called from balance_pgdat (which is the worker for kswapd) if the pagecache is above the limit.
+ The function is also called in __alloc_pages_slowpath.
+@@ -26,9 +33,11 @@ shrink_page_cache does several passes:
+ - Just reclaiming from inactive pagecache memory.
+   This is fast -- but it might not find enough free pages; if that happens,
+   the second pass will happen
+ - In the second pass, pages from active list will also be considered.
+-- The third pass is just another round of the second pass
++- The third pass will only happen if pagecacahe_limig_ignore-dirty is not 1.
++  In that case, the third pass is a repetition of the second pass, but this
++  time we allow pages to be written out.
+ 
+ In all passes, only unmapped pages will be considered.
+ 
+ 
+Index: linux-2.6.32-SLE11-SP1/mm/filemap.c
+===================================================================
+--- linux-2.6.32-SLE11-SP1.orig/mm/filemap.c
++++ linux-2.6.32-SLE11-SP1/mm/filemap.c
+@@ -531,8 +531,13 @@ int add_to_page_cache(struct page *page,
+ 	int error;
+ 
+ 	if (unlikely(vm_pagecache_limit_mb) && pagecache_over_limit() > 0)
+ 		shrink_page_cache(gfp_mask, page);
++	/* FIXME: If we add dirty pages to pagecache here, and we call
++	 * shrink_page_cache(), it might need to write out some pages to
++	 * keep us below the set pagecache limit -- in order for that to
++	 * be successful, we might need to throttle here and do some
++	 * congestion_wait(BLK_RW_ASYNC, HZ/10) here. */
+ 
+ 	__set_page_locked(page);
+ 	error = add_to_page_cache_locked(page, mapping, offset, gfp_mask);
+ 	if (unlikely(error))
