@@ -1,0 +1,235 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: cio: reenable mss after hibernation
+References: bnc#607890,LTC#64013
+Patch-mainline: Yes
+
+Symptom:     Panic after resuming from hibernation if devices from
+             subchannel sets != 0 are used.
+Problem:     Operand exception on stsch for these devices, since
+             mss (multiple subchannel set) facility is not enabled.
+Solution:    Reenable the mss facility after hibernation.
+
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ arch/s390/kernel/swsusp_asm64.S |    3 +++
+ drivers/s390/cio/chsc.c         |   29 ++++++++++++++---------------
+ drivers/s390/cio/chsc_sch.c     |    2 +-
+ drivers/s390/cio/cio.c          |   18 +++++++++---------
+ drivers/s390/cio/css.c          |   16 ++++++++--------
+ drivers/s390/cio/device_fsm.c   |    2 +-
+ 6 files changed, 36 insertions(+), 34 deletions(-)
+
+--- a/arch/s390/kernel/swsusp_asm64.S
++++ b/arch/s390/kernel/swsusp_asm64.S
+@@ -256,6 +256,9 @@ restore_registers:
+ 	lghi	%r2,0
+ 	brasl	%r14,arch_set_page_states
+ 
++	/* Reinitialize the channel subsystem */
++	brasl	%r14,channel_subsystem_reinit
++
+ 	/* Return 0 */
+ 	lmg	%r6,%r15,STACK_FRAME_OVERHEAD + __SF_GPRS(%r15)
+ 	lghi	%r2,0
+--- a/drivers/s390/cio/chsc.c
++++ b/drivers/s390/cio/chsc.c
+@@ -29,6 +29,7 @@
+ #include "chsc.h"
+ 
+ static void *sei_page;
++static DEFINE_SPINLOCK(sda_lock);
+ 
+ /**
+  * chsc_error_from_response() - convert a chsc response to an error
+@@ -832,11 +833,10 @@ void __init chsc_free_sei_area(void)
+ 	kfree(sei_page);
+ }
+ 
+-int __init
+-chsc_enable_facility(int operation_code)
++int chsc_enable_facility(int operation_code)
+ {
+ 	int ret;
+-	struct {
++	static struct {
+ 		struct chsc_header request;
+ 		u8 reserved1:4;
+ 		u8 format:4;
+@@ -849,33 +849,32 @@ chsc_enable_facility(int operation_code)
+ 		u32 reserved5:4;
+ 		u32 format2:4;
+ 		u32 reserved6:24;
+-	} __attribute__ ((packed)) *sda_area;
++	} __attribute__ ((packed, aligned(4096))) sda_area;
+ 
+-	sda_area = (void *)get_zeroed_page(GFP_KERNEL|GFP_DMA);
+-	if (!sda_area)
+-		return -ENOMEM;
+-	sda_area->request.length = 0x0400;
+-	sda_area->request.code = 0x0031;
+-	sda_area->operation_code = operation_code;
++	spin_lock(&sda_lock);
++	memset(&sda_area, 0, sizeof(sda_area));
++	sda_area.request.length = 0x0400;
++	sda_area.request.code = 0x0031;
++	sda_area.operation_code = operation_code;
+ 
+-	ret = chsc(sda_area);
++	ret = chsc(&sda_area);
+ 	if (ret > 0) {
+ 		ret = (ret == 3) ? -ENODEV : -EBUSY;
+ 		goto out;
+ 	}
+ 
+-	switch (sda_area->response.code) {
++	switch (sda_area.response.code) {
+ 	case 0x0101:
+ 		ret = -EOPNOTSUPP;
+ 		break;
+ 	default:
+-		ret = chsc_error_from_response(sda_area->response.code);
++		ret = chsc_error_from_response(sda_area.response.code);
+ 	}
+ 	if (ret != 0)
+ 		CIO_CRW_EVENT(2, "chsc: sda (oc=%x) failed (rc=%04x)\n",
+-			      operation_code, sda_area->response.code);
++			      operation_code, sda_area.response.code);
+  out:
+-	free_page((unsigned long)sda_area);
++	spin_unlock(&sda_lock);
+ 	return ret;
+ }
+ 
+--- a/drivers/s390/cio/chsc_sch.c
++++ b/drivers/s390/cio/chsc_sch.c
+@@ -122,7 +122,7 @@ static int chsc_subchannel_prepare(struc
+ 	 * since we don't have a way to clear the subchannel and
+ 	 * cannot disable it with a request running.
+ 	 */
+-	cc = stsch(sch->schid, &schib);
++	cc = stsch_err(sch->schid, &schib);
+ 	if (!cc && scsw_stctl(&schib.scsw))
+ 		return -EAGAIN;
+ 	return 0;
+--- a/drivers/s390/cio/cio.c
++++ b/drivers/s390/cio/cio.c
+@@ -361,7 +361,7 @@ int cio_commit_config(struct subchannel 
+ 	struct schib schib;
+ 	int ccode, retry, ret = 0;
+ 
+-	if (stsch(sch->schid, &schib) || !css_sch_is_valid(&schib))
++	if (stsch_err(sch->schid, &schib) || !css_sch_is_valid(&schib))
+ 		return -ENODEV;
+ 
+ 	for (retry = 0; retry < 5; retry++) {
+@@ -372,7 +372,7 @@ int cio_commit_config(struct subchannel 
+ 			return ccode;
+ 		switch (ccode) {
+ 		case 0: /* successful */
+-			if (stsch(sch->schid, &schib) ||
++			if (stsch_err(sch->schid, &schib) ||
+ 			    !css_sch_is_valid(&schib))
+ 				return -ENODEV;
+ 			if (cio_check_config(sch, &schib)) {
+@@ -404,7 +404,7 @@ int cio_update_schib(struct subchannel *
+ {
+ 	struct schib schib;
+ 
+-	if (stsch(sch->schid, &schib) || !css_sch_is_valid(&schib))
++	if (stsch_err(sch->schid, &schib) || !css_sch_is_valid(&schib))
+ 		return -ENODEV;
+ 
+ 	memcpy(&sch->schib, &schib, sizeof(schib));
+@@ -771,7 +771,7 @@ cio_get_console_sch_no(void)
+ 	if (console_irq != -1) {
+ 		/* VM provided us with the irq number of the console. */
+ 		schid.sch_no = console_irq;
+-		if (stsch(schid, &console_subchannel.schib) != 0 ||
++		if (stsch_err(schid, &console_subchannel.schib) != 0 ||
+ 		    (console_subchannel.schib.pmcw.st != SUBCHANNEL_TYPE_IO) ||
+ 		    !console_subchannel.schib.pmcw.dnv)
+ 			return -1;
+@@ -863,10 +863,10 @@ __disable_subchannel_easy(struct subchan
+ 	cc = 0;
+ 	for (retry=0;retry<3;retry++) {
+ 		schib->pmcw.ena = 0;
+-		cc = msch(schid, schib);
++		cc = msch_err(schid, schib);
+ 		if (cc)
+ 			return (cc==3?-ENODEV:-EBUSY);
+-		if (stsch(schid, schib) || !css_sch_is_valid(schib))
++		if (stsch_err(schid, schib) || !css_sch_is_valid(schib))
+ 			return -ENODEV;
+ 		if (!schib->pmcw.ena)
+ 			return 0;
+@@ -913,7 +913,7 @@ static int stsch_reset(struct subchannel
+ 
+ 	pgm_check_occured = 0;
+ 	s390_base_pgm_handler_fn = cio_reset_pgm_check_handler;
+-	rc = stsch(schid, addr);
++	rc = stsch_err(schid, addr);
+ 	s390_base_pgm_handler_fn = NULL;
+ 
+ 	/* The program check handler could have changed pgm_check_occured. */
+@@ -950,7 +950,7 @@ static int __shutdown_subchannel_easy(st
+ 			/* No default clear strategy */
+ 			break;
+ 		}
+-		stsch(schid, &schib);
++		stsch_err(schid, &schib);
+ 		__disable_subchannel_easy(schid, &schib);
+ 	}
+ out:
+@@ -1086,7 +1086,7 @@ int __init cio_get_iplinfo(struct cio_ip
+ 	schid = *(struct subchannel_id *)__LC_SUBCHANNEL_ID;
+ 	if (!schid.one)
+ 		return -ENODEV;
+-	if (stsch(schid, &schib))
++	if (stsch_err(schid, &schib))
+ 		return -ENODEV;
+ 	if (schib.pmcw.st != SUBCHANNEL_TYPE_IO)
+ 		return -ENODEV;
+--- a/drivers/s390/cio/css.c
++++ b/drivers/s390/cio/css.c
+@@ -869,15 +869,10 @@ static int __init css_bus_init(void)
+ 
+ 	/* Try to enable MSS. */
+ 	ret = chsc_enable_facility(CHSC_SDA_OC_MSS);
+-	switch (ret) {
+-	case 0: /* Success. */
+-		max_ssid = __MAX_SSID;
+-		break;
+-	case -ENOMEM:
+-		goto out;
+-	default:
++	if (ret)
+ 		max_ssid = 0;
+-	}
++	else /* Success. */
++		max_ssid = __MAX_SSID;
+ 
+ 	ret = slow_subchannel_init();
+ 	if (ret)
+@@ -1025,6 +1020,11 @@ static int __init channel_subsystem_init
+ }
+ subsys_initcall_sync(channel_subsystem_init_sync);
+ 
++void channel_subsystem_reinit(void)
++{
++	chsc_enable_facility(CHSC_SDA_OC_MSS);
++}
++
+ int sch_is_pseudo_sch(struct subchannel *sch)
+ {
+ 	return sch == to_css(sch->dev.parent)->pseudo_subchannel;
+--- a/drivers/s390/cio/device_fsm.c
++++ b/drivers/s390/cio/device_fsm.c
+@@ -45,7 +45,7 @@ static void ccw_timeout_log(struct ccw_d
+ 	sch = to_subchannel(cdev->dev.parent);
+ 	private = to_io_private(sch);
+ 	orb = &private->orb;
+-	cc = stsch(sch->schid, &schib);
++	cc = stsch_err(sch->schid, &schib);
+ 
+ 	printk(KERN_WARNING "cio: ccw device timeout occurred at %llx, "
+ 	       "device information:\n", get_clock());
