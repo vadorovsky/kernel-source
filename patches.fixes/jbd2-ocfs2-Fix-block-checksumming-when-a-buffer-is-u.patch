@@ -1,0 +1,265 @@
+From 6c6d7a77634be4ed4d439801664e242c56914270 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 14 Jul 2010 07:56:33 +0200
+Subject: [PATCH] jbd2/ocfs2: Fix block checksumming when a buffer is used in several transactions
+Patch-Mainline: 2.6.35
+References: bnc#606575
+
+OCFS2 uses t_commit trigger to compute and store checksum of the just
+committed blocks. When a buffer has b_frozen_data, checksum is computed
+for it instead of b_data but this can result in an old checksum being
+written to the filesystem in the following scenario:
+
+1) transaction1 is opened
+2) handle1 is opened
+3) journal_access(handle1, bh)
+    - This sets jh->b_transaction to transaction1
+4) modify(bh)
+5) journal_dirty(handle1, bh)
+6) handle1 is closed
+7) start committing transaction1, opening transaction2
+8) handle2 is opened
+9) journal_access(handle2, bh)
+    - This copies off b_frozen_data to make it safe for transaction1 to commit.
+      jh->b_next_transaction is set to transaction2.
+10) jbd2_journal_write_metadata() checksums b_frozen_data
+11) the journal correctly writes b_frozen_data to the disk journal
+12) handle2 is closed
+    - There was no dirty call for the bh on handle2, so it is never queued for
+      any more journal operation
+13) Checkpointing finally happens, and it just spools the bh via normal buffer
+writeback.  This will write b_data, which was never triggered on and thus
+contains a wrong (old) checksum.
+
+This patch fixes the problem by calling the trigger at the moment data is
+frozen for journal commit - i.e., either when b_frozen_data is created by
+do_get_write_access or just before we write a buffer to the log if
+b_frozen_data does not exist. We also rename the trigger to t_frozen as
+that better describes when it is called.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Acked-by: Mark Fasheh <mfasheh@suse.com>
+---
+ fs/jbd2/journal.c     |   15 +++++++--------
+ fs/jbd2/transaction.c |    9 ++++++---
+ fs/ocfs2/journal.c    |   24 ++++++++++++------------
+ include/linux/jbd2.h  |   11 ++++++-----
+ 4 files changed, 31 insertions(+), 28 deletions(-)
+
+diff --git a/fs/jbd2/journal.c b/fs/jbd2/journal.c
+index bc2ff59..0368808 100644
+--- a/fs/jbd2/journal.c
++++ b/fs/jbd2/journal.c
+@@ -297,7 +297,6 @@ int jbd2_journal_write_metadata_buffer(transaction_t *transaction,
+ 	struct page *new_page;
+ 	unsigned int new_offset;
+ 	struct buffer_head *bh_in = jh2bh(jh_in);
+-	struct jbd2_buffer_trigger_type *triggers;
+ 	journal_t *journal = transaction->t_journal;
+ 
+ 	/*
+@@ -328,21 +327,21 @@ repeat:
+ 		done_copy_out = 1;
+ 		new_page = virt_to_page(jh_in->b_frozen_data);
+ 		new_offset = offset_in_page(jh_in->b_frozen_data);
+-		triggers = jh_in->b_frozen_triggers;
+ 	} else {
+ 		new_page = jh2bh(jh_in)->b_page;
+ 		new_offset = offset_in_page(jh2bh(jh_in)->b_data);
+-		triggers = jh_in->b_triggers;
+ 	}
+ 
+ 	mapped_data = kmap_atomic(new_page, KM_USER0);
+ 	/*
+-	 * Fire any commit trigger.  Do this before checking for escaping,
+-	 * as the trigger may modify the magic offset.  If a copy-out
+-	 * happens afterwards, it will have the correct data in the buffer.
++	 * Fire data frozen trigger if data already wasn't frozen.  Do this
++	 * before checking for escaping, as the trigger may modify the magic
++	 * offset.  If a copy-out happens afterwards, it will have the correct
++	 * data in the buffer.
+ 	 */
+-	jbd2_buffer_commit_trigger(jh_in, mapped_data + new_offset,
+-				   triggers);
++	if (!done_copy_out)
++		jbd2_buffer_frozen_trigger(jh_in, mapped_data + new_offset,
++					   jh_in->b_triggers);
+ 
+ 	/*
+ 	 * Check for escaping
+diff --git a/fs/jbd2/transaction.c b/fs/jbd2/transaction.c
+index e214d68..b8e0806 100644
+--- a/fs/jbd2/transaction.c
++++ b/fs/jbd2/transaction.c
+@@ -725,6 +725,9 @@ done:
+ 		page = jh2bh(jh)->b_page;
+ 		offset = ((unsigned long) jh2bh(jh)->b_data) & ~PAGE_MASK;
+ 		source = kmap_atomic(page, KM_USER0);
++		/* Fire data frozen trigger just before we copy the data */
++		jbd2_buffer_frozen_trigger(jh, source + offset,
++					   jh->b_triggers);
+ 		memcpy(jh->b_frozen_data, source+offset, jh2bh(jh)->b_size);
+ 		kunmap_atomic(source, KM_USER0);
+ 
+@@ -963,15 +966,15 @@ void jbd2_journal_set_triggers(struct buffer_head *bh,
+ 	jh->b_triggers = type;
+ }
+ 
+-void jbd2_buffer_commit_trigger(struct journal_head *jh, void *mapped_data,
++void jbd2_buffer_frozen_trigger(struct journal_head *jh, void *mapped_data,
+ 				struct jbd2_buffer_trigger_type *triggers)
+ {
+ 	struct buffer_head *bh = jh2bh(jh);
+ 
+-	if (!triggers || !triggers->t_commit)
++	if (!triggers || !triggers->t_frozen)
+ 		return;
+ 
+-	triggers->t_commit(triggers, bh, mapped_data, bh->b_size);
++	triggers->t_frozen(triggers, bh, mapped_data, bh->b_size);
+ }
+ 
+ void jbd2_buffer_abort_trigger(struct journal_head *jh,
+diff --git a/fs/ocfs2/journal.c b/fs/ocfs2/journal.c
+index 47878cf..b305bf0 100644
+--- a/fs/ocfs2/journal.c
++++ b/fs/ocfs2/journal.c
+@@ -472,7 +472,7 @@ static inline struct ocfs2_triggers *to_ocfs2_trigger(struct jbd2_buffer_trigger
+ 	return container_of(triggers, struct ocfs2_triggers, ot_triggers);
+ }
+ 
+-static void ocfs2_commit_trigger(struct jbd2_buffer_trigger_type *triggers,
++static void ocfs2_frozen_trigger(struct jbd2_buffer_trigger_type *triggers,
+ 				 struct buffer_head *bh,
+ 				 void *data, size_t size)
+ {
+@@ -491,7 +491,7 @@ static void ocfs2_commit_trigger(struct jbd2_buffer_trigger_type *triggers,
+  * Quota blocks have their own trigger because the struct ocfs2_block_check
+  * offset depends on the blocksize.
+  */
+-static void ocfs2_dq_commit_trigger(struct jbd2_buffer_trigger_type *triggers,
++static void ocfs2_dq_frozen_trigger(struct jbd2_buffer_trigger_type *triggers,
+ 				 struct buffer_head *bh,
+ 				 void *data, size_t size)
+ {
+@@ -511,7 +511,7 @@ static void ocfs2_dq_commit_trigger(struct jbd2_buffer_trigger_type *triggers,
+  * Directory blocks also have their own trigger because the
+  * struct ocfs2_block_check offset depends on the blocksize.
+  */
+-static void ocfs2_db_commit_trigger(struct jbd2_buffer_trigger_type *triggers,
++static void ocfs2_db_frozen_trigger(struct jbd2_buffer_trigger_type *triggers,
+ 				 struct buffer_head *bh,
+ 				 void *data, size_t size)
+ {
+@@ -544,7 +544,7 @@ static void ocfs2_abort_trigger(struct jbd2_buffer_trigger_type *triggers,
+ 
+ static struct ocfs2_triggers di_triggers = {
+ 	.ot_triggers = {
+-		.t_commit = ocfs2_commit_trigger,
++		.t_frozen = ocfs2_frozen_trigger,
+ 		.t_abort = ocfs2_abort_trigger,
+ 	},
+ 	.ot_offset	= offsetof(struct ocfs2_dinode, i_check),
+@@ -552,7 +552,7 @@ static struct ocfs2_triggers di_triggers = {
+ 
+ static struct ocfs2_triggers eb_triggers = {
+ 	.ot_triggers = {
+-		.t_commit = ocfs2_commit_trigger,
++		.t_frozen = ocfs2_frozen_trigger,
+ 		.t_abort = ocfs2_abort_trigger,
+ 	},
+ 	.ot_offset	= offsetof(struct ocfs2_extent_block, h_check),
+@@ -560,7 +560,7 @@ static struct ocfs2_triggers eb_triggers = {
+ 
+ static struct ocfs2_triggers rb_triggers = {
+ 	.ot_triggers = {
+-		.t_commit = ocfs2_commit_trigger,
++		.t_frozen = ocfs2_frozen_trigger,
+ 		.t_abort = ocfs2_abort_trigger,
+ 	},
+ 	.ot_offset	= offsetof(struct ocfs2_refcount_block, rf_check),
+@@ -568,7 +568,7 @@ static struct ocfs2_triggers rb_triggers = {
+ 
+ static struct ocfs2_triggers gd_triggers = {
+ 	.ot_triggers = {
+-		.t_commit = ocfs2_commit_trigger,
++		.t_frozen = ocfs2_frozen_trigger,
+ 		.t_abort = ocfs2_abort_trigger,
+ 	},
+ 	.ot_offset	= offsetof(struct ocfs2_group_desc, bg_check),
+@@ -576,14 +576,14 @@ static struct ocfs2_triggers gd_triggers = {
+ 
+ static struct ocfs2_triggers db_triggers = {
+ 	.ot_triggers = {
+-		.t_commit = ocfs2_db_commit_trigger,
++		.t_frozen = ocfs2_db_frozen_trigger,
+ 		.t_abort = ocfs2_abort_trigger,
+ 	},
+ };
+ 
+ static struct ocfs2_triggers xb_triggers = {
+ 	.ot_triggers = {
+-		.t_commit = ocfs2_commit_trigger,
++		.t_frozen = ocfs2_frozen_trigger,
+ 		.t_abort = ocfs2_abort_trigger,
+ 	},
+ 	.ot_offset	= offsetof(struct ocfs2_xattr_block, xb_check),
+@@ -591,14 +591,14 @@ static struct ocfs2_triggers xb_triggers = {
+ 
+ static struct ocfs2_triggers dq_triggers = {
+ 	.ot_triggers = {
+-		.t_commit = ocfs2_dq_commit_trigger,
++		.t_frozen = ocfs2_dq_frozen_trigger,
+ 		.t_abort = ocfs2_abort_trigger,
+ 	},
+ };
+ 
+ static struct ocfs2_triggers dr_triggers = {
+ 	.ot_triggers = {
+-		.t_commit = ocfs2_commit_trigger,
++		.t_frozen = ocfs2_frozen_trigger,
+ 		.t_abort = ocfs2_abort_trigger,
+ 	},
+ 	.ot_offset	= offsetof(struct ocfs2_dx_root_block, dr_check),
+@@ -606,7 +606,7 @@ static struct ocfs2_triggers dr_triggers = {
+ 
+ static struct ocfs2_triggers dl_triggers = {
+ 	.ot_triggers = {
+-		.t_commit = ocfs2_commit_trigger,
++		.t_frozen = ocfs2_frozen_trigger,
+ 		.t_abort = ocfs2_abort_trigger,
+ 	},
+ 	.ot_offset	= offsetof(struct ocfs2_dx_leaf, dl_check),
+diff --git a/include/linux/jbd2.h b/include/linux/jbd2.h
+index a4d2e9f..adf832d 100644
+--- a/include/linux/jbd2.h
++++ b/include/linux/jbd2.h
+@@ -1026,11 +1026,12 @@ void __jbd2_journal_insert_checkpoint(struct journal_head *, transaction_t *);
+ 
+ struct jbd2_buffer_trigger_type {
+ 	/*
+-	 * Fired just before a buffer is written to the journal.
+-	 * mapped_data is a mapped buffer that is the frozen data for
+-	 * commit.
++	 * Fired a the moment data to write to the journal are known to be
++	 * stable - so either at the moment b_frozen_data is created or just
++	 * before a buffer is written to the journal.  mapped_data is a mapped
++	 * buffer that is the frozen data for commit.
+ 	 */
+-	void (*t_commit)(struct jbd2_buffer_trigger_type *type,
++	void (*t_frozen)(struct jbd2_buffer_trigger_type *type,
+ 			 struct buffer_head *bh, void *mapped_data,
+ 			 size_t size);
+ 
+@@ -1042,7 +1043,7 @@ struct jbd2_buffer_trigger_type {
+ 			struct buffer_head *bh);
+ };
+ 
+-extern void jbd2_buffer_commit_trigger(struct journal_head *jh,
++extern void jbd2_buffer_frozen_trigger(struct journal_head *jh,
+ 				       void *mapped_data,
+ 				       struct jbd2_buffer_trigger_type *triggers);
+ extern void jbd2_buffer_abort_trigger(struct journal_head *jh,
+-- 
+1.6.4.2
+
