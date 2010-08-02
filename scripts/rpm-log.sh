@@ -1,7 +1,19 @@
 #! /bin/sh
 
+# log.sh - Automate insertion of patches into a kernel rpm tree managed
+# with series.conf
+#
+# Usage example:
+#
+# osc branch openSUSE:11.3/kernel-source
+# osc co home:philipsb:branches:openSUSE:11.3:Update:Test/kernel-source
+# mv ~/linux-2.6/driver-fix-for-something.patch .
+# echo -e "\tpatches.drivers/driver-fix-for-something.patch" >> series.conf
+# ./log.sh
+# osc commit
+
 #############################################################################
-# Copyright (c) 2004-2006,2008,2009 Novell, Inc.
+# Copyright (c) 2004-2006,2008-2010 Novell, Inc.
 # All Rights Reserved.
 #
 # This program is free software; you can redistribute it and/or
@@ -20,21 +32,7 @@
 # you may find current contact information at www.novell.com
 #############################################################################
 
-if test -x "${0}2" -a ! -e kernel-source.changes; then
-	# hand over to scripts/log2
-	exec "${0}2" "$@"
-fi
-
 # Construct a changes entry and commit log from a patch.
-
-. ${0%/*}/wd-functions.sh
-
-if ! $using_git; then
-    echo "ERROR: not in a git working directory."
-    exit 1
-fi
-
-scripts/check-cvs-add || exit 1
 
 CHANGES=kernel-source.changes
 
@@ -50,6 +48,7 @@ log_entry() {
     | sed -e '1s/^/- /' -e '2,$s/^/  /' \
     >> $message
 }
+
 
 patch_meta() {
     local patch=$1
@@ -75,7 +74,7 @@ patch_log_entry() {
 
     local msg
     if test -z "$subject" -o "$subject" != "$old_subj"; then
-        msg="$subject${references:+ ($references)}"
+        msg="$subject${references:+ ($references)}" 
     elif test "$references" != "$old_ref"; then
         if test -n "$references"; then
             msg="Update references ($references)"
@@ -87,10 +86,31 @@ patch_log_entry() {
     log_entry "$patch: $msg${msg:+.}"
 }
 
-for file in "$@" $(scripts/cvs-touched-files); do
-    [ "${file:(-8)}" = ".changes" ] && continue
+find_patches() {
+       osc diff series.conf \
+       | sed -n "s/^+\s*\(patches.*\)/\1/p"
+}
+
+for file in  "$@" $(find_patches); do
+    dirname=$(dirname $file)
+    basename=$(basename $file)
+    archive=$dirname.tar.bz2
+
+    if [ ! -f $basename ]; then
+        echo "ERROR: $basename added to series.conf but doesn't exist in $PWD"
+        exit 1
+    fi
+
+    if [ ! -d $dirname ]; then
+        tar xvf $archive
+    fi
+    
+    mv $basename $dirname
+    rm $archive
+    tar cfj $archive $dirname
+
     files[${#files[@]}]=$file
-done
+done 
 
 if [ ${#files[@]} -eq 0 ]; then
     echo "No modified files" >&2
@@ -135,46 +155,13 @@ if [ ! -s $message ]; then
     echo "- " >> $message
 fi
 
-if [ -z "$VC" ]; then
-    VC=vc
-    for search in $HOME/bin /work/src/bin scripts; do
-	if [ -x $search/$VC ]; then
-	    VC=$search/$VC
-	    break
-	fi
-    done
-fi
-
-if $VC $CHANGES $message; then
+if osc vc $CHANGES $message; then
     entry=$(sed -ne '1,2d' -e '/^--*$/!p' -e '/^--*$/q' $CHANGES)
     entry=${entry##$'\n'}
     entry=${entry%%$'\n'}
-    echo "$entry" > $message
-
-    while :; do
-	echo
-	sed -e 's:^:| :' $message
-	echo
-	echo -n "Commit with the above changelog entry: ([y]es), [n]o, [e]dit? "
-	read yesno && \
-	case "$yesno" in
-	    "" | [yY] | yes)
-                git add $CHANGES
-                # XXX don't commit -a?
-                git commit -a -F $message || exit
-                branch=$(get_branch_name)
-                case "$branch" in
-		master | preload | slert* | SL*_BRANCH | openSUSE-??.? | \
-		SLE?? | SLE??-SP? )
-                    echo "after testing your changes, run"
-                    echo "    git push origin $branch"
-                esac
-		break ;;
-	    [nN] | no)
-		break ;;
-	    [eE] | edit)
-		${EDITOR:-vi} $message
-		;;
-	esac
-    done
 fi
+
+for c in *.changes; do
+    [ $c = $CHANGES ] && continue
+    cp $CHANGES $c
+done

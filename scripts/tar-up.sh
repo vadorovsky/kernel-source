@@ -22,6 +22,11 @@
 
 # generate a kernel-source rpm package
 
+# if this is SLE11_BRANCH and earlier, hand over to scripts/tar-up-old.sh
+if test ! -x rpm/mkspec; then
+    exec ${0%.sh}-old.sh "$@"
+fi
+
 . ${0%/*}/wd-functions.sh
 
 export LC_COLLATE=C
@@ -145,12 +150,49 @@ trap 'if test -n "$CLEANFILES"; then rm -rf "${CLEANFILES[@]}"; fi' EXIT
 tmpdir=$(mktemp -dt ${0##*/}.XXXXXX)
 CLEANFILES=("${CLEANFILES[@]}" "$tmpdir")
 
-cp -p rpm/* config.conf supported.conf doc/README.{SUSE,KSYMS} \
+cp -p rpm/* config.conf supported.conf doc/* \
 	misc/extract-modaliases $build_dir
+# install this file only if the spec file references it
+if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.in; then
+	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
+fi
+rm -f "$build_dir/kernel-source.changes.old"
 # FIXME: move config-subst out of rpm/
 rm "$build_dir/config-subst"
 
-cat kernel-source.changes{,.old} > "$build_dir/kernel-source$VARIANT.changes"
+changelog=$build_dir/kernel-source$VARIANT.changes
+if test -e kernel-source.changes; then
+    cat kernel-source.changes{,.old} >"$changelog"
+elif $using_git; then
+    exclude=()
+    # Exclude commits in the scripts branch, these are rarely interesting for
+    # users of the rpm packages.
+    # FIXME: the remote might have a different name than "origin" or there
+    # might be no remote at all.
+    if git cat-file -e origin/scripts 2>/dev/null; then
+        exclude[${#exclude[@]}]=^origin/scripts
+    fi
+    if git cat-file -e scripts 2>/dev/null; then
+        exclude[${#exclude[@]}]=^scripts
+    fi
+    if test ${#exclude[@]} -eq 0; then
+        echo "warning: no scripts or origin/scripts branch found" >&2
+        echo "warning: rpm changelog will have some useless entries" >&2
+    fi
+    changes_stop=$(sed 1q rpm/kernel-source.changes.old)
+    case "$changes_stop" in
+    last\ commit:\ *)
+        exclude[${#exclude[@]}]=^${changes_stop#*: }
+        ;;
+    *)
+        echo "expected \"last commit: <commit>\" in rpm/kernel-source.changes.old" >&2
+        exit 1
+    esac
+    scripts/gitlog2changes "${exclude[@]}" HEAD -- >"$changelog"
+    sed 1d rpm/kernel-source.changes.old >>"$changelog"
+else
+    touch "$changelog"
+fi
 
 if [ -e extra-symbols ]; then
 	install -m 755					\
@@ -222,7 +264,7 @@ stable_tar() {
         cd "$chdir"
         find "$@" \( -type f -o -type l -o -type d -a -empty \) -print0 | \
             LC_ALL=C sort -z | \
-            tar cf - --null -T - "${tar_opts[@]}"
+            tar -cf - --null -T - "${tar_opts[@]}"
     ) | bzip2 -9 >"$tarball"
 }
 
@@ -256,7 +298,7 @@ stable_tar $build_dir/kabi.tar.bz2 kabi
 # not already created: patches.addon is empty by intention; others currently
 # may contain no patches.
 archives=$(sed -ne 's,^Source[0-9]*:.*[ \t/]\([^/]*\)\.tar\.bz2$,\1,p' \
-           $build_dir/kernel-binary.spec.in | sort -u)
+           $build_dir/kernel-source.spec.in | sort -u)
 for archive in $archives; do
     [ "$archive" = "linux-%srcversion" ] && continue
     if ! [ -e $build_dir/$archive.tar.bz2 ]; then
