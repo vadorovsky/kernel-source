@@ -1,0 +1,214 @@
+From be6ee5a369709060fd8bae33e8130e39f0df0685 Mon Sep 17 00:00:00 2001
+From: Mark Fasheh <mfasheh@suse.com>
+Date: Wed, 4 Aug 2010 14:16:32 -0700
+Subject: ocfs2: allow return of new inode block location before allocation of the inode
+References: bnc#626321
+Patch-mainline: v2.6.36
+
+This allows code which needs to know the eventual block number of an inode
+but can't allocate it yet due to transaction or lock ordering. For example,
+ocfs2_create_inode_in_orphan() currently gives a junk blkno for preparation
+of the orphan dir because it can't yet know where the actual inode is placed
+- that code is actually in ocfs2_mknod_locked. This is a problem when the
+orphan dirs are indexed as the junk inode number will create an index entry
+which goes unused (and fails the later removal from the orphan dir).  Now
+with these interfaces, ocfs2_create_inode_in_orphan() can run the block
+group search (and get back the inode block number) *before* any actual
+allocation occurs.
+
+Signed-off-by: Mark Fasheh <mfasheh@suse.com>
+
+Index: linux-2.6.32-bnc626321/fs/ocfs2/suballoc.c
+===================================================================
+--- linux-2.6.32-bnc626321.orig/fs/ocfs2/suballoc.c
++++ linux-2.6.32-bnc626321/fs/ocfs2/suballoc.c
+@@ -1426,6 +1426,9 @@ static int ocfs2_search_one_group(struct
+ 
+ 	*num_bits = found;
+ 
++	if (ac->ac_find_loc_only)
++		goto out_loc_only;
++
+ 	ret = ocfs2_alloc_dinode_update_counts(alloc_inode, handle, ac->ac_bh,
+ 					       *num_bits,
+ 					       le16_to_cpu(gd->bg_chain));
+@@ -1439,6 +1442,7 @@ static int ocfs2_search_one_group(struct
+ 	if (ret < 0)
+ 		mlog_errno(ret);
+ 
++out_loc_only:
+ 	*bits_left = le16_to_cpu(gd->bg_free_bits_count);
+ 
+ out:
+@@ -1517,6 +1521,9 @@ static int ocfs2_search_chain(struct ocf
+ 
+ 	BUG_ON(*num_bits == 0);
+ 
++	if (ac->ac_find_loc_only)
++		goto out_loc_only;
++
+ 	/*
+ 	 * Keep track of previous block descriptor read. When
+ 	 * we find a target, if we have read more than X
+@@ -1564,6 +1571,7 @@ static int ocfs2_search_chain(struct ocf
+ 	mlog(0, "Allocated %u bits from suballocator %llu\n", *num_bits,
+ 	     (unsigned long long)le64_to_cpu(fe->i_blkno));
+ 
++out_loc_only:
+ 	*bg_blkno = le64_to_cpu(bg->bg_blkno);
+ 	*bits_left = le16_to_cpu(bg->bg_free_bits_count);
+ bail:
+@@ -1761,6 +1769,115 @@ static inline void ocfs2_save_inode_ac_g
+ 	OCFS2_I(dir)->ip_last_used_slot = ac->ac_alloc_slot;
+ }
+ 
++int ocfs2_find_new_inode_loc(struct inode *dir,
++			     struct buffer_head *parent_fe_bh,
++			     struct ocfs2_alloc_context *ac,
++			     u16 *suballoc_bit,
++			     u64 *fe_blkno)
++{
++	int ret;
++	handle_t *handle = NULL;
++	unsigned int num_bits;
++	u64 bg_blkno;
++
++	BUG_ON(!ac);
++	BUG_ON(ac->ac_bits_given != 0);
++	BUG_ON(ac->ac_bits_wanted != 1);
++	BUG_ON(ac->ac_which != OCFS2_AC_USE_INODE);
++
++	ocfs2_init_inode_ac_group(dir, parent_fe_bh, ac);
++
++	/*
++	 * The handle started here is for chain relink. Alternatively,
++	 * we could just disable relink for these calls.
++	 */
++	handle = ocfs2_start_trans(OCFS2_SB(dir->i_sb), OCFS2_SUBALLOC_ALLOC);
++	if (IS_ERR(handle)) {
++		ret = PTR_ERR(handle);
++		handle = NULL;
++		mlog_errno(ret);
++		goto out;
++	}
++
++	/*
++	 * This will instruct ocfs2_claim_suballoc_bits and
++	 * ocfs2_search_one_group to search but save actual allocation
++	 * for later.
++	 */
++	ac->ac_find_loc_only = 1;
++
++	ret = ocfs2_claim_suballoc_bits(OCFS2_SB(dir->i_sb), ac, handle, 1, 1,
++					suballoc_bit, &num_bits, &bg_blkno);
++	if (ret < 0) {
++		mlog_errno(ret);
++		goto out;
++	}
++
++	ac->ac_find_loc_bg = bg_blkno;
++	*fe_blkno = bg_blkno + (u64) (*suballoc_bit);
++
++out:
++	if (handle)
++		ocfs2_commit_trans(OCFS2_SB(dir->i_sb), handle);
++
++	return ret;
++}
++
++int ocfs2_claim_new_inode_at_loc(handle_t *handle,
++				 struct inode *dir,
++				 struct ocfs2_alloc_context *ac,
++				 u16 suballoc_bit,
++				 u64 di_blkno)
++{
++	int ret;
++	u16 chain;
++	struct buffer_head *bg_bh = NULL;
++	struct ocfs2_group_desc *bg;
++	struct ocfs2_dinode *di = (struct ocfs2_dinode *) ac->ac_bh->b_data;
++
++	ret = ocfs2_read_group_descriptor(ac->ac_inode, di,
++					  ac->ac_find_loc_bg, &bg_bh);
++	if (ret) {
++		mlog_errno(ret);
++		goto out;
++	}
++
++	bg = (struct ocfs2_group_desc *) bg_bh->b_data;
++	chain = le16_to_cpu(bg->bg_chain);
++
++	ret = ocfs2_alloc_dinode_update_counts(ac->ac_inode, handle,
++					       ac->ac_bh, 1,
++					       chain);
++	if (ret) {
++		mlog_errno(ret);
++		goto out;
++	}
++
++	ret = ocfs2_block_group_set_bits(handle,
++					 ac->ac_inode,
++					 bg,
++					 bg_bh,
++					 suballoc_bit,
++					 1);
++	if (ret < 0) {
++		mlog_errno(ret);
++		goto out;
++	}
++
++	mlog(0, "Allocated %u bits from suballocator %llu\n", 1,
++	     (unsigned long long)di_blkno);
++
++	atomic_inc(&OCFS2_SB(ac->ac_inode->i_sb)->alloc_stats.bg_allocs);
++
++	ac->ac_bits_given++;
++	ocfs2_save_inode_ac_group(dir, ac);
++
++out:
++	brelse(bg_bh);
++
++	return ret;
++}
++
+ int ocfs2_claim_new_inode(struct ocfs2_super *osb,
+ 			  handle_t *handle,
+ 			  struct inode *dir,
+Index: linux-2.6.32-bnc626321/fs/ocfs2/suballoc.h
+===================================================================
+--- linux-2.6.32-bnc626321.orig/fs/ocfs2/suballoc.h
++++ linux-2.6.32-bnc626321/fs/ocfs2/suballoc.h
+@@ -55,6 +55,10 @@ struct ocfs2_alloc_context {
+ 	u64    ac_max_block;  /* Highest block number to allocate. 0 is
+ 				 is the same as ~0 - unlimited */
+ 
++	int    ac_find_loc_only;  /* hack for reflink operation ordering */
++	u64    ac_find_loc_bg;    /* Target block group, needs to be stored
++				   * off in between calls */
++
+ 	struct ocfs2_alloc_reservation	*ac_resv;
+ };
+ 
+@@ -198,4 +202,22 @@ int ocfs2_lock_allocators(struct inode *
+ 			  struct ocfs2_alloc_context **meta_ac);
+ 
+ int ocfs2_test_inode_bit(struct ocfs2_super *osb, u64 blkno, int *res);
++
++
++
++/*
++ * The following two interfaces are for ocfs2_create_inode_in_orphan().
++ */
++int ocfs2_find_new_inode_loc(struct inode *dir,
++			     struct buffer_head *parent_fe_bh,
++			     struct ocfs2_alloc_context *ac,
++			     u16 *suballoc_bit,
++			     u64 *fe_blkno);
++
++int ocfs2_claim_new_inode_at_loc(handle_t *handle,
++				 struct inode *dir,
++				 struct ocfs2_alloc_context *ac,
++				 u16 suballoc_bit,
++				 u64 di_blkno);
++
+ #endif /* _CHAINALLOC_H_ */
