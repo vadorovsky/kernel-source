@@ -1,0 +1,220 @@
+From: Jiri Bohac <jbohac@suse.cz>
+Subject: IPv6: fix DAD races
+References: bnc#577967
+Patch-mainline: 2.6.35
+
+This is a backport of the following mainline patches to solve various IPv6 DAD race
+conditions:
+
+e9d3e084975869754d16f639378675c353560be9 ipv6: Replace inet6_ifaddr->dead with state
+4c5ff6a6fe794f102479db998c69054319279e3c ipv6: Use state_lock to protect ifa state
+f2344a131bccdbfc5338e17fa71a807dee7944fa ipv6: Use POSTDAD state
+622ccdf107bcb49c4d8fb65512652566d4c8928a ipv6: Never schedule DAD timer on dead address
+
+The following modifications have been made to preserve the KABI:
+ - the "state" member of struct inet6_ifaddr is still called "dead", but with the new
+   semantics
+ - the "state_lock" member of struct inet6_ifaddr is replaced by a global ifa_state_lock.
+   It is never used in any time-critical code, so contention on the global lock is not an
+   issue
+
+
+
+Index: work/include/net/if_inet6.h
+===================================================================
+--- work.orig/include/net/if_inet6.h	2010-07-08 18:23:53.000000000 +0200
++++ work/include/net/if_inet6.h	2010-07-08 18:23:56.000000000 +0200
+@@ -32,6 +32,14 @@
+ 
+ #ifdef __KERNEL__
+ 
++enum {
++	INET6_IFADDR_STATE_DAD,
++	INET6_IFADDR_STATE_POSTDAD,
++	INET6_IFADDR_STATE_UP,
++	INET6_IFADDR_STATE_DEAD,
++};
++
++
+ struct inet6_ifaddr 
+ {
+ 	struct in6_addr		addr;
+Index: work/net/ipv6/addrconf.c
+===================================================================
+--- work.orig/net/ipv6/addrconf.c	2010-07-08 18:23:53.000000000 +0200
++++ work/net/ipv6/addrconf.c	2010-07-08 18:24:11.000000000 +0200
+@@ -540,7 +540,7 @@ void inet6_ifa_finish_destroy(struct ine
+ 	if (del_timer(&ifp->timer))
+ 		printk("Timer is still running, when freeing ifa=%p\n", ifp);
+ 
+-	if (!ifp->dead) {
++	if (ifp->dead != INET6_IFADDR_STATE_DEAD) {
+ 		printk("Freeing alive inet6 address %p\n", ifp);
+ 		return;
+ 	}
+@@ -590,6 +590,8 @@ static u8 ipv6_addr_hash(const struct in
+ 
+ /* On success it returns ifp with increased reference count */
+ 
++DEFINE_SPINLOCK(ifa_state_lock);
++
+ static struct inet6_ifaddr *
+ ipv6_add_addr(struct inet6_dev *idev, const struct in6_addr *addr, int pfxlen,
+ 	      int scope, u32 flags)
+@@ -711,13 +713,20 @@ static void ipv6_del_addr(struct inet6_i
+ {
+ 	struct inet6_ifaddr *ifa, **ifap;
+ 	struct inet6_dev *idev = ifp->idev;
++	int state;
+ 	int hash;
+ 	int deleted = 0, onlink = 0;
+ 	unsigned long expires = jiffies;
+ 
+ 	hash = ipv6_addr_hash(&ifp->addr);
+ 
+-	ifp->dead = 1;
++	spin_lock_bh(&ifa_state_lock);
++	state = ifp->dead;
++	ifp->dead = INET6_IFADDR_STATE_DEAD;
++	spin_unlock_bh(&ifa_state_lock);
++
++	if (state == INET6_IFADDR_STATE_DEAD)
++		goto out;
+ 
+ 	write_lock_bh(&addrconf_hash_lock);
+ 	for (ifap = &inet6_addr_lst[hash]; (ifa=*ifap) != NULL;
+@@ -831,6 +840,7 @@ static void ipv6_del_addr(struct inet6_i
+ 		dst_release(&rt->u.dst);
+ 	}
+ 
++out:
+ 	in6_ifa_put(ifp);
+ }
+ 
+@@ -1405,10 +1415,27 @@ static void addrconf_dad_stop(struct ine
+ 		ipv6_del_addr(ifp);
+ }
+ 
++static int addrconf_dad_end(struct inet6_ifaddr *ifp)
++{
++	int err = -ENOENT;
++
++	spin_lock(&ifa_state_lock);
++	if (ifp->dead == INET6_IFADDR_STATE_DAD) {
++		ifp->dead = INET6_IFADDR_STATE_POSTDAD;
++		err = 0;
++	}
++	spin_unlock(&ifa_state_lock);
++
++	return err;
++}
++
+ void addrconf_dad_failure(struct inet6_ifaddr *ifp)
+ {
+ 	struct inet6_dev *idev = ifp->idev;
+ 
++	if (addrconf_dad_end(ifp))
++		return;
++
+ 	if (net_ratelimit())
+ 		printk(KERN_INFO "%s: IPv6 duplicate address %pI6c detected!\n",
+ 			ifp->idev->dev->name, &ifp->addr);
+@@ -2623,6 +2650,7 @@ static int addrconf_ifdown(struct net_de
+ 	struct inet6_ifaddr *ifa, **bifa;
+ 	struct net *net = dev_net(dev);
+ 	int i;
++	int state;
+ 
+ 	ASSERT_RTNL();
+ 
+@@ -2680,7 +2708,6 @@ static int addrconf_ifdown(struct net_de
+ 	while ((ifa = idev->tempaddr_list) != NULL) {
+ 		idev->tempaddr_list = ifa->tmp_next;
+ 		ifa->tmp_next = NULL;
+-		ifa->dead = 1;
+ 		write_unlock_bh(&idev->lock);
+ 		spin_lock_bh(&ifa->lock);
+ 
+@@ -2696,12 +2723,21 @@ static int addrconf_ifdown(struct net_de
+ 	while ((ifa = idev->addr_list) != NULL) {
+ 		idev->addr_list = ifa->if_next;
+ 		ifa->if_next = NULL;
+-		ifa->dead = 1;
+ 		addrconf_del_timer(ifa);
+ 		write_unlock_bh(&idev->lock);
+ 
++		spin_lock_bh(&ifa_state_lock);
++		state = ifa->dead;
++		ifa->dead = INET6_IFADDR_STATE_DEAD;
++		spin_unlock_bh(&ifa_state_lock);
++
++		if (state == INET6_IFADDR_STATE_DEAD)
++			goto put_ifa;
++
+ 		__ipv6_ifa_notify(RTM_DELADDR, ifa);
+ 		atomic_notifier_call_chain(&inet6addr_chain, NETDEV_DOWN, ifa);
++
++put_ifa:
+ 		in6_ifa_put(ifa);
+ 
+ 		write_lock_bh(&idev->lock);
+@@ -2794,9 +2830,9 @@ static void addrconf_dad_start(struct in
+ 	net_srandom(ifp->addr.s6_addr32[3]);
+ 
+ 	read_lock_bh(&idev->lock);
+-	if (ifp->dead)
+-		goto out;
+ 	spin_lock_bh(&ifp->lock);
++	if (ifp->dead == INET6_IFADDR_STATE_DEAD)
++		goto out;
+ 
+ 	if (dev->flags&(IFF_NOARP|IFF_LOOPBACK) ||
+ 	    idev->cnf.accept_dad < 1 ||
+@@ -2831,8 +2867,8 @@ static void addrconf_dad_start(struct in
+ 		ip6_ins_rt(ifp->rt);
+ 
+ 	addrconf_dad_kick(ifp);
+-	spin_unlock_bh(&ifp->lock);
+ out:
++	spin_unlock_bh(&ifp->lock);
+ 	read_unlock_bh(&idev->lock);
+ }
+ 
+@@ -2842,12 +2878,21 @@ static void addrconf_dad_timer(unsigned
+ 	struct inet6_dev *idev = ifp->idev;
+ 	struct in6_addr mcaddr;
+ 
++	if (!ifp->probes && addrconf_dad_end(ifp))
++		goto out;
++
+ 	read_lock_bh(&idev->lock);
+ 	if (idev->dead) {
+ 		read_unlock_bh(&idev->lock);
+ 		goto out;
+ 	}
+ 	spin_lock_bh(&ifp->lock);
++	if (ifp->dead == INET6_IFADDR_STATE_DEAD) {
++		spin_unlock_bh(&ifp->lock);
++		read_unlock_bh(&idev->lock);
++		goto out;
++	}
++
+ 	if (ifp->probes == 0) {
+ 		/*
+ 		 * DAD was successful
+@@ -2913,12 +2958,10 @@ static void addrconf_dad_run(struct inet
+ 	read_lock_bh(&idev->lock);
+ 	for (ifp = idev->addr_list; ifp; ifp = ifp->if_next) {
+ 		spin_lock_bh(&ifp->lock);
+-		if (!(ifp->flags & IFA_F_TENTATIVE)) {
+-			spin_unlock_bh(&ifp->lock);
+-			continue;
+-		}
++		if (ifp->flags & IFA_F_TENTATIVE &&
++		    ifp->dead == INET6_IFADDR_STATE_DAD)
++			addrconf_dad_kick(ifp);
+ 		spin_unlock_bh(&ifp->lock);
+-		addrconf_dad_kick(ifp);
+ 	}
+ 	read_unlock_bh(&idev->lock);
+ }
