@@ -29,11 +29,15 @@ fi
 
 . ${0%/*}/wd-functions.sh
 
-export LC_COLLATE=C
+sort()
+{
+	LC_ALL=C command sort "$@"
+}
 
 tolerate_unknown_new_config_options=
 ignore_kabi=
 mkspec_args=()
+source $(dirname $0)/config.sh
 until [ "$#" = "0" ] ; do
   case "$1" in
     --dir=*)
@@ -78,6 +82,7 @@ these options are recognized:
     -nf                to proceed if a new unknown .config option is found during make oldconfig
     -u		       update generated files in an existing kernel-source dir
     -i                 ignore kabi failures
+    -d, --dir=DIR      create package in DIR instead of default $BUILD_DIR
 
 EOF
 	exit 1
@@ -88,7 +93,6 @@ EOF
       ;;
   esac
 done
-source $(dirname $0)/config.sh
 export LANG=POSIX
 SRC_FILE=linux-$SRCVERSION.tar.bz2
 
@@ -157,6 +161,11 @@ if grep -q '^Source.*:[[:space:]]*log\.sh[[:space:]]*$' rpm/kernel-source.spec.i
 	cp -p scripts/rpm-log.sh "$build_dir"/log.sh
 fi
 rm -f "$build_dir/kernel-source.changes.old"
+if test -e "$build_dir"/config-options.changes; then
+	# Rename to  avoid triggering a build service rule error
+	mv "$build_dir"/config-options.changes \
+		"$build_dir"/config-options.changes.txt
+fi
 # FIXME: move config-subst out of rpm/
 rm "$build_dir/config-subst"
 
@@ -300,15 +309,20 @@ stable_tar $build_dir/kabi.tar.bz2 kabi
 archives=$(sed -ne 's,^Source[0-9]*:.*[ \t/]\([^/]*\)\.tar\.bz2$,\1,p' \
            $build_dir/kernel-source.spec.in | sort -u)
 for archive in $archives; do
-    [ "$archive" = "linux-%srcversion" ] && continue
-    if ! [ -e $build_dir/$archive.tar.bz2 ]; then
-	echo "$archive.tar.bz2 (empty)"
-	tmpdir2=$(mktemp -dt ${0##*/}.XXXXXX)
-	CLEANFILES=("${CLEANFILES[@]}" "$tmpdir2")
-	mkdir -p $tmpdir2/$archive
-	stable_tar -C $tmpdir2 -t "Wed, 01 Apr 2009 12:00:00 +0200" \
-	    $build_dir/$archive.tar.bz2 $archive
+    case "$archive" in
+    *%*)
+        # skip archive names with macros
+        continue
+    esac
+    if test -e "$build_dir/$archive.tar.bz2"; then
+        continue
     fi
+    echo "$archive.tar.bz2 (empty)"
+    tmpdir2=$(mktemp -dt ${0##*/}.XXXXXX)
+    CLEANFILES=("${CLEANFILES[@]}" "$tmpdir2")
+    mkdir -p $tmpdir2/$archive
+    stable_tar -C $tmpdir2 -t "Wed, 01 Apr 2009 12:00:00 +0200" \
+        $build_dir/$archive.tar.bz2 $archive
 done
 
 # Force mbuild to choose build hosts with enough memory available:
