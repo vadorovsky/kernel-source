@@ -1,0 +1,191 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: dasd: fix unsolicited interrupt recognition
+References: bnc#643173,LTC#67886
+Patch-mainline: Yes
+
+Symptom:     A situation that should have been recovered leads to I/O errors.
+             Example: An 'mkflash -freeze' should put the source device in
+	     a 'long busy' state. But the long busy is not recognized and
+	     requests on the source device run out of retries and end with
+	     I/O errors.
+Problem:     The dasd interrupt handler needs to distinguish solicited from
+	     unsolicited interrupts, as unsolicited interrupts may require
+	     special handling (e.g. summary unit checks) and solicited
+	     interrupts require proper error recovery for the failed I/O
+	     request. The interrupt handler needs to check several bit fields
+	     in the interrupt response block (irb) to make this distinction.
+	     So far our check of the status control bits has not been specific
+	     enough, which may lead to a failed request getting just retried
+	     instead of the necessary error recovery. 
+Solution:    Fix the solicited/unsolicited check in the dasd_int_handler.
+
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/block/dasd.c      |   11 +++++-
+ drivers/s390/block/dasd_eckd.c |   72 +++++++++++++++++------------------------
+ 2 files changed, 41 insertions(+), 42 deletions(-)
+
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -1076,11 +1076,20 @@ void dasd_int_handler(struct ccw_device 
+ 	cqr = (struct dasd_ccw_req *) intparm;
+ 	if (!cqr || ((scsw_cc(&irb->scsw) == 1) &&
+ 		     (scsw_fctl(&irb->scsw) & SCSW_FCTL_START_FUNC) &&
+-		     (scsw_stctl(&irb->scsw) & SCSW_STCTL_STATUS_PEND))) {
++		     ((scsw_stctl(&irb->scsw) == SCSW_STCTL_STATUS_PEND) ||
++		      (scsw_stctl(&irb->scsw) == (SCSW_STCTL_STATUS_PEND |
++						  SCSW_STCTL_ALERT_STATUS))))) {
+ 		if (cqr && cqr->status == DASD_CQR_IN_IO)
+ 			cqr->status = DASD_CQR_QUEUED;
++		if (cqr)
++			memcpy(&cqr->irb, irb, sizeof(*irb));
+ 		device = dasd_device_from_cdev_locked(cdev);
+ 		if (!IS_ERR(device)) {
++			device->discipline->dump_sense_dbf(device, irb,
++							   "unsolicited");
++			if ((device->features & DASD_FEATURE_ERPLOG))
++				device->discipline->dump_sense(device, cqr,
++							       irb);
+ 			dasd_device_clear_timer(device);
+ 			device->discipline->handle_unsolicited_interrupt(device,
+ 									 irb);
+--- a/drivers/s390/block/dasd_eckd.c
++++ b/drivers/s390/block/dasd_eckd.c
+@@ -1683,13 +1683,13 @@ static void dasd_eckd_handle_unsolicited
+ 	}
+ 
+ 	/* summary unit check */
+-	if ((scsw_dstat(&irb->scsw) & DEV_STAT_UNIT_CHECK) &&
+-	    (irb->ecw[7] == 0x0D)) {
++	sense = dasd_get_sense(irb);
++	if (sense && (sense[7] == 0x0D) &&
++	    (scsw_dstat(&irb->scsw) & DEV_STAT_UNIT_CHECK)) {
+ 		dasd_alias_handle_summary_unit_check(device, irb);
+ 		return;
+ 	}
+ 
+-	sense = dasd_get_sense(irb);
+ 	/* service information message SIM */
+ 	if (sense && !(sense[27] & DASD_SENSE_BIT_0) &&
+ 	    ((sense[6] & DASD_SIM_SENSE) == DASD_SIM_SENSE)) {
+@@ -1698,26 +1698,15 @@ static void dasd_eckd_handle_unsolicited
+ 		return;
+ 	}
+ 
+-	if ((scsw_cc(&irb->scsw) == 1) &&
+-	    (scsw_fctl(&irb->scsw) & SCSW_FCTL_START_FUNC) &&
+-	    (scsw_actl(&irb->scsw) & SCSW_ACTL_START_PEND) &&
+-	    (scsw_stctl(&irb->scsw) & SCSW_STCTL_STATUS_PEND)) {
++	if ((scsw_cc(&irb->scsw) == 1) && !sense &&
++	    (scsw_fctl(&irb->scsw) == SCSW_FCTL_START_FUNC) &&
++	    (scsw_actl(&irb->scsw) == SCSW_ACTL_START_PEND) &&
++	    (scsw_stctl(&irb->scsw) == SCSW_STCTL_STATUS_PEND)) {
+ 		/* fake irb do nothing, they are handled elsewhere */
+ 		dasd_schedule_device_bh(device);
+ 		return;
+ 	}
+ 
+-	if (!sense) {
+-		/* just report other unsolicited interrupts */
+-		DBF_DEV_EVENT(DBF_ERR, device, "%s",
+-			    "unsolicited interrupt received");
+-	} else {
+-		DBF_DEV_EVENT(DBF_ERR, device, "%s",
+-			    "unsolicited interrupt received "
+-			    "(sense available)");
+-		device->discipline->dump_sense_dbf(device, irb, "unsolicited");
+-	}
+-
+ 	dasd_schedule_device_bh(device);
+ 	return;
+ };
+@@ -2996,23 +2985,19 @@ dasd_eckd_dump_sense_dbf(struct dasd_dev
+ 			 char *reason)
+ {
+ 	u64 *sense;
+-	u32 stat;
++	u64 *stat;
+ 
+ 	sense = (u64 *) dasd_get_sense(irb);
+-	stat = scsw_cstat(&irb->scsw);
+-	stat <<= 8;
+-	stat |=	scsw_dstat(&irb->scsw);
+-	stat <<= 8;
+-	stat |= scsw_cc(&irb->scsw);
+-
++	stat = (u64 *) &irb->scsw;
+ 	if (sense) {
+-		DBF_DEV_EVENT(DBF_EMERG, device,
+-			      "%s: %s %06x %016llx %016llx %016llx %016llx",
+-			      reason, scsw_is_tm(&irb->scsw) ? "t" : "c", stat,
++		DBF_DEV_EVENT(DBF_EMERG, device, "%s: %016llx %08x : "
++			      "%016llx %016llx %016llx %016llx",
++			      reason, *stat, *((u32 *) (stat + 1)),
+ 			      sense[0], sense[1], sense[2], sense[3]);
+ 	} else {
+-		DBF_DEV_EVENT(DBF_EMERG, device, "%s",
+-			      "SORRY - NO VALID SENSE AVAILABLE\n");
++		DBF_DEV_EVENT(DBF_EMERG, device, "%s: %016llx %08x : %s",
++			      reason, *stat, *((u32 *) (stat + 1)),
++			      "NO VALID SENSE");
+ 	}
+ }
+ 
+@@ -3038,9 +3023,12 @@ static void dasd_eckd_dump_sense_ccw(str
+ 		      " I/O status report for device %s:\n",
+ 		      dev_name(&device->cdev->dev));
+ 	len += sprintf(page + len, KERN_ERR PRINTK_HEADER
+-		       " in req: %p CS: 0x%02X DS: 0x%02X CC: 0x%02X RC: %d\n",
+-		       req, scsw_cstat(&irb->scsw), scsw_dstat(&irb->scsw),
+-		       scsw_cc(&irb->scsw), req ? req->intrc : 0);
++		       " in req: %p CC:%02X FC:%02X AC:%02X SC:%02X DS:%02X "
++		       "CS:%02X RC:%d\n",
++		       req, scsw_cc(&irb->scsw), scsw_fctl(&irb->scsw),
++		       scsw_actl(&irb->scsw), scsw_stctl(&irb->scsw),
++		       scsw_dstat(&irb->scsw), scsw_cstat(&irb->scsw),
++		       req ? req->intrc : 0);
+ 	len += sprintf(page + len, KERN_ERR PRINTK_HEADER
+ 		       " device %s: Failing CCW: %p\n",
+ 		       dev_name(&device->cdev->dev),
+@@ -3141,11 +3129,13 @@ static void dasd_eckd_dump_sense_tcw(str
+ 		      " I/O status report for device %s:\n",
+ 		      dev_name(&device->cdev->dev));
+ 	len += sprintf(page + len, KERN_ERR PRINTK_HEADER
+-		       " in req: %p CS: 0x%02X DS: 0x%02X CC: 0x%02X RC: %d "
+-		       "fcxs: 0x%02X schxs: 0x%02X\n", req,
+-		       scsw_cstat(&irb->scsw), scsw_dstat(&irb->scsw),
+-		       scsw_cc(&irb->scsw), req->intrc,
+-		       irb->scsw.tm.fcxs, irb->scsw.tm.schxs);
++		       " in req: %p CC:%02X FC:%02X AC:%02X SC:%02X DS:%02X "
++		       "CS:%02X fcxs:%02X schxs:%02X RC:%d\n",
++		       req, scsw_cc(&irb->scsw), scsw_fctl(&irb->scsw),
++		       scsw_actl(&irb->scsw), scsw_stctl(&irb->scsw),
++		       scsw_dstat(&irb->scsw), scsw_cstat(&irb->scsw),
++		       irb->scsw.tm.fcxs, irb->scsw.tm.schxs,
++		       req ? req->intrc : 0);
+ 	len += sprintf(page + len, KERN_ERR PRINTK_HEADER
+ 		       " device %s: Failing TCW: %p\n",
+ 		       dev_name(&device->cdev->dev),
+@@ -3153,11 +3143,11 @@ static void dasd_eckd_dump_sense_tcw(str
+ 
+ 	tsb = NULL;
+ 	sense = NULL;
+-	if (irb->scsw.tm.tcw)
++	if (irb->scsw.tm.tcw && (irb->scsw.tm.fcxs & 0x01))
+ 		tsb = tcw_get_tsb(
+ 			(struct tcw *)(unsigned long)irb->scsw.tm.tcw);
+ 
+-	if (tsb && (irb->scsw.tm.fcxs == 0x01)) {
++	if (tsb) {
+ 		len += sprintf(page + len, KERN_ERR PRINTK_HEADER
+ 			       " tsb->length %d\n", tsb->length);
+ 		len += sprintf(page + len, KERN_ERR PRINTK_HEADER
+@@ -3251,7 +3241,7 @@ static void dasd_eckd_dump_sense_tcw(str
+ static void dasd_eckd_dump_sense(struct dasd_device *device,
+ 				 struct dasd_ccw_req *req, struct irb *irb)
+ {
+-	if (req && scsw_is_tm(&req->irb.scsw))
++	if (scsw_is_tm(&irb->scsw))
+ 		dasd_eckd_dump_sense_tcw(device, req, irb);
+ 	else
+ 		dasd_eckd_dump_sense_ccw(device, req, irb);
