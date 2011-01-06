@@ -1,0 +1,183 @@
+From: http://xenbits.xensource.com/linux-2.6.18-xen.hg?rev/59f097ef181b
+# HG changeset patch
+# User Keir Fraser <keir@xen.org>
+# Date 1290520718 0
+# Node ID 59f097ef181b2d131fdc72a56071b964d771bcaa
+# Parent  26562626c866026c62c4be83b4c4c87b4cdc31a4
+Subject: blkback/blktap/netback: Fix CVE-2010-3699
+Patch-mainline: n/a
+References: CVE-2010-3699 bnc#655964
+
+A guest can cause the backend driver to leak a kernel
+thread. Such leaked threads hold references to the device, whichmakes
+the device impossible to tear down. If shut down, the guest remains a
+zombie domain, the xenwatch process hangs, and most xm commands will
+stop working.
+
+This patch tries to do the following, for all of netback, blkback,
+blktap:
+    - identify/extract idempotent teardown operations,
+    - add/move the invocation of said teardown operation
+      right before we're about to allocate new resources in the
+      Connected states.
+
+Signed-off-by: Laszlo Ersek <lersek@redhat.com>
+
+From: http://xenbits.xensource.com/linux-2.6.18-xen.hg?rev/4d8ca2afea93
+# HG changeset patch
+# User Keir Fraser <keir@xen.org>
+# Date 1291746916 0
+# Node ID 4d8ca2afea936b7f47cb385fa67a110828083b15
+# Parent  dc1d2d3da95f44452e66e00aea9febb5e9a78b65
+netback: Recent change caused spurious hotplug event firings.
+
+From: Laszlo Ersek <lersek@redhat.com>
+Signed-off-by: Keir Fraser <keir@xen.org>
+
+Acked-by: jbeulich@novell.com
+
+--- sle11sp1-2010-12-13.orig/drivers/xen/blkback/xenbus.c	2010-12-13 12:37:03.000000000 +0100
++++ sle11sp1-2010-12-13/drivers/xen/blkback/xenbus.c	2010-11-30 12:16:23.000000000 +0100
+@@ -380,6 +380,11 @@ static void frontend_changed(struct xenb
+ 		if (dev->state == XenbusStateConnected)
+ 			break;
+ 
++		/* Enforce precondition before potential leak point.
++		 * blkif_disconnect() is idempotent.
++		 */
++		blkif_disconnect(be->blkif);
++
+ 		err = connect_ring(be);
+ 		if (err)
+ 			break;
+@@ -397,6 +402,7 @@ static void frontend_changed(struct xenb
+ 			break;
+ 		/* fall through if not online */
+ 	case XenbusStateUnknown:
++		/* implies blkif_disconnect() via blkback_remove() */
+ 		device_unregister(&dev->dev);
+ 		break;
+ 
+--- sle11sp1-2010-12-13.orig/drivers/xen/blktap/xenbus.c	2010-12-13 12:37:03.000000000 +0100
++++ sle11sp1-2010-12-13/drivers/xen/blktap/xenbus.c	2010-11-30 12:16:23.000000000 +0100
+@@ -339,6 +339,18 @@ static void tap_backend_changed(struct x
+ 	tap_update_blkif_status(be->blkif);
+ }
+ 
++
++static void blkif_disconnect(blkif_t *blkif)
++{
++	if (blkif->xenblkd) {
++		kthread_stop(blkif->xenblkd);
++		blkif->xenblkd = NULL;
++	}
++
++	/* idempotent */
++	tap_blkif_free(blkif);
++}
++
+ /**
+  * Callback received when the frontend's state changes.
+  */
+@@ -367,6 +379,11 @@ static void tap_frontend_changed(struct 
+ 		if (dev->state == XenbusStateConnected)
+ 			break;
+ 
++		/* Enforce precondition before potential leak point.
++		 * blkif_disconnect() is idempotent.
++		 */
++		blkif_disconnect(be->blkif);
++
+ 		err = connect_ring(be);
+ 		if (err)
+ 			break;
+@@ -374,11 +391,7 @@ static void tap_frontend_changed(struct 
+ 		break;
+ 
+ 	case XenbusStateClosing:
+-		if (be->blkif->xenblkd) {
+-			kthread_stop(be->blkif->xenblkd);
+-			be->blkif->xenblkd = NULL;
+-		}
+-		tap_blkif_free(be->blkif);
++		blkif_disconnect(be->blkif);
+ 		xenbus_switch_state(dev, XenbusStateClosing);
+ 		break;
+ 
+@@ -388,6 +401,9 @@ static void tap_frontend_changed(struct 
+ 			break;
+ 		/* fall through if not online */
+ 	case XenbusStateUnknown:
++		/* Implies the effects of blkif_disconnect() via
++		 * blktap_remove().
++		 */
+ 		device_unregister(&dev->dev);
+ 		break;
+ 
+--- sle11sp1-2010-12-13.orig/drivers/xen/netback/xenbus.c	2010-12-13 12:37:03.000000000 +0100
++++ sle11sp1-2010-12-13/drivers/xen/netback/xenbus.c	2010-12-13 12:38:46.000000000 +0100
+@@ -32,6 +32,7 @@
+ static int connect_rings(struct backend_info *);
+ static void connect(struct backend_info *);
+ static void backend_create_netif(struct backend_info *be);
++static void netback_disconnect(struct device *);
+ 
+ static int netback_remove(struct xenbus_device *dev)
+ {
+@@ -39,16 +40,22 @@ static int netback_remove(struct xenbus_
+ 
+ 	netback_remove_accelerators(be, dev);
+ 
+-	if (be->netif) {
+-		kobject_uevent(&dev->dev.kobj, KOBJ_OFFLINE);
+-		netif_disconnect(be->netif);
+-		be->netif = NULL;
+-	}
++	netback_disconnect(&dev->dev);
+ 	kfree(be);
+ 	dev->dev.driver_data = NULL;
+ 	return 0;
+ }
+ 
++static void netback_disconnect(struct device *xbdev_dev)
++{
++	struct backend_info *be = xbdev_dev->driver_data;
++
++	if (be->netif) {
++		kobject_uevent(&xbdev_dev->kobj, KOBJ_OFFLINE);
++		netif_disconnect(be->netif);
++		be->netif = NULL;
++	}
++}
+ 
+ /**
+  * Entry point to this code when a new device is created.  Allocate the basic
+@@ -234,17 +241,15 @@ static void frontend_changed(struct xenb
+ 	case XenbusStateConnected:
+ 		if (dev->state == XenbusStateConnected)
+ 			break;
++
++		/* backend_create_netif() is idempotent */
+ 		backend_create_netif(be);
+ 		if (be->netif)
+ 			connect(be);
+ 		break;
+ 
+ 	case XenbusStateClosing:
+-		if (be->netif) {
+-			kobject_uevent(&dev->dev.kobj, KOBJ_OFFLINE);
+-			netif_disconnect(be->netif);
+-			be->netif = NULL;
+-		}
++		netback_disconnect(&dev->dev);
+ 		xenbus_switch_state(dev, XenbusStateClosing);
+ 		break;
+ 
+@@ -254,6 +259,7 @@ static void frontend_changed(struct xenb
+ 			break;
+ 		/* fall through if not online */
+ 	case XenbusStateUnknown:
++		/* implies netback_disconnect() via netback_remove() */
+ 		device_unregister(&dev->dev);
+ 		break;
+ 
