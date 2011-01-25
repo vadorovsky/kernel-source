@@ -37,7 +37,24 @@ sles9* | sles10* | sle10* | 9.* | 10.* | 11.0)
 esac
 
 usage() {
-    echo "SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...] [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]"
+    cat <<END
+SYNOPSIS: $0 [-qv] [--symbol=...] [--dir=...]
+          [--combine] [--fast] [last-patch-name] [--vanilla] [--fuzz=NUM]
+          [--build-dir=PATH] [--config=ARCH-FLAVOR [--kabi]] [--ctags]
+	  [--cscope]
+
+  The --build-dir option supports internal shell aliases, like ~, and variable
+  expansion when the variables are properly escaped.  Environment variables
+  and the following list of internal variables are permitted:
+  \$PATCH_DIR:		The expanded source tree
+  \$SRCVERSION:		The current linux source tarball version
+  \$TAG:			The current tag or branch of this repo
+  \$EXT:			A string expanded from current \$EXTRA_SYMBOLS
+  With --config=ARCH-FLAVOR, these have values. Otherwise they are empty.
+  \$CONFIG:		The current ARCH-FLAVOR.
+  \$CONFIG_ARCH:		The current ARCH.
+  \$CONFIG_FLAVOR:	The current FLAVOR.
+END
     exit 1
 }
 
@@ -49,7 +66,7 @@ if $have_arch_patches; then
 else
 	arch_opt=""
 fi
-options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz -- "$@"`
+options=`getopt -o qvd:F: --long quilt,no-quilt,$arch_opt,symbol:,dir:,combine,fast,vanilla,fuzz,build-dir:,config:,kabi,ctags,cscope -- "$@"`
 
 if [ $? -ne 0 ]
 then
@@ -64,6 +81,13 @@ QUILT=true
 COMBINE=
 FAST=
 VANILLA=false
+SP_BUILD_DIR=
+CONFIG=
+CONFIG_ARCH=
+CONFIG_FLAVOR=
+KABI=false
+CTAGS=false
+CSCOPE=false
 
 while true; do
     case "$1" in
@@ -105,6 +129,23 @@ while true; do
 	    fuzz="-F$2"
 	    shift
 	    ;;
+	--build-dir)
+	    SP_BUILD_DIR="$2"
+	    shift
+	    ;;
+	--config)
+	    CONFIG="$2"
+	    shift
+	    ;;
+	--kabi)
+	    KABI=true
+	    ;;
+	--ctags)
+	    CTAGS=true
+	    ;;
+	--cscope)
+	    CSCOPE=true
+	    ;;
 	--)
 	    shift
 	    break ;;
@@ -118,6 +159,16 @@ unset LIMIT
 if [ $# -ge 1 ]; then
     LIMIT=$1
     shift
+fi
+
+if test -n "$CONFIG"; then
+    CONFIG_ARCH=${CONFIG%%-*}
+    CONFIG_FLAVOR=${CONFIG##*-}
+    if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
+         -z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
+	echo "Invalid config spec: --config=ARCH-FLAVOR is expected."
+	usage
+    fi
 fi
 
 if [ $# -ne 0 ]; then
@@ -163,37 +214,6 @@ LAST_LOG=$SCRATCH_AREA/last-$SRCVERSION${TAG:+-$TAG}.log
 free_blocks="$(df -P "$SCRATCH_AREA" \
     | awk 'NR==2 && match($4, /^[0-9]*$/) { print $4 }' 2> /dev/null)"
 [ "0$free_blocks" -gt 262144 ] && enough_free_space=1
-
-if [ ! -d $ORIG_DIR ]; then
-    # Check if linux-$SRCVERSION.tar.gz is accessible.
-    for file in {$SCRATCH_AREA/,,$MIRROR/,$MIRROR/testing/}linux-$SRCVERSION.tar.{gz,bz2}; do
-	if [ -r $file ]; then
-	    LINUX_ORIG_TARBALL=$file
-	    [ ${file:(-3)} = .gz  ] && COMPRESS_MODE=z
-	    [ ${file:(-4)} = .bz2 ] && COMPRESS_MODE=j
-	    break
-	fi
-    done
-    if [ -z "$LINUX_ORIG_TARBALL" ]; then
-        if type ketchup 2>/dev/null; then
-	    pushd . > /dev/null
-	    cd $SCRATCH_AREA && \
-	    rm -rf linux-$SRCVERSION && \
-	    mkdir linux-$SRCVERSION && \
-	    cd linux-$SRCVERSION && \
-	    ketchup $SRCVERSION && \
-	    cd $SCRATCH_AREA && \
-	    mv linux-$SRCVERSION linux-$SRCVERSION.orig
-	    popd > /dev/null
-	fi
-	if [ ! -d "$ORIG_DIR" ]; then
-	    echo "Kernel source archive \`linux-$SRCVERSION.tar.gz' not found," >&2
-	    echo "alternatively you can put an unpatched kernel tree to" >&2
-	    echo "$ORIG_DIR." >&2
-	    exit 1
-	fi
-    fi
-fi
 
 # Check series.conf.
 if [ ! -r series.conf ]; then
@@ -245,6 +265,13 @@ EXT=${EXTRA_SYMBOLS// /-}
 EXT=${EXT//\//}
 PATCH_DIR=${PATCH_DIR}${EXT:+-}$EXT
 
+if [ -n "$SP_BUILD_DIR" ]; then
+    # This allows alias (~) and variable expansion
+    SP_BUILD_DIR=$(eval echo "$SP_BUILD_DIR")
+else
+    SP_BUILD_DIR="$PATCH_DIR"
+fi
+
 echo "Creating tree in $PATCH_DIR"
 
 # Clean up from previous run
@@ -263,14 +290,7 @@ fi
 
 # Create fresh $SCRATCH_AREA/linux-$SRCVERSION.
 if ! [ -d $ORIG_DIR ]; then
-    echo "Extracting $LINUX_ORIG_TARBALL"
-    tar xf$COMPRESS_MODE $LINUX_ORIG_TARBALL --directory $SCRATCH_AREA
-    if [ -e $SCRATCH_AREA/linux-$SRCVERSION ]; then
-	mv $SCRATCH_AREA/linux-$SRCVERSION $ORIG_DIR || exit 1
-    elif [ -e $SCRATCH_AREA/linux ]; then
-	# Old kernels unpack into linux/ instead of linux-$SRCVERSION/.
-	mv $SCRATCH_AREA/linux $ORIG_DIR || exit 1
-    fi
+    unpack_tarball "$SRCVERSION" "$ORIG_DIR"
     find $ORIG_DIR -type f | xargs chmod a-w,a+r
 fi
 
@@ -469,9 +489,58 @@ fi
 
 echo "[ Tree: $PATCH_DIR ]"
 
+append=
+if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
+    mkdir -p "$SP_BUILD_DIR"
+    echo "[ Build Dir: $SP_BUILD_DIR ]"
+    rm -f "$SP_BUILD_DIR/source"
+    rm -f "$SP_BUILD_DIR/patches"
+    ln -sf "$PATCH_DIR" "$SP_BUILD_DIR/source"
+    ln -sf "source/patches" "$SP_BUILD_DIR/patches"
+fi
+
 if test -e supported.conf; then
     echo "[ Generating Module.supported ]"
-    scripts/guards base external < supported.conf > $PATCH_DIR/Module.supported
+    scripts/guards base external < supported.conf > "$SP_BUILD_DIR/Module.supported"
+fi
+
+if test -n "$CONFIG"; then
+    if test -e "config/$CONFIG_ARCH/$CONFIG_FLAVOR"; then
+	echo "[ Copying config/$CONFIG_ARCH/$CONFIG ]"
+	cp -a "config/$CONFIG_ARCH/$CONFIG_FLAVOR" "$SP_BUILD_DIR/.config"
+    else
+	echo "[ Config $CONFIG does not exist. ]"
+    fi
+
+    if $KABI; then
+	if [ ! -x rpm/modversions ]; then
+	    echo "[ This branch does not support the modversions kABI mechanism. Skipping. ]"
+	elif [ -e "kabi/$CONFIG_ARCH/symtypes-$CONFIG_FLAVOR" ]; then
+	    echo "[ Expanding kABI references for $CONFIG ]"
+	    rpm/modversions --unpack "$SP_BUILD_DIR" < \
+		"kabi/$CONFIG_ARCH/symtypes-$CONFIG_FLAVOR"
+	else
+	    echo "[ No kABI references for $CONFIG ]"
+	fi
+    fi
+fi
+
+if $CTAGS; then
+    if ctags --version > /dev/null; then
+	echo "[ Generating ctags (this may take a while)]"
+	make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" tags
+    else
+	echo "[ Could not generate ctags: ctags not found ]"
+    fi
+fi
+
+if $CSCOPE; then
+    if cscope -V 2> /dev/null; then
+	echo "[ Generating cscope db (this may take a while)]"
+	make -s --no-print-directory -C "$PATCH_DIR" O="$SP_BUILD_DIR" cscope
+    else
+	echo "[ Could not generate cscope db: cscope not found ]"
+    fi
 fi
 
 [ $# -gt 0 ] && exit $status
