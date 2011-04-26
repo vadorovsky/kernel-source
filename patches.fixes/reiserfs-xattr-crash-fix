@@ -1,72 +1,43 @@
 From: Jeff Mahoney <jeffm@suse.com>
-Subject: reiserfs: Fix crash during umount
-References: bnc#610598
-Patch-mainline: Submitted to reiserfs-devel Jun 4 2010
+Subject: reiserfs: Force inode evictions before umount to avoid crash
+References: bnc#610598 bnc#680073 bnc#684112 bnc#686921
+Patch-mainline: Submitted to reiserfs-devel Apr 6 2011
 
- There is a conflict between shrink_dcache_for_umount_subtree and how
- xattrs are cleaned up for deleted files at umount.
+ This patch fixes a crash in reiserfs_delete_xattrs during umount.
 
- shrink_dcache_for_umount_subtree wants to ensure that all dentries for a
- file system have been evicted and it walks the dentry tree from the root
- of the file system to do this. It will BUG if there are any dentries
- left with elevated counts.
+ When shrink_dcache_for_umount clears the dcache from
+ generic_shutdown_super, delayed evictions are forced to disk. If an
+ evicted inode has extended attributes associated with it, it will
+ need to walk the xattr tree to locate and remove them.
 
- The reiserfs xattr infrastructure caches two dentries. One is for
- .reiserfs_priv and the other is for .reiserfs_priv/xattrs. When
- shrink_dcache_for_umount_subtree goes through, it will BUG on these dentries
- if they aren't freed. OTOH, it will Oops in reiserfs_delete_xattrs if
- they are due to the xattr code needing to walk the list of xattrs for
- a file undergoing delayed deletion. This will end up loading up other
- dentries and possibly queue up more delayed deletions.
+ But since shrink_dcache_for_umount will BUG if it encounters active
+ dentries, the xattr tree must be released before it's called or it will
+ crash during every umount.
 
- This patch detaches the tree under .reiserfs_priv during ->kill_sb. This
- allows shrink_dcache_for_umount_subtree to complete successfully as well
- as keeps around the .reiserfs_priv tree for deletion handling. After
- the regular cycle is completed, it will call shrink_dcache_for_umount_subtree
- again itself to ensure that the xattrs are cleaned up.
+ This patch forces the evictions to occur before generic_shutdown_super
+ by calling shrink_dcache_sb first. The additional evictions caused
+ by the removal of each associated xattr file and dir will be automatically
+ handled as they're added to the LRU list.
+
+ Unnecessary EXPORT_SYMBOL_GPL(shrink_dcache_for_umount_subtree) to 
+ preserve kABI because of deletion of patches.fixes/reiserfs-xattr-crash-fix
 
 Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
 ---
- fs/dcache.c                    |    3 ++-
- fs/reiserfs/super.c            |   37 ++++++++++++++++++++++++-------------
- fs/reiserfs/xattr.c            |   21 +++++++++++++++++++++
- include/linux/dcache.h         |    1 +
- include/linux/reiserfs_xattr.h |    1 +
- 5 files changed, 49 insertions(+), 14 deletions(-)
+ fs/dcache.c            |    3 ++-
+ fs/reiserfs/super.c    |   24 ++++++++++++++----------
+ include/linux/dcache.h |    1 +
+ 3 files changed, 17 insertions(+), 11 deletions(-)
 
---- a/fs/dcache.c
-+++ b/fs/dcache.c
-@@ -616,7 +616,7 @@ void shrink_dcache_sb(struct super_block
-  * - see the comments on shrink_dcache_for_umount() for a description of the
-  *   locking
-  */
--static void shrink_dcache_for_umount_subtree(struct dentry *dentry)
-+void shrink_dcache_for_umount_subtree(struct dentry *dentry)
+Index: linux-2.6.32-SLE11-SP1/fs/reiserfs/super.c
+===================================================================
+--- linux-2.6.32-SLE11-SP1.orig/fs/reiserfs/super.c	2011-04-13 15:12:27.000000000 -0500
++++ linux-2.6.32-SLE11-SP1/fs/reiserfs/super.c	2011-04-13 15:12:50.000000000 -0500
+@@ -445,16 +445,20 @@ int remove_save_link(struct inode *inode
+ static void reiserfs_kill_sb(struct super_block *s)
  {
- 	struct dentry *parent;
- 	unsigned detached = 0;
-@@ -2348,3 +2348,4 @@ EXPORT_SYMBOL(have_submounts);
- EXPORT_SYMBOL(names_cachep);
- EXPORT_SYMBOL(shrink_dcache_parent);
- EXPORT_SYMBOL(shrink_dcache_sb);
-+EXPORT_SYMBOL_GPL(shrink_dcache_for_umount_subtree);
---- a/fs/reiserfs/super.c
-+++ b/fs/reiserfs/super.c
-@@ -442,21 +442,30 @@ int remove_save_link(struct inode *inode
- 	return journal_end(&th, inode->i_sb, JOURNAL_PER_BALANCE_CNT);
- }
- 
--static void reiserfs_kill_sb(struct super_block *s)
-+/*
-+ * Detach the priv root from the root. Technically this becomes anonymous
-+ * but we don't want it added to the anon list. This is necessary to
-+ * work around shrink_dcache_for_umount BUG'ing on the xattr dentries if
-+ * we don't clean them up before the call and Oopsing on cleaning up
-+ * xattrs during inode deletion if we do.
-+ */
-+static void detach_privroot(struct super_block *s)
- {
--	if (REISERFS_SB(s)) {
+ 	if (REISERFS_SB(s)) {
 -		if (REISERFS_SB(s)->xattr_root) {
 -			d_invalidate(REISERFS_SB(s)->xattr_root);
 -			dput(REISERFS_SB(s)->xattr_root);
@@ -77,63 +48,45 @@ Signed-off-by: Jeff Mahoney <jeffm@suse.com>
 -			dput(REISERFS_SB(s)->priv_root);
 -			REISERFS_SB(s)->priv_root = NULL;
 -		}
--	}
-+	struct dentry *root = REISERFS_SB(s)->priv_root;
-+	if (!root)
-+		return;
++		/*
++		 * Force any pending inode evictions to occur now. Any
++		 * inodes to be removed that have extended attributes
++		 * associated with them need to clean them up before
++		 * we can release the extended attribute root dentries.
++		 * shrink_dcache_for_umount will BUG if we don't release
++		 * those before it's called so ->put_super is too late.
++		 */
++		shrink_dcache_sb(s);
 +
-+	d_drop(root);
-+	dput(root->d_parent);
-+	spin_lock(&dcache_lock);
-+	list_del_init(&root->d_u.d_child);
-+	root->d_parent = root;
-+	spin_unlock(&dcache_lock);
-+}
- 
-+static void reiserfs_kill_sb(struct super_block *s)
-+{
-+	detach_privroot(s);
- 	kill_block_super(s);
- }
- 
-@@ -465,6 +474,8 @@ static void reiserfs_put_super(struct su
- 	struct reiserfs_transaction_handle th;
- 	th.t_trans_id = 0;
- 
-+	reiserfs_xattr_shutdown(s);
-+
- 	lock_kernel();
- 
- 	if (s->s_dirt)
---- a/fs/reiserfs/xattr.c
-+++ b/fs/reiserfs/xattr.c
-@@ -1029,3 +1029,24 @@ error:
- 
- 	return err;
- }
-+
-+void reiserfs_xattr_shutdown(struct super_block *s)
-+{
-+	struct dentry *priv_root = REISERFS_SB(s)->priv_root;
-+
-+	if (REISERFS_SB(s)->xattr_root) {
 +		dput(REISERFS_SB(s)->xattr_root);
 +		REISERFS_SB(s)->xattr_root = NULL;
-+	}
-+
-+	if (priv_root) {
-+		dput(priv_root);
++		dput(REISERFS_SB(s)->priv_root);
 +		REISERFS_SB(s)->priv_root = NULL;
-+
-+		/* This will drop the final reference to priv_root and
-+		 * clean up anything that was deleted during the call in
-+		 * generic_shutdown_super(). */
-+		shrink_dcache_for_umount_subtree(priv_root);
-+		sync_filesystem(s);
-+	}
-+}
---- a/include/linux/dcache.h
-+++ b/include/linux/dcache.h
+ 	}
+ 
+ 	kill_block_super(s);
+Index: linux-2.6.32-SLE11-SP1/fs/dcache.c
+===================================================================
+--- linux-2.6.32-SLE11-SP1.orig/fs/dcache.c	2011-04-13 15:11:10.000000000 -0500
++++ linux-2.6.32-SLE11-SP1/fs/dcache.c	2011-04-13 15:14:22.000000000 -0500
+@@ -616,7 +616,7 @@ void shrink_dcache_sb(struct super_block
+  * - see the comments on shrink_dcache_for_umount() for a description of the
+  *   locking
+  */
+-static void shrink_dcache_for_umount_subtree(struct dentry *dentry)
++void shrink_dcache_for_umount_subtree(struct dentry *dentry)
+ {
+ 	struct dentry *parent;
+ 	unsigned detached = 0;
+@@ -2351,3 +2351,4 @@ EXPORT_SYMBOL(have_submounts);
+ EXPORT_SYMBOL(names_cachep);
+ EXPORT_SYMBOL(shrink_dcache_parent);
+ EXPORT_SYMBOL(shrink_dcache_sb);
++EXPORT_SYMBOL_GPL(shrink_dcache_for_umount_subtree);
+Index: linux-2.6.32-SLE11-SP1/include/linux/dcache.h
+===================================================================
+--- linux-2.6.32-SLE11-SP1.orig/include/linux/dcache.h	2011-04-13 15:11:10.000000000 -0500
++++ linux-2.6.32-SLE11-SP1/include/linux/dcache.h	2011-04-13 15:16:03.000000000 -0500
 @@ -243,6 +243,7 @@ extern struct dentry * d_obtain_alias(st
  extern void shrink_dcache_sb(struct super_block *);
  extern void shrink_dcache_parent(struct dentry *);
@@ -142,13 +95,3 @@ Signed-off-by: Jeff Mahoney <jeffm@suse.com>
  extern int d_invalidate(struct dentry *);
  
  /* only used at mount-time */
---- a/include/linux/reiserfs_xattr.h
-+++ b/include/linux/reiserfs_xattr.h
-@@ -38,6 +38,7 @@ struct nameidata;
- int reiserfs_xattr_register_handlers(void) __init;
- void reiserfs_xattr_unregister_handlers(void);
- int reiserfs_xattr_init(struct super_block *sb, int mount_flags);
-+void reiserfs_xattr_shutdown(struct super_block *sb);
- int reiserfs_lookup_privroot(struct super_block *sb);
- int reiserfs_delete_xattrs(struct inode *inode);
- int reiserfs_chown_xattrs(struct inode *inode, struct iattr *attrs);
