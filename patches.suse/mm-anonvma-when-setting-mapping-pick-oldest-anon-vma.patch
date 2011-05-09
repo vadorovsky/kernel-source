@@ -1,0 +1,99 @@
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Mon, 12 Apr 2010 12:44:29 -0700
+Subject: [PATCH] anonvma: when setting up page->mapping, we need to pick the _oldest_ anonvma
+References: anon_vma scalability (fate#311931)
+Patch-mainline: yes (2.6.36)
+Commit-ID: ea90002b0fa7bdee86ec22eba1d951f30bf043a6
+
+Otherwise we might be mapping in a page in a new mapping, but that page
+(through the swapcache) would later be mapped into an old mapping too.
+The page->mapping must be the case that works for everybody, not just
+the mapping that happened to page it in first.
+
+Here's the scenario:
+
+ - page gets allocated/mapped by process A. Let's call the anon_vma we
+   associate the page with 'A' to keep it easy to track.
+
+ - Process A forks, creating process B. The anon_vma in B is 'B', and has
+   a chain that looks like 'B' -> 'A'. Everything is fine.
+
+ - Swapping happens. The page (with mapping pointing to 'A') gets swapped
+   out (perhaps not to disk - it's enough to assume that it's just not
+   mapped any more, and lives entirely in the swap-cache)
+
+ - Process B pages it in, which goes like this:
+
+        do_swap_page ->
+          page = lookup_swap_cache(entry);
+         ...
+          set_pte_at(mm, address, page_table, pte);
+          page_add_anon_rmap(page, vma, address);
+
+   And think about what happens here!
+
+   In particular, what happens is that this will now be the "first"
+   mapping of that page, so page_add_anon_rmap() used to do
+
+        if (first)
+                __page_set_anon_rmap(page, vma, address);
+
+   and notice what anon_vma it will use? It will use the anon_vma for
+   process B!
+
+   What happens then? Trivial: process 'A' also pages it in (nothing
+   happens, it's not the first mapping), and then process 'B' execve's
+   or exits or unmaps, making anon_vma B go away.
+
+   End result: process A has a page that points to anon_vma B, but
+   anon_vma B does not exist any more.  This can go on forever.  Forget
+   about RCU grace periods, forget about locking, forget anything like
+   that.  The bug is simply that page->mapping points to an anon_vma
+   that was correct at one point, but was _not_ the one that was shared
+   by all users of that possible mapping.
+
+Changing it to always use the deepest anon_vma in the anonvma chain gets
+us to the safest model.
+
+This can be improved in certain cases: if we know the page is private to
+just this particular mapping (for example, it's a new page, or it is the
+only swapcache entry), we could pick the top (most specific) anon_vma.
+
+But that's a future optimization. Make it _work_ reliably first.
+
+Reviewed-by: Rik van Riel <riel@redhat.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Tested-by: Borislav Petkov <bp@alien8.de> [ "What do you know, I think you fixed it!" ]
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ mm/rmap.c |   15 +++++++++++++--
+ 1 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 508166e..b2b16cb 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -759,9 +759,20 @@ void page_move_anon_rmap(struct page *page,
+ static void __page_set_anon_rmap(struct page *page,
+ 	struct vm_area_struct *vma, unsigned long address)
+ {
+-	struct anon_vma *anon_vma = vma->anon_vma;
++	struct anon_vma_chain *avc;
++	struct anon_vma *anon_vma;
++
++	BUG_ON(!vma->anon_vma);
++
++	/*
++	 * We must use the _oldest_ possible anon_vma for the page mapping!
++	 *
++	 * So take the last AVC chain entry in the vma, which is the deepest
++	 * ancestor, and use the anon_vma from that.
++	 */
++	avc = list_entry(vma->anon_vma_chain.prev, struct anon_vma_chain, same_vma);
++	anon_vma = avc->anon_vma;
+ 
+-	BUG_ON(!anon_vma);
+ 	anon_vma = (void *) anon_vma + PAGE_MAPPING_ANON;
+ 	page->mapping = (struct address_space *) anon_vma;
+ 	page->index = linear_page_index(vma, address);
