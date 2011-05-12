@@ -1,0 +1,214 @@
+From e93f68a1fc6244c05ad8fae28e75835ec74ab34e Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Tue, 15 Jun 2010 09:36:03 +0100
+Subject: [PATCH] md: fix handling of array level takeover that re-arranges devices.
+
+Most array level changes leave the list of devices largely unchanged,
+possibly causing one at the end to become redundant.
+However conversions between RAID0 and RAID10 need to renumber
+all devices (except 0).
+
+This renumbering is currently being done in the ->run method when the
+new personality takes over.  However this is too late as the common
+code in md.c might already have invalidated some of the devices if
+they had a ->raid_disk number that appeared to high.
+
+Moving it into the ->takeover method is too early as the array is
+still active at that time and wrong ->raid_disk numbers could cause
+confusion.
+
+So add a ->new_raid_disk field to mdk_rdev_s and use it to communicate
+the new raid_disk number.
+Now the common code knows exactly which devices need to be renumbered,
+and which can be invalidated, and can do it all at a convenient time
+when the array is suspend.
+It can also update some symlinks in sysfs which previously were not be
+updated correctly.
+
+Reported-by: Maciej Trela <maciej.trela@intel.com>
+Signed-off-by: NeilBrown <neilb@suse.de>
+---
+ drivers/md/md.c     |   35 ++++++++++++++++++++++++++++++-----
+ drivers/md/md.h     |    3 +++
+ drivers/md/raid0.c  |   11 +++--------
+ drivers/md/raid0.h  |    3 ---
+ drivers/md/raid10.c |   19 +++++--------------
+ drivers/md/raid10.h |    5 -----
+ 6 files changed, 41 insertions(+), 35 deletions(-)
+
+--- linux-2.6.32-SLE11-SP1.orig/drivers/md/md.c
++++ linux-2.6.32-SLE11-SP1/drivers/md/md.c
+@@ -2976,6 +2976,9 @@ level_store(mddev_t *mddev, const char *
+ 		return -EINVAL;
+ 	}
+ 
++	list_for_each_entry(rdev, &mddev->disks, same_set)
++		rdev->new_raid_disk = rdev->raid_disk;
++
+ 	/* ->takeover must set new_* and/or delta_disks
+ 	 * if it succeeds, and may set them when it fails.
+ 	 */
+@@ -3026,13 +3029,35 @@ level_store(mddev_t *mddev, const char *
+ 		mddev->safemode = 0;
+ 	}
+ 
+-	module_put(mddev->pers->owner);
+-	/* Invalidate devices that are now superfluous */
+-	list_for_each_entry(rdev, &mddev->disks, same_set)
+-		if (rdev->raid_disk >= mddev->raid_disks) {
+-			rdev->raid_disk = -1;
++	list_for_each_entry(rdev, &mddev->disks, same_set) {
++		char nm[20];
++		if (rdev->raid_disk < 0)
++			continue;
++		if (rdev->new_raid_disk > mddev->raid_disks)
++			rdev->new_raid_disk = -1;
++		if (rdev->new_raid_disk == rdev->raid_disk)
++			continue;
++		sprintf(nm, "rd%d", rdev->raid_disk);
++		sysfs_remove_link(&mddev->kobj, nm);
++	}
++	list_for_each_entry(rdev, &mddev->disks, same_set) {
++		if (rdev->raid_disk < 0)
++			continue;
++		if (rdev->new_raid_disk == rdev->raid_disk)
++			continue;
++		rdev->raid_disk = rdev->new_raid_disk;
++		if (rdev->raid_disk < 0)
+ 			clear_bit(In_sync, &rdev->flags);
++		else {
++			char nm[20];
++			sprintf(nm, "rd%d", rdev->raid_disk);
++			if(sysfs_create_link(&mddev->kobj, &rdev->kobj, nm))
++				printk("md: cannot register %s for %s after level change\n",
++				       nm, mdname(mddev));
+ 		}
++	}
++
++	module_put(mddev->pers->owner);
+ 	mddev->pers = pers;
+ 	mddev->private = priv;
+ 	strlcpy(mddev->clevel, pers->name, sizeof(mddev->clevel));
+--- linux-2.6.32-SLE11-SP1.orig/drivers/md/md.h
++++ linux-2.6.32-SLE11-SP1/drivers/md/md.h
+@@ -81,6 +81,9 @@ struct mdk_rdev_s
+ 
+ 	int desc_nr;			/* descriptor index in the superblock */
+ 	int raid_disk;			/* role of device in array */
++	int new_raid_disk;		/* role that the device will have in
++					 * the array after a level-change completes.
++					 */
+ 	int saved_raid_disk;		/* role that device used to have in the
+ 					 * array and could again if we did a partial
+ 					 * resync from the bitmap
+--- linux-2.6.32-SLE11-SP1.orig/drivers/md/raid0.c
++++ linux-2.6.32-SLE11-SP1/drivers/md/raid0.c
+@@ -165,9 +165,11 @@ static int create_strip_zones(mddev_t *m
+ 	list_for_each_entry(rdev1, &mddev->disks, same_set) {
+ 		int j = rdev1->raid_disk;
+ 
+-		if (mddev->level == 10)
++		if (mddev->level == 10) {
+ 			/* taking over a raid10-n2 array */
+ 			j /= 2;
++			rdev1->new_raid_disk = j;
++		}
+ 
+ 		if (j < 0 || j >= mddev->raid_disks) {
+ 			printk(KERN_ERR "raid0: bad disk number %d - "
+@@ -347,12 +349,6 @@ static int raid0_run(mddev_t *mddev)
+ 		mddev->private = conf;
+ 	}
+ 	conf = mddev->private;
+-	if (conf->scale_raid_disks) {
+-		int i;
+-		for (i=0; i < conf->strip_zone[0].nb_dev; i++)
+-			conf->devlist[i]->raid_disk /= conf->scale_raid_disks;
+-		/* FIXME update sysfs rd links */
+-	}
+ 
+ 	/* calculate array device size */
+ 	md_set_array_sectors(mddev, raid0_size(mddev, 0, 0));
+@@ -631,7 +627,6 @@ static void *raid0_takeover_raid10(mddev
+ 	mddev->recovery_cp = MaxSector;
+ 
+ 	create_strip_zones(mddev, &priv_conf);
+-	priv_conf->scale_raid_disks = 2;
+ 	return priv_conf;
+ }
+ 
+--- linux-2.6.32-SLE11-SP1.orig/drivers/md/raid0.h
++++ linux-2.6.32-SLE11-SP1/drivers/md/raid0.h
+@@ -13,9 +13,6 @@ struct raid0_private_data
+ 	struct strip_zone *strip_zone;
+ 	mdk_rdev_t **devlist; /* lists of rdevs, pointed to by strip_zone->dev */
+ 	int nr_strip_zones;
+-	int scale_raid_disks; /* divide rdev->raid_disks by this in run()
+-			       * to handle conversion from raid10
+-			       */
+ };
+ 
+ typedef struct raid0_private_data raid0_conf_t;
+--- linux-2.6.32-SLE11-SP1.orig/drivers/md/raid10.c
++++ linux-2.6.32-SLE11-SP1/drivers/md/raid10.c
+@@ -2257,7 +2257,6 @@ static conf_t *setup_conf(mddev_t *mddev
+ 	if (!conf->thread)
+ 		goto out;
+ 
+-	conf->scale_disks = 0;
+ 	conf->mddev = mddev;
+ 	return conf;
+ 
+@@ -2316,11 +2315,6 @@ static int run(mddev_t *mddev)
+ 		if (disk_idx >= conf->raid_disks
+ 		    || disk_idx < 0)
+ 			continue;
+-		if (conf->scale_disks) {
+-			disk_idx *= conf->scale_disks;
+-			rdev->raid_disk = disk_idx;
+-			/* MOVE 'rd%d' link !! */
+-		}
+ 		disk = conf->mirrors + disk_idx;
+ 
+ 		disk->rdev = rdev;
+@@ -2457,13 +2451,6 @@ static void *raid10_takeover_raid0(mddev
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
+-	/* Update slot numbers to obtain
+-	 * degraded raid10 with missing mirrors
+-	 */
+-	list_for_each_entry(rdev, &mddev->disks, same_set) {
+-		rdev->raid_disk *= 2;
+-	}
+-
+ 	/* Set new parameters */
+ 	mddev->new_level = 10;
+ 	/* new layout: far_copies = 1, near_copies = 2 */
+@@ -2476,7 +2463,11 @@ static void *raid10_takeover_raid0(mddev
+ 	mddev->recovery_cp = MaxSector;
+ 
+ 	conf = setup_conf(mddev);
+-	conf->scale_disks = 2;
++	if (!IS_ERR(conf))
++		list_for_each_entry(rdev, &mddev->disks, same_set)
++			if (rdev->raid_disk >= 0)
++				rdev->new_raid_disk = rdev->raid_disk * 2;
++		
+ 	return conf;
+ }
+ 
+--- linux-2.6.32-SLE11-SP1.orig/drivers/md/raid10.h
++++ linux-2.6.32-SLE11-SP1/drivers/md/raid10.h
+@@ -38,11 +38,6 @@ struct r10_private_data_s {
+ 	int chunk_shift; /* shift from chunks to sectors */
+ 	sector_t chunk_mask;
+ 
+-	int			scale_disks;  /* When starting array, multiply
+-					       * each ->raid_disk by this.
+-					       * Need for raid0->raid10 migration
+-					       */
+-
+ 	struct list_head	retry_list;
+ 	/* queue pending writes and submit them on unplug */
+ 	struct bio_list		pending_bio_list;
