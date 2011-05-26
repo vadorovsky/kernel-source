@@ -1,0 +1,181 @@
+Subject: [patch 02/15] sched: hierarchical task accounting for SCHED_OTHER
+From:	Paul Turner <pjt@google.com>
+Date:	Tue, 03 May 2011 02:28:48 -0700
+Patch-mainline: no
+References:
+
+Introduce hierarchal task accounting for the group scheduling case in CFS, as
+well as promoting the responsibility for maintaining rq->nr_running to the
+scheduling classes.
+
+The primary motivation for this is that with scheduling classes supporting
+bandwidht throttling it is possible for entities participating in trottled
+sub-trees to not have root visible changes in rq->nr_running across activate
+and de-activate operations.  This in turn leads to incorrect idle and 
+weight-per-task load balance decisions.
+
+This also allows us to make a small fixlet to the fastpath in pick_next_task()
+under group scheduling.
+
+Note: this issue also exists with the existing sched_rt throttling mechanism.
+This patch does not address that.
+
+Signed-off-by: Paul Turner <pjt@google.com>
+Acked-by: Mike Galbraith <mgalbraith@suse.de>
+
+---
+ kernel/sched.c          |    6 ++----
+ kernel/sched_fair.c     |   14 ++++++++++----
+ kernel/sched_rt.c       |    5 ++++-
+ kernel/sched_stoptask.c |    2 ++
+ 4 files changed, 18 insertions(+), 9 deletions(-)
+
+Index: linux-2.6.32-SLE11-SP2-sched/kernel/sched.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2-sched.orig/kernel/sched.c
++++ linux-2.6.32-SLE11-SP2-sched/kernel/sched.c
+@@ -339,7 +339,7 @@ static inline struct task_group *task_gr
+ /* CFS-related fields in a runqueue */
+ struct cfs_rq {
+ 	struct load_weight load;
+-	unsigned long nr_running;
++	unsigned long nr_running, h_nr_running;
+ 
+ 	u64 exec_clock;
+ 	u64 min_vruntime;
+@@ -1935,7 +1935,6 @@ static void activate_task(struct rq *rq,
+ 		rq->nr_uninterruptible--;
+ 
+ 	enqueue_task(rq, p, flags);
+-	inc_nr_running(rq);
+ }
+ 
+ /*
+@@ -1947,7 +1946,6 @@ static void deactivate_task(struct rq *r
+ 		rq->nr_uninterruptible++;
+ 
+ 	dequeue_task(rq, p, flags);
+-	dec_nr_running(rq);
+ }
+ 
+ #include "sched_idletask.c"
+@@ -4015,7 +4013,7 @@ pick_next_task(struct rq *rq)
+ 	 * Optimization: we know that if all tasks are in
+ 	 * the fair class we can call that function directly:
+ 	 */
+-	if (likely(rq->nr_running == rq->cfs.nr_running)) {
++	if (likely(rq->nr_running == rq->cfs.h_nr_running)) {
+ 		p = fair_sched_class.pick_next_task(rq);
+ 		if (likely(p))
+ 			return p;
+Index: linux-2.6.32-SLE11-SP2-sched/kernel/sched_fair.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2-sched.orig/kernel/sched_fair.c
++++ linux-2.6.32-SLE11-SP2-sched/kernel/sched_fair.c
+@@ -1268,7 +1268,7 @@ static inline void hrtick_update(struct
+ static void
+ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ {
+-	struct cfs_rq *cfs_rq;
++	struct cfs_rq *cfs_rq = NULL;
+ 	struct sched_entity *se = &p->se;
+ 
+ 	for_each_sched_entity(se) {
+@@ -1276,16 +1276,19 @@ enqueue_task_fair(struct rq *rq, struct
+ 			break;
+ 		cfs_rq = cfs_rq_of(se);
+ 		enqueue_entity(cfs_rq, se, flags);
++		cfs_rq->h_nr_running++;
+ 		flags = ENQUEUE_WAKEUP;
+ 	}
+ 
+ 	for_each_sched_entity(se) {
+-		struct cfs_rq *cfs_rq = cfs_rq_of(se);
++		cfs_rq = cfs_rq_of(se);
++		cfs_rq->h_nr_running++;
+ 
+ 		update_cfs_load(cfs_rq, 0);
+ 		update_cfs_shares(cfs_rq);
+ 	}
+ 
++	inc_nr_running(rq);
+ 	hrtick_update(rq);
+ }
+ 
+@@ -1298,13 +1301,14 @@ static void set_next_buddy(struct sched_
+  */
+ static void dequeue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ {
+-	struct cfs_rq *cfs_rq;
++	struct cfs_rq *cfs_rq = NULL;
+ 	struct sched_entity *se = &p->se;
+ 	int task_sleep = flags & DEQUEUE_SLEEP;
+ 
+ 	for_each_sched_entity(se) {
+ 		cfs_rq = cfs_rq_of(se);
+ 		dequeue_entity(cfs_rq, se, flags);
++		cfs_rq->h_nr_running--;
+ 
+ 		/* Don't dequeue parent if it has other entities besides us */
+ 		if (cfs_rq->load.weight) {
+@@ -1323,12 +1327,14 @@ static void dequeue_task_fair(struct rq
+ 	}
+ 
+ 	for_each_sched_entity(se) {
+-		struct cfs_rq *cfs_rq = cfs_rq_of(se);
++		cfs_rq = cfs_rq_of(se);
++		cfs_rq->h_nr_running--;
+ 
+ 		update_cfs_load(cfs_rq, 0);
+ 		update_cfs_shares(cfs_rq);
+ 	}
+ 
++	dec_nr_running(rq);
+ 	hrtick_update(rq);
+ }
+ 
+Index: linux-2.6.32-SLE11-SP2-sched/kernel/sched_rt.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2-sched.orig/kernel/sched_rt.c
++++ linux-2.6.32-SLE11-SP2-sched/kernel/sched_rt.c
+@@ -942,6 +942,8 @@ enqueue_task_rt(struct rq *rq, struct ta
+ 
+ 	if (!task_current(rq, p) && p->rt.nr_cpus_allowed > 1)
+ 		enqueue_pushable_task(rq, p);
++
++	inc_nr_running(rq);
+ }
+ 
+ static void dequeue_task_rt(struct rq *rq, struct task_struct *p, int flags)
+@@ -952,6 +954,8 @@ static void dequeue_task_rt(struct rq *r
+ 	dequeue_rt_entity(rt_se);
+ 
+ 	dequeue_pushable_task(rq, p);
++
++	dec_nr_running(rq);
+ }
+ 
+ /*
+@@ -1817,4 +1821,3 @@ static void print_rt_stats(struct seq_fi
+ 	rcu_read_unlock();
+ }
+ #endif /* CONFIG_SCHED_DEBUG */
+-
+Index: linux-2.6.32-SLE11-SP2-sched/kernel/sched_stoptask.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2-sched.orig/kernel/sched_stoptask.c
++++ linux-2.6.32-SLE11-SP2-sched/kernel/sched_stoptask.c
+@@ -35,11 +35,13 @@ static struct task_struct *pick_next_tas
+ static void
+ enqueue_task_stop(struct rq *rq, struct task_struct *p, int flags)
+ {
++	inc_nr_running(rq);
+ }
+ 
+ static void
+ dequeue_task_stop(struct rq *rq, struct task_struct *p, int flags)
+ {
++	dec_nr_running(rq);
+ }
+ 
+ static void yield_task_stop(struct rq *rq)
