@@ -1,0 +1,235 @@
+From: Kiyoshi Ueda <k-ueda@ct.jp.nec.com>
+Date: Thu, 10 Dec 2009 23:52:16 +0000
+Subject: [PATCH] dm: simplify request based suspend
+X-Git: 9f518b27cf682dd5155a4c1679d52cd4b5be82f2
+References: FATE#311054
+Patch-Mainline: 2.6.33
+
+The semantics of bio-based dm were changed recently in the case of
+suspend with "--nolockfs" but without "--noflush".
+Before 2.6.30, I/Os submitted before the suspend invocation were always
+flushed.  From 2.6.30 onwards, I/Os submitted before the suspend
+invocation might not be flushed.  (For details, see
+http://marc.info/?t=123994433400003&r=1&w=2)
+
+This patch brings the behaviour of request-based dm into line with
+bio-based dm, simplifying the code and preparing for a subsequent patch
+that will wait for all in_flight I/Os to complete without stopping
+request_queue and use dm_wait_for_completion() for it.
+
+This change in semantics simplifies the suspend code as follows:
+  o Suspend is implemented as stopping request_queue
+    in request-based dm, and all I/Os are queued in the request_queue
+    even after suspend is invoked.
+  o In the old semantics, we had to track whether I/Os were
+    queued before or after the suspend invocation, so a special
+    barrier-like request called 'suspend marker' was introduced.
+  o With the new semantics, we don't need to flush any I/O
+    so we can remove the marker and the code related to the marker
+    handling and I/O flushing.
+
+After removing this codes, the suspend sequence is now:
+  1. Flush all I/Os by lock_fs() if needed.
+  2. Stop dispatching any I/O by stopping the request_queue.
+  3. Wait for all in-flight I/Os to be completed or requeued.
+
+Signed-off-by: Kiyoshi Ueda <k-ueda@ct.jp.nec.com>
+Signed-off-by: Jun'ichi Nomura <j-nomura@ce.jp.nec.com>
+Signed-off-by: Alasdair G Kergon <agk@redhat.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/md/dm.c |   77 +++++++++++++------------------------------------------
+ 1 files changed, 18 insertions(+), 59 deletions(-)
+
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 5a5c80e..634b1da 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -322,25 +322,16 @@ static void __exit dm_exit(void)
+ static int dm_blk_open(struct block_device *bdev, fmode_t mode)
+ {
+ 	struct mapped_device *md;
+-	int retval = 0;
+ 
+ 	spin_lock(&_minor_lock);
+ 
+ 	md = bdev->bd_disk->private_data;
+-	if (!md) {
+-		retval = -ENXIO;
++	if (!md)
+ 		goto out;
+-	}
+ 
+ 	if (test_bit(DMF_FREEING, &md->flags) ||
+ 	    test_bit(DMF_DELETING, &md->flags)) {
+ 		md = NULL;
+-		retval = -ENXIO;
+-		goto out;
+-	}
+-	if (get_disk_ro(md->disk) && (mode & FMODE_WRITE)) {
+-		md = NULL;
+-		retval = -EROFS;
+ 		goto out;
+ 	}
+ 
+@@ -350,7 +341,7 @@ static int dm_blk_open(struct block_device *bdev, fmode_t mode)
+ out:
+ 	spin_unlock(&_minor_lock);
+ 
+-	return retval;
++	return md ? 0 : -ENXIO;
+ }
+ 
+ static int dm_blk_close(struct gendisk *disk, fmode_t mode)
+@@ -403,25 +394,19 @@ static int dm_blk_ioctl(struct block_device *bdev, fmode_t mode,
+ 	if (!map || !dm_table_get_size(map))
+ 		goto out;
+ 
++	/* We only support devices that have a single target */
++	if (dm_table_get_num_targets(map) != 1)
++		goto out;
++
++	tgt = dm_table_get_target(map, 0);
++
+ 	if (dm_suspended(md)) {
+ 		r = -EAGAIN;
+ 		goto out;
+ 	}
+ 
+-	if (cmd == BLKRRPART) {
+-		/* Emulate Re-read partitions table */
+-		kobject_uevent(&disk_to_dev(md->disk)->kobj, KOBJ_CHANGE);
+-		r = 0;
+-	} else {
+-		/* We only support devices that have a single target */
+-		if (dm_table_get_num_targets(map) != 1)
+-			goto out;
+-
+-		tgt = dm_table_get_target(map, 0);
+-
+-		if (tgt->type->ioctl)
+-			r = tgt->type->ioctl(tgt, cmd, arg);
+-	}
++	if (tgt->type->ioctl)
++		r = tgt->type->ioctl(tgt, cmd, arg);
+ 
+ out:
+ 	dm_table_put(map);
+@@ -635,10 +620,8 @@ static void dec_pending(struct dm_io *io, int error)
+ 			if (!md->barrier_error && io_error != -EOPNOTSUPP)
+ 				md->barrier_error = io_error;
+ 			end_io_acct(io);
+-			free_io(md, io);
+ 		} else {
+ 			end_io_acct(io);
+-			free_io(md, io);
+ 
+ 			if (io_error != DM_ENDIO_REQUEUE) {
+ 				trace_block_bio_complete(md->queue, bio);
+@@ -646,6 +629,8 @@ static void dec_pending(struct dm_io *io, int error)
+ 				bio_endio(bio, io_error);
+ 			}
+ 		}
++
++		free_io(md, io);
+ 	}
+ }
+ 
+@@ -1506,16 +1491,10 @@ static int dm_prep_fn(struct request_queue *q, struct request *rq)
+ 	return BLKPREP_OK;
+ }
+ 
+-/*
+- * Returns:
+- * 0  : the request has been processed (not requeued)
+- * !0 : the request has been requeued
+- */
+-static int map_request(struct dm_target *ti, struct request *rq,
+-		       struct mapped_device *md)
++static void map_request(struct dm_target *ti, struct request *clone,
++			struct mapped_device *md)
+ {
+-	int r, requeued = 0;
+-	struct request *clone = rq->special;
++	int r;
+ 	struct dm_rq_target_io *tio = clone->end_io_data;
+ 
+ 	/*
+@@ -1535,14 +1514,11 @@ static int map_request(struct dm_target *ti, struct request *rq,
+ 		break;
+ 	case DM_MAPIO_REMAPPED:
+ 		/* The target has remapped the I/O so dispatch it */
+-		trace_block_rq_remap(clone->q, clone, disk_devt(dm_disk(md)),
+-				     blk_rq_pos(tio->orig));
+ 		dm_dispatch_request(clone);
+ 		break;
+ 	case DM_MAPIO_REQUEUE:
+ 		/* The target wants to requeue the I/O */
+ 		dm_requeue_unmapped_request(clone);
+-		requeued = 1;
+ 		break;
+ 	default:
+ 		if (r > 0) {
+@@ -1554,8 +1530,6 @@ static int map_request(struct dm_target *ti, struct request *rq,
+ 		dm_kill_unmapped_request(clone, r);
+ 		break;
+ 	}
+-
+-	return requeued;
+ }
+ 
+ /*
+@@ -1585,17 +1559,12 @@ static void dm_request_fn(struct request_queue *q)
+ 
+ 		blk_start_request(rq);
+ 		spin_unlock(q->queue_lock);
+-		if (map_request(ti, rq, md))
+-			goto requeued;
+-
++		map_request(ti, rq->special, md);
+ 		spin_lock_irq(q->queue_lock);
+ 	}
+ 
+ 	goto out;
+ 
+-requeued:
+-	spin_lock_irq(q->queue_lock);
+-
+ plug_and_out:
+ 	if (!elv_queue_empty(q))
+ 		/* Some requests still remain, retry later */
+@@ -1934,14 +1903,13 @@ static void event_callback(void *context)
+ 	wake_up(&md->eventq);
+ }
+ 
+-/*
+- * Protected by md->suspend_lock obtained by dm_swap_table().
+- */
+ static void __set_size(struct mapped_device *md, sector_t size)
+ {
+ 	set_capacity(md->disk, size);
+ 
++	mutex_lock(&md->bdev->bd_inode->i_mutex);
+ 	i_size_write(md->bdev->bd_inode, (loff_t)size << SECTOR_SHIFT);
++	mutex_unlock(&md->bdev->bd_inode->i_mutex);
+ }
+ 
+ static int __bind(struct mapped_device *md, struct dm_table *t,
+@@ -1985,14 +1953,6 @@ static int __bind(struct mapped_device *md, struct dm_table *t,
+ 	dm_table_set_restrictions(t, q, limits);
+ 	write_unlock_irqrestore(&md->map_lock, flags);
+ 
+-	dm_table_get(md->map);
+-	if (!(dm_table_get_mode(t) & FMODE_WRITE)) {
+-		set_disk_ro(md->disk, 1);
+-	} else {
+-		set_disk_ro(md->disk, 0);
+-	}
+-	dm_table_put(md->map);
+-
+ 	return 0;
+ }
+ 
+-- 
+1.6.0.2
+
