@@ -1,0 +1,201 @@
+From d7c86ff8cd00abc730fe5d031f43dc9138b6324e Mon Sep 17 00:00:00 2001
+From: Jeff Layton <jlayton@redhat.com>
+Date: Mon, 11 Oct 2010 15:07:19 -0400
+Subject: cifs: don't use vfsmount to pin superblock for oplock breaks
+References: FATE#311695
+Patch-mainline: yes
+
+Filesystems aren't really supposed to do anything with a vfsmount. It's
+considered a layering violation since vfsmounts are entirely managed at
+the VFS layer.
+
+CIFS currently keeps an active reference to a vfsmount in order to
+prevent the superblock vanishing before an oplock break has completed.
+What we really want to do instead is to keep sb->s_active high until the
+oplock break has completed. This patch borrows the scheme that NFS uses
+for handling sillyrenames.
+
+An atomic_t is added to the cifs_sb_info. When it transitions from 0 to
+1, an extra reference to the superblock is taken (by bumping the
+s_active value). When it transitions from 1 to 0, that reference is
+dropped and a the superblock teardown may proceed if there are no more
+references to it.
+
+Also, the vfsmount pointer is removed from cifsFileInfo and from
+cifs_new_fileinfo, and some bogus forward declarations are removed from
+cifsfs.h.
+
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+Reviewed-by: Suresh Jayaraman <sjayaraman@suse.de>
+Acked-by: Dave Kleikamp <shaggy@linux.vnet.ibm.com>
+Signed-off-by: Steve French <sfrench@us.ibm.com>
+Signed-off-by: Suresh Jayaraman <sjayaraman@suse.de>
+---
+
+Index: linux-2.6.32-SLE11-SP2/fs/cifs/cifs_fs_sb.h
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/cifs/cifs_fs_sb.h
++++ linux-2.6.32-SLE11-SP2/fs/cifs/cifs_fs_sb.h
+@@ -47,6 +47,7 @@ struct cifs_sb_info {
+ 	struct nls_table *local_nls;
+ 	unsigned int rsize;
+ 	unsigned int wsize;
++	atomic_t active;
+ 	uid_t	mnt_uid;
+ 	gid_t	mnt_gid;
+ 	mode_t	mnt_file_mode;
+Index: linux-2.6.32-SLE11-SP2/fs/cifs/cifsfs.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/cifs/cifsfs.c
++++ linux-2.6.32-SLE11-SP2/fs/cifs/cifsfs.c
+@@ -84,6 +84,24 @@ extern mempool_t *cifs_sm_req_poolp;
+ extern mempool_t *cifs_req_poolp;
+ extern mempool_t *cifs_mid_poolp;
+ 
++void
++cifs_sb_active(struct super_block *sb)
++{
++	struct cifs_sb_info *server = CIFS_SB(sb);
++
++	if (atomic_inc_return(&server->active) == 1)
++		atomic_inc(&sb->s_active);
++}
++
++void
++cifs_sb_deactive(struct super_block *sb)
++{
++	struct cifs_sb_info *server = CIFS_SB(sb);
++
++	if (atomic_dec_and_test(&server->active))
++		deactivate_super(sb);
++}
++
+ static int
+ cifs_read_super(struct super_block *sb, void *data,
+ 		const char *devname, int silent)
+Index: linux-2.6.32-SLE11-SP2/fs/cifs/cifsfs.h
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/cifs/cifsfs.h
++++ linux-2.6.32-SLE11-SP2/fs/cifs/cifsfs.h
+@@ -42,10 +42,8 @@ extern const struct address_space_operat
+ extern const struct address_space_operations cifs_addr_ops_smallbuf;
+ 
+ /* Functions related to super block operations */
+-/* extern const struct super_operations cifs_super_ops;*/
+-extern void cifs_read_inode(struct inode *);
+-/*extern void cifs_delete_inode(struct inode *);*/  /* BB not needed yet */
+-/* extern void cifs_write_inode(struct inode *); */ /* BB not needed yet */
++extern void cifs_sb_active(struct super_block *sb);
++extern void cifs_sb_deactive(struct super_block *sb);
+ 
+ /* Functions related to inodes */
+ extern const struct inode_operations cifs_dir_inode_ops;
+Index: linux-2.6.32-SLE11-SP2/fs/cifs/cifsglob.h
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/cifs/cifsglob.h
++++ linux-2.6.32-SLE11-SP2/fs/cifs/cifsglob.h
+@@ -387,7 +387,6 @@ struct cifsFileInfo {
+ 	/* lock scope id (0 if none) */
+ 	struct file *pfile; /* needed for writepage */
+ 	struct dentry *dentry;
+-	struct vfsmount *mnt;
+ 	struct tcon_link *tlink;
+ 	struct mutex lock_mutex;
+ 	struct list_head llist; /* list of byte range locks we have. */
+Index: linux-2.6.32-SLE11-SP2/fs/cifs/cifsproto.h
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/cifs/cifsproto.h
++++ linux-2.6.32-SLE11-SP2/fs/cifs/cifsproto.h
+@@ -107,7 +107,7 @@ extern struct timespec cnvrtDosUnixTm(__
+ 
+ extern struct cifsFileInfo *cifs_new_fileinfo(struct inode *newinode,
+ 				__u16 fileHandle, struct file *file,
+-				struct vfsmount *mnt, struct tcon_link *tlink,
++				struct tcon_link *tlink,
+ 				unsigned int oflags, __u32 oplock);
+ extern int cifs_posix_open(char *full_path, struct inode **pinode,
+ 				struct super_block *sb,
+Index: linux-2.6.32-SLE11-SP2/fs/cifs/dir.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/cifs/dir.c
++++ linux-2.6.32-SLE11-SP2/fs/cifs/dir.c
+@@ -132,8 +132,7 @@ cifs_bp_rename_retry:
+ 
+ struct cifsFileInfo *
+ cifs_new_fileinfo(struct inode *newinode, __u16 fileHandle, struct file *file,
+-		  struct vfsmount *mnt, struct tcon_link *tlink,
+-		  unsigned int oflags, __u32 oplock)
++		  struct tcon_link *tlink, unsigned int oflags, __u32 oplock)
+ {
+ 	struct dentry *dentry = file->f_path.dentry;
+ 	struct cifsFileInfo *pCifsFile;
+@@ -147,7 +146,6 @@ cifs_new_fileinfo(struct inode *newinode
+ 	pCifsFile->pid = current->tgid;
+ 	pCifsFile->uid = current_fsuid();
+ 	pCifsFile->dentry = dget(dentry);
+-	pCifsFile->mnt = mnt;
+ 	pCifsFile->pfile = file;
+ 	pCifsFile->invalidHandle = false;
+ 	pCifsFile->closePend = false;
+@@ -484,8 +482,7 @@ cifs_create_set_dentry:
+ 		}
+ 
+ 		pfile_info = cifs_new_fileinfo(newinode, fileHandle, filp,
+-						nd->path.mnt, tlink, oflags,
+-						oplock);
++						tlink, oflags, oplock);
+ 		if (pfile_info == NULL) {
+ 			fput(filp);
+ 			CIFSSMBClose(xid, tcon, fileHandle);
+@@ -759,8 +756,7 @@ cifs_lookup(struct inode *parent_dir_ino
+ 			}
+ 
+ 			cfile = cifs_new_fileinfo(newInode, fileHandle, filp,
+-						  nd->path.mnt, tlink,
+-						  nd->intent.open.flags,
++						  tlink, nd->intent.open.flags,
+ 						  oplock);
+ 			if (cfile == NULL) {
+ 				fput(filp);
+Index: linux-2.6.32-SLE11-SP2/fs/cifs/file.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/cifs/file.c
++++ linux-2.6.32-SLE11-SP2/fs/cifs/file.c
+@@ -279,7 +279,6 @@ int cifs_open(struct inode *inode, struc
+ 			}
+ 
+ 			pCifsFile = cifs_new_fileinfo(inode, netfid, file,
+-							file->f_path.mnt,
+ 							tlink, oflags, oplock);
+ 			if (pCifsFile == NULL) {
+ 				CIFSSMBClose(xid, tcon, netfid);
+@@ -372,8 +371,8 @@ int cifs_open(struct inode *inode, struc
+ 	if (rc != 0)
+ 		goto out;
+ 
+-	pCifsFile = cifs_new_fileinfo(inode, netfid, file, file->f_path.mnt,
+-					tlink, file->f_flags, oplock);
++	pCifsFile = cifs_new_fileinfo(inode, netfid, file, tlink,
++					file->f_flags, oplock);
+ 	if (pCifsFile == NULL) {
+ 		rc = -ENOMEM;
+ 		goto out;
+@@ -2380,7 +2379,7 @@ cifs_oplock_break_get(struct slow_work *
+ {
+ 	struct cifsFileInfo *cfile = container_of(work, struct cifsFileInfo,
+ 						  oplock_break);
+-	mntget(cfile->mnt);
++	cifs_sb_active(cfile->dentry->d_sb);
+ 	cifsFileInfo_get(cfile);
+ 	return 0;
+ }
+@@ -2390,8 +2389,8 @@ cifs_oplock_break_put(struct slow_work *
+ {
+ 	struct cifsFileInfo *cfile = container_of(work, struct cifsFileInfo,
+ 						  oplock_break);
+-	mntput(cfile->mnt);
+ 	cifsFileInfo_put(cfile);
++	cifs_sb_deactive(cfile->dentry->d_sb);
+ }
+ 
+ const struct slow_work_ops cifs_oplock_break_ops = {
