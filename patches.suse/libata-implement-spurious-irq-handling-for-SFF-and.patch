@@ -1,0 +1,172 @@
+From: Tejun Heo <tj@kernel.org>
+Date: Tue, 19 Jan 2010 10:49:19 +0900
+Subject: [PATCH] libata: implement spurious irq handling for SFF and apply it to piix
+X-Git: 27943620cbd960f710a385ff4a538e14ed3f1922
+References: FATE#311692
+Patch-Mainline: 2.6.34
+
+Traditional IDE interface sucks in that it doesn't have a reliable IRQ
+pending bit, so if the controller raises IRQ while the driver is
+expecting it not to, the IRQ won't be cleared and eventually the IRQ
+line will be killed by interrupt subsystem.  Some controllers have
+non-standard mechanism to indicate IRQ pending so that this condition
+can be detected and worked around.
+
+This patch adds an optional operation ->sff_irq_check() which will be
+called for each port from the ata_sff_interrupt() if an unexpected
+interrupt is received.  If the operation returns %true,
+->sff_check_status() and ->sff_irq_clear() will be cleared for the
+port.  Note that this doesn't mark the interrupt as handled so it
+won't prevent IRQ subsystem from killing the IRQ if this mechanism
+fails to clear the spurious IRQ.
+
+This patch also implements ->sff_irq_check() for ata_piix.  Note that
+this adds slight overhead to shared IRQ operation as IRQs which are
+destined for other controllers will trigger extra register accesses to
+check whether IDE interrupt is pending but this solves rare screaming
+IRQ cases and for some curious reason also helps weird BIOS related
+glitch on Samsung n130 as reported in bko#14314.
+
+  http://bugzilla.kernel.org/show_bug.cgi?id=14314
+
+* piix_base_ops dropped as suggested by Sergei.
+
+* Spurious IRQ detection doesn't kick in anymore if polling qc is in
+  progress.  This provides less protection but some controllers have
+  possible data corruption issues if the wrong register is accessed
+  while a command is in progress.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Johannes Stezenbach <js@sig21.net>
+Reported-by: Hans Werner <hwerner4@gmx.de>
+Cc: Alan Cox <alan@lxorguk.ukuu.org.uk>
+Cc: Sergei Shtylyov <sshtylyov@ru.mvista.com>
+Signed-off-by: Jeff Garzik <jgarzik@redhat.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/ata/ata_piix.c   |   20 +++++++++++++++-----
+ drivers/ata/libata-sff.c |   35 ++++++++++++++++++++++++++++++++---
+ include/linux/libata.h   |    1 +
+ 3 files changed, 48 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/ata/ata_piix.c b/drivers/ata/ata_piix.c
+index 25b7a1e..092dbdc 100644
+--- a/drivers/ata/ata_piix.c
++++ b/drivers/ata/ata_piix.c
+@@ -174,6 +174,7 @@ static int piix_sidpr_scr_read(struct ata_link *link,
+ 			       unsigned int reg, u32 *val);
+ static int piix_sidpr_scr_write(struct ata_link *link,
+ 				unsigned int reg, u32 val);
++static bool piix_irq_check(struct ata_port *ap);
+ #ifdef CONFIG_PM
+ static int piix_pci_device_suspend(struct pci_dev *pdev, pm_message_t mesg);
+ static int piix_pci_device_resume(struct pci_dev *pdev);
+@@ -322,8 +323,13 @@ static struct scsi_host_template piix_sht = {
+ 	ATA_BMDMA_SHT(DRV_NAME),
+ };
+ 
+-static struct ata_port_operations piix_pata_ops = {
++static struct ata_port_operations piix_sata_ops = {
+ 	.inherits		= &ata_bmdma32_port_ops,
++	.sff_irq_check		= piix_irq_check,
++};
++
++static struct ata_port_operations piix_pata_ops = {
++	.inherits		= &piix_sata_ops,
+ 	.cable_detect		= ata_cable_40wire,
+ 	.set_piomode		= piix_set_piomode,
+ 	.set_dmamode		= piix_set_dmamode,
+@@ -341,10 +347,6 @@ static struct ata_port_operations ich_pata_ops = {
+ 	.set_dmamode		= ich_set_dmamode,
+ };
+ 
+-static struct ata_port_operations piix_sata_ops = {
+-	.inherits		= &ata_bmdma32_port_ops,
+-};
+-
+ static struct ata_port_operations piix_sidpr_sata_ops = {
+ 	.inherits		= &piix_sata_ops,
+ 	.hardreset		= sata_std_hardreset,
+@@ -1055,6 +1057,14 @@ static int piix_sidpr_scr_write(struct ata_link *link,
+ 	return 0;
+ }
+ 
++static bool piix_irq_check(struct ata_port *ap)
++{
++	if (unlikely(!ap->ioaddr.bmdma_addr))
++		return false;
++
++	return ap->ops->bmdma_status(ap) & ATA_DMA_INTR;
++}
++
+ #ifdef CONFIG_PM
+ static int piix_broken_suspend(void)
+ {
+diff --git a/drivers/ata/libata-sff.c b/drivers/ata/libata-sff.c
+index 370ec51..0852607 100644
+--- a/drivers/ata/libata-sff.c
++++ b/drivers/ata/libata-sff.c
+@@ -1771,7 +1771,7 @@ irqreturn_t ata_sff_interrupt(int irq, void *dev_instance)
+ {
+ 	struct ata_host *host = dev_instance;
+ 	unsigned int i;
+-	unsigned int handled = 0;
++	unsigned int handled = 0, polling = 0;
+ 	unsigned long flags;
+ 
+ 	/* TODO: make _irqsave conditional on x86 PCI IDE legacy mode */
+@@ -1785,8 +1785,37 @@ irqreturn_t ata_sff_interrupt(int irq, void *dev_instance)
+ 			continue;
+ 
+ 		qc = ata_qc_from_tag(ap, ap->link.active_tag);
+-		if (qc && !(qc->tf.flags & ATA_TFLAG_POLLING))
+-			handled |= ata_sff_host_intr(ap, qc);
++		if (qc) {
++			if (!(qc->tf.flags & ATA_TFLAG_POLLING))
++				handled |= ata_sff_host_intr(ap, qc);
++			else
++				polling |= 1 << i;
++		}
++	}
++
++	/*
++	 * If no port was expecting IRQ but the controller is actually
++	 * asserting IRQ line, nobody cared will ensue.  Check IRQ
++	 * pending status if available and clear spurious IRQ.
++	 */
++	if (!handled) {
++		for (i = 0; i < host->n_ports; i++) {
++			struct ata_port *ap = host->ports[i];
++
++			if (polling & (1 << i))
++				continue;
++
++			if (!ap->ops->sff_irq_check ||
++			    !ap->ops->sff_irq_check(ap))
++				continue;
++
++			if (printk_ratelimit())
++				ata_port_printk(ap, KERN_INFO,
++						"clearing spurious IRQ\n");
++
++			ap->ops->sff_check_status(ap);
++			ap->ops->sff_irq_clear(ap);
++		}
+ 	}
+ 
+ 	spin_unlock_irqrestore(&host->lock, flags);
+diff --git a/include/linux/libata.h b/include/linux/libata.h
+index e44d14a..656e810 100644
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
+@@ -858,6 +858,7 @@ struct ata_port_operations {
+ 	unsigned int (*sff_data_xfer)(struct ata_device *dev,
+ 			unsigned char *buf, unsigned int buflen, int rw);
+ 	u8   (*sff_irq_on)(struct ata_port *);
++	bool (*sff_irq_check)(struct ata_port *);
+ 	void (*sff_irq_clear)(struct ata_port *);
+ 
+ 	void (*bmdma_setup)(struct ata_queued_cmd *qc);
+-- 
+1.6.0.2
+

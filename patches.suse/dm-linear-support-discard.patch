@@ -1,0 +1,269 @@
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Thu, 12 Aug 2010 04:14:08 +0100
+Subject: [PATCH] dm: linear support discard
+X-Git: 5ae89a8720c28caf35c4e53711d77df2856c404e
+References: FATE#311692
+Patch-Mainline: 2.6.34
+
+Allow discards to be passed through to linear mappings if at least one
+underlying device supports it.  Discards will be forwarded only to
+devices that support them.
+
+A target that supports discards should set num_discard_requests to
+indicate how many times each discard request must be submitted to it.
+
+Verify table's underlying devices support discards prior to setting the
+associated DM device as capable of discards (via QUEUE_FLAG_DISCARD).
+
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Reviewed-by: Joe Thornber <thornber@redhat.com>
+Signed-off-by: Alasdair G Kergon <agk@redhat.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/md/dm-linear.c        |    1 +
+ drivers/md/dm-table.c         |   44 +++++++++++++++++++++++++++
+ drivers/md/dm.c               |   65 +++++++++++++++++++++++++++++++++-------
+ drivers/md/dm.h               |    1 +
+ include/linux/device-mapper.h |    6 ++++
+ 5 files changed, 105 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/md/dm-linear.c b/drivers/md/dm-linear.c
+index 9200dbf..f043b5f 100644
+--- a/drivers/md/dm-linear.c
++++ b/drivers/md/dm-linear.c
+@@ -53,6 +53,7 @@ static int linear_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 	}
+ 
+ 	ti->num_flush_requests = 1;
++	ti->num_discard_requests = 1;
+ 	ti->private = lc;
+ 	return 0;
+ 
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index 38d2b30..462a143 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -53,6 +53,8 @@ struct dm_table {
+ 	sector_t *highs;
+ 	struct dm_target *targets;
+ 
++	unsigned discards_supported:1;
++
+ 	/*
+ 	 * Indicates the rw permissions for the new logical
+ 	 * device.  This should be a combination of FMODE_READ
+@@ -202,6 +204,7 @@ int dm_table_create(struct dm_table **result, fmode_t mode,
+ 
+ 	INIT_LIST_HEAD(&t->devices);
+ 	atomic_set(&t->holders, 0);
++	t->discards_supported = 1;
+ 
+ 	if (!num_targets)
+ 		num_targets = KEYS_PER_NODE;
+@@ -787,6 +790,9 @@ int dm_table_add_target(struct dm_table *t, const char *type,
+ 
+ 	t->highs[t->num_targets++] = tgt->begin + tgt->len - 1;
+ 
++	if (!tgt->num_discard_requests)
++		t->discards_supported = 0;
++
+ 	return 0;
+ 
+  bad:
+@@ -1147,6 +1153,11 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
+ 	 */
+ 	q->limits = *limits;
+ 
++	if (!dm_table_supports_discards(t))
++		queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD, q);
++	else
++		queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, q);
++
+ 	dm_table_set_integrity(t);
+ 
+ 	/*
+@@ -1293,6 +1304,39 @@ struct mapped_device *dm_table_get_md(struct dm_table *t)
+ 	return t->md;
+ }
+ 
++static int device_discard_capable(struct dm_target *ti, struct dm_dev *dev,
++				  sector_t start, sector_t len, void *data)
++{
++	struct request_queue *q = bdev_get_queue(dev->bdev);
++
++	return q && blk_queue_discard(q);
++}
++
++bool dm_table_supports_discards(struct dm_table *t)
++{
++	struct dm_target *ti;
++	unsigned i = 0;
++
++	if (!t->discards_supported)
++		return 0;
++
++	/*
++	 * Ensure that at least one underlying device supports discards.
++	 * t->devices includes internal dm devices such as mirror logs
++	 * so we need to use iterate_devices here, which targets
++	 * supporting discard must provide.
++	 */
++	while (i < dm_table_get_num_targets(t)) {
++		ti = dm_table_get_target(t, i++);
++
++		if (ti->type->iterate_devices &&
++		    ti->type->iterate_devices(ti, device_discard_capable, NULL))
++			return 1;
++	}
++
++	return 0;
++}
++
+ EXPORT_SYMBOL(dm_vcalloc);
+ EXPORT_SYMBOL(dm_get_device);
+ EXPORT_SYMBOL(dm_put_device);
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index e9977fb..b6fe2bd 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1205,6 +1205,53 @@ static int __clone_and_map_empty_barrier(struct clone_info *ci)
+ 	return 0;
+ }
+ 
++/*
++ * Perform all io with a single clone.
++ */
++static void __clone_and_map_simple(struct clone_info *ci, struct dm_target *ti)
++{
++	struct bio *clone, *bio = ci->bio;
++	struct dm_target_io *tio;
++
++	tio = alloc_tio(ci, ti);
++	clone = clone_bio(bio, ci->sector, ci->idx,
++			  bio->bi_vcnt - ci->idx, ci->sector_count,
++			  ci->md->bs);
++	__map_bio(ti, clone, tio);
++	ci->sector_count = 0;
++}
++
++static int __clone_and_map_discard(struct clone_info *ci)
++{
++	struct dm_target *ti;
++	sector_t max;
++
++	ti = dm_table_find_target(ci->map, ci->sector);
++	if (!dm_target_is_valid(ti))
++		return -EIO;
++
++	/*
++	 * Even though the device advertised discard support,
++	 * reconfiguration might have changed that since the
++	 * check was performed.
++	 */
++
++	if (!ti->num_discard_requests)
++		return -EOPNOTSUPP;
++
++	max = max_io_len(ci->md, ci->sector, ti);
++
++	if (ci->sector_count > max)
++		/*
++		 * FIXME: Handle a discard that spans two or more targets.
++		 */
++		return -EOPNOTSUPP;
++
++	__clone_and_map_simple(ci, ti);
++
++	return 0;
++}
++
+ static int __clone_and_map(struct clone_info *ci)
+ {
+ 	struct bio *clone, *bio = ci->bio;
+@@ -1215,27 +1262,21 @@ static int __clone_and_map(struct clone_info *ci)
+ 	if (unlikely(bio_empty_barrier(bio)))
+ 		return __clone_and_map_empty_barrier(ci);
+ 
++	if (unlikely(bio->bi_rw & REQ_DISCARD))
++		return __clone_and_map_discard(ci);
++
+ 	ti = dm_table_find_target(ci->map, ci->sector);
+ 	if (!dm_target_is_valid(ti))
+ 		return -EIO;
+ 
+ 	max = max_io_len(ci->md, ci->sector, ti);
+ 
+-	/*
+-	 * Allocate a target io object.
+-	 */
+-	tio = alloc_tio(ci, ti);
+-
+ 	if (ci->sector_count <= max) {
+ 		/*
+ 		 * Optimise for the simple case where we can do all of
+ 		 * the remaining io with a single clone.
+ 		 */
+-		clone = clone_bio(bio, ci->sector, ci->idx,
+-				  bio->bi_vcnt - ci->idx, ci->sector_count,
+-				  ci->md->bs);
+-		__map_bio(ti, clone, tio);
+-		ci->sector_count = 0;
++		__clone_and_map_simple(ci, ti);
+ 
+ 	} else if (to_sector(bio->bi_io_vec[ci->idx].bv_len) <= max) {
+ 		/*
+@@ -1256,6 +1297,7 @@ static int __clone_and_map(struct clone_info *ci)
+ 			len += bv_len;
+ 		}
+ 
++		tio = alloc_tio(ci, ti);
+ 		clone = clone_bio(bio, ci->sector, ci->idx, i - ci->idx, len,
+ 				  ci->md->bs);
+ 		__map_bio(ti, clone, tio);
+@@ -1279,12 +1321,11 @@ static int __clone_and_map(struct clone_info *ci)
+ 					return -EIO;
+ 
+ 				max = max_io_len(ci->md, ci->sector, ti);
+-
+-				tio = alloc_tio(ci, ti);
+ 			}
+ 
+ 			len = min(remaining, max);
+ 
++			tio = alloc_tio(ci, ti);
+ 			clone = split_bvec(bio, ci->sector, ci->idx,
+ 					   bv->bv_offset + offset, len,
+ 					   ci->md->bs);
+diff --git a/drivers/md/dm.h b/drivers/md/dm.h
+index 0d7b374..0c2dd5f 100644
+--- a/drivers/md/dm.h
++++ b/drivers/md/dm.h
+@@ -61,6 +61,7 @@ int dm_table_any_congested(struct dm_table *t, int bdi_bits);
+ int dm_table_any_busy_target(struct dm_table *t);
+ unsigned dm_table_get_type(struct dm_table *t);
+ bool dm_table_request_based(struct dm_table *t);
++bool dm_table_supports_discards(struct dm_table *t);
+ int dm_table_alloc_md_mempools(struct dm_table *t);
+ void dm_table_free_md_mempools(struct dm_table *t);
+ struct dm_md_mempools *dm_table_get_md_mempools(struct dm_table *t);
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index 531a6f2..751ce21 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -180,6 +180,12 @@ struct dm_target {
+ 	 */
+ 	unsigned num_flush_requests;
+ 
++	/*
++	 * The number of discard requests that will be submitted to the
++	 * target.  map_info->request_nr is used just like num_flush_requests.
++	 */
++	unsigned num_discard_requests;
++
+ 	/* target specific data */
+ 	void *private;
+ 
+-- 
+1.6.0.2
+

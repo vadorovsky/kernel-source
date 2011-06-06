@@ -1,0 +1,424 @@
+From: Tejun Heo <tj@kernel.org>
+Date: Mon, 10 May 2010 21:41:39 +0200
+Subject: [PATCH] libata-sff: separate out BMDMA EH
+X-Git: fe06e5f9b7c61dc567edace3f4909672067f7d7e
+References: FATE#311692
+Patch-Mainline: 2.6.34
+
+Some of error handling logic in ata_sff_error_handler() and all of
+ata_sff_post_internal_cmd() are for BMDMA.  Create
+ata_bmdma_error_handler() and ata_bmdma_post_internal_cmd() and move
+BMDMA part into those.
+
+While at it, change DMA protocol check to ata_is_dma(), fix
+post_internal_cmd to call ap->ops->bmdma_stop instead of directly
+calling ata_bmdma_stop() and open code hardreset selection so that
+ata_std_error_handler() doesn't have to know about sff hardreset.
+
+As these two functions are BMDMA specific, there's no reason to check
+for bmdma_addr before calling bmdma methods if the protocol of the
+failed command is DMA.  sata_mv and pata_mpc52xx now don't need to set
+.post_internal_cmd to ATA_OP_NULL and pata_icside and sata_qstor don't
+need to set it to their bmdma_stop routines.
+
+ata_sff_post_internal_cmd() becomes noop and is removed.
+
+This fixes p3 described in clean-up-BMDMA-initialization patch.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Jeff Garzik <jgarzik@redhat.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/ata/libata-eh.c    |    2 +-
+ drivers/ata/libata-sff.c   |  159 ++++++++++++++++++++++++++------------------
+ drivers/ata/libata.h       |   11 ---
+ drivers/ata/pata_icside.c  |    1 -
+ drivers/ata/pata_scc.c     |    1 -
+ drivers/ata/sata_nv.c      |    6 +-
+ drivers/ata/sata_promise.c |    2 +-
+ drivers/ata/sata_qstor.c   |    3 +-
+ drivers/ata/sata_sx4.c     |    2 +-
+ include/linux/libata.h     |    3 +-
+ 10 files changed, 102 insertions(+), 88 deletions(-)
+
+diff --git a/drivers/ata/libata-eh.c b/drivers/ata/libata-eh.c
+index 4768ba6..da5a55b 100644
+--- a/drivers/ata/libata-eh.c
++++ b/drivers/ata/libata-eh.c
+@@ -3688,7 +3688,7 @@ void ata_std_error_handler(struct ata_port *ap)
+ 	ata_reset_fn_t hardreset = ops->hardreset;
+ 
+ 	/* ignore built-in hardreset if SCR access is not available */
+-	if (ata_is_builtin_hardreset(hardreset) && !sata_scr_valid(&ap->link))
++	if (hardreset == sata_std_hardreset && !sata_scr_valid(&ap->link))
+ 		hardreset = NULL;
+ 
+ 	ata_do_eh(ap, ops->prereset, ops->softreset, hardreset, ops->postreset);
+diff --git a/drivers/ata/libata-sff.c b/drivers/ata/libata-sff.c
+index 752bb26..e8a4439 100644
+--- a/drivers/ata/libata-sff.c
++++ b/drivers/ata/libata-sff.c
+@@ -55,7 +55,6 @@ const struct ata_port_operations ata_sff_port_ops = {
+ 	.hardreset		= sata_sff_hardreset,
+ 	.postreset		= ata_sff_postreset,
+ 	.error_handler		= ata_sff_error_handler,
+-	.post_internal_cmd	= ata_sff_post_internal_cmd,
+ 
+ 	.sff_dev_select		= ata_sff_dev_select,
+ 	.sff_check_status	= ata_sff_check_status,
+@@ -2360,7 +2359,7 @@ void ata_sff_drain_fifo(struct ata_queued_cmd *qc)
+ EXPORT_SYMBOL_GPL(ata_sff_drain_fifo);
+ 
+ /**
+- *	ata_sff_error_handler - Stock error handler for BMDMA controller
++ *	ata_sff_error_handler - Stock error handler for SFF controller
+  *	@ap: port to handle error for
+  *
+  *	Stock error handler for SFF controller.  It can handle both
+@@ -2377,64 +2376,32 @@ void ata_sff_error_handler(struct ata_port *ap)
+ 	ata_reset_fn_t hardreset = ap->ops->hardreset;
+ 	struct ata_queued_cmd *qc;
+ 	unsigned long flags;
+-	bool thaw = false;
+ 
+ 	qc = __ata_qc_from_tag(ap, ap->link.active_tag);
+ 	if (qc && !(qc->flags & ATA_QCFLAG_FAILED))
+ 		qc = NULL;
+ 
+-	/* reset PIO HSM and stop DMA engine */
+ 	spin_lock_irqsave(ap->lock, flags);
+ 
+-	if (ap->ioaddr.bmdma_addr &&
+-	    qc && (qc->tf.protocol == ATA_PROT_DMA ||
+-		   qc->tf.protocol == ATAPI_PROT_DMA)) {
+-		u8 host_stat;
+-
+-		host_stat = ap->ops->bmdma_status(ap);
+-
+-		/* BMDMA controllers indicate host bus error by
+-		 * setting DMA_ERR bit and timing out.  As it wasn't
+-		 * really a timeout event, adjust error mask and
+-		 * cancel frozen state.
+-		 */
+-		if (qc->err_mask == AC_ERR_TIMEOUT
+-						&& (host_stat & ATA_DMA_ERR)) {
+-			qc->err_mask = AC_ERR_HOST_BUS;
+-			thaw = true;
+-		}
+-
+-		ap->ops->bmdma_stop(qc);
+-
+-		/* if we're gonna thaw, make sure IRQ is clear */
+-		if (thaw) {
+-			ap->ops->sff_check_status(ap);
+-			ap->ops->sff_irq_clear(ap);
+-
+-			spin_unlock_irqrestore(ap->lock, flags);
+-			ata_eh_thaw_port(ap);
+-			spin_lock_irqsave(ap->lock, flags);
+-		}
+-	}
+-
+-	/* We *MUST* do FIFO draining before we issue a reset as several
+-	 * devices helpfully clear their internal state and will lock solid
+-	 * if we touch the data port post reset. Pass qc in case anyone wants
+-	 *  to do different PIO/DMA recovery or has per command fixups
++	/*
++	 * We *MUST* do FIFO draining before we issue a reset as
++	 * several devices helpfully clear their internal state and
++	 * will lock solid if we touch the data port post reset. Pass
++	 * qc in case anyone wants to do different PIO/DMA recovery or
++	 * has per command fixups
+ 	 */
+ 	if (ap->ops->sff_drain_fifo)
+ 		ap->ops->sff_drain_fifo(qc);
+ 
+ 	spin_unlock_irqrestore(ap->lock, flags);
+ 
+-	/* PIO and DMA engines have been stopped, perform recovery */
+-
+-	/* Ignore ata_sff_softreset if ctl isn't accessible and
+-	 * built-in hardresets if SCR access isn't available.
+-	 */
++	/* ignore ata_sff_softreset if ctl isn't accessible */
+ 	if (softreset == ata_sff_softreset && !ap->ioaddr.ctl_addr)
+ 		softreset = NULL;
+-	if (ata_is_builtin_hardreset(hardreset) && !sata_scr_valid(&ap->link))
++
++	/* ignore built-in hardresets if SCR access is not available */
++	if ((hardreset == sata_std_hardreset ||
++	     hardreset == sata_sff_hardreset) && !sata_scr_valid(&ap->link))
+ 		hardreset = NULL;
+ 
+ 	ata_do_eh(ap, ap->ops->prereset, softreset, hardreset,
+@@ -2443,27 +2410,6 @@ void ata_sff_error_handler(struct ata_port *ap)
+ EXPORT_SYMBOL_GPL(ata_sff_error_handler);
+ 
+ /**
+- *	ata_sff_post_internal_cmd - Stock post_internal_cmd for SFF controller
+- *	@qc: internal command to clean up
+- *
+- *	LOCKING:
+- *	Kernel thread context (may sleep)
+- */
+-void ata_sff_post_internal_cmd(struct ata_queued_cmd *qc)
+-{
+-	struct ata_port *ap = qc->ap;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(ap->lock, flags);
+-
+-	if (ap->ioaddr.bmdma_addr)
+-		ap->ops->bmdma_stop(qc);
+-
+-	spin_unlock_irqrestore(ap->lock, flags);
+-}
+-EXPORT_SYMBOL_GPL(ata_sff_post_internal_cmd);
+-
+-/**
+  *	ata_sff_std_ports - initialize ioaddr with standard port offsets.
+  *	@ioaddr: IO address structure to be initialized
+  *
+@@ -2810,6 +2756,9 @@ EXPORT_SYMBOL_GPL(ata_pci_sff_init_one);
+ const struct ata_port_operations ata_bmdma_port_ops = {
+ 	.inherits		= &ata_sff_port_ops,
+ 
++	.error_handler		= ata_bmdma_error_handler,
++	.post_internal_cmd	= ata_bmdma_post_internal_cmd,
++
+ 	.bmdma_setup		= ata_bmdma_setup,
+ 	.bmdma_start		= ata_bmdma_start,
+ 	.bmdma_stop		= ata_bmdma_stop,
+@@ -2828,6 +2777,84 @@ const struct ata_port_operations ata_bmdma32_port_ops = {
+ EXPORT_SYMBOL_GPL(ata_bmdma32_port_ops);
+ 
+ /**
++ *	ata_bmdma_error_handler - Stock error handler for BMDMA controller
++ *	@ap: port to handle error for
++ *
++ *	Stock error handler for BMDMA controller.  It can handle both
++ *	PATA and SATA controllers.  Most BMDMA controllers should be
++ *	able to use this EH as-is or with some added handling before
++ *	and after.
++ *
++ *	LOCKING:
++ *	Kernel thread context (may sleep)
++ */
++void ata_bmdma_error_handler(struct ata_port *ap)
++{
++	struct ata_queued_cmd *qc;
++	unsigned long flags;
++	bool thaw = false;
++
++	qc = __ata_qc_from_tag(ap, ap->link.active_tag);
++	if (qc && !(qc->flags & ATA_QCFLAG_FAILED))
++		qc = NULL;
++
++	/* reset PIO HSM and stop DMA engine */
++	spin_lock_irqsave(ap->lock, flags);
++
++	if (qc && ata_is_dma(qc->tf.protocol)) {
++		u8 host_stat;
++
++		host_stat = ap->ops->bmdma_status(ap);
++
++		/* BMDMA controllers indicate host bus error by
++		 * setting DMA_ERR bit and timing out.  As it wasn't
++		 * really a timeout event, adjust error mask and
++		 * cancel frozen state.
++		 */
++		if (qc->err_mask == AC_ERR_TIMEOUT && (host_stat & ATA_DMA_ERR)) {
++			qc->err_mask = AC_ERR_HOST_BUS;
++			thaw = true;
++		}
++
++		ap->ops->bmdma_stop(qc);
++
++		/* if we're gonna thaw, make sure IRQ is clear */
++		if (thaw) {
++			ap->ops->sff_check_status(ap);
++			ap->ops->sff_irq_clear(ap);
++		}
++	}
++
++	spin_unlock_irqrestore(ap->lock, flags);
++
++	if (thaw)
++		ata_eh_thaw_port(ap);
++
++	ata_sff_error_handler(ap);
++}
++EXPORT_SYMBOL_GPL(ata_bmdma_error_handler);
++
++/**
++ *	ata_bmdma_post_internal_cmd - Stock post_internal_cmd for BMDMA
++ *	@qc: internal command to clean up
++ *
++ *	LOCKING:
++ *	Kernel thread context (may sleep)
++ */
++void ata_bmdma_post_internal_cmd(struct ata_queued_cmd *qc)
++{
++	struct ata_port *ap = qc->ap;
++	unsigned long flags;
++
++	if (ata_is_dma(qc->tf.protocol)) {
++		spin_lock_irqsave(ap->lock, flags);
++		ap->ops->bmdma_stop(qc);
++		spin_unlock_irqrestore(ap->lock, flags);
++	}
++}
++EXPORT_SYMBOL_GPL(ata_bmdma_post_internal_cmd);
++
++/**
+  *	ata_bmdma_setup - Set up PCI IDE BMDMA transaction
+  *	@qc: Info associated with this ATA transaction.
+  *
+diff --git a/drivers/ata/libata.h b/drivers/ata/libata.h
+index 002390c..4b84ed6 100644
+--- a/drivers/ata/libata.h
++++ b/drivers/ata/libata.h
+@@ -38,17 +38,6 @@ struct ata_scsi_args {
+ 	void			(*done)(struct scsi_cmnd *);
+ };
+ 
+-static inline int ata_is_builtin_hardreset(ata_reset_fn_t reset)
+-{
+-	if (reset == sata_std_hardreset)
+-		return 1;
+-#ifdef CONFIG_ATA_SFF
+-	if (reset == sata_sff_hardreset)
+-		return 1;
+-#endif
+-	return 0;
+-}
+-
+ /* libata-core.c */
+ enum {
+ 	/* flags for ata_dev_read_id() */
+diff --git a/drivers/ata/pata_icside.c b/drivers/ata/pata_icside.c
+index 38ebdd8..c0a7735 100644
+--- a/drivers/ata/pata_icside.c
++++ b/drivers/ata/pata_icside.c
+@@ -332,7 +332,6 @@ static struct ata_port_operations pata_icside_port_ops = {
+ 	.cable_detect		= ata_cable_40wire,
+ 	.set_dmamode		= pata_icside_set_dmamode,
+ 	.postreset		= pata_icside_postreset,
+-	.post_internal_cmd	= pata_icside_bmdma_stop,
+ 
+ 	.port_start		= ATA_OP_NULL,	/* don't need PRD table */
+ };
+diff --git a/drivers/ata/pata_scc.c b/drivers/ata/pata_scc.c
+index 70d549e..93f690e 100644
+--- a/drivers/ata/pata_scc.c
++++ b/drivers/ata/pata_scc.c
+@@ -951,7 +951,6 @@ static struct ata_port_operations scc_pata_ops = {
+ 	.prereset		= scc_pata_prereset,
+ 	.softreset		= scc_softreset,
+ 	.postreset		= scc_postreset,
+-	.post_internal_cmd	= scc_bmdma_stop,
+ 
+ 	.sff_irq_clear		= scc_irq_clear,
+ 
+diff --git a/drivers/ata/sata_nv.c b/drivers/ata/sata_nv.c
+index 59ecb11..18b1412 100644
+--- a/drivers/ata/sata_nv.c
++++ b/drivers/ata/sata_nv.c
+@@ -1130,7 +1130,7 @@ static void nv_adma_post_internal_cmd(struct ata_queued_cmd *qc)
+ 	struct nv_adma_port_priv *pp = qc->ap->private_data;
+ 
+ 	if (pp->flags & NV_ADMA_PORT_REGISTER_MODE)
+-		ata_sff_post_internal_cmd(qc);
++		ata_bmdma_post_internal_cmd(qc);
+ }
+ 
+ static int nv_adma_port_start(struct ata_port *ap)
+@@ -1736,7 +1736,7 @@ static void nv_adma_error_handler(struct ata_port *ap)
+ 		readw(mmio + NV_ADMA_CTL);	/* flush posted write */
+ 	}
+ 
+-	ata_sff_error_handler(ap);
++	ata_bmdma_error_handler(ap);
+ }
+ 
+ static void nv_swncq_qc_to_dq(struct ata_port *ap, struct ata_queued_cmd *qc)
+@@ -1862,7 +1862,7 @@ static void nv_swncq_error_handler(struct ata_port *ap)
+ 		ehc->i.action |= ATA_EH_RESET;
+ 	}
+ 
+-	ata_sff_error_handler(ap);
++	ata_bmdma_error_handler(ap);
+ }
+ 
+ #ifdef CONFIG_PM
+diff --git a/drivers/ata/sata_promise.c b/drivers/ata/sata_promise.c
+index bcd20b3..1492d2c 100644
+--- a/drivers/ata/sata_promise.c
++++ b/drivers/ata/sata_promise.c
+@@ -838,7 +838,7 @@ static void pdc_error_handler(struct ata_port *ap)
+ 	if (!(ap->pflags & ATA_PFLAG_FROZEN))
+ 		pdc_reset_port(ap);
+ 
+-	ata_std_error_handler(ap);
++	ata_sff_error_handler(ap);
+ }
+ 
+ static void pdc_post_internal_cmd(struct ata_queued_cmd *qc)
+diff --git a/drivers/ata/sata_qstor.c b/drivers/ata/sata_qstor.c
+index 742490b..7b43c8c 100644
+--- a/drivers/ata/sata_qstor.c
++++ b/drivers/ata/sata_qstor.c
+@@ -146,7 +146,6 @@ static struct ata_port_operations qs_ata_ops = {
+ 	.prereset		= qs_prereset,
+ 	.softreset		= ATA_OP_NULL,
+ 	.error_handler		= qs_error_handler,
+-	.post_internal_cmd	= ATA_OP_NULL,
+ 	.lost_interrupt		= ATA_OP_NULL,
+ 
+ 	.scr_read		= qs_scr_read,
+@@ -254,7 +253,7 @@ static int qs_scr_read(struct ata_link *link, unsigned int sc_reg, u32 *val)
+ static void qs_error_handler(struct ata_port *ap)
+ {
+ 	qs_enter_reg_mode(ap);
+-	ata_std_error_handler(ap);
++	ata_sff_error_handler(ap);
+ }
+ 
+ static int qs_scr_write(struct ata_link *link, unsigned int sc_reg, u32 val)
+diff --git a/drivers/ata/sata_sx4.c b/drivers/ata/sata_sx4.c
+index 9ca6006..b4457e2 100644
+--- a/drivers/ata/sata_sx4.c
++++ b/drivers/ata/sata_sx4.c
+@@ -920,7 +920,7 @@ static void pdc_error_handler(struct ata_port *ap)
+ 	if (!(ap->pflags & ATA_PFLAG_FROZEN))
+ 		pdc_reset_port(ap);
+ 
+-	ata_std_error_handler(ap);
++	ata_sff_error_handler(ap);
+ }
+ 
+ static void pdc_post_internal_cmd(struct ata_queued_cmd *qc)
+diff --git a/include/linux/libata.h b/include/linux/libata.h
+index 52e8691..44564f2 100644
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
+@@ -1615,7 +1615,6 @@ extern int sata_sff_hardreset(struct ata_link *link, unsigned int *class,
+ extern void ata_sff_postreset(struct ata_link *link, unsigned int *classes);
+ extern void ata_sff_drain_fifo(struct ata_queued_cmd *qc);
+ extern void ata_sff_error_handler(struct ata_port *ap);
+-extern void ata_sff_post_internal_cmd(struct ata_queued_cmd *qc);
+ extern void ata_sff_std_ports(struct ata_ioports *ioaddr);
+ #ifdef CONFIG_PCI
+ extern int ata_pci_sff_init_host(struct ata_host *host);
+@@ -1630,6 +1629,8 @@ extern int ata_pci_sff_init_one(struct pci_dev *pdev,
+ 		struct scsi_host_template *sht, void *host_priv, int hflags);
+ #endif /* CONFIG_PCI */
+ 
++extern void ata_bmdma_error_handler(struct ata_port *ap);
++extern void ata_bmdma_post_internal_cmd(struct ata_queued_cmd *qc);
+ extern void ata_bmdma_setup(struct ata_queued_cmd *qc);
+ extern void ata_bmdma_start(struct ata_queued_cmd *qc);
+ extern void ata_bmdma_stop(struct ata_queued_cmd *qc);
+-- 
+1.6.0.2
+
