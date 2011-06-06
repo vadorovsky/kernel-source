@@ -1,0 +1,196 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: qeth: serialize device removal and config changes
+References: bnc#696586,LTC#72239
+Patch-mainline: Yes
+
+Symptom:     kernel panic with script ungrouping and changing layer
+Problem:     Running ungroup, group, and layer-switching of a qeth
+             device from a script, the ungroup invocation returns
+             immediately after qeth device removal is scheduled.
+             Following group invocation fails if qeth device has not
+             yet been removed. A following layer-switch may still refer
+             to the old qeth device being removed. Removal and layer
+             switch both trigger an unregister_netdev. Running a 
+             duplicate unregister_netdev causes the kernel panic.
+Solution:    Serialize device removal and other sysfs-triggered
+             configurations by moving removal of sysfs-attributes to
+             the beginning of the remove functions. And serialize
+             online/offline setting and discipline-switching (causing
+             reestablishing of the net_device) by making use of a new
+             discipline mutex.
+
+Acked-by: John Jolly <jjolly@suse.de>
+
+---
+
+ drivers/s390/net/qeth_core.h      |    1 +
+ drivers/s390/net/qeth_core_main.c |   11 +++++++----
+ drivers/s390/net/qeth_core_sys.c  |    4 ++--
+ drivers/s390/net/qeth_l2_main.c   |    5 +++++
+ drivers/s390/net/qeth_l3_main.c   |    8 +++++++-
+ 5 files changed, 22 insertions(+), 7 deletions(-)
+
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -739,6 +739,7 @@ struct qeth_card {
+ 	struct service_level qeth_service_level;
+ 	struct qdio_ssqd_desc ssqd;
+ 	struct mutex conf_mutex;
++	struct mutex discipline_mutex;
+ };
+ 
+ struct qeth_card_list_struct {
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -1150,6 +1150,7 @@ static int qeth_setup_card(struct qeth_c
+ 	spin_lock_init(&card->ip_lock);
+ 	spin_lock_init(&card->thread_mask_lock);
+ 	mutex_init(&card->conf_mutex);
++	mutex_init(&card->discipline_mutex);
+ 	card->thread_start_mask = 0;
+ 	card->thread_allowed_mask = 0;
+ 	card->thread_running_mask = 0;
+@@ -4354,16 +4355,18 @@ static void qeth_core_remove_device(stru
+ 	struct qeth_card *card = dev_get_drvdata(&gdev->dev);
+ 
+ 	QETH_DBF_TEXT(SETUP, 2, "removedv");
+-	if (card->discipline.ccwgdriver) {
+-		card->discipline.ccwgdriver->remove(gdev);
+-		qeth_core_free_discipline(card);
+-	}
+ 
+ 	if (card->info.type == QETH_CARD_TYPE_OSN) {
+ 		qeth_core_remove_osn_attributes(&gdev->dev);
+ 	} else {
+ 		qeth_core_remove_device_attributes(&gdev->dev);
+ 	}
++
++	if (card->discipline.ccwgdriver) {
++		card->discipline.ccwgdriver->remove(gdev);
++		qeth_core_free_discipline(card);
++	}
++
+ 	write_lock_irqsave(&qeth_core_card_list.rwlock, flags);
+ 	list_del(&card->list);
+ 	write_unlock_irqrestore(&qeth_core_card_list.rwlock, flags);
+--- a/drivers/s390/net/qeth_core_sys.c
++++ b/drivers/s390/net/qeth_core_sys.c
+@@ -408,7 +408,7 @@ static ssize_t qeth_dev_layer2_store(str
+ 	if (!card)
+ 		return -EINVAL;
+ 
+-	mutex_lock(&card->conf_mutex);
++	mutex_lock(&card->discipline_mutex);
+ 	if (card->state != CARD_STATE_DOWN) {
+ 		rc = -EPERM;
+ 		goto out;
+@@ -443,7 +443,7 @@ static ssize_t qeth_dev_layer2_store(str
+ 
+ 	rc = card->discipline.ccwgdriver->probe(card->gdev);
+ out:
+-	mutex_unlock(&card->conf_mutex);
++	mutex_unlock(&card->discipline_mutex);
+ 	return rc ? rc : count;
+ }
+ 
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@ -932,6 +932,7 @@ static int __qeth_l2_set_online(struct c
+ 	enum qeth_card_states recover_flag;
+ 
+ 	BUG_ON(!card);
++	mutex_lock(&card->discipline_mutex);
+ 	mutex_lock(&card->conf_mutex);
+ 	QETH_DBF_TEXT(SETUP, 2, "setonlin");
+ 	QETH_DBF_HEX(SETUP, 2, &card, sizeof(void *));
+@@ -1028,6 +1029,7 @@ contin:
+ 	kobject_uevent(&gdev->dev.kobj, KOBJ_CHANGE);
+ out:
+ 	mutex_unlock(&card->conf_mutex);
++	mutex_unlock(&card->discipline_mutex);
+ 	return rc;
+ out_remove:
+ 	qeth_l2_stop_card(card, 0);
+@@ -1039,6 +1041,7 @@ out_remove:
+ 	else
+ 		card->state = CARD_STATE_DOWN;
+ 	mutex_unlock(&card->conf_mutex);
++	mutex_unlock(&card->discipline_mutex);
+ 	return -ENODEV;
+ }
+ 
+@@ -1054,6 +1057,7 @@ static int __qeth_l2_set_offline(struct 
+ 	int rc = 0, rc2 = 0, rc3 = 0;
+ 	enum qeth_card_states recover_flag;
+ 
++	mutex_lock(&card->discipline_mutex);
+ 	mutex_lock(&card->conf_mutex);
+ 	QETH_DBF_TEXT(SETUP, 3, "setoffl");
+ 	QETH_DBF_HEX(SETUP, 3, &card, sizeof(void *));
+@@ -1074,6 +1078,7 @@ static int __qeth_l2_set_offline(struct 
+ 	/* let user_space know that device is offline */
+ 	kobject_uevent(&cgdev->dev.kobj, KOBJ_CHANGE);
+ 	mutex_unlock(&card->conf_mutex);
++	mutex_unlock(&card->discipline_mutex);
+ 	return 0;
+ }
+ 
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -3267,6 +3267,8 @@ static void qeth_l3_remove_device(struct
+ {
+ 	struct qeth_card *card = dev_get_drvdata(&cgdev->dev);
+ 
++	qeth_l3_remove_device_attributes(&cgdev->dev);
++
+ 	qeth_set_allowed_threads(card, 0, 1);
+ 	wait_event(card->wait_q, qeth_threads_running(card, 0xffffffff) == 0);
+ 
+@@ -3278,7 +3280,6 @@ static void qeth_l3_remove_device(struct
+ 		card->dev = NULL;
+ 	}
+ 
+-	qeth_l3_remove_device_attributes(&cgdev->dev);
+ 	qeth_l3_clear_ip_list(card, 0);
+ 	qeth_l3_clear_ipato_list(card);
+ 	return;
+@@ -3291,6 +3292,7 @@ static int __qeth_l3_set_online(struct c
+ 	enum qeth_card_states recover_flag;
+ 
+ 	BUG_ON(!card);
++	mutex_lock(&card->discipline_mutex);
+ 	mutex_lock(&card->conf_mutex);
+ 	QETH_DBF_TEXT(SETUP, 2, "setonlin");
+ 	QETH_DBF_HEX(SETUP, 2, &card, sizeof(void *));
+@@ -3391,6 +3393,7 @@ contin:
+ 	kobject_uevent(&gdev->dev.kobj, KOBJ_CHANGE);
+ out:
+ 	mutex_unlock(&card->conf_mutex);
++	mutex_unlock(&card->discipline_mutex);
+ 	return rc;
+ out_remove:
+ 	qeth_l3_stop_card(card, 0);
+@@ -3402,6 +3405,7 @@ out_remove:
+ 	else
+ 		card->state = CARD_STATE_DOWN;
+ 	mutex_unlock(&card->conf_mutex);
++	mutex_unlock(&card->discipline_mutex);
+ 	return -ENODEV;
+ }
+ 
+@@ -3417,6 +3421,7 @@ static int __qeth_l3_set_offline(struct 
+ 	int rc = 0, rc2 = 0, rc3 = 0;
+ 	enum qeth_card_states recover_flag;
+ 
++	mutex_lock(&card->discipline_mutex);
+ 	mutex_lock(&card->conf_mutex);
+ 	QETH_DBF_TEXT(SETUP, 3, "setoffl");
+ 	QETH_DBF_HEX(SETUP, 3, &card, sizeof(void *));
+@@ -3437,6 +3442,7 @@ static int __qeth_l3_set_offline(struct 
+ 	/* let user_space know that device is offline */
+ 	kobject_uevent(&cgdev->dev.kobj, KOBJ_CHANGE);
+ 	mutex_unlock(&card->conf_mutex);
++	mutex_unlock(&card->discipline_mutex);
+ 	return 0;
+ }
+ 
