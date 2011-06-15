@@ -1,0 +1,174 @@
+From: Tejun Heo <tj@kernel.org>
+Date: Fri, 3 Sep 2010 11:56:16 +0200
+Subject: [PATCH] block: deprecate barrier and replace blk_queue_ordered() with blk_queue_flush()
+X-Git: 4913efe456c987057e5d36a3f0a55422a9072cae
+References: FATE#311692
+Patch-Mainline: 2.6.34
+
+Barrier is deemed too heavy and will soon be replaced by FLUSH/FUA
+requests.  Deprecate barrier.  All REQ_HARDBARRIERs are failed with
+-EOPNOTSUPP and blk_queue_ordered() is replaced with simpler
+blk_queue_flush().
+
+blk_queue_flush() takes combinations of REQ_FLUSH and FUA.  If a
+device has write cache and can flush it, it should set REQ_FLUSH.  If
+the device can handle FUA writes, it should also set REQ_FUA.
+
+All blk_queue_ordered() users are converted.
+
+* ORDERED_DRAIN is mapped to 0 which is the default value.
+* ORDERED_DRAIN_FLUSH is mapped to REQ_FLUSH.
+* ORDERED_DRAIN_FLUSH_FUA is mapped to REQ_FLUSH | REQ_FUA.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Acked-by: Boaz Harrosh <bharrosh@panasas.com>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Nick Piggin <npiggin@kernel.dk>
+Cc: Michael S. Tsirkin <mst@redhat.com>
+Cc: Jeremy Fitzhardinge <jeremy@xensource.com>
+Cc: Chris Wright <chrisw@sous-sol.org>
+Cc: FUJITA Tomonori <fujita.tomonori@lab.ntt.co.jp>
+Cc: Geert Uytterhoeven <Geert.Uytterhoeven@sonycom.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Alasdair G Kergon <agk@redhat.com>
+Cc: Pierre Ossman <drzeus@drzeus.cx>
+Cc: Stefan Weinhuber <wein@de.ibm.com>
+Signed-off-by: Jens Axboe <jaxboe@fusionio.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+
+Automatically created from "patches.suse/block-deprecate-barrier-and-replace-blk_queue_order.patch" by xen-port-patches.py
+
+--- sle11sp2-2011-06-15.orig/drivers/xen/blkfront/blkfront.c	2010-11-22 13:25:54.000000000 +0100
++++ sle11sp2-2011-06-15/drivers/xen/blkfront/blkfront.c	2011-06-15 11:56:39.000000000 +0200
+@@ -328,7 +328,7 @@ static void connect(struct blkfront_info
+ 	unsigned long long sectors;
+ 	unsigned long sector_size;
+ 	unsigned int binfo;
+-	int err;
++	int err, barrier;
+ 
+ 	switch (info->connected) {
+ 	case BLKIF_STATE_CONNECTED:
+@@ -364,10 +364,19 @@ static void connect(struct blkfront_info
+ 	}
+ 
+ 	err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
+-			    "feature-barrier", "%d", &info->feature_barrier,
++			    "feature-barrier", "%d", &barrier,
+ 			    NULL);
+-	if (err)
+-		info->feature_barrier = 0;
++	/*
++	 * If there's no "feature-barrier" defined, then it means
++	 * we're dealing with a very old backend which writes
++	 * synchronously; nothing to do.
++	 *
++	 * If there are barriers, then we use flush.
++	 */
++	if (!err && barrier)
++		info->feature_flush = REQ_FLUSH | REQ_FUA;
++	else
++		info->feature_flush = 0;
+ 
+ 	err = xlvbd_add(sectors, info->vdevice, binfo, sector_size, info);
+ 	if (err) {
+@@ -812,8 +821,19 @@ static irqreturn_t blkif_int(int irq, vo
+ 					   " write barrier op failed\n",
+ 					   info->gd->disk_name);
+ 				ret = -EOPNOTSUPP;
+-				info->feature_barrier = 0;
+-			        xlvbd_barrier(info);
++			}
++			if (unlikely(bret->status == BLKIF_RSP_ERROR &&
++				     info->shadow[id].req.nr_segments == 0)) {
++				pr_warning("blkfront: %s:"
++					   " empty write barrier op failed\n",
++					   info->gd->disk_name);
++				ret = -EOPNOTSUPP;
++			}
++			if (unlikely(ret)) {
++				if (ret == -EOPNOTSUPP)
++					ret = 0;
++				info->feature_flush = 0;
++			        xlvbd_flush(info);
+ 			}
+ 			/* fall through */
+ 		case BLKIF_OP_READ:
+--- sle11sp2-2011-06-15.orig/drivers/xen/blkfront/block.h	2010-01-18 16:49:13.000000000 +0100
++++ sle11sp2-2011-06-15/drivers/xen/blkfront/block.h	2011-06-15 11:50:49.000000000 +0200
+@@ -111,7 +111,7 @@ struct blkfront_info
+ 	struct gnttab_free_callback callback;
+ 	struct blk_shadow shadow[BLK_RING_SIZE];
+ 	unsigned long shadow_free;
+-	int feature_barrier;
++	int feature_flush;
+ 	int is_ready;
+ 
+ 	/**
+@@ -146,7 +146,7 @@ extern void do_blkif_request (struct req
+ int xlvbd_add(blkif_sector_t capacity, int device,
+ 	      u16 vdisk_info, u16 sector_size, struct blkfront_info *info);
+ void xlvbd_del(struct blkfront_info *info);
+-int xlvbd_barrier(struct blkfront_info *info);
++void xlvbd_flush(struct blkfront_info *info);
+ 
+ #ifdef CONFIG_SYSFS
+ int xlvbd_sysfs_addif(struct blkfront_info *info);
+--- sle11sp2-2011-06-15.orig/drivers/xen/blkfront/vbd.c	2011-06-14 16:41:53.000000000 +0200
++++ sle11sp2-2011-06-15/drivers/xen/blkfront/vbd.c	2011-06-15 12:24:34.000000000 +0200
+@@ -422,8 +422,7 @@ xlvbd_add(blkif_sector_t capacity, int v
+ 	info->rq = gd->queue;
+ 	info->gd = gd;
+ 
+-	if (info->feature_barrier)
+-		xlvbd_barrier(info);
++	xlvbd_flush(info);
+ 
+ 	if (vdisk_info & VDISK_READONLY)
+ 		set_disk_ro(gd, 1);
+@@ -469,29 +468,14 @@ xlvbd_del(struct blkfront_info *info)
+ 	info->rq = NULL;
+ }
+ 
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,16)
+-int
+-xlvbd_barrier(struct blkfront_info *info)
++void
++xlvbd_flush(struct blkfront_info *info)
+ {
+-	int err;
+-
+-	err = blk_queue_ordered(info->rq,
+-		info->feature_barrier ? QUEUE_ORDERED_DRAIN : QUEUE_ORDERED_NONE);
+-	if (err)
+-		return err;
++	blk_queue_flush(info->rq, info->feature_flush);
+ 	pr_info("blkfront: %s: barriers %s\n",
+ 		info->gd->disk_name,
+-		info->feature_barrier ? "enabled" : "disabled");
+-	return 0;
+-}
+-#else
+-int
+-xlvbd_barrier(struct blkfront_info *info)
+-{
+-	pr_info("blkfront: %s: barriers disabled\n", info->gd->disk_name);
+-	return -ENOSYS;
++		info->feature_flush ? "enabled" : "disabled");
+ }
+-#endif
+ 
+ #ifdef CONFIG_SYSFS
+ static ssize_t show_media(struct device *dev,
+--- sle11sp2-2011-06-15.orig/drivers/xen/blktap2-new/device.c	2011-06-14 16:41:49.000000000 +0200
++++ sle11sp2-2011-06-15/drivers/xen/blktap2-new/device.c	2011-06-15 11:57:39.000000000 +0200
+@@ -302,9 +302,6 @@ blktap_device_configure(struct blktap *t
+ 	/* Make sure buffer addresses are sector-aligned. */
+ 	blk_queue_dma_alignment(rq, 511);
+ 
+-	/* We are reordering, but cacheless. */
+-	blk_queue_ordered(rq, QUEUE_ORDERED_DRAIN);
+-
+ 	spin_unlock_irq(&dev->lock);
+ }
+ 
