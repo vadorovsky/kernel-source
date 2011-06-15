@@ -1,0 +1,268 @@
+From: Jens Axboe <axboe@kernel.dk>
+Subject: Fix superblock locking when doing writeback
+Patch-mainline: Never (fixed differently)
+References: bnc#649000 bnc#617437
+
+In some cases superblock is already locked even for WB_SYNC_NONE writeback.
+The first writeback pass during umount is one such prominent case. Currently
+writeback code failed to lock the superblock in such case and bailed out
+thus leaving all the writeback for the synchronous mode which can take much
+longer.
+
+Also when bdi_start_fn called wb_do_writeback, we did WB_SYNC_ALL writeback
+without having superblock locked possibly leading to Oops if umount happened
+at the right moment.
+
+Fix both these issues by introducing new 'locked' bit expressing whether the
+caller took care of the superblock locking or not.
+
+Signed-off-by: Stefan Bader <stefan.bader@canonical.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+
+---
+ fs/fs-writeback.c           |   31 +++++++++++++++++++++++--------
+ fs/sync.c                   |    2 +-
+ fs/ubifs/budget.c           |    2 +-
+ include/linux/backing-dev.h |    2 +-
+ include/linux/writeback.h   |    4 +++-
+ mm/page-writeback.c         |    2 +-
+ 6 files changed, 30 insertions(+), 13 deletions(-)
+
+Index: linux-2.6.32-writeback-SLE11-SP1/fs/fs-writeback.c
+===================================================================
+--- linux-2.6.32-writeback-SLE11-SP1.orig/fs/fs-writeback.c
++++ linux-2.6.32-writeback-SLE11-SP1/fs/fs-writeback.c
+@@ -42,6 +42,7 @@ struct wb_writeback_args {
+ 	int for_kupdate:1;
+ 	int range_cyclic:1;
+ 	int for_background:1;
++	int locked:1;
+ };
+ 
+ /*
+@@ -237,6 +238,7 @@ static void bdi_sync_writeback(struct ba
+ 		.sync_mode	= WB_SYNC_ALL,
+ 		.nr_pages	= LONG_MAX,
+ 		.range_cyclic	= 0,
++		.locked		= 1,
+ 	};
+ 	struct bdi_work work;
+ 
+@@ -259,13 +261,14 @@ static void bdi_sync_writeback(struct ba
+  *
+  */
+ void bdi_start_writeback(struct backing_dev_info *bdi, struct super_block *sb,
+-			 long nr_pages)
++			 long nr_pages, int locked)
+ {
+ 	struct wb_writeback_args args = {
+ 		.sb		= sb,
+ 		.sync_mode	= WB_SYNC_NONE,
+ 		.nr_pages	= nr_pages,
+ 		.range_cyclic	= 1,
++		.locked		= locked,
+ 	};
+ 
+ 	/*
+@@ -277,7 +280,17 @@ void bdi_start_writeback(struct backing_
+ 		args.for_background = 1;
+ 	}
+ 
+-	bdi_alloc_queue_work(bdi, &args);
++	if (locked) {
++		struct bdi_work work;
++
++		bdi_work_init(&work, &args);
++		work.state |= WS_ONSTACK;
++
++		bdi_queue_work(bdi, &work);
++		bdi_wait_on_work_clear(&work);
++	} else {
++		bdi_alloc_queue_work(bdi, &args);
++	}
+ }
+ 
+ /*
+@@ -575,11 +588,9 @@ static void unpin_sb_for_writeback(struc
+  * Returns 0 if the super was successfully pinned (or pinning wasn't needed),
+  * 1 if we failed.
+  */
+-static int pin_sb_for_writeback(struct writeback_control *wbc,
+-				struct inode *inode, struct super_block **psb)
++static int pin_sb_for_writeback(struct super_block *sb, int locked,
++				struct super_block **psb)
+ {
+-	struct super_block *sb = inode->i_sb;
+-
+ 	/*
+ 	 * If this sb is already pinned, nothing more to do. If not and
+ 	 * *psb is non-NULL, unpin the old one first
+@@ -592,7 +603,7 @@ static int pin_sb_for_writeback(struct w
+ 	/*
+ 	 * Caller must already hold the ref for this
+ 	 */
+-	if (wbc->sync_mode == WB_SYNC_ALL) {
++	if (locked) {
+ 		WARN_ON(!rwsem_is_locked(&sb->s_umount));
+ 		return 0;
+ 	}
+@@ -619,7 +630,7 @@ pinned:
+ }
+ 
+ static void writeback_inodes_wb(struct bdi_writeback *wb,
+-				struct writeback_control *wbc)
++				struct writeback_control *wbc, int locked)
+ {
+ 	struct super_block *sb = wbc->sb, *pin_sb = NULL;
+ 	const int is_blkdev_sb = sb_is_blkdev_sb(sb);
+@@ -680,7 +691,7 @@ static void writeback_inodes_wb(struct b
+ 		if (inode_dirtied_after(inode, start))
+ 			break;
+ 
+-		if (pin_sb_for_writeback(wbc, inode, &pin_sb)) {
++		if (pin_sb_for_writeback(sb, locked, &pin_sb)) {
+ 			requeue_io(inode);
+ 			continue;
+ 		}
+@@ -718,7 +729,7 @@ void writeback_inodes_wbc(struct writeba
+ {
+ 	struct backing_dev_info *bdi = wbc->bdi;
+ 
+-	writeback_inodes_wb(&bdi->wb, wbc);
++	writeback_inodes_wb(&bdi->wb, wbc, wbc->sync_mode == WB_SYNC_ALL);
+ }
+ 
+ /*
+@@ -798,7 +809,7 @@ static long wb_writeback(struct bdi_writ
+ 		wbc.encountered_congestion = 0;
+ 		wbc.nr_to_write = MAX_WRITEBACK_PAGES;
+ 		wbc.pages_skipped = 0;
+-		writeback_inodes_wb(wb, &wbc);
++		writeback_inodes_wb(wb, &wbc, args->locked);
+ 		args->nr_pages -= MAX_WRITEBACK_PAGES - wbc.nr_to_write;
+ 		wrote += MAX_WRITEBACK_PAGES - wbc.nr_to_write;
+ 
+@@ -919,7 +930,7 @@ long wb_do_writeback(struct bdi_writebac
+ 		 * If this isn't a data integrity operation, just notify
+ 		 * that we have seen this work and we are now starting it.
+ 		 */
+-		if (args.sync_mode == WB_SYNC_NONE)
++		if (args.sync_mode == WB_SYNC_NONE && !args.locked)
+ 			wb_clear_pending(wb, work);
+ 
+ 		wrote += wb_writeback(wb, &args);
+@@ -928,7 +939,7 @@ long wb_do_writeback(struct bdi_writebac
+ 		 * This is a data integrity writeback, so only do the
+ 		 * notification when we have completed the work.
+ 		 */
+-		if (args.sync_mode == WB_SYNC_ALL)
++		if (args.sync_mode == WB_SYNC_ALL || args.locked)
+ 			wb_clear_pending(wb, work);
+ 	}
+ 
+@@ -1211,6 +1222,7 @@ static void wait_sb_inodes(struct super_
+ /**
+  * writeback_inodes_sb	-	writeback dirty inodes from given super_block
+  * @sb: the superblock
++ * @locked: sb already pinned
+  *
+  * Start writeback on some inodes on this super_block. No guarantees are made
+  * on how many (if any) will be written, and this function does not wait
+@@ -1219,6 +1231,12 @@ static void wait_sb_inodes(struct super_
+  */
+ void writeback_inodes_sb(struct super_block *sb)
+ {
++	writeback_inodes_sb_locked(sb, 0);
++}
++EXPORT_SYMBOL(writeback_inodes_sb);
++
++void writeback_inodes_sb_locked(struct super_block *sb, int locked)
++{
+ 	unsigned long nr_dirty = global_page_state(NR_FILE_DIRTY);
+ 	unsigned long nr_unstable = global_page_state(NR_UNSTABLE_NFS);
+ 	long nr_to_write;
+@@ -1226,9 +1244,9 @@ void writeback_inodes_sb(struct super_bl
+ 	nr_to_write = nr_dirty + nr_unstable +
+ 			(inodes_stat.nr_inodes - inodes_stat.nr_unused);
+ 
+-	bdi_start_writeback(sb->s_bdi, sb, nr_to_write);
++	bdi_start_writeback(sb->s_bdi, sb, nr_to_write, locked);
+ }
+-EXPORT_SYMBOL(writeback_inodes_sb);
++EXPORT_SYMBOL(writeback_inodes_sb_locked);
+ 
+ /**
+  * writeback_inodes_sb_if_idle	-	start writeback if none underway
+@@ -1240,7 +1258,7 @@ EXPORT_SYMBOL(writeback_inodes_sb);
+ int writeback_inodes_sb_if_idle(struct super_block *sb)
+ {
+ 	if (!writeback_in_progress(sb->s_bdi)) {
+-		writeback_inodes_sb(sb);
++		writeback_inodes_sb_locked(sb, 0);
+ 		return 1;
+ 	} else
+ 		return 0;
+Index: linux-2.6.32-writeback-SLE11-SP1/fs/sync.c
+===================================================================
+--- linux-2.6.32-writeback-SLE11-SP1.orig/fs/sync.c
++++ linux-2.6.32-writeback-SLE11-SP1/fs/sync.c
+@@ -37,7 +37,7 @@ static int __sync_filesystem(struct supe
+ 	/* Avoid doing twice syncing and cache pruning for quota sync */
+ 	if (!wait) {
+ 		writeout_quota_sb(sb, -1);
+-		writeback_inodes_sb(sb);
++		writeback_inodes_sb_locked(sb, 1);
+ 	} else {
+ 		sync_quota_sb(sb, -1);
+ 		sync_inodes_sb(sb);
+Index: linux-2.6.32-writeback-SLE11-SP1/fs/ubifs/budget.c
+===================================================================
+--- linux-2.6.32-writeback-SLE11-SP1.orig/fs/ubifs/budget.c
++++ linux-2.6.32-writeback-SLE11-SP1/fs/ubifs/budget.c
+@@ -62,7 +62,7 @@
+  */
+ static void shrink_liability(struct ubifs_info *c, int nr_to_write)
+ {
+-	writeback_inodes_sb(c->vfs_sb);
++	writeback_inodes_sb_locked(c->vfs_sb, 0);
+ }
+ 
+ /**
+Index: linux-2.6.32-writeback-SLE11-SP1/include/linux/backing-dev.h
+===================================================================
+--- linux-2.6.32-writeback-SLE11-SP1.orig/include/linux/backing-dev.h
++++ linux-2.6.32-writeback-SLE11-SP1/include/linux/backing-dev.h
+@@ -102,7 +102,7 @@ int bdi_register(struct backing_dev_info
+ int bdi_register_dev(struct backing_dev_info *bdi, dev_t dev);
+ void bdi_unregister(struct backing_dev_info *bdi);
+ void bdi_start_writeback(struct backing_dev_info *bdi, struct super_block *sb,
+-				long nr_pages);
++				long nr_pages, int locked);
+ int bdi_writeback_task(struct bdi_writeback *wb);
+ int bdi_has_dirty_io(struct backing_dev_info *bdi);
+ 
+Index: linux-2.6.32-writeback-SLE11-SP1/include/linux/writeback.h
+===================================================================
+--- linux-2.6.32-writeback-SLE11-SP1.orig/include/linux/writeback.h
++++ linux-2.6.32-writeback-SLE11-SP1/include/linux/writeback.h
+@@ -69,6 +69,7 @@ struct writeback_control {
+ struct bdi_writeback;
+ int inode_wait(void *);
+ void writeback_inodes_sb(struct super_block *);
++void writeback_inodes_sb_locked(struct super_block *, int);
+ int writeback_inodes_sb_if_idle(struct super_block *);
+ void sync_inodes_sb(struct super_block *);
+ void writeback_inodes_wbc(struct writeback_control *wbc);
+Index: linux-2.6.32-writeback-SLE11-SP1/mm/page-writeback.c
+===================================================================
+--- linux-2.6.32-writeback-SLE11-SP1.orig/mm/page-writeback.c
++++ linux-2.6.32-writeback-SLE11-SP1/mm/page-writeback.c
+@@ -597,7 +597,7 @@ static void balance_dirty_pages(struct a
+ 	    (!laptop_mode && ((global_page_state(NR_FILE_DIRTY)
+ 			       + global_page_state(NR_UNSTABLE_NFS))
+ 					  > background_thresh)))
+-		bdi_start_writeback(bdi, NULL, 0);
++		bdi_start_writeback(bdi, NULL, 0, 0);
+ }
+ 
+ void set_page_dirty_balance(struct page *page, int page_mkwrite)
