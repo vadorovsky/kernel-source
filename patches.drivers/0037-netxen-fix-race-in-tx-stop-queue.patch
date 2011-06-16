@@ -1,0 +1,124 @@
+From: Rajesh Borundia <rajesh.borundia@qlogic.com>
+Date: Mon, 18 Oct 2010 02:03:41 +0000
+Subject: [PATCH 37/56] netxen: fix race in tx stop queue
+Git-commit: 7a9905e64272c8021a8cfaf6015dd0fb8eeeb378
+Patch-mainline: v2.6.37-rc1
+
+There is race between netif_stop_queue and netif_stopped_queue
+check.So check once again if buffers are available to avoid race.
+With above logic we can also get rid of tx lock in process_cmd_ring.
+
+Signed-off-by: Rajesh Borundia <rajesh.borundia@qlogic.com>
+Signed-off-by: Amit Kumar Salecha <amit.salecha@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+ drivers/net/netxen/netxen_nic.h      |    5 ++++-
+ drivers/net/netxen/netxen_nic_hw.c   |   10 ++++++++--
+ drivers/net/netxen/netxen_nic_init.c |   10 +++-------
+ drivers/net/netxen/netxen_nic_main.c |   15 +++++++--------
+ 4 files changed, 22 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/net/netxen/netxen_nic.h b/drivers/net/netxen/netxen_nic.h
+index 8f099df..410e1ae 100644
+--- a/drivers/net/netxen/netxen_nic.h
++++ b/drivers/net/netxen/netxen_nic.h
+@@ -176,7 +176,10 @@
+ #define	MAX_NUM_CARDS		4
+ 
+ #define MAX_BUFFERS_PER_CMD	32
+-#define TX_STOP_THRESH		((MAX_SKB_FRAGS >> 2) + 4)
++#define MAX_TSO_HEADER_DESC	2
++#define MGMT_CMD_DESC_RESV	4
++#define TX_STOP_THRESH		((MAX_SKB_FRAGS >> 2) + MAX_TSO_HEADER_DESC \
++							+ MGMT_CMD_DESC_RESV)
+ #define NX_MAX_TX_TIMEOUTS	2
+ 
+ /*
+diff --git a/drivers/net/netxen/netxen_nic_hw.c b/drivers/net/netxen/netxen_nic_hw.c
+index 7d12da1..57ad057 100644
+--- a/drivers/net/netxen/netxen_nic_hw.c
++++ b/drivers/net/netxen/netxen_nic_hw.c
+@@ -597,8 +597,14 @@ netxen_send_cmd_descs(struct netxen_adapter *adapter,
+ 
+ 	if (nr_desc >= netxen_tx_avail(tx_ring)) {
+ 		netif_tx_stop_queue(tx_ring->txq);
+-		__netif_tx_unlock_bh(tx_ring->txq);
+-		return -EBUSY;
++		smp_mb();
++		if (netxen_tx_avail(tx_ring) > nr_desc) {
++			if (netxen_tx_avail(tx_ring) > TX_STOP_THRESH)
++				netif_tx_wake_queue(tx_ring->txq);
++		} else {
++			__netif_tx_unlock_bh(tx_ring->txq);
++			return -EBUSY;
++		}
+ 	}
+ 
+ 	do {
+diff --git a/drivers/net/netxen/netxen_nic_init.c b/drivers/net/netxen/netxen_nic_init.c
+index fc9a23c..d9b0b48 100644
+--- a/drivers/net/netxen/netxen_nic_init.c
++++ b/drivers/net/netxen/netxen_nic_init.c
+@@ -1762,14 +1762,10 @@ int netxen_process_cmd_ring(struct netxen_adapter *adapter)
+ 
+ 		smp_mb();
+ 
+-		if (netif_queue_stopped(netdev) && netif_carrier_ok(netdev)) {
+-			__netif_tx_lock(tx_ring->txq, smp_processor_id());
+-			if (netxen_tx_avail(tx_ring) > TX_STOP_THRESH) {
++		if (netif_queue_stopped(netdev) && netif_carrier_ok(netdev))
++			if (netxen_tx_avail(tx_ring) > TX_STOP_THRESH)
+ 				netif_wake_queue(netdev);
+-				adapter->tx_timeo_cnt = 0;
+-			}
+-			__netif_tx_unlock(tx_ring->txq);
+-		}
++		adapter->tx_timeo_cnt = 0;
+ 	}
+ 	/*
+ 	 * If everything is freed up to consumer then check if the ring is full
+diff --git a/drivers/net/netxen/netxen_nic_main.c b/drivers/net/netxen/netxen_nic_main.c
+index 1559001..b4702f3 100644
+--- a/drivers/net/netxen/netxen_nic_main.c
++++ b/drivers/net/netxen/netxen_nic_main.c
+@@ -124,11 +124,6 @@ netxen_nic_update_cmd_producer(struct netxen_adapter *adapter,
+ 		struct nx_host_tx_ring *tx_ring)
+ {
+ 	NXWRIO(adapter, tx_ring->crb_cmd_producer, tx_ring->producer);
+-
+-	if (netxen_tx_avail(tx_ring) <= TX_STOP_THRESH) {
+-		netif_stop_queue(adapter->netdev);
+-		smp_mb();
+-	}
+ }
+ 
+ static uint32_t crb_cmd_consumer[4] = {
+@@ -1208,7 +1203,7 @@ netxen_setup_netdev(struct netxen_adapter *adapter,
+ 		adapter->max_mc_count = 16;
+ 
+ 	netdev->netdev_ops	   = &netxen_netdev_ops;
+-	netdev->watchdog_timeo     = 2*HZ;
++	netdev->watchdog_timeo     = 5*HZ;
+ 
+ 	netxen_nic_change_mtu(netdev, netdev->mtu);
+ 
+@@ -1824,9 +1819,13 @@ netxen_nic_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
+ 	/* 4 fragments per cmd des */
+ 	no_of_desc = (frag_count + 3) >> 2;
+ 
+-	if (unlikely(no_of_desc + 2 > netxen_tx_avail(tx_ring))) {
++	if (unlikely(netxen_tx_avail(tx_ring) <= TX_STOP_THRESH)) {
+ 		netif_stop_queue(netdev);
+-		return NETDEV_TX_BUSY;
++		smp_mb();
++		if (netxen_tx_avail(tx_ring) > TX_STOP_THRESH)
++			netif_start_queue(netdev);
++		else
++			return NETDEV_TX_BUSY;
+ 	}
+ 
+ 	producer = tx_ring->producer;
+-- 
+1.6.3.3
+
