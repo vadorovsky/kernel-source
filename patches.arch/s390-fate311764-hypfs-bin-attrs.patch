@@ -1,0 +1,691 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: s390_hypfs: Add new binary attributes
+References: bnc#700080,LTC#69444,FATE#311764
+Patch-mainline: Yes
+
+Description: In order to access the data of the hypfs diagnose calls from user
+             space also in binary form, this patch adds two new attributes in
+             debugfs:
+             * z/VM: s390_hypfs/d2fc_bin
+             * LPAR: s390_hypfs/d204_bin
+             commit: 57b28f66316d287b9dbf7b28358ca90257230769
+
+             This patch also includes some cleanup & bugfix patches:
+             commit: 3c8ebca0453c71a2a8be79e6dd40e7be2d6167cb
+             commit: b8e660b83d505148c83ddc6d5ba69c29d0eab1e3
+             commit: 1d802e24774c94ec7bdb12b6515226f3341533c1
+
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ arch/s390/hypfs/Makefile      |    2 
+ arch/s390/hypfs/hypfs.h       |   33 ++++++++++++
+ arch/s390/hypfs/hypfs_dbfs.c  |  115 ++++++++++++++++++++++++++++++++++++++++++
+ arch/s390/hypfs/hypfs_diag.c  |  102 +++++++++++++++++++++++++++++++------
+ arch/s390/hypfs/hypfs_vm.c    |   70 ++++++++++++++++++++++---
+ arch/s390/hypfs/inode.c       |   82 ++++++++++++-----------------
+ arch/s390/include/asm/timex.h |    5 +
+ 7 files changed, 336 insertions(+), 73 deletions(-)
+
+--- a/arch/s390/hypfs/Makefile
++++ b/arch/s390/hypfs/Makefile
+@@ -4,4 +4,4 @@
+ 
+ obj-$(CONFIG_S390_HYPFS_FS) += s390_hypfs.o
+ 
+-s390_hypfs-objs := inode.o hypfs_diag.o hypfs_vm.o
++s390_hypfs-objs := inode.o hypfs_diag.o hypfs_vm.o hypfs_dbfs.o
+--- a/arch/s390/hypfs/hypfs.h
++++ b/arch/s390/hypfs/hypfs.h
+@@ -11,6 +11,9 @@
+ 
+ #include <linux/fs.h>
+ #include <linux/types.h>
++#include <linux/debugfs.h>
++#include <linux/workqueue.h>
++#include <linux/kref.h>
+ 
+ #define REG_FILE_MODE    0440
+ #define UPDATE_FILE_MODE 0220
+@@ -34,6 +37,36 @@ extern int hypfs_diag_create_files(struc
+ 
+ /* VM Hypervisor */
+ extern int hypfs_vm_init(void);
++extern void hypfs_vm_exit(void);
+ extern int hypfs_vm_create_files(struct super_block *sb, struct dentry *root);
+ 
++/* debugfs interface */
++struct hypfs_dbfs_file;
++
++struct hypfs_dbfs_data {
++	void			*buf;
++	void			*buf_free_ptr;
++	size_t			size;
++	struct hypfs_dbfs_file	*dbfs_file;;
++	struct kref		kref;
++};
++
++struct hypfs_dbfs_file {
++	const char	*name;
++	int		(*data_create)(void **data, void **data_free_ptr,
++				       size_t *size);
++	void		(*data_free)(const void *buf_free_ptr);
++
++	/* Private data for hypfs_dbfs.c */
++	struct hypfs_dbfs_data	*data;
++	struct delayed_work	data_free_work;
++	struct mutex		lock;
++	struct dentry		*dentry;
++};
++
++extern int hypfs_dbfs_init(void);
++extern void hypfs_dbfs_exit(void);
++extern int hypfs_dbfs_create_file(struct hypfs_dbfs_file *df);
++extern void hypfs_dbfs_remove_file(struct hypfs_dbfs_file *df);
++
+ #endif /* _HYPFS_H_ */
+--- /dev/null
++++ b/arch/s390/hypfs/hypfs_dbfs.c
+@@ -0,0 +1,115 @@
++/*
++ * Hypervisor filesystem for Linux on s390 - debugfs interface
++ *
++ * Copyright (C) IBM Corp. 2010
++ * Author(s): Michael Holzheu <holzheu@linux.vnet.ibm.com>
++ */
++
++#include <linux/slab.h>
++#include "hypfs.h"
++
++static struct dentry *dbfs_dir;
++
++static struct hypfs_dbfs_data *hypfs_dbfs_data_alloc(struct hypfs_dbfs_file *f)
++{
++	struct hypfs_dbfs_data *data;
++
++	data = kmalloc(sizeof(*data), GFP_KERNEL);
++	if (!data)
++		return NULL;
++	kref_init(&data->kref);
++	data->dbfs_file = f;
++	return data;
++}
++
++static void hypfs_dbfs_data_free(struct kref *kref)
++{
++	struct hypfs_dbfs_data *data;
++
++	data = container_of(kref, struct hypfs_dbfs_data, kref);
++	data->dbfs_file->data_free(data->buf_free_ptr);
++	kfree(data);
++}
++
++static void data_free_delayed(struct work_struct *work)
++{
++	struct hypfs_dbfs_data *data;
++	struct hypfs_dbfs_file *df;
++
++	df = container_of(work, struct hypfs_dbfs_file, data_free_work.work);
++	mutex_lock(&df->lock);
++	data = df->data;
++	df->data = NULL;
++	mutex_unlock(&df->lock);
++	kref_put(&data->kref, hypfs_dbfs_data_free);
++}
++
++static ssize_t dbfs_read(struct file *file, char __user *buf,
++			 size_t size, loff_t *ppos)
++{
++	struct hypfs_dbfs_data *data;
++	struct hypfs_dbfs_file *df;
++	ssize_t rc;
++
++	if (*ppos != 0)
++		return 0;
++
++	df = file->f_path.dentry->d_inode->i_private;
++	mutex_lock(&df->lock);
++	if (!df->data) {
++		data = hypfs_dbfs_data_alloc(df);
++		if (!data) {
++			mutex_unlock(&df->lock);
++			return -ENOMEM;
++		}
++		rc = df->data_create(&data->buf, &data->buf_free_ptr,
++				     &data->size);
++		if (rc) {
++			mutex_unlock(&df->lock);
++			kfree(data);
++			return rc;
++		}
++		df->data = data;
++		schedule_delayed_work(&df->data_free_work, HZ);
++	}
++	data = df->data;
++	kref_get(&data->kref);
++	mutex_unlock(&df->lock);
++
++	rc = simple_read_from_buffer(buf, size, ppos, data->buf, data->size);
++	kref_put(&data->kref, hypfs_dbfs_data_free);
++	return rc;
++}
++
++static const struct file_operations dbfs_ops = {
++	.read		= dbfs_read,
++};
++
++int hypfs_dbfs_create_file(struct hypfs_dbfs_file *df)
++{
++	df->dentry = debugfs_create_file(df->name, 0400, dbfs_dir, df,
++					 &dbfs_ops);
++	if (IS_ERR(df->dentry))
++		return PTR_ERR(df->dentry);
++	mutex_init(&df->lock);
++	INIT_DELAYED_WORK(&df->data_free_work, data_free_delayed);
++	return 0;
++}
++
++void hypfs_dbfs_remove_file(struct hypfs_dbfs_file *df)
++{
++	debugfs_remove(df->dentry);
++}
++
++int hypfs_dbfs_init(void)
++{
++	dbfs_dir = debugfs_create_dir("s390_hypfs", NULL);
++	if (IS_ERR(dbfs_dir))
++		return PTR_ERR(dbfs_dir);
++	return 0;
++}
++
++void hypfs_dbfs_exit(void)
++{
++	debugfs_remove(dbfs_dir);
++}
+--- a/arch/s390/hypfs/hypfs_diag.c
++++ b/arch/s390/hypfs/hypfs_diag.c
+@@ -12,10 +12,10 @@
+ 
+ #include <linux/types.h>
+ #include <linux/errno.h>
+-#include <linux/gfp.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/vmalloc.h>
++#include <linux/mm.h>
+ #include <asm/ebcdic.h>
+ #include "hypfs.h"
+ 
+@@ -23,6 +23,8 @@
+ #define CPU_NAME_LEN 16		/* type name len of cpus in diag224 name table */
+ #define TMP_SIZE 64		/* size of temporary buffers */
+ 
++#define DBFS_D204_HDR_VERSION	0
++
+ /* diag 204 subcodes */
+ enum diag204_sc {
+ 	SUBC_STIB4 = 4,
+@@ -48,6 +50,8 @@ static void *diag204_buf;		/* 4K aligned
+ static void *diag204_buf_vmalloc;	/* vmalloc pointer for diag204 data */
+ static int diag204_buf_pages;		/* number of pages for diag204 data */
+ 
++static struct dentry *dbfs_d204_file;
++
+ /*
+  * DIAG 204 data structures and member access functions.
+  *
+@@ -365,18 +369,21 @@ static void diag204_free_buffer(void)
+ 	} else {
+ 		free_pages((unsigned long) diag204_buf, 0);
+ 	}
+-	diag204_buf_pages = 0;
+ 	diag204_buf = NULL;
+ }
+ 
++static void *page_align_ptr(void *ptr)
++{
++	return (void *) PAGE_ALIGN((unsigned long) ptr);
++}
++
+ static void *diag204_alloc_vbuf(int pages)
+ {
+ 	/* The buffer has to be page aligned! */
+ 	diag204_buf_vmalloc = vmalloc(PAGE_SIZE * (pages + 1));
+ 	if (!diag204_buf_vmalloc)
+ 		return ERR_PTR(-ENOMEM);
+-	diag204_buf = (void*)((unsigned long)diag204_buf_vmalloc
+-				& ~0xfffUL) + 0x1000;
++	diag204_buf = page_align_ptr(diag204_buf_vmalloc);
+ 	diag204_buf_pages = pages;
+ 	return diag204_buf;
+ }
+@@ -469,17 +476,26 @@ fail_alloc:
+ 	return rc;
+ }
+ 
++static int diag204_do_store(void *buf, int pages)
++{
++	int rc;
++
++	rc = diag204((unsigned long) diag204_store_sc |
++		     (unsigned long) diag204_info_type, pages, buf);
++	return rc < 0 ? -ENOSYS : 0;
++}
++
+ static void *diag204_store(void)
+ {
+ 	void *buf;
+-	int pages;
++	int pages, rc;
+ 
+ 	buf = diag204_get_buffer(diag204_info_type, &pages);
+ 	if (IS_ERR(buf))
+ 		goto out;
+-	if (diag204((unsigned long)diag204_store_sc |
+-		    (unsigned long)diag204_info_type, pages, buf) < 0)
+-		return ERR_PTR(-ENOSYS);
++	rc = diag204_do_store(buf, pages);
++	if (rc)
++		return ERR_PTR(rc);
+ out:
+ 	return buf;
+ }
+@@ -488,7 +504,7 @@ out:
+ 
+ static int diag224(void *ptr)
+ {
+-	int rc = -ENOTSUPP;
++	int rc = -EOPNOTSUPP;
+ 
+ 	asm volatile(
+ 		"	diag	%1,%2,0x224\n"
+@@ -507,7 +523,7 @@ static int diag224_get_name_table(void)
+ 		return -ENOMEM;
+ 	if (diag224(diag224_cpu_names)) {
+ 		kfree(diag224_cpu_names);
+-		return -ENOTSUPP;
++		return -EOPNOTSUPP;
+ 	}
+ 	EBCASC(diag224_cpu_names + 16, (*diag224_cpu_names + 1) * 16);
+ 	return 0;
+@@ -527,6 +543,50 @@ static int diag224_idx2name(int index, c
+ 	return 0;
+ }
+ 
++struct dbfs_d204_hdr {
++	u64	len;		/* Length of d204 buffer without header */
++	u16	version;	/* Version of header */
++	u8	sc;		/* Used subcode */
++	char	reserved[53];
++} __attribute__ ((packed));
++
++struct dbfs_d204 {
++	struct dbfs_d204_hdr	hdr;	/* 64 byte header */
++	char			buf[];	/* d204 buffer */
++} __attribute__ ((packed));
++
++static int dbfs_d204_create(void **data, void **data_free_ptr, size_t *size)
++{
++	struct dbfs_d204 *d204;
++	int rc, buf_size;
++	void *base;
++
++	buf_size = PAGE_SIZE * (diag204_buf_pages + 1) + sizeof(d204->hdr);
++	base = vmalloc(buf_size);
++	if (!base)
++		return -ENOMEM;
++	memset(base, 0, buf_size);
++	d204 = page_align_ptr(base + sizeof(d204->hdr)) - sizeof(d204->hdr);
++	rc = diag204_do_store(d204->buf, diag204_buf_pages);
++	if (rc) {
++		vfree(base);
++		return rc;
++	}
++	d204->hdr.version = DBFS_D204_HDR_VERSION;
++	d204->hdr.len = PAGE_SIZE * diag204_buf_pages;
++	d204->hdr.sc = diag204_store_sc;
++	*data = d204;
++	*data_free_ptr = base;
++	*size = d204->hdr.len + sizeof(struct dbfs_d204_hdr);
++	return 0;
++}
++
++static struct hypfs_dbfs_file dbfs_file_d204 = {
++	.name		= "diag_204",
++	.data_create	= dbfs_d204_create,
++	.data_free	= vfree,
++};
++
+ __init int hypfs_diag_init(void)
+ {
+ 	int rc;
+@@ -535,19 +595,29 @@ __init int hypfs_diag_init(void)
+ 		pr_err("The hardware system does not support hypfs\n");
+ 		return -ENODATA;
+ 	}
+-	rc = diag224_get_name_table();
+-	if (rc) {
+-		diag204_free_buffer();
+-		pr_err("The hardware system does not provide all "
+-		       "functions required by hypfs\n");
++	if (diag204_info_type == INFO_EXT) {
++		rc = hypfs_dbfs_create_file(&dbfs_file_d204);
++		if (rc)
++			return rc;
+ 	}
+-	return rc;
++	if (!MACHINE_IS_VM) {
++		rc = diag224_get_name_table();
++		if (rc) {
++			pr_err("The hardware system does not provide all "
++			       "functions required by hypfs\n");
++			debugfs_remove(dbfs_d204_file);
++			return rc;
++		}
++	}
++	return 0;
+ }
+ 
+ void hypfs_diag_exit(void)
+ {
++	debugfs_remove(dbfs_d204_file);
+ 	diag224_delete_name_table();
+ 	diag204_free_buffer();
++	hypfs_dbfs_remove_file(&dbfs_file_d204);
+ }
+ 
+ /*
+--- a/arch/s390/hypfs/hypfs_vm.c
++++ b/arch/s390/hypfs/hypfs_vm.c
+@@ -10,9 +10,11 @@
+ #include <linux/string.h>
+ #include <linux/vmalloc.h>
+ #include <asm/ebcdic.h>
++#include <asm/timex.h>
+ #include "hypfs.h"
+ 
+ #define NAME_LEN 8
++#define DBFS_D2FC_HDR_VERSION 0
+ 
+ static char local_guest[] = "        ";
+ static char all_guests[] = "*       ";
+@@ -76,28 +78,31 @@ static int diag2fc(int size, char* query
+ 		return -residual_cnt;
+ }
+ 
+-static struct diag2fc_data *diag2fc_store(char *query, int *count)
++/*
++ * Allocate buffer for "query" and store diag 2fc at "offset"
++ */
++static void *diag2fc_store(char *query, unsigned int *count, int offset)
+ {
++	void *data;
+ 	int size;
+-	struct diag2fc_data *data;
+ 
+ 	do {
+ 		size = diag2fc(0, query, NULL);
+ 		if (size < 0)
+ 			return ERR_PTR(-EACCES);
+-		data = vmalloc(size);
++		data = vmalloc(size + offset);
+ 		if (!data)
+ 			return ERR_PTR(-ENOMEM);
+-		if (diag2fc(size, query, data) == 0)
++		if (diag2fc(size, query, data + offset) == 0)
+ 			break;
+ 		vfree(data);
+ 	} while (1);
+-	*count = (size / sizeof(*data));
++	*count = (size / sizeof(struct diag2fc_data));
+ 
+ 	return data;
+ }
+ 
+-static void diag2fc_free(void *data)
++static void diag2fc_free(const void *data)
+ {
+ 	vfree(data);
+ }
+@@ -168,9 +173,10 @@ int hypfs_vm_create_files(struct super_b
+ {
+ 	struct dentry *dir, *file;
+ 	struct diag2fc_data *data;
+-	int rc, i, count = 0;
++	unsigned int count = 0;
++	int rc, i;
+ 
+-	data = diag2fc_store(guest_query, &count);
++	data = diag2fc_store(guest_query, &count, 0);
+ 	if (IS_ERR(data))
+ 		return PTR_ERR(data);
+ 
+@@ -218,14 +224,60 @@ failed:
+ 	return rc;
+ }
+ 
++struct dbfs_d2fc_hdr {
++	u64	len;		/* Length of d2fc buffer without header */
++	u16	version;	/* Version of header */
++	char	tod_ext[16];	/* TOD clock for d2fc */
++	u64	count;		/* Number of VM guests in d2fc buffer */
++	char	reserved[30];
++} __attribute__ ((packed));
++
++struct dbfs_d2fc {
++	struct dbfs_d2fc_hdr	hdr;	/* 64 byte header */
++	char			buf[];	/* d2fc buffer */
++} __attribute__ ((packed));
++
++static int dbfs_diag2fc_create(void **data, void **data_free_ptr, size_t *size)
++{
++	struct dbfs_d2fc *d2fc;
++	unsigned int count;
++
++	d2fc = diag2fc_store(guest_query, &count, sizeof(d2fc->hdr));
++	if (IS_ERR(d2fc))
++		return PTR_ERR(d2fc);
++	get_clock_ext(d2fc->hdr.tod_ext);
++	d2fc->hdr.len = count * sizeof(struct diag2fc_data);
++	d2fc->hdr.version = DBFS_D2FC_HDR_VERSION;
++	d2fc->hdr.count = count;
++	memset(&d2fc->hdr.reserved, 0, sizeof(d2fc->hdr.reserved));
++	*data = d2fc;
++	*data_free_ptr = d2fc;
++	*size = d2fc->hdr.len + sizeof(struct dbfs_d2fc_hdr);
++	return 0;
++}
++
++static struct hypfs_dbfs_file dbfs_file_2fc = {
++	.name		= "diag_2fc",
++	.data_create	= dbfs_diag2fc_create,
++	.data_free	= diag2fc_free,
++};
++
+ int hypfs_vm_init(void)
+ {
++	if (!MACHINE_IS_VM)
++		return 0;
+ 	if (diag2fc(0, all_guests, NULL) > 0)
+ 		guest_query = all_guests;
+ 	else if (diag2fc(0, local_guest, NULL) > 0)
+ 		guest_query = local_guest;
+ 	else
+ 		return -EACCES;
++	return hypfs_dbfs_create_file(&dbfs_file_2fc);
++}
+ 
+-	return 0;
++void hypfs_vm_exit(void)
++{
++	if (!MACHINE_IS_VM)
++		return;
++	hypfs_dbfs_remove_file(&dbfs_file_2fc);
+ }
+--- a/arch/s390/hypfs/inode.c
++++ b/arch/s390/hypfs/inode.c
+@@ -14,8 +14,8 @@
+ #include <linux/fs.h>
+ #include <linux/namei.h>
+ #include <linux/vfs.h>
++#include <linux/slab.h>
+ #include <linux/pagemap.h>
+-#include <linux/gfp.h>
+ #include <linux/time.h>
+ #include <linux/parser.h>
+ #include <linux/sysfs.h>
+@@ -145,7 +145,7 @@ static int hypfs_open(struct inode *inod
+ 		}
+ 		mutex_unlock(&fs_info->lock);
+ 	}
+-	return 0;
++	return nonseekable_open(inode, filp);
+ }
+ 
+ static ssize_t hypfs_aio_read(struct kiocb *iocb, const struct iovec *iov,
+@@ -288,46 +288,30 @@ static int hypfs_fill_super(struct super
+ 	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
+ 	sb->s_magic = HYPFS_MAGIC;
+ 	sb->s_op = &hypfs_s_ops;
+-	if (hypfs_parse_options(data, sb)) {
+-		rc = -EINVAL;
+-		goto err_alloc;
+-	}
++	if (hypfs_parse_options(data, sb))
++		return -EINVAL;
+ 	root_inode = hypfs_make_inode(sb, S_IFDIR | 0755);
+-	if (!root_inode) {
+-		rc = -ENOMEM;
+-		goto err_alloc;
+-	}
++	if (!root_inode)
++		return -ENOMEM;
+ 	root_inode->i_op = &simple_dir_inode_operations;
+ 	root_inode->i_fop = &simple_dir_operations;
+-	root_dentry = d_alloc_root(root_inode);
++	sb->s_root = root_dentry = d_alloc_root(root_inode);
+ 	if (!root_dentry) {
+ 		iput(root_inode);
+-		rc = -ENOMEM;
+-		goto err_alloc;
++		return -ENOMEM;
+ 	}
+ 	if (MACHINE_IS_VM)
+ 		rc = hypfs_vm_create_files(sb, root_dentry);
+ 	else
+ 		rc = hypfs_diag_create_files(sb, root_dentry);
+ 	if (rc)
+-		goto err_tree;
++		return rc;
+ 	sbi->update_file = hypfs_create_update_file(sb, root_dentry);
+-	if (IS_ERR(sbi->update_file)) {
+-		rc = PTR_ERR(sbi->update_file);
+-		goto err_tree;
+-	}
++	if (IS_ERR(sbi->update_file))
++		return PTR_ERR(sbi->update_file);
+ 	hypfs_update_update(sb);
+-	sb->s_root = root_dentry;
+ 	pr_info("Hypervisor filesystem mounted\n");
+ 	return 0;
+-
+-err_tree:
+-	hypfs_delete_tree(root_dentry);
+-	d_genocide(root_dentry);
+-	dput(root_dentry);
+-err_alloc:
+-	kfree(sbi);
+-	return rc;
+ }
+ 
+ static int hypfs_get_super(struct file_system_type *fst, int flags,
+@@ -340,12 +324,12 @@ static void hypfs_kill_super(struct supe
+ {
+ 	struct hypfs_sb_info *sb_info = sb->s_fs_info;
+ 
+-	if (sb->s_root) {
++	if (sb->s_root)
+ 		hypfs_delete_tree(sb->s_root);
++	if (sb_info->update_file)
+ 		hypfs_remove(sb_info->update_file);
+-		kfree(sb->s_fs_info);
+-		sb->s_fs_info = NULL;
+-	}
++	kfree(sb->s_fs_info);
++	sb->s_fs_info = NULL;
+ 	kill_litter_super(sb);
+ }
+ 
+@@ -484,20 +468,21 @@ static int __init hypfs_init(void)
+ {
+ 	int rc;
+ 
+-	if (MACHINE_IS_VM) {
+-		if (hypfs_vm_init())
+-			/* no diag 2fc, just exit */
+-			return -ENODATA;
+-	} else {
+-		if (hypfs_diag_init()) {
+-			rc = -ENODATA;
+-			goto fail_diag;
+-		}
++	rc = hypfs_dbfs_init();
++	if (rc)
++		return rc;
++	if (hypfs_diag_init()) {
++		rc = -ENODATA;
++		goto fail_dbfs_exit;
++	}
++	if (hypfs_vm_init()) {
++		rc = -ENODATA;
++		goto fail_hypfs_diag_exit;
+ 	}
+ 	s390_kobj = kobject_create_and_add("s390", hypervisor_kobj);
+ 	if (!s390_kobj) {
+ 		rc = -ENOMEM;
+-		goto fail_sysfs;
++		goto fail_hypfs_vm_exit;
+ 	}
+ 	rc = register_filesystem(&hypfs_type);
+ 	if (rc)
+@@ -506,18 +491,21 @@ static int __init hypfs_init(void)
+ 
+ fail_filesystem:
+ 	kobject_put(s390_kobj);
+-fail_sysfs:
+-	if (!MACHINE_IS_VM)
+-		hypfs_diag_exit();
+-fail_diag:
++fail_hypfs_vm_exit:
++	hypfs_vm_exit();
++fail_hypfs_diag_exit:
++	hypfs_diag_exit();
++fail_dbfs_exit:
++	hypfs_dbfs_exit();
+ 	pr_err("Initialization of hypfs failed with rc=%i\n", rc);
+ 	return rc;
+ }
+ 
+ static void __exit hypfs_exit(void)
+ {
+-	if (!MACHINE_IS_VM)
+-		hypfs_diag_exit();
++	hypfs_diag_exit();
++	hypfs_vm_exit();
++	hypfs_dbfs_exit();
+ 	unregister_filesystem(&hypfs_type);
+ 	kobject_put(s390_kobj);
+ }
+--- a/arch/s390/include/asm/timex.h
++++ b/arch/s390/include/asm/timex.h
+@@ -65,6 +65,11 @@ static inline unsigned long long get_clo
+ 	return clk;
+ }
+ 
++static inline void get_clock_ext(char *clk)
++{
++	asm volatile("stcke %0" : "=Q" (*clk) : : "cc");
++}
++
+ static inline unsigned long long get_clock_xt(void)
+ {
+ 	unsigned char clk[16];

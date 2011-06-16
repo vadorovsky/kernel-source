@@ -1,0 +1,382 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: kernel: Get CPC name.
+References: bnc#700080,LTC#69688,FATE#311920
+Patch-mainline: Yes
+
+Description: Provide sysfs attributes that contain the CPC name and the
+             HMC network name of the machine the operating system is
+             running on. This information is useful in high availability
+             configurations with multiple System z machines.
+
+Acked-by: John Jolly <jjolly@suse.de>
+---
+
+ drivers/s390/char/Makefile   |    2 
+ drivers/s390/char/sclp.h     |   24 +++++++
+ drivers/s390/char/sclp_ocf.c |  145 +++++++++++++++++++++++++++++++++++++++++++
+ drivers/s390/char/sclp_tty.c |  122 +++++++++++-------------------------
+ 4 files changed, 208 insertions(+), 85 deletions(-)
+
+--- a/drivers/s390/char/Makefile
++++ b/drivers/s390/char/Makefile
+@@ -3,7 +3,7 @@
+ #
+ 
+ obj-y += ctrlchar.o keyboard.o defkeymap.o sclp.o sclp_rw.o sclp_quiesce.o \
+-	 sclp_cmd.o sclp_config.o sclp_cpi_sys.o
++	 sclp_cmd.o sclp_config.o sclp_cpi_sys.o sclp_ocf.o
+ 
+ obj-$(CONFIG_TN3270) += raw3270.o
+ obj-$(CONFIG_TN3270_CONSOLE) += con3270.o
+--- a/drivers/s390/char/sclp.h
++++ b/drivers/s390/char/sclp.h
+@@ -28,6 +28,7 @@
+ #define EVTYP_CONFMGMDATA	0x04
+ #define EVTYP_SDIAS		0x1C
+ #define EVTYP_ASYNC		0x0A
++#define EVTYP_OCF		0x1E
+ 
+ #define EVTYP_OPCMD_MASK	0x80000000
+ #define EVTYP_MSG_MASK		0x40000000
+@@ -40,6 +41,7 @@
+ #define EVTYP_CONFMGMDATA_MASK	0x10000000
+ #define EVTYP_SDIAS_MASK	0x00000010
+ #define EVTYP_ASYNC_MASK	0x00400000
++#define EVTYP_OCF_MASK		0x00000004
+ 
+ #define GNRLMSGFLGS_DOM		0x8000
+ #define GNRLMSGFLGS_SNDALRM	0x4000
+@@ -186,4 +188,26 @@ sclp_ascebc_str(unsigned char *str, int
+ 	(MACHINE_IS_VM) ? ASCEBC(str, nr) : ASCEBC_500(str, nr);
+ }
+ 
++static inline struct gds_vector *
++sclp_find_gds_vector(void *start, void *end, u16 id)
++{
++	struct gds_vector *v;
++
++	for (v = start; (void *) v < end; v = (void *) v + v->length)
++		if (v->gds_id == id)
++			return v;
++	return NULL;
++}
++
++static inline struct gds_subvector *
++sclp_find_gds_subvector(void *start, void *end, u8 key)
++{
++	struct gds_subvector *sv;
++
++	for (sv = start; (void *) sv < end; sv = (void *) sv + sv->length)
++		if (sv->key == key)
++			return sv;
++	return NULL;
++}
++
+ #endif	 /* __SCLP_H__ */
+--- /dev/null
++++ b/drivers/s390/char/sclp_ocf.c
+@@ -0,0 +1,145 @@
++/*
++ *  drivers/s390/char/sclp_ocf.c
++ *    SCLP OCF communication parameters sysfs interface
++ *
++ *    Copyright IBM Corp. 2011
++ *    Author(s): Martin Schwidefsky <schwidefsky@de.ibm.com>
++ */
++
++#define KMSG_COMPONENT "sclp_ocf"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/stat.h>
++#include <linux/device.h>
++#include <linux/string.h>
++#include <linux/ctype.h>
++#include <linux/kmod.h>
++#include <linux/timer.h>
++#include <linux/err.h>
++#include <asm/ebcdic.h>
++#include <asm/sclp.h>
++
++#include "sclp.h"
++
++#define OCF_LENGTH_HMC_NETWORK 8UL
++#define OCF_LENGTH_CPC_NAME 8UL
++
++static char hmc_network[OCF_LENGTH_HMC_NETWORK + 1];
++static char cpc_name[OCF_LENGTH_CPC_NAME + 1];
++
++static DEFINE_SPINLOCK(sclp_ocf_lock);
++static struct work_struct sclp_ocf_change_work;
++
++static struct kset *ocf_kset;
++
++static void sclp_ocf_change_notify(struct work_struct *work)
++{
++	kobject_uevent(&ocf_kset->kobj, KOBJ_CHANGE);
++}
++
++/* Handler for OCF event. Look for the CPC image name. */
++static void sclp_ocf_handler(struct evbuf_header *evbuf)
++{
++	struct gds_vector *v;
++	struct gds_subvector *sv, *netid, *cpc;
++	size_t size;
++
++	/* Find the 0x9f00 block. */
++	v = sclp_find_gds_vector(evbuf + 1, (void *) evbuf + evbuf->length,
++				 0x9f00);
++	if (!v)
++		return;
++	/* Find the 0x9f22 block inside the 0x9f00 block. */
++	v = sclp_find_gds_vector(v + 1, (void *) v + v->length, 0x9f22);
++	if (!v)
++		return;
++	/* Find the 0x81 block inside the 0x9f22 block. */
++	sv = sclp_find_gds_subvector(v + 1, (void *) v + v->length, 0x81);
++	if (!sv)
++		return;
++	/* Find the 0x01 block inside the 0x81 block. */
++	netid = sclp_find_gds_subvector(sv + 1, (void *) sv + sv->length, 1);
++	/* Find the 0x02 block inside the 0x81 block. */
++	cpc = sclp_find_gds_subvector(sv + 1, (void *) sv + sv->length, 2);
++	/* Copy network name and cpc name. */
++	spin_lock(&sclp_ocf_lock);
++	if (netid) {
++		size = min(OCF_LENGTH_HMC_NETWORK, (size_t) netid->length);
++		memcpy(hmc_network, netid + 1, size);
++		EBCASC(hmc_network, size);
++		hmc_network[size] = 0;
++	}
++	if (cpc) {
++		size = min(OCF_LENGTH_CPC_NAME, (size_t) cpc->length);
++		memcpy(cpc_name, cpc + 1, size);
++		EBCASC(cpc_name, size);
++		cpc_name[size] = 0;
++	}
++	spin_unlock(&sclp_ocf_lock);
++	schedule_work(&sclp_ocf_change_work);
++}
++
++static struct sclp_register sclp_ocf_event = {
++	.receive_mask = EVTYP_OCF_MASK,
++	.receiver_fn = sclp_ocf_handler,
++};
++
++static ssize_t cpc_name_show(struct kobject *kobj,
++			     struct kobj_attribute *attr, char *page)
++{
++	int rc;
++
++	spin_lock_irq(&sclp_ocf_lock);
++	rc = snprintf(page, PAGE_SIZE, "%s\n", cpc_name);
++	spin_unlock_irq(&sclp_ocf_lock);
++	return rc;
++}
++
++static struct kobj_attribute cpc_name_attr =
++	__ATTR(cpc_name, 0444, cpc_name_show, NULL);
++
++static ssize_t hmc_network_show(struct kobject *kobj,
++				struct kobj_attribute *attr, char *page)
++{
++	int rc;
++
++	spin_lock_irq(&sclp_ocf_lock);
++	rc = snprintf(page, PAGE_SIZE, "%s\n", hmc_network);
++	spin_unlock_irq(&sclp_ocf_lock);
++	return rc;
++}
++
++static struct kobj_attribute hmc_network_attr =
++	__ATTR(hmc_network, 0444, hmc_network_show, NULL);
++
++static struct attribute *ocf_attrs[] = {
++	&cpc_name_attr.attr,
++	&hmc_network_attr.attr,
++	NULL,
++};
++
++static struct attribute_group ocf_attr_group = {
++	.attrs = ocf_attrs,
++};
++
++static int __init ocf_init(void)
++{
++	int rc;
++
++	INIT_WORK(&sclp_ocf_change_work, sclp_ocf_change_notify);
++	ocf_kset = kset_create_and_add("ocf", NULL, firmware_kobj);
++	if (!ocf_kset)
++		return -ENOMEM;
++
++	rc = sysfs_create_group(&ocf_kset->kobj, &ocf_attr_group);
++	if (rc) {
++		kset_unregister(ocf_kset);
++		return rc;
++	}
++
++	return sclp_register(&sclp_ocf_event);
++}
++
++device_initcall(ocf_init);
+--- a/drivers/s390/char/sclp_tty.c
++++ b/drivers/s390/char/sclp_tty.c
+@@ -408,118 +408,72 @@ static int sclp_switch_cases(unsigned ch
+ 	return op - buf;
+ }
+ 
+-static void
+-sclp_get_input(unsigned char *start, unsigned char *end)
++static void sclp_get_input(struct gds_subvector *sv)
+ {
++	unsigned char *str;
+ 	int count;
+ 
+-	count = end - start;
++	str = (unsigned char *) (sv + 1);
++	count = sv->length - sizeof(*sv);
+ 	if (sclp_tty_tolower)
+-		EBC_TOLOWER(start, count);
+-	count = sclp_switch_cases(start, count);
++		EBC_TOLOWER(str, count);
++	count = sclp_switch_cases(str, count);
+ 	/* convert EBCDIC to ASCII (modify original input in SCCB) */
+-	sclp_ebcasc_str(start, count);
++	sclp_ebcasc_str(str, count);
+ 
+ 	/* transfer input to high level driver */
+-	sclp_tty_input(start, count);
+-}
+-
+-static inline struct gds_vector *
+-find_gds_vector(struct gds_vector *start, struct gds_vector *end, u16 id)
+-{
+-	struct gds_vector *vec;
+-
+-	for (vec = start; vec < end; vec = (void *) vec + vec->length)
+-		if (vec->gds_id == id)
+-			return vec;
+-	return NULL;
++	sclp_tty_input(str, count);
+ }
+ 
+-static inline struct gds_subvector *
+-find_gds_subvector(struct gds_subvector *start,
+-		   struct gds_subvector *end, u8 key)
++static inline void sclp_eval_selfdeftextmsg(struct gds_subvector *sv)
+ {
+-	struct gds_subvector *subvec;
++	void *end;
+ 
+-	for (subvec = start; subvec < end;
+-	     subvec = (void *) subvec + subvec->length)
+-		if (subvec->key == key)
+-			return subvec;
+-	return NULL;
++	end = (void *) sv + sv->length;
++	for (sv = sv + 1; (void *) sv < end; sv = (void *) sv + sv->length)
++		if (sv->key == 0x30)
++			sclp_get_input(sv);
+ }
+ 
+-static inline void
+-sclp_eval_selfdeftextmsg(struct gds_subvector *start,
+-			 struct gds_subvector *end)
++static inline void sclp_eval_textcmd(struct gds_vector *v)
+ {
+-	struct gds_subvector *subvec;
++	struct gds_subvector *sv;
++	void *end;
+ 
+-	subvec = start;
+-	while (subvec < end) {
+-		subvec = find_gds_subvector(subvec, end, 0x30);
+-		if (!subvec)
+-			break;
+-		sclp_get_input((unsigned char *)(subvec + 1),
+-			       (unsigned char *) subvec + subvec->length);
+-		subvec = (void *) subvec + subvec->length;
+-	}
+-}
+-
+-static inline void
+-sclp_eval_textcmd(struct gds_subvector *start,
+-		  struct gds_subvector *end)
+-{
+-	struct gds_subvector *subvec;
++	end = (void *) v + v->length;
++	for (sv = (struct gds_subvector *) (v + 1);
++	     (void *) sv < end; sv = (void *) sv + sv->length)
++		if (sv->key == GDS_KEY_SELFDEFTEXTMSG)
++			sclp_eval_selfdeftextmsg(sv);
+ 
+-	subvec = start;
+-	while (subvec < end) {
+-		subvec = find_gds_subvector(subvec, end,
+-					    GDS_KEY_SELFDEFTEXTMSG);
+-		if (!subvec)
+-			break;
+-		sclp_eval_selfdeftextmsg((struct gds_subvector *)(subvec + 1),
+-					 (void *)subvec + subvec->length);
+-		subvec = (void *) subvec + subvec->length;
+-	}
+ }
+ 
+-static inline void
+-sclp_eval_cpmsu(struct gds_vector *start, struct gds_vector *end)
++static inline void sclp_eval_cpmsu(struct gds_vector *v)
+ {
+-	struct gds_vector *vec;
++	void *end;
+ 
+-	vec = start;
+-	while (vec < end) {
+-		vec = find_gds_vector(vec, end, GDS_ID_TEXTCMD);
+-		if (!vec)
+-			break;
+-		sclp_eval_textcmd((struct gds_subvector *)(vec + 1),
+-				  (void *) vec + vec->length);
+-		vec = (void *) vec + vec->length;
+-	}
++	end = (void *) v + v->length;
++	for (v = v + 1; (void *) v < end; v = (void *) v + v->length)
++		if (v->gds_id == GDS_ID_TEXTCMD)
++			sclp_eval_textcmd(v);
+ }
+ 
+ 
+-static inline void
+-sclp_eval_mdsmu(struct gds_vector *start, void *end)
++static inline void sclp_eval_mdsmu(struct gds_vector *v)
+ {
+-	struct gds_vector *vec;
+-
+-	vec = find_gds_vector(start, end, GDS_ID_CPMSU);
+-	if (vec)
+-		sclp_eval_cpmsu(vec + 1, (void *) vec + vec->length);
++	v = sclp_find_gds_vector(v + 1, (void *) v + v->length, GDS_ID_CPMSU);
++	if (v)
++		sclp_eval_cpmsu(v);
+ }
+ 
+-static void
+-sclp_tty_receiver(struct evbuf_header *evbuf)
++static void sclp_tty_receiver(struct evbuf_header *evbuf)
+ {
+-	struct gds_vector *start, *end, *vec;
++	struct gds_vector *v;
+ 
+-	start = (struct gds_vector *)(evbuf + 1);
+-	end = (void *) evbuf + evbuf->length;
+-	vec = find_gds_vector(start, end, GDS_ID_MDSMU);
+-	if (vec)
+-		sclp_eval_mdsmu(vec + 1, (void *) vec + vec->length);
++	v = sclp_find_gds_vector(evbuf + 1, (void *) evbuf + evbuf->length,
++				 GDS_ID_MDSMU);
++	if (v)
++		sclp_eval_mdsmu(v);
+ }
+ 
+ static void

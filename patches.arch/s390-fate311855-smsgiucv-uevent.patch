@@ -1,0 +1,428 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: smsgiucv_app: deliver z/VM CP special messages as uevents
+References: bnc#700080,LTC#69456,FATE#311855
+Patch-mainline: Yes
+
+Description: The smsgiucv_app kernel device driver receives z/VM CP
+	     special messages (SMSG) and delivers these messages to
+	     user space as udev events (uevents).  The device driver
+	     only receives messages starting with "APP".
+	     The generated uevents contain the message sender and content
+	     as environment variables.  You can create udev rules to match
+	     specific special messages, for example, to start Linux commands.
+
+	     The patch includes these upstream commits:
+
+	     09003ed [S390] smsgiucv: declare char pointers as "const"
+	     1ffaa64 [S390] smsgiucv_app: deliver z/VM CP special messages
+	     41b4287 [S390] cmm, smsgiucv_app: convert sender to uppercase
+	     a20852d [S390] cmm: fix crash on case conversion
+	     59b60e9 smsgiucv: guarantee single iucv connect in thaw
+
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ arch/s390/mm/cmm.c              |   16 ++
+ drivers/s390/net/Kconfig        |   10 +
+ drivers/s390/net/Makefile       |    1 
+ drivers/s390/net/smsgiucv.c     |   26 +++-
+ drivers/s390/net/smsgiucv.h     |    8 +
+ drivers/s390/net/smsgiucv_app.c |  218 ++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 266 insertions(+), 13 deletions(-)
+
+--- a/arch/s390/mm/cmm.c
++++ b/arch/s390/mm/cmm.c
+@@ -24,7 +24,10 @@
+ #include <asm/uaccess.h>
+ #include <asm/diag.h>
+ 
+-static char *sender = "VMRMSVM";
++#ifdef CONFIG_CMM_IUCV
++static char *cmm_default_sender = "VMRMSVM";
++#endif
++static char *sender;
+ module_param(sender, charp, 0400);
+ MODULE_PARM_DESC(sender,
+ 		 "Guest name that may send SMSG messages (default VMRMSVM)");
+@@ -375,7 +378,7 @@ static struct ctl_table cmm_dir_table[]
+ #ifdef CONFIG_CMM_IUCV
+ #define SMSG_PREFIX "CMM"
+ static void
+-cmm_smsg_target(char *from, char *msg)
++cmm_smsg_target(const char *from, char *msg)
+ {
+ 	long nr, seconds;
+ 
+@@ -456,6 +459,15 @@ cmm_init (void)
+ 		goto out_sysctl;
+ #endif
+ #ifdef CONFIG_CMM_IUCV
++	/* convert sender to uppercase characters */
++	if (sender) {
++		int len = strlen(sender);
++		while (len--)
++			sender[len] = toupper(sender[len]);
++	} else {
++		sender = cmm_default_sender;
++	}
++
+ 	rc = smsg_register_callback(SMSG_PREFIX, cmm_smsg_target);
+ 	if (rc < 0)
+ 		goto out_smsg;
+--- a/drivers/s390/net/Kconfig
++++ b/drivers/s390/net/Kconfig
+@@ -43,6 +43,16 @@ config SMSGIUCV
+ 	  Select this option if you want to be able to receive SMSG messages
+ 	  from other VM guest systems.
+ 
++config SMSGIUCV_EVENT
++	tristate "Deliver IUCV special messages as uevents (VM only)"
++	depends on SMSGIUCV
++	help
++	  Select this option to deliver CP special messages (SMSGs) as
++	  uevents.  The driver handles only those special messages that
++	  start with "APP".
++
++	  To compile as a module, choose M. The module name is "smsgiucv_app".
++
+ config CLAW
+ 	tristate "CLAW device support"
+ 	depends on CCW && NETDEVICES
+--- a/drivers/s390/net/Makefile
++++ b/drivers/s390/net/Makefile
+@@ -6,6 +6,7 @@ ctcm-y += ctcm_main.o ctcm_fsms.o ctcm_m
+ obj-$(CONFIG_CTCM) += ctcm.o fsm.o cu3088.o
+ obj-$(CONFIG_NETIUCV) += netiucv.o fsm.o
+ obj-$(CONFIG_SMSGIUCV) += smsgiucv.o
++obj-$(CONFIG_SMSGIUCV_EVENT) += smsgiucv_app.o
+ obj-$(CONFIG_LCS) += lcs.o cu3088.o
+ obj-$(CONFIG_CLAW) += claw.o cu3088.o
+ qeth-y += qeth_core_sys.o qeth_core_main.o qeth_core_mpc.o
+--- a/drivers/s390/net/smsgiucv.c
++++ b/drivers/s390/net/smsgiucv.c
+@@ -31,9 +31,9 @@
+ 
+ struct smsg_callback {
+ 	struct list_head list;
+-	char *prefix;
++	const char *prefix;
+ 	int len;
+-	void (*callback)(char *from, char *str);
++	void (*callback)(const char *from, char *str);
+ };
+ 
+ MODULE_AUTHOR
+@@ -46,6 +46,7 @@ static struct device *smsg_dev;
+ 
+ static DEFINE_SPINLOCK(smsg_list_lock);
+ static LIST_HEAD(smsg_list);
++static int iucv_path_connected;
+ 
+ static int smsg_path_pending(struct iucv_path *, u8 ipvmid[8], u8 ipuser[16]);
+ static void smsg_message_pending(struct iucv_path *, struct iucv_message *);
+@@ -100,8 +101,8 @@ static void smsg_message_pending(struct
+ 	kfree(buffer);
+ }
+ 
+-int smsg_register_callback(char *prefix,
+-			   void (*callback)(char *from, char *str))
++int smsg_register_callback(const char *prefix,
++			   void (*callback)(const char *from, char *str))
+ {
+ 	struct smsg_callback *cb;
+ 
+@@ -117,8 +118,9 @@ int smsg_register_callback(char *prefix,
+ 	return 0;
+ }
+ 
+-void smsg_unregister_callback(char *prefix,
+-			      void (*callback)(char *from, char *str))
++void smsg_unregister_callback(const char *prefix,
++			      void (*callback)(const char *from,
++					       char *str))
+ {
+ 	struct smsg_callback *cb, *tmp;
+ 
+@@ -140,8 +142,10 @@ static int smsg_pm_freeze(struct device
+ #ifdef CONFIG_PM_DEBUG
+ 	printk(KERN_WARNING "smsg_pm_freeze\n");
+ #endif
+-	if (smsg_path)
++	if (smsg_path && iucv_path_connected) {
+ 		iucv_path_sever(smsg_path, NULL);
++		iucv_path_connected = 0;
++	}
+ 	return 0;
+ }
+ 
+@@ -152,7 +156,7 @@ static int smsg_pm_restore_thaw(struct d
+ #ifdef CONFIG_PM_DEBUG
+ 	printk(KERN_WARNING "smsg_pm_restore_thaw\n");
+ #endif
+-	if (smsg_path) {
++	if (smsg_path && iucv_path_connected) {
+ 		memset(smsg_path, 0, sizeof(*smsg_path));
+ 		smsg_path->msglim = 255;
+ 		smsg_path->flags = 0;
+@@ -163,6 +167,8 @@ static int smsg_pm_restore_thaw(struct d
+ 			printk(KERN_ERR
+ 			       "iucv_path_connect returned with rc %i\n", rc);
+ #endif
++		if (!rc)
++			iucv_path_connected = 1;
+ 		cpcmd("SET SMSG IUCV", NULL, 0, NULL);
+ 	}
+ 	return 0;
+@@ -176,7 +182,7 @@ static struct dev_pm_ops smsg_pm_ops = {
+ 
+ static struct device_driver smsg_driver = {
+ 	.owner = THIS_MODULE,
+-	.name = "SMSGIUCV",
++	.name = SMSGIUCV_DRV_NAME,
+ 	.bus  = &iucv_bus,
+ 	.pm = &smsg_pm_ops,
+ };
+@@ -212,6 +218,8 @@ static int __init smsg_init(void)
+ 			       NULL, NULL, NULL);
+ 	if (rc)
+ 		goto out_free_path;
++	else
++		iucv_path_connected = 1;
+ 	smsg_dev = kzalloc(sizeof(struct device), GFP_KERNEL);
+ 	if (!smsg_dev) {
+ 		rc = -ENOMEM;
+--- a/drivers/s390/net/smsgiucv.h
++++ b/drivers/s390/net/smsgiucv.h
+@@ -5,6 +5,10 @@
+  * Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com)
+  */
+ 
+-int  smsg_register_callback(char *, void (*)(char *, char *));
+-void smsg_unregister_callback(char *, void (*)(char *, char *));
++#define SMSGIUCV_DRV_NAME     "SMSGIUCV"
++
++int  smsg_register_callback(const char *,
++			    void (*)(const char *, char *));
++void smsg_unregister_callback(const char *,
++			      void (*)(const char *, char *));
+ 
+--- /dev/null
++++ b/drivers/s390/net/smsgiucv_app.c
+@@ -0,0 +1,218 @@
++/*
++ * Deliver z/VM CP special messages (SMSG) as uevents.
++ *
++ * The driver registers for z/VM CP special messages with the
++ * "APP" prefix. Incoming messages are delivered to user space
++ * as uevents.
++ *
++ * Copyright IBM Corp. 2010
++ * Author(s): Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
++ *
++ */
++#define KMSG_COMPONENT		"smsgiucv_app"
++#define pr_fmt(fmt)		KMSG_COMPONENT ": " fmt
++
++#include <linux/ctype.h>
++#include <linux/err.h>
++#include <linux/device.h>
++#include <linux/list.h>
++#include <linux/kobject.h>
++#include <linux/module.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
++#include <net/iucv/iucv.h>
++#include "smsgiucv.h"
++
++/* prefix used for SMSG registration */
++#define SMSG_PREFIX		"APP"
++
++/* SMSG related uevent environment variables */
++#define ENV_SENDER_STR		"SMSG_SENDER="
++#define ENV_SENDER_LEN		(strlen(ENV_SENDER_STR) + 8 + 1)
++#define ENV_PREFIX_STR		"SMSG_ID="
++#define ENV_PREFIX_LEN		(strlen(ENV_PREFIX_STR) + \
++				 strlen(SMSG_PREFIX) + 1)
++#define ENV_TEXT_STR		"SMSG_TEXT="
++#define ENV_TEXT_LEN(msg)	(strlen(ENV_TEXT_STR) + strlen((msg)) + 1)
++
++/* z/VM user ID which is permitted to send SMSGs
++ * If the value is undefined or empty (""), special messages are
++ * accepted from any z/VM user ID. */
++static char *sender;
++module_param(sender, charp, 0400);
++MODULE_PARM_DESC(sender, "z/VM user ID from which CP SMSGs are accepted");
++
++/* SMSG device representation */
++static struct device *smsg_app_dev;
++
++/* list element for queuing received messages for delivery */
++struct smsg_app_event {
++	struct list_head list;
++	char *buf;
++	char *envp[4];
++};
++
++/* queue for outgoing uevents */
++static LIST_HEAD(smsg_event_queue);
++static DEFINE_SPINLOCK(smsg_event_queue_lock);
++
++static void smsg_app_event_free(struct smsg_app_event *ev)
++{
++	kfree(ev->buf);
++	kfree(ev);
++}
++
++static struct smsg_app_event *smsg_app_event_alloc(const char *from,
++						   const char *msg)
++{
++	struct smsg_app_event *ev;
++
++	ev = kzalloc(sizeof(*ev), GFP_ATOMIC);
++	if (!ev)
++		return NULL;
++
++	ev->buf = kzalloc(ENV_SENDER_LEN + ENV_PREFIX_LEN +
++			  ENV_TEXT_LEN(msg), GFP_ATOMIC);
++	if (!ev->buf) {
++		kfree(ev);
++		return NULL;
++	}
++
++	/* setting up environment pointers into buf */
++	ev->envp[0] = ev->buf;
++	ev->envp[1] = ev->envp[0] + ENV_SENDER_LEN;
++	ev->envp[2] = ev->envp[1] + ENV_PREFIX_LEN;
++	ev->envp[3] = NULL;
++
++	/* setting up environment: sender, prefix name, and message text */
++	snprintf(ev->envp[0], ENV_SENDER_LEN, ENV_SENDER_STR "%s", from);
++	snprintf(ev->envp[1], ENV_PREFIX_LEN, ENV_PREFIX_STR "%s", SMSG_PREFIX);
++	snprintf(ev->envp[2], ENV_TEXT_LEN(msg), ENV_TEXT_STR "%s", msg);
++
++	return ev;
++}
++
++static void smsg_event_work_fn(struct work_struct *work)
++{
++	LIST_HEAD(event_queue);
++	struct smsg_app_event *p, *n;
++	struct device *dev;
++
++	dev = get_device(smsg_app_dev);
++	if (!dev)
++		return;
++
++	spin_lock_bh(&smsg_event_queue_lock);
++	list_splice_init(&smsg_event_queue, &event_queue);
++	spin_unlock_bh(&smsg_event_queue_lock);
++
++	list_for_each_entry_safe(p, n, &event_queue, list) {
++		list_del(&p->list);
++		kobject_uevent_env(&dev->kobj, KOBJ_CHANGE, p->envp);
++		smsg_app_event_free(p);
++	}
++
++	put_device(dev);
++}
++static DECLARE_WORK(smsg_event_work, smsg_event_work_fn);
++
++static void smsg_app_callback(const char *from, char *msg)
++{
++	struct smsg_app_event *se;
++
++	/* check if the originating z/VM user ID matches
++	 * the configured sender. */
++	if (sender && strlen(sender) > 0 && strcmp(from, sender) != 0)
++		return;
++
++	/* get start of message text (skip prefix and leading blanks) */
++	msg += strlen(SMSG_PREFIX);
++	while (*msg && isspace(*msg))
++		msg++;
++	if (*msg == '\0')
++		return;
++
++	/* allocate event list element and its environment */
++	se = smsg_app_event_alloc(from, msg);
++	if (!se)
++		return;
++
++	/* queue event and schedule work function */
++	spin_lock(&smsg_event_queue_lock);
++	list_add_tail(&se->list, &smsg_event_queue);
++	spin_unlock(&smsg_event_queue_lock);
++
++	schedule_work(&smsg_event_work);
++	return;
++}
++
++static int __init smsgiucv_app_init(void)
++{
++	struct device_driver *smsgiucv_drv;
++	int rc;
++
++	if (!MACHINE_IS_VM)
++		return -ENODEV;
++
++	smsg_app_dev = kzalloc(sizeof(*smsg_app_dev), GFP_KERNEL);
++	if (!smsg_app_dev)
++		return -ENOMEM;
++
++	smsgiucv_drv = driver_find(SMSGIUCV_DRV_NAME, &iucv_bus);
++	if (!smsgiucv_drv) {
++		kfree(smsg_app_dev);
++		return -ENODEV;
++	}
++
++	rc = dev_set_name(smsg_app_dev, KMSG_COMPONENT);
++	if (rc) {
++		kfree(smsg_app_dev);
++		goto fail_put_driver;
++	}
++	smsg_app_dev->bus = &iucv_bus;
++	smsg_app_dev->parent = iucv_root;
++	smsg_app_dev->release = (void (*)(struct device *)) kfree;
++	smsg_app_dev->driver = smsgiucv_drv;
++	rc = device_register(smsg_app_dev);
++	if (rc) {
++		put_device(smsg_app_dev);
++		goto fail_put_driver;
++	}
++
++	/* convert sender to uppercase characters */
++	if (sender) {
++		int len = strlen(sender);
++		while (len--)
++			sender[len] = toupper(sender[len]);
++	}
++
++	/* register with the smsgiucv device driver */
++	rc = smsg_register_callback(SMSG_PREFIX, smsg_app_callback);
++	if (rc) {
++		device_unregister(smsg_app_dev);
++		goto fail_put_driver;
++	}
++
++	rc = 0;
++fail_put_driver:
++	put_driver(smsgiucv_drv);
++	return rc;
++}
++module_init(smsgiucv_app_init);
++
++static void __exit smsgiucv_app_exit(void)
++{
++	/* unregister callback */
++	smsg_unregister_callback(SMSG_PREFIX, smsg_app_callback);
++
++	/* cancel pending work and flush any queued event work */
++	cancel_work_sync(&smsg_event_work);
++	smsg_event_work_fn(&smsg_event_work);
++
++	device_unregister(smsg_app_dev);
++}
++module_exit(smsgiucv_app_exit);
++
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("Deliver z/VM CP SMSG as uevents");
++MODULE_AUTHOR("Hendrik Brueckner <brueckner@linux.vnet.ibm.com>");

@@ -1,0 +1,275 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: dasd: add dynamic PAV toleration
+References: bnc#700080,LTC#69441,FATE#311760
+Patch-mainline: Yes
+
+Description: For base Parallel Access Volume (PAV) there is a fixed mapping of
+	     base and alias devices. With dynamic PAV this mapping can be 
+	     changed so that an alias device is used with another base device.
+	     This patch enables the DASD device driver to tolerate dynamic PAV
+	     changes.
+
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/block/dasd.c          |   22 +++++++++++
+ drivers/s390/block/dasd_3990_erp.c |   20 ++++++++++
+ drivers/s390/block/dasd_alias.c    |    8 ++++
+ drivers/s390/block/dasd_eckd.c     |   68 +++++++++++++++++++++++++++++++++++--
+ drivers/s390/block/dasd_eckd.h     |    2 -
+ drivers/s390/block/dasd_int.h      |    5 ++
+ 6 files changed, 122 insertions(+), 3 deletions(-)
+
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -65,6 +65,7 @@ static void dasd_device_tasklet(struct d
+ static void dasd_block_tasklet(struct dasd_block *);
+ static void do_kick_device(struct work_struct *);
+ static void do_restore_device(struct work_struct *);
++static void do_reload_device(struct work_struct *);
+ static void dasd_return_cqr_cb(struct dasd_ccw_req *, void *);
+ static void dasd_device_timeout(unsigned long);
+ static void dasd_block_timeout(unsigned long);
+@@ -114,6 +115,7 @@ struct dasd_device *dasd_alloc_device(vo
+ 	device->timer.data = (unsigned long) device;
+ 	INIT_WORK(&device->kick_work, do_kick_device);
+ 	INIT_WORK(&device->restore_device, do_restore_device);
++	INIT_WORK(&device->reload_device, do_reload_device);
+ 	device->state = DASD_STATE_NEW;
+ 	device->target = DASD_STATE_NEW;
+ 	mutex_init(&device->state_mutex);
+@@ -520,6 +522,26 @@ void dasd_kick_device(struct dasd_device
+ }
+ 
+ /*
++ * dasd_reload_device will schedule a call do do_reload_device to the kernel
++ * event daemon.
++ */
++static void do_reload_device(struct work_struct *work)
++{
++	struct dasd_device *device = container_of(work, struct dasd_device,
++						  reload_device);
++	device->discipline->reload(device);
++	dasd_put_device(device);
++}
++
++void dasd_reload_device(struct dasd_device *device)
++{
++	dasd_get_device(device);
++	/* queue call to dasd_reload_device to the kernel event daemon. */
++	schedule_work(&device->reload_device);
++}
++EXPORT_SYMBOL(dasd_reload_device);
++
++/*
+  * dasd_restore_device will schedule a call do do_restore_device to the kernel
+  * event daemon.
+  */
+--- a/drivers/s390/block/dasd_3990_erp.c
++++ b/drivers/s390/block/dasd_3990_erp.c
+@@ -1403,9 +1403,29 @@ static struct dasd_ccw_req *dasd_3990_er
+ 						struct dasd_ccw_req *erp)
+ {
+ 	struct dasd_ccw_req *cqr = erp->refers;
++	char *sense;
+ 
+ 	if (cqr->block &&
+ 	    (cqr->block->base != cqr->startdev)) {
++
++		sense = dasd_get_sense(&erp->refers->irb);
++		/*
++		 * dynamic pav may have changed base alias mapping
++		 */
++		if (!test_bit(DASD_FLAG_OFFLINE, &cqr->startdev->flags) && sense
++		    && (sense[0] == 0x10) && (sense[7] == 0x0F)
++		    && (sense[8] == 0x67)) {
++			/*
++			 * remove device from alias handling to prevent new
++			 * requests from being scheduled on the
++			 * wrong alias device
++			 */
++			dasd_alias_remove_device(cqr->startdev);
++
++			/* schedule worker to reload device */
++			dasd_reload_device(cqr->startdev);
++		}
++
+ 		if (cqr->startdev->features & DASD_FEATURE_ERPLOG) {
+ 			DBF_DEV_EVENT(DBF_ERR, cqr->startdev,
+ 				    "ERP on alias device for request %p,"
+--- a/drivers/s390/block/dasd_alias.c
++++ b/drivers/s390/block/dasd_alias.c
+@@ -666,6 +666,14 @@ int dasd_alias_add_device(struct dasd_de
+ 	return rc;
+ }
+ 
++int dasd_alias_update_add_device(struct dasd_device *device)
++{
++	struct dasd_eckd_private *private;
++	private = (struct dasd_eckd_private *) device->private;
++	private->lcu->flags |= UPDATE_PENDING;
++	return dasd_alias_add_device(device);
++}
++
+ int dasd_alias_remove_device(struct dasd_device *device)
+ {
+ 	struct dasd_eckd_private *private;
+--- a/drivers/s390/block/dasd_eckd.c
++++ b/drivers/s390/block/dasd_eckd.c
+@@ -1434,6 +1434,7 @@ static int dasd_eckd_ready_to_online(str
+ 
+ static int dasd_eckd_online_to_ready(struct dasd_device *device)
+ {
++	cancel_work_sync(&device->reload_device);
+ 	return dasd_alias_remove_device(device);
+ };
+ 
+@@ -1693,10 +1694,27 @@ static void dasd_eckd_handle_unsolicited
+ {
+ 	char mask;
+ 	char *sense = NULL;
++	struct dasd_eckd_private *private;
+ 
++	private = (struct dasd_eckd_private *) device->private;
+ 	/* first of all check for state change pending interrupt */
+ 	mask = DEV_STAT_ATTENTION | DEV_STAT_DEV_END | DEV_STAT_UNIT_EXCEP;
+ 	if ((scsw_dstat(&irb->scsw) & mask) == mask) {
++		/* for alias only and not in offline processing*/
++		if (!device->block && private->lcu &&
++		    !test_bit(DASD_FLAG_OFFLINE, &device->flags)) {
++			/*
++			 * the state change could be caused by an alias
++			 * reassignment remove device from alias handling
++			 * to prevent new requests from being scheduled on
++			 * the wrong alias device
++			 */
++			dasd_alias_remove_device(device);
++
++			/* schedule worker to reload device */
++			dasd_reload_device(device);
++		}
++
+ 		dasd_generic_handle_state_change(device);
+ 		return;
+ 	}
+@@ -3266,7 +3284,7 @@ static void dasd_eckd_dump_sense(struct
+ 		dasd_eckd_dump_sense_ccw(device, req, irb);
+ }
+ 
+-int dasd_eckd_pm_freeze(struct dasd_device *device)
++static int dasd_eckd_pm_freeze(struct dasd_device *device)
+ {
+ 	/*
+ 	 * the device should be disconnected from our LCU structure
+@@ -3279,7 +3297,7 @@ int dasd_eckd_pm_freeze(struct dasd_devi
+ 	return 0;
+ }
+ 
+-int dasd_eckd_restore_device(struct dasd_device *device)
++static int dasd_eckd_restore_device(struct dasd_device *device)
+ {
+ 	struct dasd_eckd_private *private;
+ 	struct dasd_eckd_characteristics temp_rdc_data;
+@@ -3344,6 +3362,51 @@ out_err:
+ 	return -1;
+ }
+ 
++static int dasd_eckd_reload_device(struct dasd_device *device)
++{
++	struct dasd_eckd_private *private;
++	int rc, old_base;
++	char uid[60];
++
++	private = (struct dasd_eckd_private *) device->private;
++	old_base = private->uid.base_unit_addr;
++	/* Read Configuration Data */
++	rc = dasd_eckd_read_conf(device);
++	if (rc)
++		goto out_err;
++
++	rc = dasd_eckd_generate_uid(device);
++	if (rc)
++		goto out_err;
++
++	/*
++	 * update unit address configuration and
++	 * add device to alias management
++	 */
++	dasd_alias_update_add_device(device);
++
++	if (old_base != private->uid.base_unit_addr) {
++		if (strlen(private->uid.vduit) > 0)
++			snprintf(uid, 60, "%s.%s.%04x.%02x.%s",
++				 private->uid.vendor, private->uid.serial,
++				 private->uid.ssid, private->uid.base_unit_addr,
++				 private->uid.vduit);
++		else
++			snprintf(uid, 60, "%s.%s.%04x.%02x",
++				 private->uid.vendor, private->uid.serial,
++				 private->uid.ssid,
++				 private->uid.base_unit_addr);
++
++		dev_info(&device->cdev->dev,
++			 "An Alias device was reassigned to a new base device "
++			 "with UID: %s\n", uid);
++	}
++	return 0;
++
++out_err:
++	return -1;
++}
++
+ static struct ccw_driver dasd_eckd_driver = {
+ 	.name	     = "dasd-eckd",
+ 	.owner	     = THIS_MODULE,
+@@ -3399,6 +3462,7 @@ static struct dasd_discipline dasd_eckd_
+ 	.freeze = dasd_eckd_pm_freeze,
+ 	.restore = dasd_eckd_restore_device,
+ 	.get_uid = dasd_eckd_get_uid,
++	.reload = dasd_eckd_reload_device,
+ };
+ 
+ static int __init
+--- a/drivers/s390/block/dasd_eckd.h
++++ b/drivers/s390/block/dasd_eckd.h
+@@ -426,7 +426,6 @@ struct alias_pav_group {
+ 	struct dasd_device *next;
+ };
+ 
+-
+ struct dasd_eckd_private {
+ 	struct dasd_eckd_characteristics rdc_data;
+ 	u8 *conf_data;
+@@ -463,4 +462,5 @@ void dasd_alias_handle_summary_unit_chec
+ void dasd_eckd_reset_ccw_to_base_io(struct dasd_ccw_req *);
+ void dasd_alias_lcu_setup_complete(struct dasd_device *);
+ void dasd_alias_wait_for_lcu_setup(struct dasd_device *);
++int dasd_alias_update_add_device(struct dasd_device *);
+ #endif				/* DASD_ECKD_H */
+--- a/drivers/s390/block/dasd_int.h
++++ b/drivers/s390/block/dasd_int.h
+@@ -336,6 +336,9 @@ struct dasd_discipline {
+ 	int (*restore) (struct dasd_device *);
+ 
+  	int (*get_uid) (struct dasd_device *, struct dasd_uid *);
++
++	/* reload device after state change */
++	int (*reload) (struct dasd_device *);
+ };
+ 
+ extern struct dasd_discipline *dasd_diag_discipline_pointer;
+@@ -392,6 +395,7 @@ struct dasd_device {
+         struct tasklet_struct tasklet;
+ 	struct work_struct kick_work;
+ 	struct work_struct restore_device;
++	struct work_struct reload_device;
+ 	struct timer_list timer;
+ 
+ 	debug_info_t *debug_area;
+@@ -584,6 +588,7 @@ void dasd_enable_device(struct dasd_devi
+ void dasd_set_target_state(struct dasd_device *, int);
+ void dasd_kick_device(struct dasd_device *);
+ void dasd_restore_device(struct dasd_device *);
++void dasd_reload_device(struct dasd_device *);
+ 
+ void dasd_add_request_head(struct dasd_ccw_req *);
+ void dasd_add_request_tail(struct dasd_ccw_req *);

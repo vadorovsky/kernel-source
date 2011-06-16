@@ -1,0 +1,502 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: dasd: Improve handling of stolen DASD reservation
+References: bnc#700080,LTC#69470,FATE#311906
+Patch-mainline: Yes
+
+Description: If a DASD device has been reserved by a Linux system, and later
+             this reservation is ‘stolen’ by a second system by means of an
+             unconditional reserve, then the first system receives a
+             notification about this fact. With this patch such an event can
+             be either ignored, as before, or it can be used to let the device
+             fail all I/O request, so that the device will not block anymore.
+
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ arch/s390/include/asm/dasd.h     |    1 
+ drivers/s390/block/dasd.c        |   71 ++++++++++++++++-----------
+ drivers/s390/block/dasd_devmap.c |   99 +++++++++++++++++++++++++++++++++++++++
+ drivers/s390/block/dasd_eckd.c   |   51 +++++++++++---------
+ drivers/s390/block/dasd_eer.c    |    1 
+ drivers/s390/block/dasd_fba.c    |   18 +------
+ drivers/s390/block/dasd_int.h    |   13 +++--
+ 7 files changed, 188 insertions(+), 66 deletions(-)
+
+--- a/arch/s390/include/asm/dasd.h
++++ b/arch/s390/include/asm/dasd.h
+@@ -80,6 +80,7 @@ typedef struct dasd_information2_t {
+ #define DASD_FEATURE_INITIAL_ONLINE  0x04
+ #define DASD_FEATURE_ERPLOG	     0x08
+ #define DASD_FEATURE_FAILFAST	     0x10
++#define DASD_FEATURE_FAILONSLCK      0x20
+ 
+ #define DASD_PARTN_BITS 2
+ 
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -901,6 +901,16 @@ int dasd_start_IO(struct dasd_ccw_req *c
+ 		return rc;
+ 	}
+ 	device = (struct dasd_device *) cqr->startdev;
++	if (((cqr->block &&
++	      test_bit(DASD_FLAG_LOCK_STOLEN, &cqr->block->base->flags)) ||
++	     test_bit(DASD_FLAG_LOCK_STOLEN, &device->flags)) &&
++	    !test_bit(DASD_CQR_ALLOW_SLOCK, &cqr->flags)) {
++		DBF_DEV_EVENT(DBF_DEBUG, device, "start_IO: return request %p "
++			      "because of stolen lock", cqr);
++		cqr->status = DASD_CQR_ERROR;
++		cqr->intrc = -EPERM;
++		return -EPERM;
++	}
+ 	if (cqr->retries < 0) {
+ 		/* internal error 14 - start_IO run out of retries */
+ 		sprintf(errorstring, "14 %p", cqr);
+@@ -1090,16 +1100,11 @@ void dasd_int_handler(struct ccw_device
+ 	}
+ 
+ 	now = get_clock();
+-
+-	/* check for unsolicited interrupts */
+ 	cqr = (struct dasd_ccw_req *) intparm;
+-	if (!cqr || ((scsw_cc(&irb->scsw) == 1) &&
+-		     (scsw_fctl(&irb->scsw) & SCSW_FCTL_START_FUNC) &&
+-		     ((scsw_stctl(&irb->scsw) == SCSW_STCTL_STATUS_PEND) ||
+-		      (scsw_stctl(&irb->scsw) == (SCSW_STCTL_STATUS_PEND |
+-						  SCSW_STCTL_ALERT_STATUS))))) {
+-		if (cqr && cqr->status == DASD_CQR_IN_IO)
+-			cqr->status = DASD_CQR_QUEUED;
++	/* check for conditions that should be handled immediately */
++	if (!cqr ||
++	    !(scsw_dstat(&irb->scsw) == (DEV_STAT_CHN_END | DEV_STAT_DEV_END) &&
++	      scsw_cstat(&irb->scsw) == 0)) {
+ 		if (cqr)
+ 			memcpy(&cqr->irb, irb, sizeof(*irb));
+ 		device = dasd_device_from_cdev_locked(cdev);
+@@ -1110,15 +1115,14 @@ void dasd_int_handler(struct ccw_device
+ 			dasd_put_device(device);
+ 			return;
+ 		}
+-		device->discipline->dump_sense_dbf(device, irb,
+-						   "unsolicited");
+-		if ((device->features & DASD_FEATURE_ERPLOG))
++		device->discipline->dump_sense_dbf(device, irb, "int");
++		if (device->features & DASD_FEATURE_ERPLOG)
+ 			device->discipline->dump_sense(device, cqr, irb);
+-		dasd_device_clear_timer(device);
+-		device->discipline->handle_unsolicited_interrupt(device, irb);
++		device->discipline->check_for_device_change(device, cqr, irb);
+ 		dasd_put_device(device);
+-		return;
+ 	}
++	if (!cqr)
++		return;
+ 
+ 	device = (struct dasd_device *) cqr->startdev;
+ 	if (!device ||
+@@ -1158,13 +1162,6 @@ void dasd_int_handler(struct ccw_device
+ 					  struct dasd_ccw_req, devlist);
+ 		}
+ 	} else {  /* error */
+-		memcpy(&cqr->irb, irb, sizeof(struct irb));
+-		/* log sense for every failed I/O to s390 debugfeature */
+-		dasd_log_sense_dbf(cqr, irb);
+-		if (device->features & DASD_FEATURE_ERPLOG) {
+-			dasd_log_sense(cqr, irb);
+-		}
+-
+ 		/*
+ 		 * If we don't want complex ERP for this request, then just
+ 		 * reset this and retry it in the fastpath
+@@ -1204,13 +1201,13 @@ enum uc_todo dasd_generic_uc_handler(str
+ 		goto out;
+ 	if (test_bit(DASD_FLAG_OFFLINE, &device->flags) ||
+ 	   device->state != device->target ||
+-	   !device->discipline->handle_unsolicited_interrupt){
++	   !device->discipline->check_for_device_change){
+ 		dasd_put_device(device);
+ 		goto out;
+ 	}
+-
+-	dasd_device_clear_timer(device);
+-	device->discipline->handle_unsolicited_interrupt(device, irb);
++	if (device->discipline->dump_sense_dbf)
++		device->discipline->dump_sense_dbf(device, irb, "uc");
++	device->discipline->check_for_device_change(device, NULL, irb);
+ 	dasd_put_device(device);
+ out:
+ 	return UC_TODO_RETRY;
+@@ -1607,7 +1604,12 @@ static int _dasd_sleep_on(struct dasd_cc
+ 			continue;
+ 		if (cqr->status != DASD_CQR_FILLED) /* could be failed */
+ 			continue;
+-
++		if (test_bit(DASD_FLAG_LOCK_STOLEN, &device->flags) &&
++		    !test_bit(DASD_CQR_ALLOW_SLOCK, &cqr->flags)) {
++			cqr->status = DASD_CQR_FAILED;
++			cqr->intrc = -EPERM;
++			continue;
++		}
+ 		/* Non-temporary stop condition will trigger fail fast */
+ 		if (device->stopped & ~DASD_STOPPED_PENDING &&
+ 		    test_bit(DASD_CQR_FLAGS_FAILFAST, &cqr->flags) &&
+@@ -1615,7 +1617,6 @@ static int _dasd_sleep_on(struct dasd_cc
+ 			cqr->status = DASD_CQR_FAILED;
+ 			continue;
+ 		}
+-
+ 		/* Don't try to start requests if device is stopped */
+ 		if (interruptible) {
+ 			rc = wait_event_interruptible(
+@@ -1700,13 +1701,18 @@ int dasd_sleep_on_immediatly(struct dasd
+ 	int rc;
+ 
+ 	device = cqr->startdev;
++	if (test_bit(DASD_FLAG_LOCK_STOLEN, &device->flags) &&
++	    !test_bit(DASD_CQR_ALLOW_SLOCK, &cqr->flags)) {
++		cqr->status = DASD_CQR_FAILED;
++		cqr->intrc = -EPERM;
++		return -EIO;
++	}
+ 	spin_lock_irq(get_ccwdev_lock(device->cdev));
+ 	rc = _dasd_term_running_cqr(device);
+ 	if (rc) {
+ 		spin_unlock_irq(get_ccwdev_lock(device->cdev));
+ 		return rc;
+ 	}
+-
+ 	cqr->callback = dasd_wakeup_cb;
+ 	cqr->callback_data = DASD_SLEEPON_START_TAG;
+ 	cqr->status = DASD_CQR_QUEUED;
+@@ -2009,6 +2015,13 @@ static void __dasd_block_start_head(stru
+ 	list_for_each_entry(cqr, &block->ccw_queue, blocklist) {
+ 		if (cqr->status != DASD_CQR_FILLED)
+ 			continue;
++		if (test_bit(DASD_FLAG_LOCK_STOLEN, &block->base->flags) &&
++		    !test_bit(DASD_CQR_ALLOW_SLOCK, &cqr->flags)) {
++			cqr->status = DASD_CQR_FAILED;
++			cqr->intrc = -EPERM;
++			dasd_schedule_block_bh(block);
++			continue;
++		}
+ 		/* Non-temporary stop condition will trigger fail fast */
+ 		if (block->base->stopped & ~DASD_STOPPED_PENDING &&
+ 		    test_bit(DASD_CQR_FLAGS_FAILFAST, &cqr->flags) &&
+--- a/drivers/s390/block/dasd_devmap.c
++++ b/drivers/s390/block/dasd_devmap.c
+@@ -1152,6 +1152,103 @@ dasd_expires_store(struct device *dev, s
+ 
+ static DEVICE_ATTR(expires, 0644, dasd_expires_show, dasd_expires_store);
+ 
++static ssize_t dasd_reservation_policy_show(struct device *dev,
++					    struct device_attribute *attr,
++					    char *buf)
++{
++	struct dasd_devmap *devmap;
++	int rc = 0;
++
++	devmap = dasd_find_busid(dev_name(dev));
++	if (IS_ERR(devmap)) {
++		rc = snprintf(buf, PAGE_SIZE, "ignore\n");
++	} else {
++		spin_lock(&dasd_devmap_lock);
++		if (devmap->features & DASD_FEATURE_FAILONSLCK)
++			rc = snprintf(buf, PAGE_SIZE, "fail\n");
++		else
++			rc = snprintf(buf, PAGE_SIZE, "ignore\n");
++		spin_unlock(&dasd_devmap_lock);
++	}
++	return rc;
++}
++
++static ssize_t dasd_reservation_policy_store(struct device *dev,
++					     struct device_attribute *attr,
++					     const char *buf, size_t count)
++{
++	struct dasd_devmap *devmap;
++	int rc;
++
++	devmap = dasd_devmap_from_cdev(to_ccwdev(dev));
++	if (IS_ERR(devmap))
++		return PTR_ERR(devmap);
++	rc = 0;
++	spin_lock(&dasd_devmap_lock);
++	if (sysfs_streq("ignore", buf))
++		devmap->features &= ~DASD_FEATURE_FAILONSLCK;
++	else if (sysfs_streq("fail", buf))
++		devmap->features |= DASD_FEATURE_FAILONSLCK;
++	else
++		rc = -EINVAL;
++	if (devmap->device)
++		devmap->device->features = devmap->features;
++	spin_unlock(&dasd_devmap_lock);
++	if (rc)
++		return rc;
++	else
++		return count;
++}
++
++static DEVICE_ATTR(reservation_policy, 0644,
++		   dasd_reservation_policy_show, dasd_reservation_policy_store);
++
++static ssize_t dasd_reservation_state_show(struct device *dev,
++					   struct device_attribute *attr,
++					   char *buf)
++{
++	struct dasd_device *device;
++	int rc = 0;
++
++	device = dasd_device_from_cdev(to_ccwdev(dev));
++	if (IS_ERR(device))
++		return snprintf(buf, PAGE_SIZE, "none\n");
++
++	if (test_bit(DASD_FLAG_IS_RESERVED, &device->flags))
++		rc = snprintf(buf, PAGE_SIZE, "reserved\n");
++	else if (test_bit(DASD_FLAG_LOCK_STOLEN, &device->flags))
++		rc = snprintf(buf, PAGE_SIZE, "lost\n");
++	else
++		rc = snprintf(buf, PAGE_SIZE, "none\n");
++	dasd_put_device(device);
++	return rc;
++}
++
++static ssize_t dasd_reservation_state_store(struct device *dev,
++					    struct device_attribute *attr,
++					    const char *buf, size_t count)
++{
++	struct dasd_device *device;
++	int rc = 0;
++
++	device = dasd_device_from_cdev(to_ccwdev(dev));
++	if (IS_ERR(device))
++		return -ENODEV;
++	if (sysfs_streq("reset", buf))
++		clear_bit(DASD_FLAG_LOCK_STOLEN, &device->flags);
++	else
++		rc = -EINVAL;
++	dasd_put_device(device);
++
++	if (rc)
++		return rc;
++	else
++		return count;
++}
++
++static DEVICE_ATTR(last_known_reservation_state, 0644,
++		   dasd_reservation_state_show, dasd_reservation_state_store);
++
+ static struct attribute * dasd_attrs[] = {
+ 	&dev_attr_readonly.attr,
+ 	&dev_attr_discipline.attr,
+@@ -1164,6 +1261,8 @@ static struct attribute * dasd_attrs[] =
+ 	&dev_attr_erplog.attr,
+ 	&dev_attr_failfast.attr,
+ 	&dev_attr_expires.attr,
++	&dev_attr_reservation_policy.attr,
++	&dev_attr_last_known_reservation_state.attr,
+ 	NULL,
+ };
+ 
+--- a/drivers/s390/block/dasd_eckd.c
++++ b/drivers/s390/block/dasd_eckd.c
+@@ -1771,9 +1771,9 @@ dasd_eckd_erp_postaction(struct dasd_ccw
+ 	return dasd_default_erp_postaction;
+ }
+ 
+-
+-static void dasd_eckd_handle_unsolicited_interrupt(struct dasd_device *device,
+-						   struct irb *irb)
++static void dasd_eckd_check_for_device_change(struct dasd_device *device,
++					      struct dasd_ccw_req *cqr,
++					      struct irb *irb)
+ {
+ 	char mask;
+ 	char *sense = NULL;
+@@ -1797,40 +1797,42 @@ static void dasd_eckd_handle_unsolicited
+ 			/* schedule worker to reload device */
+ 			dasd_reload_device(device);
+ 		}
+-
+ 		dasd_generic_handle_state_change(device);
+ 		return;
+ 	}
+ 
+-	/* summary unit check */
+ 	sense = dasd_get_sense(irb);
+-	if (sense && (sense[7] == 0x0D) &&
++	if (!sense)
++		return;
++
++	/* summary unit check */
++	if ((sense[27] & DASD_SENSE_BIT_0) && (sense[7] == 0x0D) &&
+ 	    (scsw_dstat(&irb->scsw) & DEV_STAT_UNIT_CHECK)) {
+ 		dasd_alias_handle_summary_unit_check(device, irb);
+ 		return;
+ 	}
+ 
+ 	/* service information message SIM */
+-	if (sense && !(sense[27] & DASD_SENSE_BIT_0) &&
++	if (!cqr && !(sense[27] & DASD_SENSE_BIT_0) &&
+ 	    ((sense[6] & DASD_SIM_SENSE) == DASD_SIM_SENSE)) {
+ 		dasd_3990_erp_handle_sim(device, sense);
+-		dasd_schedule_device_bh(device);
+ 		return;
+ 	}
+ 
+-	if ((scsw_cc(&irb->scsw) == 1) && !sense &&
+-	    (scsw_fctl(&irb->scsw) == SCSW_FCTL_START_FUNC) &&
+-	    (scsw_actl(&irb->scsw) == SCSW_ACTL_START_PEND) &&
+-	    (scsw_stctl(&irb->scsw) == SCSW_STCTL_STATUS_PEND)) {
+-		/* fake irb do nothing, they are handled elsewhere */
+-		dasd_schedule_device_bh(device);
+-		return;
++	/* loss of device reservation is handled via base devices only
++	 * as alias devices may be used with several bases
++	 */
++	if (device->block && (sense[27] & DASD_SENSE_BIT_0) &&
++	    (sense[7] == 0x3F) &&
++	    (scsw_dstat(&irb->scsw) & DEV_STAT_UNIT_CHECK) &&
++	    test_bit(DASD_FLAG_IS_RESERVED, &device->flags)) {
++		if (device->features & DASD_FEATURE_FAILONSLCK)
++			set_bit(DASD_FLAG_LOCK_STOLEN, &device->flags);
++		clear_bit(DASD_FLAG_IS_RESERVED, &device->flags);
++		dev_err(&device->cdev->dev,
++			"The device reservation was lost\n");
+ 	}
+-
+-	dasd_schedule_device_bh(device);
+-	return;
+-};
+-
++}
+ 
+ static struct dasd_ccw_req *dasd_eckd_build_cp_cmd_single(
+ 					       struct dasd_device *startdev,
+@@ -2755,6 +2757,8 @@ dasd_eckd_release(struct dasd_device *de
+ 	cqr->status = DASD_CQR_FILLED;
+ 
+ 	rc = dasd_sleep_on_immediatly(cqr);
++	if (!rc)
++		clear_bit(DASD_FLAG_IS_RESERVED, &device->flags);
+ 
+ 	if (useglobal)
+ 		mutex_unlock(&dasd_reserve_mutex);
+@@ -2808,6 +2812,8 @@ dasd_eckd_reserve(struct dasd_device *de
+ 	cqr->status = DASD_CQR_FILLED;
+ 
+ 	rc = dasd_sleep_on_immediatly(cqr);
++	if (!rc)
++		set_bit(DASD_FLAG_IS_RESERVED, &device->flags);
+ 
+ 	if (useglobal)
+ 		mutex_unlock(&dasd_reserve_mutex);
+@@ -2860,6 +2866,8 @@ dasd_eckd_steal_lock(struct dasd_device
+ 	cqr->status = DASD_CQR_FILLED;
+ 
+ 	rc = dasd_sleep_on_immediatly(cqr);
++	if (!rc)
++		set_bit(DASD_FLAG_IS_RESERVED, &device->flags);
+ 
+ 	if (useglobal)
+ 		mutex_unlock(&dasd_reserve_mutex);
+@@ -2912,6 +2920,7 @@ static int dasd_eckd_snid(struct dasd_de
+ 	cqr->memdev = device;
+ 	clear_bit(DASD_CQR_FLAGS_USE_ERP, &cqr->flags);
+ 	set_bit(DASD_CQR_FLAGS_FAILFAST, &cqr->flags);
++	set_bit(DASD_CQR_ALLOW_SLOCK, &cqr->flags);
+ 	cqr->retries = 5;
+ 	cqr->expires = 10 * HZ;
+ 	cqr->buildclk = get_clock();
+@@ -3646,7 +3655,7 @@ static struct dasd_discipline dasd_eckd_
+ 	.format_device = dasd_eckd_format_device,
+ 	.erp_action = dasd_eckd_erp_action,
+ 	.erp_postaction = dasd_eckd_erp_postaction,
+-	.handle_unsolicited_interrupt = dasd_eckd_handle_unsolicited_interrupt,
++	.check_for_device_change = dasd_eckd_check_for_device_change,
+ 	.build_cp = dasd_eckd_build_alias_cp,
+ 	.free_cp = dasd_eckd_free_alias_cp,
+ 	.dump_sense = dasd_eckd_dump_sense,
+--- a/drivers/s390/block/dasd_eer.c
++++ b/drivers/s390/block/dasd_eer.c
+@@ -473,6 +473,7 @@ int dasd_eer_enable(struct dasd_device *
+ 	cqr->retries = 255;
+ 	cqr->expires = 10 * HZ;
+ 	clear_bit(DASD_CQR_FLAGS_USE_ERP, &cqr->flags);
++	set_bit(DASD_CQR_ALLOW_SLOCK, &cqr->flags);
+ 
+ 	ccw = cqr->cpaddr;
+ 	ccw->cmd_code = DASD_ECKD_CCW_SNSS;
+--- a/drivers/s390/block/dasd_fba.c
++++ b/drivers/s390/block/dasd_fba.c
+@@ -226,24 +226,16 @@ dasd_fba_erp_postaction(struct dasd_ccw_
+ 	return NULL;
+ }
+ 
+-static void dasd_fba_handle_unsolicited_interrupt(struct dasd_device *device,
+-						   struct irb *irb)
++static void dasd_fba_check_for_device_change(struct dasd_device *device,
++					     struct dasd_ccw_req *cqr,
++					     struct irb *irb)
+ {
+ 	char mask;
+ 
+ 	/* first of all check for state change pending interrupt */
+ 	mask = DEV_STAT_ATTENTION | DEV_STAT_DEV_END | DEV_STAT_UNIT_EXCEP;
+-	if ((irb->scsw.cmd.dstat & mask) == mask) {
++	if ((irb->scsw.cmd.dstat & mask) == mask)
+ 		dasd_generic_handle_state_change(device);
+-		return;
+-	}
+-
+-	/* check for unsolicited interrupts */
+-	DBF_DEV_EVENT(DBF_WARNING, device, "%s",
+-		    "unsolicited interrupt received");
+-	device->discipline->dump_sense_dbf(device, irb, "unsolicited");
+-	dasd_schedule_device_bh(device);
+-	return;
+ };
+ 
+ static struct dasd_ccw_req *dasd_fba_build_cp(struct dasd_device * memdev,
+@@ -597,7 +589,7 @@ static struct dasd_discipline dasd_fba_d
+ 	.handle_terminated_request = dasd_fba_handle_terminated_request,
+ 	.erp_action = dasd_fba_erp_action,
+ 	.erp_postaction = dasd_fba_erp_postaction,
+-	.handle_unsolicited_interrupt = dasd_fba_handle_unsolicited_interrupt,
++	.check_for_device_change = dasd_fba_check_for_device_change,
+ 	.build_cp = dasd_fba_build_cp,
+ 	.free_cp = dasd_fba_free_cp,
+ 	.dump_sense = dasd_fba_dump_sense,
+--- a/drivers/s390/block/dasd_int.h
++++ b/drivers/s390/block/dasd_int.h
+@@ -231,6 +231,10 @@ struct dasd_ccw_req {
+ /* per dasd_ccw_req flags */
+ #define DASD_CQR_FLAGS_USE_ERP   0	/* use ERP for this request */
+ #define DASD_CQR_FLAGS_FAILFAST  1	/* FAILFAST */
++#define DASD_CQR_ALLOW_SLOCK     3      /* Try this request even when lock was
++					 * stolen. Should not be combined with
++					 * DASD_CQR_FLAGS_USE_ERP
++					 */
+ 
+ /* Signature for error recovery functions. */
+ typedef struct dasd_ccw_req *(*dasd_erp_fn_t) (struct dasd_ccw_req *);
+@@ -325,9 +329,9 @@ struct dasd_discipline {
+ 	void (*dump_sense) (struct dasd_device *, struct dasd_ccw_req *,
+ 			    struct irb *);
+ 	void (*dump_sense_dbf) (struct dasd_device *, struct irb *, char *);
+-
+-	void (*handle_unsolicited_interrupt) (struct dasd_device *,
+-					      struct irb *);
++	void (*check_for_device_change) (struct dasd_device *,
++					 struct dasd_ccw_req *,
++					 struct irb *);
+ 
+         /* i/o control functions. */
+ 	int (*fill_geometry) (struct dasd_block *, struct hd_geometry *);
+@@ -452,6 +456,9 @@ struct dasd_block {
+ #define DASD_FLAG_OFFLINE	3	/* device is in offline processing */
+ #define DASD_FLAG_EER_SNSS	4	/* A SNSS is required */
+ #define DASD_FLAG_EER_IN_USE	5	/* A SNSS request is running */
++#define DASD_FLAG_IS_RESERVED	7	/* The device is reserved */
++#define DASD_FLAG_LOCK_STOLEN	8	/* The device lock was stolen */
++
+ 
+ void dasd_put_device_wake(struct dasd_device *);
+ 

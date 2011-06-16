@@ -1,0 +1,375 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: cio: improve resume handling
+References: bnc#700080,LTC#69463,FATE#311876
+Patch-mainline: Yes
+
+Description:  This feature improves cio resume handling to cope
+              with devices that were attached on different
+              subchannels prior to the suspend operation.
+
+              This patch contains the following upstream patches:
+              76e6fb4b86446e4605379b99ad3dd3f96bb1696f
+              0d01bb89220490763d89571d27e7ee3f13f9b372
+
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/cio/css.c        |    2 
+ drivers/s390/cio/css.h        |    1 
+ drivers/s390/cio/device.c     |  121 ++++++++++++++++++++++--------------------
+ drivers/s390/cio/device.h     |    2 
+ drivers/s390/cio/device_fsm.c |   39 ++++++++++---
+ 5 files changed, 100 insertions(+), 65 deletions(-)
+
+--- a/drivers/s390/cio/css.c
++++ b/drivers/s390/cio/css.c
+@@ -1015,7 +1015,7 @@ static int css_settle(struct device_driv
+ 	return 0;
+ }
+ 
+-static inline int css_complete_work(void)
++int css_complete_work(void)
+ {
+ 	int ret;
+ 
+--- a/drivers/s390/cio/css.h
++++ b/drivers/s390/cio/css.h
+@@ -146,6 +146,7 @@ extern struct channel_subsystem *channel
+ /* Helper functions to build lists for the slow path. */
+ void css_schedule_eval(struct subchannel_id schid);
+ void css_schedule_eval_all(void);
++int css_complete_work(void);
+ 
+ int sch_is_pseudo_sch(struct subchannel *);
+ struct schib;
+--- a/drivers/s390/cio/device.c
++++ b/drivers/s390/cio/device.c
+@@ -1375,7 +1375,7 @@ static enum io_sch_action sch_get_action
+ 		/* Not operational. */
+ 		if (!cdev)
+ 			return IO_SCH_UNREG;
+-		if (!ccw_device_notify(cdev, CIO_GONE))
++		if (ccw_device_notify(cdev, CIO_GONE) != NOTIFY_OK)
+ 			return IO_SCH_UNREG;
+ 		return IO_SCH_ORPH_UNREG;
+ 	}
+@@ -1383,12 +1383,12 @@ static enum io_sch_action sch_get_action
+ 	if (!cdev)
+ 		return IO_SCH_ATTACH;
+ 	if (sch->schib.pmcw.dev != cdev->private->dev_id.devno) {
+-		if (!ccw_device_notify(cdev, CIO_GONE))
++		if (ccw_device_notify(cdev, CIO_GONE) != NOTIFY_OK)
+ 			return IO_SCH_UNREG_ATTACH;
+ 		return IO_SCH_ORPH_ATTACH;
+ 	}
+ 	if ((sch->schib.pmcw.pam & sch->opm) == 0) {
+-		if (!ccw_device_notify(cdev, CIO_NO_PATH))
++		if (ccw_device_notify(cdev, CIO_NO_PATH) != NOTIFY_OK)
+ 			return IO_SCH_UNREG;
+ 		return IO_SCH_DISC;
+ 	}
+@@ -1437,6 +1437,12 @@ static int io_subchannel_sch_event(struc
+ 		rc = 0;
+ 		goto out_unlock;
+ 	case IO_SCH_VERIFY:
++		if (cdev->private->flags.resuming == 1) {
++			if (cio_enable_subchannel(sch, (u32)(addr_t)sch)) {
++				ccw_device_set_notoper(cdev);
++				break;
++			}
++		}
+ 		/* Trigger path verification. */
+ 		io_subchannel_verify(sch);
+ 		rc = 0;
+@@ -1484,7 +1490,8 @@ static int io_subchannel_sch_event(struc
+ 		break;
+ 	case IO_SCH_UNREG_ATTACH:
+ 		/* Unregister ccw device. */
+-		ccw_device_unregister(cdev);
++		if (!cdev->private->flags.resuming)
++			ccw_device_unregister(cdev);
+ 		break;
+ 	default:
+ 		break;
+@@ -1493,7 +1500,8 @@ static int io_subchannel_sch_event(struc
+ 	switch (action) {
+ 	case IO_SCH_ORPH_UNREG:
+ 	case IO_SCH_UNREG:
+-		css_sch_device_unregister(sch);
++		if (!cdev || !cdev->private->flags.resuming)
++			css_sch_device_unregister(sch);
+ 		break;
+ 	case IO_SCH_ORPH_ATTACH:
+ 	case IO_SCH_UNREG_ATTACH:
+@@ -1815,26 +1823,42 @@ static void __ccw_device_pm_restore(stru
+ {
+ 	struct subchannel *sch = to_subchannel(cdev->dev.parent);
+ 
+-	if (cio_is_console(sch->schid))
+-		goto out;
++	spin_lock_irq(sch->lock);
++	if (cio_is_console(sch->schid)) {
++		cio_enable_subchannel(sch, (u32)(addr_t)sch);
++		goto out_unlock;
++	}
+ 	/*
+ 	 * While we were sleeping, devices may have gone or become
+ 	 * available again. Kick re-detection.
+ 	 */
+-	spin_lock_irq(sch->lock);
+ 	cdev->private->flags.resuming = 1;
++	css_schedule_eval(sch->schid);
++	spin_unlock_irq(sch->lock);
++	css_complete_work();
++
++	/* cdev may have been moved to a different subchannel. */
++	sch = to_subchannel(cdev->dev.parent);
++	spin_lock_irq(sch->lock);
++	if (cdev->private->state != DEV_STATE_ONLINE &&
++	    cdev->private->state != DEV_STATE_OFFLINE)
++		goto out_unlock;
++
+ 	ccw_device_recognition(cdev);
+ 	spin_unlock_irq(sch->lock);
+ 	wait_event(cdev->private->wait_q, dev_fsm_final_state(cdev) ||
+ 		   cdev->private->state == DEV_STATE_DISCONNECTED);
+-out:
++	spin_lock_irq(sch->lock);
++
++out_unlock:
+ 	cdev->private->flags.resuming = 0;
++	spin_unlock_irq(sch->lock);
+ }
+ 
+ static int resume_handle_boxed(struct ccw_device *cdev)
+ {
+ 	cdev->private->state = DEV_STATE_BOXED;
+-	if (ccw_device_notify(cdev, CIO_BOXED))
++	if (ccw_device_notify(cdev, CIO_BOXED) == NOTIFY_OK)
+ 		return 0;
+ 	ccw_device_sched_todo(cdev, CDEV_TODO_UNREG);
+ 	return -ENODEV;
+@@ -1843,7 +1867,7 @@ static int resume_handle_boxed(struct cc
+ static int resume_handle_disc(struct ccw_device *cdev)
+ {
+ 	cdev->private->state = DEV_STATE_DISCONNECTED;
+-	if (ccw_device_notify(cdev, CIO_GONE))
++	if (ccw_device_notify(cdev, CIO_GONE) == NOTIFY_OK)
+ 		return 0;
+ 	ccw_device_sched_todo(cdev, CDEV_TODO_UNREG);
+ 	return -ENODEV;
+@@ -1852,40 +1876,31 @@ static int resume_handle_disc(struct ccw
+ static int ccw_device_pm_restore(struct device *dev)
+ {
+ 	struct ccw_device *cdev = to_ccwdev(dev);
+-	struct subchannel *sch = to_subchannel(cdev->dev.parent);
+-	int ret = 0, cm_enabled;
++	struct subchannel *sch;
++	int ret = 0;
+ 
+ 	__ccw_device_pm_restore(cdev);
++	sch = to_subchannel(cdev->dev.parent);
+ 	spin_lock_irq(sch->lock);
+-	if (cio_is_console(sch->schid)) {
+-		cio_enable_subchannel(sch, (u32)(addr_t)sch);
+-		spin_unlock_irq(sch->lock);
++	if (cio_is_console(sch->schid))
+ 		goto out_restore;
+-	}
+-	cdev->private->flags.donotify = 0;
++
+ 	/* check recognition results */
+ 	switch (cdev->private->state) {
+ 	case DEV_STATE_OFFLINE:
++	case DEV_STATE_ONLINE:
++		cdev->private->flags.donotify = 0;
+ 		break;
+ 	case DEV_STATE_BOXED:
+ 		ret = resume_handle_boxed(cdev);
+-		spin_unlock_irq(sch->lock);
+ 		if (ret)
+-			goto out;
++			goto out_unlock;
+ 		goto out_restore;
+-	case DEV_STATE_DISCONNECTED:
+-		goto out_disc_unlock;
+ 	default:
+-		goto out_unreg_unlock;
+-	}
+-	/* check if the device id has changed */
+-	if (sch->schib.pmcw.dev != cdev->private->dev_id.devno) {
+-		CIO_MSG_EVENT(0, "resume: sch 0.%x.%04x: failed (devno "
+-			      "changed from %04x to %04x)\n",
+-			      sch->schid.ssid, sch->schid.sch_no,
+-			      cdev->private->dev_id.devno,
+-			      sch->schib.pmcw.dev);
+-		goto out_unreg_unlock;
++		ret = resume_handle_disc(cdev);
++		if (ret)
++			goto out_unlock;
++		goto out_restore;
+ 	}
+ 	/* check if the device type has changed */
+ 	if (!ccw_device_test_sense_data(cdev)) {
+@@ -1894,24 +1909,30 @@ static int ccw_device_pm_restore(struct
+ 		ret = -ENODEV;
+ 		goto out_unlock;
+ 	}
+-	if (!cdev->online) {
+-		ret = 0;
++	if (!cdev->online)
+ 		goto out_unlock;
+-	}
+-	ret = ccw_device_online(cdev);
+-	if (ret)
+-		goto out_disc_unlock;
+ 
+-	cm_enabled = cdev->private->cmb != NULL;
++	if (ccw_device_online(cdev)) {
++		ret = resume_handle_disc(cdev);
++		if (ret)
++			goto out_unlock;
++		goto out_restore;
++	}
+ 	spin_unlock_irq(sch->lock);
+-
+ 	wait_event(cdev->private->wait_q, dev_fsm_final_state(cdev));
+-	if (cdev->private->state != DEV_STATE_ONLINE) {
+-		spin_lock_irq(sch->lock);
+-		goto out_disc_unlock;
++	spin_lock_irq(sch->lock);
++
++	if (ccw_device_notify(cdev, CIO_OPER) == NOTIFY_BAD) {
++		ccw_device_sched_todo(cdev, CDEV_TODO_UNREG);
++		ret = -ENODEV;
++		goto out_unlock;
+ 	}
+-	if (cm_enabled) {
++
++	/* reenable cmf, if needed */
++	if (cdev->private->cmb) {
++		spin_unlock_irq(sch->lock);
+ 		ret = ccw_set_cmf(cdev, 1);
++		spin_lock_irq(sch->lock);
+ 		if (ret) {
+ 			CIO_MSG_EVENT(2, "resume: cdev 0.%x.%04x: cmf failed "
+ 				      "(rc=%d)\n", cdev->private->dev_id.ssid,
+@@ -1921,21 +1942,11 @@ static int ccw_device_pm_restore(struct
+ 	}
+ 
+ out_restore:
++	spin_unlock_irq(sch->lock);
+ 	if (cdev->online && cdev->drv && cdev->drv->restore)
+ 		ret = cdev->drv->restore(cdev);
+-out:
+ 	return ret;
+ 
+-out_disc_unlock:
+-	ret = resume_handle_disc(cdev);
+-	spin_unlock_irq(sch->lock);
+-	if (ret)
+-		return ret;
+-	goto out_restore;
+-
+-out_unreg_unlock:
+-	ccw_device_sched_todo(cdev, CDEV_TODO_UNREG_EVAL);
+-	ret = -ENODEV;
+ out_unlock:
+ 	spin_unlock_irq(sch->lock);
+ 	return ret;
+--- a/drivers/s390/cio/device.h
++++ b/drivers/s390/cio/device.h
+@@ -4,7 +4,7 @@
+ #include <asm/ccwdev.h>
+ #include <asm/atomic.h>
+ #include <linux/wait.h>
+-
++#include <linux/notifier.h>
+ #include "io_sch.h"
+ 
+ /*
+--- a/drivers/s390/cio/device_fsm.c
++++ b/drivers/s390/cio/device_fsm.c
+@@ -316,21 +316,43 @@ ccw_device_sense_id_done(struct ccw_devi
+ 	}
+ }
+ 
++/**
++  * ccw_device_notify() - inform the device's driver about an event
++  * @cdev: device for which an event occured
++  * @event: event that occurred
++  *
++  * Returns:
++  *   -%EINVAL if the device is offline or has no driver.
++  *   -%EOPNOTSUPP if the device's driver has no notifier registered.
++  *   %NOTIFY_OK if the driver wants to keep the device.
++  *   %NOTIFY_BAD if the driver doesn't want to keep the device.
++  */
+ int ccw_device_notify(struct ccw_device *cdev, int event)
+ {
++	int ret = -EINVAL;
++
+ 	if (!cdev->drv)
+-		return 0;
++		goto out;
+ 	if (!cdev->online)
+-		return 0;
++		goto out;
+ 	CIO_MSG_EVENT(2, "notify called for 0.%x.%04x, event=%d\n",
+ 		      cdev->private->dev_id.ssid, cdev->private->dev_id.devno,
+ 		      event);
+-	return cdev->drv->notify ? cdev->drv->notify(cdev, event) : 0;
++	if (!cdev->drv->notify) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++	if (cdev->drv->notify(cdev, event))
++		ret = NOTIFY_OK;
++	else
++		ret = NOTIFY_BAD;
++out:
++	return ret;
+ }
+ 
+ static void ccw_device_oper_notify(struct ccw_device *cdev)
+ {
+-	if (ccw_device_notify(cdev, CIO_OPER)) {
++	if (ccw_device_notify(cdev, CIO_OPER) == NOTIFY_OK) {
+ 		/* Reenable channel measurements, if needed. */
+ 		ccw_device_sched_todo(cdev, CDEV_TODO_ENABLE_CMF);
+ 		return;
+@@ -364,14 +386,15 @@ ccw_device_done(struct ccw_device *cdev,
+ 	case DEV_STATE_BOXED:
+ 		CIO_MSG_EVENT(0, "Boxed device %04x on subchannel %04x\n",
+ 			      cdev->private->dev_id.devno, sch->schid.sch_no);
+-		if (cdev->online && !ccw_device_notify(cdev, CIO_BOXED))
++		if (cdev->online &&
++		    ccw_device_notify(cdev, CIO_BOXED) != NOTIFY_OK)
+ 			ccw_device_sched_todo(cdev, CDEV_TODO_UNREG);
+ 		cdev->private->flags.donotify = 0;
+ 		break;
+ 	case DEV_STATE_NOT_OPER:
+ 		CIO_MSG_EVENT(0, "Device %04x gone on subchannel %04x\n",
+ 			      cdev->private->dev_id.devno, sch->schid.sch_no);
+-		if (!ccw_device_notify(cdev, CIO_GONE))
++		if (ccw_device_notify(cdev, CIO_GONE) != NOTIFY_OK)
+ 			ccw_device_sched_todo(cdev, CDEV_TODO_UNREG);
+ 		else
+ 			ccw_device_set_disconnected(cdev);
+@@ -381,7 +404,7 @@ ccw_device_done(struct ccw_device *cdev,
+ 		CIO_MSG_EVENT(0, "Disconnected device %04x on subchannel "
+ 			      "%04x\n", cdev->private->dev_id.devno,
+ 			      sch->schid.sch_no);
+-		if (!ccw_device_notify(cdev, CIO_NO_PATH))
++		if (ccw_device_notify(cdev, CIO_NO_PATH) != NOTIFY_OK)
+ 			ccw_device_sched_todo(cdev, CDEV_TODO_UNREG);
+ 		else
+ 			ccw_device_set_disconnected(cdev);
+@@ -589,7 +612,7 @@ ccw_device_offline(struct ccw_device *cd
+ static void ccw_device_generic_notoper(struct ccw_device *cdev,
+ 				       enum dev_event dev_event)
+ {
+-	if (!ccw_device_notify(cdev, CIO_GONE))
++	if (ccw_device_notify(cdev, CIO_GONE) != NOTIFY_OK)
+ 		ccw_device_sched_todo(cdev, CDEV_TODO_UNREG);
+ 	else
+ 		ccw_device_set_disconnected(cdev);
