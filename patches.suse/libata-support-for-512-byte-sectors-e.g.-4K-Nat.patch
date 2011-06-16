@@ -1,0 +1,299 @@
+From: Grant Grundler <grundler@google.com>
+Date: Tue, 17 Aug 2010 10:56:53 -0700
+Subject: [PATCH] [libata] support for > 512 byte sectors (e.g. 4K Native)
+X-Git: 295124dce4ddfd40b1f12d3ffd2779673e87c701
+References: FATE#311826
+Patch-Mainline: 2.6.39
+
+This change enables my x86 machine to recognize and talk to a
+"Native 4K" SATA device.
+
+When I started working on this, I didn't know Matthew Wilcox had
+posted a similar patch 2 years ago:
+  http://git.kernel.org/?p=linux/kernel/git/willy/ata.git;a=shortlog;h=refs/heads/ata-large-sectors
+
+Gwendal Grignou pointed me at the the above code and small portions of
+this patch include Matthew's work. That's why Mathew is first on the
+"Signed-off-by:". I've NOT included his use of a bitmap to determine
+512 vs Native for ATA command block size - just used a simple table.
+And bugs are almost certainly mine.
+
+Lastly, the patch has been tested with a native 4K 'Engineering
+Sample' drive provided by Hitachi GST.
+
+Signed-off-by: Matthew Wilcox <matthew.r.wilcox@intel.com>
+Signed-off-by: Grant Grundler <grundler@google.com>
+Reviewed-by: Gwendal Grignou <gwendal@google.com>
+Signed-off-by: Jeff Garzik <jgarzik@redhat.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/ata/libata-scsi.c |   97 +++++++++++++++++++++++++++++++--------------
+ include/linux/ata.h       |   46 ++++++++++++++++++---
+ 2 files changed, 107 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
+index 6cf4f50..687f5ba 100644
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -51,7 +51,6 @@
+ 
+ #include "libata.h"
+ 
+-#define SECTOR_SIZE		512
+ #define ATA_SCSI_RBUF_SIZE	4096
+ 
+ static DEFINE_SPINLOCK(ata_scsi_rbuf_lock);
+@@ -514,7 +513,7 @@ int ata_cmd_ioctl(struct scsi_device *scsidev, void __user *arg)
+ 	memset(scsi_cmd, 0, sizeof(scsi_cmd));
+ 
+ 	if (args[3]) {
+-		argsize = SECTOR_SIZE * args[3];
++		argsize = ATA_SECT_SIZE * args[3];
+ 		argbuf = kmalloc(argsize, GFP_KERNEL);
+ 		if (argbuf == NULL) {
+ 			rc = -ENOMEM;
+@@ -1145,6 +1144,10 @@ static int ata_scsi_dev_config(struct scsi_device *sdev,
+ 
+ 		blk_queue_dma_drain(q, atapi_drain_needed, buf, ATAPI_MAX_DRAIN);
+ 	} else {
++		/* ATA devices must be sector aligned */
++		sdev->sector_size = ata_id_logical_sector_size(dev->id);
++		blk_queue_update_dma_alignment(sdev->request_queue,
++					       sdev->sector_size - 1);
+ 		sdev->manage_start_stop = 1;
+ 	}
+ 
+@@ -1174,6 +1177,7 @@ static int ata_scsi_dev_config(struct scsi_device *sdev,
+ 		scsi_adjust_queue_depth(sdev, MSG_SIMPLE_TAG, depth);
+ 	}
+ 
++	dev->sdev = sdev;
+ 	return 0;
+ }
+ 
+@@ -1704,7 +1708,7 @@ static unsigned int ata_scsi_rw_xlat(struct ata_queued_cmd *qc)
+ 		goto nothing_to_do;
+ 
+ 	qc->flags |= ATA_QCFLAG_IO;
+-	qc->nbytes = n_block * ATA_SECT_SIZE;
++	qc->nbytes = n_block * scmd->device->sector_size;
+ 
+ 	rc = ata_build_rw_tf(&qc->tf, qc->dev, block, n_block, tf_flags,
+ 			     qc->tag);
+@@ -2130,7 +2134,7 @@ static unsigned int ata_scsiop_inq_89(struct ata_scsi_args *args, u8 *rbuf)
+ 
+ static unsigned int ata_scsiop_inq_b0(struct ata_scsi_args *args, u8 *rbuf)
+ {
+-	u32 min_io_sectors;
++	u16 min_io_sectors;
+ 
+ 	rbuf[1] = 0xb0;
+ 	rbuf[3] = 0x3c;		/* required VPD size with unmap support */
+@@ -2142,10 +2146,7 @@ static unsigned int ata_scsiop_inq_b0(struct ata_scsi_args *args, u8 *rbuf)
+ 	 * logical than physical sector size we need to figure out what the
+ 	 * latter is.
+ 	 */
+-	if (ata_id_has_large_logical_sectors(args->id))
+-		min_io_sectors = ata_id_logical_per_physical_sectors(args->id);
+-	else
+-		min_io_sectors = 1;
++	min_io_sectors = 1 << ata_id_log2_per_physical_sector(args->id);
+ 	put_unaligned_be16(min_io_sectors, &rbuf[6]);
+ 
+ 	/*
+@@ -2414,21 +2415,13 @@ static unsigned int ata_scsiop_read_cap(struct ata_scsi_args *args, u8 *rbuf)
+ {
+ 	struct ata_device *dev = args->dev;
+ 	u64 last_lba = dev->n_sectors - 1; /* LBA of the last block */
+-	u8 log_per_phys = 0;
+-	u16 lowest_aligned = 0;
+-	u16 word_106 = dev->id[106];
+-	u16 word_209 = dev->id[209];
+-
+-	if ((word_106 & 0xc000) == 0x4000) {
+-		/* Number and offset of logical sectors per physical sector */
+-		if (word_106 & (1 << 13))
+-			log_per_phys = word_106 & 0xf;
+-		if ((word_209 & 0xc000) == 0x4000) {
+-			u16 first = dev->id[209] & 0x3fff;
+-			if (first > 0)
+-				lowest_aligned = (1 << log_per_phys) - first;
+-		}
+-	}
++	u32 sector_size; /* physical sector size in bytes */
++	u8 log2_per_phys;
++	u16 lowest_aligned;
++
++	sector_size = ata_id_logical_sector_size(dev->id);
++	log2_per_phys = ata_id_log2_per_physical_sector(dev->id);
++	lowest_aligned = ata_id_logical_sector_offset(dev->id, log2_per_phys);
+ 
+ 	VPRINTK("ENTER\n");
+ 
+@@ -2443,8 +2436,10 @@ static unsigned int ata_scsiop_read_cap(struct ata_scsi_args *args, u8 *rbuf)
+ 		rbuf[3] = last_lba;
+ 
+ 		/* sector size */
+-		rbuf[6] = ATA_SECT_SIZE >> 8;
+-		rbuf[7] = ATA_SECT_SIZE & 0xff;
++		rbuf[4] = sector_size >> (8 * 3);
++		rbuf[5] = sector_size >> (8 * 2);
++		rbuf[6] = sector_size >> (8 * 1);
++		rbuf[7] = sector_size;
+ 	} else {
+ 		/* sector count, 64-bit */
+ 		rbuf[0] = last_lba >> (8 * 7);
+@@ -2457,11 +2452,13 @@ static unsigned int ata_scsiop_read_cap(struct ata_scsi_args *args, u8 *rbuf)
+ 		rbuf[7] = last_lba;
+ 
+ 		/* sector size */
+-		rbuf[10] = ATA_SECT_SIZE >> 8;
+-		rbuf[11] = ATA_SECT_SIZE & 0xff;
++		rbuf[ 8] = sector_size >> (8 * 3);
++		rbuf[ 9] = sector_size >> (8 * 2);
++		rbuf[10] = sector_size >> (8 * 1);
++		rbuf[11] = sector_size;
+ 
+ 		rbuf[12] = 0;
+-		rbuf[13] = log_per_phys;
++		rbuf[13] = log2_per_phys;
+ 		rbuf[14] = (lowest_aligned >> 8) & 0x3f;
+ 		rbuf[15] = lowest_aligned;
+ 
+@@ -2908,9 +2905,8 @@ static unsigned int ata_scsi_pass_thru(struct ata_queued_cmd *qc)
+ 	tf->device = dev->devno ?
+ 		tf->device | ATA_DEV1 : tf->device & ~ATA_DEV1;
+ 
+-	/* READ/WRITE LONG use a non-standard sect_size */
+-	qc->sect_size = ATA_SECT_SIZE;
+ 	switch (tf->command) {
++	/* READ/WRITE LONG use a non-standard sect_size */
+ 	case ATA_CMD_READ_LONG:
+ 	case ATA_CMD_READ_LONG_ONCE:
+ 	case ATA_CMD_WRITE_LONG:
+@@ -2918,6 +2914,45 @@ static unsigned int ata_scsi_pass_thru(struct ata_queued_cmd *qc)
+ 		if (tf->protocol != ATA_PROT_PIO || tf->nsect != 1)
+ 			goto invalid_fld;
+ 		qc->sect_size = scsi_bufflen(scmd);
++		break;
++
++	/* commands using reported Logical Block size (e.g. 512 or 4K) */
++	case ATA_CMD_CFA_WRITE_NE:
++	case ATA_CMD_CFA_TRANS_SECT:
++	case ATA_CMD_CFA_WRITE_MULT_NE:
++	/* XXX: case ATA_CMD_CFA_WRITE_SECTORS_WITHOUT_ERASE: */
++	case ATA_CMD_READ:
++	case ATA_CMD_READ_EXT:
++	case ATA_CMD_READ_QUEUED:
++	/* XXX: case ATA_CMD_READ_QUEUED_EXT: */
++	case ATA_CMD_FPDMA_READ:
++	case ATA_CMD_READ_MULTI:
++	case ATA_CMD_READ_MULTI_EXT:
++	case ATA_CMD_PIO_READ:
++	case ATA_CMD_PIO_READ_EXT:
++	case ATA_CMD_READ_STREAM_DMA_EXT:
++	case ATA_CMD_READ_STREAM_EXT:
++	case ATA_CMD_VERIFY:
++	case ATA_CMD_VERIFY_EXT:
++	case ATA_CMD_WRITE:
++	case ATA_CMD_WRITE_EXT:
++	case ATA_CMD_WRITE_FUA_EXT:
++	case ATA_CMD_WRITE_QUEUED:
++	case ATA_CMD_WRITE_QUEUED_FUA_EXT:
++	case ATA_CMD_FPDMA_WRITE:
++	case ATA_CMD_WRITE_MULTI:
++	case ATA_CMD_WRITE_MULTI_EXT:
++	case ATA_CMD_WRITE_MULTI_FUA_EXT:
++	case ATA_CMD_PIO_WRITE:
++	case ATA_CMD_PIO_WRITE_EXT:
++	case ATA_CMD_WRITE_STREAM_DMA_EXT:
++	case ATA_CMD_WRITE_STREAM_EXT:
++		qc->sect_size = scmd->device->sector_size;
++		break;
++
++	/* Everything else uses 512 byte "sectors" */
++	default:
++		qc->sect_size = ATA_SECT_SIZE;
+ 	}
+ 
+ 	/*
+@@ -3412,6 +3447,8 @@ void ata_scsi_scan_host(struct ata_port *ap, int sync)
+ 			if (!IS_ERR(sdev)) {
+ 				dev->sdev = sdev;
+ 				scsi_device_put(sdev);
++			} else {
++				dev->sdev = NULL;
+ 			}
+ 		}
+ 	}
+diff --git a/include/linux/ata.h b/include/linux/ata.h
+index fe6e681..0c4929f 100644
+--- a/include/linux/ata.h
++++ b/include/linux/ata.h
+@@ -89,6 +89,7 @@ enum {
+ 	ATA_ID_SPG		= 98,
+ 	ATA_ID_LBA_CAPACITY_2	= 100,
+ 	ATA_ID_SECTOR_SIZE	= 106,
++	ATA_ID_LOGICAL_SECTOR_SIZE	= 117,	/* and 118 */
+ 	ATA_ID_LAST_LUN		= 126,
+ 	ATA_ID_DLF		= 128,
+ 	ATA_ID_CSFO		= 129,
+@@ -640,16 +641,49 @@ static inline int ata_id_flush_ext_enabled(const u16 *id)
+ 	return (id[ATA_ID_CFS_ENABLE_2] & 0x2400) == 0x2400;
+ }
+ 
+-static inline int ata_id_has_large_logical_sectors(const u16 *id)
++static inline u32 ata_id_logical_sector_size(const u16 *id)
+ {
+-	if ((id[ATA_ID_SECTOR_SIZE] & 0xc000) != 0x4000)
+-		return 0;
+-	return id[ATA_ID_SECTOR_SIZE] & (1 << 13);
++	/* T13/1699-D Revision 6a, Sep 6, 2008. Page 128.
++	 * IDENTIFY DEVICE data, word 117-118.
++	 * 0xd000 ignores bit 13 (logical:physical > 1)
++	 */
++	if ((id[ATA_ID_SECTOR_SIZE] & 0xd000) == 0x5000)
++		return (((id[ATA_ID_LOGICAL_SECTOR_SIZE+1] << 16)
++			 + id[ATA_ID_LOGICAL_SECTOR_SIZE]) * sizeof(u16)) ;
++	return ATA_SECT_SIZE;
++}
++
++static inline u8 ata_id_log2_per_physical_sector(const u16 *id)
++{
++	/* T13/1699-D Revision 6a, Sep 6, 2008. Page 128.
++	 * IDENTIFY DEVICE data, word 106.
++	 * 0xe000 ignores bit 12 (logical sector > 512 bytes)
++	 */
++	if ((id[ATA_ID_SECTOR_SIZE] & 0xe000) == 0x6000)
++		return (id[ATA_ID_SECTOR_SIZE] & 0xf);
++	return 0;
+ }
+ 
+-static inline u16 ata_id_logical_per_physical_sectors(const u16 *id)
++/* Offset of logical sectors relative to physical sectors.
++ *
++ * If device has more than one logical sector per physical sector
++ * (aka 512 byte emulation), vendors might offset the "sector 0" address
++ * so sector 63 is "naturally aligned" - e.g. FAT partition table.
++ * This avoids Read/Mod/Write penalties when using FAT partition table
++ * and updating "well aligned" (FS perspective) physical sectors on every
++ * transaction.
++ */
++static inline u16 ata_id_logical_sector_offset(const u16 *id,
++	 u8 log2_per_phys)
+ {
+-	return 1 << (id[ATA_ID_SECTOR_SIZE] & 0xf);
++	u16 word_209 = id[209];
++
++	if ((log2_per_phys > 1) && (word_209 & 0xc000) == 0x4000) {
++		u16 first = word_209 & 0x3fff;
++		if (first > 0)
++			return (1 << log2_per_phys) - first;
++	}
++	return 0;
+ }
+ 
+ static inline int ata_id_has_lba48(const u16 *id)
+-- 
+1.6.0.2
+
