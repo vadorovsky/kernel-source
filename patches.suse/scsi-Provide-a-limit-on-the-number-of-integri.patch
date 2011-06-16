@@ -1,0 +1,184 @@
+From: Martin K. Petersen <martin.petersen@oracle.com>
+Date: Fri, 10 Sep 2010 20:50:10 +0200
+Subject: scsi: Provide a limit on the number of integrity segments
+X-Git: 13f05c8d8e98bbdce89158bfdb2e380940695a88
+References: FATE#311755
+Patch-Mainline: 2.6.38
+
+Some controllers have a hardware limit on the number of protection
+information scatter-gather list segments they can handle.
+
+Introduce a max_integrity_segments limit in the block layer and provide
+a new scsi_host_template setting that allows HBA drivers to provide a
+value suitable for the hardware.
+
+Add support for honoring the integrity segment limit when merging both
+bios and requests.
+
+Split off from the original patch to apply cleanly.
+
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jens Axboe <axboe@carl.home.kernel.dk>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/hosts.c      |    1 +
+ drivers/scsi/scsi_lib.c   |   26 +++++++++----
+ drivers/scsi/scsi_sysfs.c |    2 +
+ include/scsi/scsi.h       |    6 +++
+ include/scsi/scsi_host.h  |    7 +++
+ 12 files changed, 167 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/scsi/hosts.c b/drivers/scsi/hosts.c
+index e42173b..749a378 100644
+--- a/drivers/scsi/hosts.c
++++ b/drivers/scsi/hosts.c
+@@ -365,6 +365,7 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
+ 	shost->this_id = sht->this_id;
+ 	shost->can_queue = sht->can_queue;
+ 	shost->sg_tablesize = sht->sg_tablesize;
++	shost->sg_prot_tablesize = sht->sg_prot_tablesize;
+ 	shost->cmd_per_lun = sht->cmd_per_lun;
+ 	shost->unchecked_isa_dma = sht->unchecked_isa_dma;
+ 	shost->use_clustering = sht->use_clustering;
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 3d9b5fc..5bd5a5d 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -997,11 +997,13 @@ static int scsi_init_sgtable(struct request *req, struct scsi_data_buffer *sdb,
+  */
+ int scsi_init_io(struct scsi_cmnd *cmd, gfp_t gfp_mask)
+ {
+-	int error = scsi_init_sgtable(cmd->request, &cmd->sdb, gfp_mask);
++	struct request *rq = cmd->request;
++
++	int error = scsi_init_sgtable(rq, &cmd->sdb, gfp_mask);
+ 	if (error)
+ 		goto err_exit;
+ 
+-	if (blk_bidi_rq(cmd->request)) {
++	if (blk_bidi_rq(rq)) {
+ 		struct scsi_data_buffer *bidi_sdb = kmem_cache_zalloc(
+ 			scsi_sdb_cache, GFP_ATOMIC);
+ 		if (!bidi_sdb) {
+@@ -1009,28 +1011,28 @@ int scsi_init_io(struct scsi_cmnd *cmd, gfp_t gfp_mask)
+ 			goto err_exit;
+ 		}
+ 
+-		cmd->request->next_rq->special = bidi_sdb;
+-		error = scsi_init_sgtable(cmd->request->next_rq, bidi_sdb,
+-								    GFP_ATOMIC);
++		rq->next_rq->special = bidi_sdb;
++		error = scsi_init_sgtable(rq->next_rq, bidi_sdb, GFP_ATOMIC);
+ 		if (error)
+ 			goto err_exit;
+ 	}
+ 
+-	if (blk_integrity_rq(cmd->request)) {
++	if (blk_integrity_rq(rq)) {
+ 		struct scsi_data_buffer *prot_sdb = cmd->prot_sdb;
+ 		int ivecs, count;
+ 
+ 		BUG_ON(prot_sdb == NULL);
+-		ivecs = blk_rq_count_integrity_sg(cmd->request);
++		ivecs = blk_rq_count_integrity_sg(rq->q, rq->bio);
+ 
+ 		if (scsi_alloc_sgtable(prot_sdb, ivecs, gfp_mask)) {
+ 			error = BLKPREP_DEFER;
+ 			goto err_exit;
+ 		}
+ 
+-		count = blk_rq_map_integrity_sg(cmd->request,
++		count = blk_rq_map_integrity_sg(rq->q, rq->bio,
+ 						prot_sdb->table.sgl);
+ 		BUG_ON(unlikely(count > ivecs));
++		BUG_ON(unlikely(count > queue_max_integrity_segments(rq->q)));
+ 
+ 		cmd->prot_sdb = prot_sdb;
+ 		cmd->prot_sdb->table.nents = count;
+@@ -1665,6 +1667,14 @@ struct request_queue *__scsi_alloc_queue(struct Scsi_Host *shost,
+ 	blk_queue_max_segments(q, min_t(unsigned short, shost->sg_tablesize,
+ 					SCSI_MAX_SG_CHAIN_SEGMENTS));
+ 
++	if (scsi_host_prot_dma(shost)) {
++		shost->sg_prot_tablesize =
++			min_not_zero(shost->sg_prot_tablesize,
++				     (unsigned short)SCSI_MAX_PROT_SG_SEGMENTS);
++		BUG_ON(shost->sg_prot_tablesize < shost->sg_tablesize);
++		blk_queue_max_integrity_segments(q, shost->sg_prot_tablesize);
++	}
++
+ 	blk_queue_max_hw_sectors(q, shost->max_sectors);
+ 	blk_queue_bounce_limit(q, scsi_calculate_bounce_limit(shost));
+ 	blk_queue_segment_boundary(q, shost->dma_boundary);
+diff --git a/drivers/scsi/scsi_sysfs.c b/drivers/scsi/scsi_sysfs.c
+index d328343..7062da2 100644
+--- a/drivers/scsi/scsi_sysfs.c
++++ b/drivers/scsi/scsi_sysfs.c
+@@ -249,6 +249,7 @@ shost_rd_attr(host_busy, "%hu\n");
+ shost_rd_attr(cmd_per_lun, "%hd\n");
+ shost_rd_attr(can_queue, "%hd\n");
+ shost_rd_attr(sg_tablesize, "%hu\n");
++shost_rd_attr(sg_prot_tablesize, "%hu\n");
+ shost_rd_attr(unchecked_isa_dma, "%d\n");
+ shost_rd_attr(prot_capabilities, "%u\n");
+ shost_rd_attr(prot_guard_type, "%hd\n");
+@@ -260,6 +261,7 @@ static struct attribute *scsi_sysfs_shost_attrs[] = {
+ 	&dev_attr_cmd_per_lun.attr,
+ 	&dev_attr_can_queue.attr,
+ 	&dev_attr_sg_tablesize.attr,
++	&dev_attr_sg_prot_tablesize.attr,
+ 	&dev_attr_unchecked_isa_dma.attr,
+ 	&dev_attr_proc_name.attr,
+ 	&dev_attr_scan.attr,
+diff --git a/include/scsi/scsi.h b/include/scsi/scsi.h
+index 300069c..7596dbb 100644
+--- a/include/scsi/scsi.h
++++ b/include/scsi/scsi.h
+@@ -32,6 +32,12 @@ struct scsi_cmnd;
+ #endif
+ 
+ /*
++ * DIX-capable adapters effectively support infinite chaining for the
++ * protection information scatterlist
++ */
++#define SCSI_MAX_PROT_SG_SEGMENTS	0xFFFF
++
++/*
+  * Special value for scanning to specify scanning or rescanning of all
+  * possible channels, (target) ids, or luns on a given shost.
+  */
+diff --git a/include/scsi/scsi_host.h b/include/scsi/scsi_host.h
+index 4de9fb3..e7e3858 100644
+--- a/include/scsi/scsi_host.h
++++ b/include/scsi/scsi_host.h
+@@ -387,6 +387,7 @@ struct scsi_host_template {
+ 	 * of scatter-gather.
+ 	 */
+ 	unsigned short sg_tablesize;
++	unsigned short sg_prot_tablesize;
+ 
+ 	/*
+ 	 * Set this if the host adapter has limitations beside segment count.
+@@ -617,6 +618,7 @@ struct Scsi_Host {
+ 	int can_queue;
+ 	short cmd_per_lun;
+ 	short unsigned int sg_tablesize;
++	short unsigned int sg_prot_tablesize;
+ 	short unsigned int max_sectors;
+ 	unsigned long dma_boundary;
+ 	/* 
+@@ -842,6 +844,11 @@ static inline unsigned int scsi_host_get_prot(struct Scsi_Host *shost)
+ 	return shost->prot_capabilities;
+ }
+ 
++static inline int scsi_host_prot_dma(struct Scsi_Host *shost)
++{
++	return shost->prot_capabilities >= SHOST_DIX_TYPE0_PROTECTION;
++}
++
+ static inline unsigned int scsi_host_dif_capable(struct Scsi_Host *shost, unsigned int target_type)
+ {
+ 	static unsigned char cap[] = { 0,
+-- 
+1.6.0.2
+
