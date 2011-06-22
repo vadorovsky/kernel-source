@@ -1,9 +1,9 @@
-From ef8ff89b58546055e238c3b521f83b440dfe8ef2 Mon Sep 17 00:00:00 2001
 From: Michal Marek <mmarek@suse.cz>
 Date: Tue, 9 Mar 2010 16:00:20 +0100
 Subject: [PATCH] kbuild: Really don't clean bounds.h and asm-offsets.h
 Patch-mainline: Submitted for 2.6.37-rc1
 References: bnc#585743
+Git-commit: ef8ff89b58546055e238c3b521f83b440dfe8ef2
 
 Commit 7d3cc8b tried to keep bounds.h and asm-offsets.h during make
 clean by filtering these out of $(clean-files), but they are listed in
