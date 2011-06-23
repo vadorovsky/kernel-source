@@ -1,0 +1,274 @@
+From: Xiao Guangrong <xiaoguangrong@cn.fujitsu.com>
+Date: Wed, 20 Apr 2011 10:09:16 +0000
+Patch-mainline: yes
+References: FATE#306586
+Subject: [PATCH] Btrfs: using rcu lock in the reader side of devices
+ list
+
+fs_devices->devices is only updated on remove and add device paths, so we can
+use rcu to protect it in the reader side
+
+Signed-off-by: Xiao Guangrong <xiaoguangrong@cn.fujitsu.com>
+Signed-off-by: Chris Mason <chris.mason@oracle.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/disk-io.c |   14 ++++----
+ fs/btrfs/volumes.c |   83 +++++++++++++++++++++++++++++++++++++----------------
+ fs/btrfs/volumes.h |    2 +
+ 3 files changed, 68 insertions(+), 31 deletions(-)
+
+Index: linux-2.6.32-SLE11-SP2/fs/btrfs/disk-io.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/btrfs/disk-io.c
++++ linux-2.6.32-SLE11-SP2/fs/btrfs/disk-io.c
+@@ -1372,8 +1372,8 @@ static int btrfs_congested_fn(void *cong
+ 	struct btrfs_device *device;
+ 	struct backing_dev_info *bdi;
+ 
+-	mutex_lock(&info->fs_devices->device_list_mutex);
+-	list_for_each_entry(device, &info->fs_devices->devices, dev_list) {
++	rcu_read_lock();
++	list_for_each_entry_rcu(device, &info->fs_devices->devices, dev_list) {
+ 		if (!device->bdev)
+ 			continue;
+ 		bdi = blk_get_backing_dev_info(device->bdev);
+@@ -1382,7 +1382,7 @@ static int btrfs_congested_fn(void *cong
+ 			break;
+ 		}
+ 	}
+-	mutex_unlock(&info->fs_devices->device_list_mutex);
++	rcu_read_unlock();
+ 	return ret;
+ }
+ 
+@@ -2404,9 +2404,9 @@ int write_all_supers(struct btrfs_root *
+ 	sb = &root->fs_info->super_for_commit;
+ 	dev_item = &sb->dev_item;
+ 
+-	mutex_lock(&root->fs_info->fs_devices->device_list_mutex);
++	rcu_read_lock();
+ 	head = &root->fs_info->fs_devices->devices;
+-	list_for_each_entry(dev, head, dev_list) {
++	list_for_each_entry_rcu(dev, head, dev_list) {
+ 		if (!dev->bdev) {
+ 			total_errors++;
+ 			continue;
+@@ -2439,7 +2439,7 @@ int write_all_supers(struct btrfs_root *
+ 	}
+ 
+ 	total_errors = 0;
+-	list_for_each_entry(dev, head, dev_list) {
++	list_for_each_entry_rcu(dev, head, dev_list) {
+ 		if (!dev->bdev)
+ 			continue;
+ 		if (!dev->in_fs_metadata || !dev->writeable)
+@@ -2449,7 +2449,7 @@ int write_all_supers(struct btrfs_root *
+ 		if (ret)
+ 			total_errors++;
+ 	}
+-	mutex_unlock(&root->fs_info->fs_devices->device_list_mutex);
++	rcu_read_unlock();
+ 	if (total_errors > max_errors) {
+ 		printk(KERN_ERR "btrfs: %d errors while writing supers\n",
+ 		       total_errors);
+Index: linux-2.6.32-SLE11-SP2/fs/btrfs/volumes.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/btrfs/volumes.c
++++ linux-2.6.32-SLE11-SP2/fs/btrfs/volumes.c
+@@ -383,7 +383,7 @@ static noinline int device_list_add(cons
+ 		INIT_LIST_HEAD(&device->dev_alloc_list);
+ 
+ 		mutex_lock(&fs_devices->device_list_mutex);
+-		list_add(&device->dev_list, &fs_devices->devices);
++		list_add_rcu(&device->dev_list, &fs_devices->devices);
+ 		mutex_unlock(&fs_devices->device_list_mutex);
+ 
+ 		device->fs_devices = fs_devices;
+@@ -491,6 +491,29 @@ again:
+ 	return 0;
+ }
+ 
++static void __free_device(struct work_struct *work)
++{
++	struct btrfs_device *device;
++
++	device = container_of(work, struct btrfs_device, rcu_work);
++
++	if (device->bdev)
++		blkdev_put(device->bdev, device->mode);
++
++	kfree(device->name);
++	kfree(device);
++}
++
++static void free_device(struct rcu_head *head)
++{
++	struct btrfs_device *device;
++
++	device = container_of(head, struct btrfs_device, rcu);
++
++	INIT_WORK(&device->rcu_work, __free_device);
++	schedule_work(&device->rcu_work);
++}
++
+ static int __btrfs_close_devices(struct btrfs_fs_devices *fs_devices)
+ {
+ 	struct btrfs_device *device;
+@@ -500,18 +523,27 @@ static int __btrfs_close_devices(struct
+ 
+ 	mutex_lock(&fs_devices->device_list_mutex);
+ 	list_for_each_entry(device, &fs_devices->devices, dev_list) {
+-		if (device->bdev) {
+-			close_bdev_exclusive(device->bdev, device->mode);
++		struct btrfs_device *new_device;
++
++		if (device->bdev)
+ 			fs_devices->open_devices--;
+-		}
+ 		if (device->writeable) {
+ 			list_del_init(&device->dev_alloc_list);
+ 			fs_devices->rw_devices--;
+ 		}
+ 
+-		device->bdev = NULL;
+-		device->writeable = 0;
+-		device->in_fs_metadata = 0;
++		new_device = kmalloc(sizeof(*new_device), GFP_NOFS);
++		BUG_ON(!new_device);
++		memcpy(new_device, device, sizeof(*new_device));
++		new_device->name = kstrdup(device->name, GFP_NOFS);
++		BUG_ON(!new_device->name);
++		new_device->bdev = NULL;
++		new_device->writeable = 0;
++		new_device->in_fs_metadata = 0;
++		list_replace_rcu(&device->dev_list, &new_device->dev_list);
++
++		call_rcu(&device->rcu, free_device);
++
+ 	}
+ 	mutex_unlock(&fs_devices->device_list_mutex);
+ 
+@@ -1218,11 +1250,13 @@ int btrfs_rm_device(struct btrfs_root *r
+ 	struct block_device *bdev;
+ 	struct buffer_head *bh = NULL;
+ 	struct btrfs_super_block *disk_super;
++	struct btrfs_fs_devices *cur_devices;
+ 	u64 all_avail;
+ 	u64 devid;
+ 	u64 num_devices;
+ 	u8 *dev_uuid;
+ 	int ret = 0;
++	bool clear_super = false;
+ 
+ 	mutex_lock(&uuid_mutex);
+ 	mutex_lock(&root->fs_info->volume_mutex);
+@@ -1308,6 +1342,7 @@ int btrfs_rm_device(struct btrfs_root *r
+ 		list_del_init(&device->dev_alloc_list);
+ 		unlock_chunks(root);
+ 		root->fs_info->fs_devices->rw_devices--;
++		clear_super = true;
+ 	}
+ 
+ 	ret = btrfs_shrink_device(device, 0);
+@@ -1326,9 +1361,10 @@ int btrfs_rm_device(struct btrfs_root *r
+ 	 * the device list while someone else is writing out all
+ 	 * the device supers.
+ 	 */
++
++	cur_devices = device->fs_devices;
+ 	mutex_lock(&root->fs_info->fs_devices->device_list_mutex);
+-	list_del_init(&device->dev_list);
+-	mutex_unlock(&root->fs_info->fs_devices->device_list_mutex);
++	list_del_rcu(&device->dev_list);
+ 
+ 	device->fs_devices->num_devices--;
+ 
+@@ -1342,36 +1378,36 @@ int btrfs_rm_device(struct btrfs_root *r
+ 	if (device->bdev == root->fs_info->fs_devices->latest_bdev)
+ 		root->fs_info->fs_devices->latest_bdev = next_device->bdev;
+ 
+-	if (device->bdev) {
+-		close_bdev_exclusive(device->bdev, device->mode);
+-		device->bdev = NULL;
++	if (device->bdev)
+ 		device->fs_devices->open_devices--;
+-	}
++
++	call_rcu(&device->rcu, free_device);
++	mutex_unlock(&root->fs_info->fs_devices->device_list_mutex);
+ 
+ 	num_devices = btrfs_super_num_devices(&root->fs_info->super_copy) - 1;
+ 	btrfs_set_super_num_devices(&root->fs_info->super_copy, num_devices);
+ 
+-	if (device->fs_devices->open_devices == 0) {
++	if (cur_devices->open_devices == 0) {
+ 		struct btrfs_fs_devices *fs_devices;
+ 		fs_devices = root->fs_info->fs_devices;
+ 		while (fs_devices) {
+-			if (fs_devices->seed == device->fs_devices)
++			if (fs_devices->seed == cur_devices)
+ 				break;
+ 			fs_devices = fs_devices->seed;
+ 		}
+-		fs_devices->seed = device->fs_devices->seed;
+-		device->fs_devices->seed = NULL;
++		fs_devices->seed = cur_devices->seed;
++		cur_devices->seed = NULL;
+ 		lock_chunks(root);
+-		__btrfs_close_devices(device->fs_devices);
++		__btrfs_close_devices(cur_devices);
+ 		unlock_chunks(root);
+-		free_fs_devices(device->fs_devices);
++		free_fs_devices(cur_devices);
+ 	}
+ 
+ 	/*
+ 	 * at this point, the device is zero sized.  We want to
+ 	 * remove it from the devices list and zero out the old super
+ 	 */
+-	if (device->writeable) {
++	if (clear_super) {
+ 		/* make sure this device isn't detected as part of
+ 		 * the FS anymore
+ 		 */
+@@ -1380,8 +1416,6 @@ int btrfs_rm_device(struct btrfs_root *r
+ 		sync_dirty_buffer(bh);
+ 	}
+ 
+-	kfree(device->name);
+-	kfree(device);
+ 	ret = 0;
+ 
+ error_brelse:
+@@ -1440,7 +1474,8 @@ static int btrfs_prepare_sprout(struct b
+ 	mutex_init(&seed_devices->device_list_mutex);
+ 
+ 	mutex_lock(&root->fs_info->fs_devices->device_list_mutex);
+-	list_splice_init(&fs_devices->devices, &seed_devices->devices);
++	list_splice_init_rcu(&fs_devices->devices, &seed_devices->devices,
++			      synchronize_rcu);
+ 	mutex_unlock(&root->fs_info->fs_devices->device_list_mutex);
+ 
+ 	list_splice_init(&fs_devices->alloc_list, &seed_devices->alloc_list);
+@@ -1638,7 +1673,7 @@ int btrfs_init_new_device(struct btrfs_r
+ 	 * half setup
+ 	 */
+ 	mutex_lock(&root->fs_info->fs_devices->device_list_mutex);
+-	list_add(&device->dev_list, &root->fs_info->fs_devices->devices);
++	list_add_rcu(&device->dev_list, &root->fs_info->fs_devices->devices);
+ 	list_add(&device->dev_alloc_list,
+ 		 &root->fs_info->fs_devices->alloc_list);
+ 	root->fs_info->fs_devices->num_devices++;
+Index: linux-2.6.32-SLE11-SP2/fs/btrfs/volumes.h
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/btrfs/volumes.h
++++ linux-2.6.32-SLE11-SP2/fs/btrfs/volumes.h
+@@ -89,6 +89,8 @@ struct btrfs_device {
+ 	struct scrub_dev *scrub_device;
+ 
+ 	struct btrfs_work work;
++	struct rcu_head rcu;
++	struct work_struct rcu_work;
+ };
+ 
+ struct btrfs_fs_devices {
