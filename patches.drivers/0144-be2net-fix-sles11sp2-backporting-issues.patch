@@ -1,0 +1,629 @@
+From: Subbu Seetharaman <subbus@emulex.com>
+Subject: be2net: Fix sles11sp2 backporting issues
+References: FATE#311448, bnc#697255
+Patch-mainline: never, SLES specific
+
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+ drivers/net/benet/be.h         |   49 ++++++++++++-----
+ drivers/net/benet/be_cmds.c    |   34 +++++++++++-
+ drivers/net/benet/be_cmds.h    |   21 ++++++-
+ drivers/net/benet/be_ethtool.c |   43 ++-------------
+ drivers/net/benet/be_main.c    |  113 +++++++++++++++--------------------------
+ 5 files changed, 138 insertions(+), 122 deletions(-)
+
+--- a/drivers/net/benet/be.h
++++ b/drivers/net/benet/be.h
+@@ -33,7 +33,7 @@
+ 
+ #include "be_hw.h"
+ 
+-#define DRV_VER			"2.102.147s"
++#define DRV_VER			"4.0.244s"
+ #define DRV_NAME		"be2net"
+ #define BE_NAME			"ServerEngines BladeEngine2 10Gbps NIC"
+ #define BE3_NAME		"ServerEngines BladeEngine3 10Gbps NIC"
+@@ -95,6 +95,11 @@ static inline char *nic_name(struct pci_
+ 
+ #define FW_VER_LEN		32
+ 
++#ifndef VLAN_PRIO_MASK
++#define VLAN_PRIO_MASK		0xe000	/* Priority Code Point */
++#define VLAN_PRIO_SHIFT		13
++#endif
++
+ struct be_dma_mem {
+ 	void *va;
+ 	dma_addr_t dma;
+@@ -190,7 +195,7 @@ struct be_tx_obj {
+ /* Struct to remember the pages posted for rx frags */
+ struct be_rx_page_info {
+ 	struct page *page;
+-	DEFINE_DMA_UNMAP_ADDR(bus);
++	dma_addr_t bus;
+ 	u16 page_offset;
+ 	bool last_page_user;
+ };
+@@ -286,6 +291,16 @@ struct be_drv_stats {
+ 	u64 jabber_events;
+ };
+ 
++struct be_vf_cfg {
++	unsigned char vf_mac_addr[ETH_ALEN];
++	u32 vf_if_handle;
++	u32 vf_pmac_id;
++	u16 vf_vlan_tag;
++	u32 vf_tx_rate;
++};
++
++#define BE_INVALID_PMAC_ID		0xffffffff
++
+ struct be_adapter {
+ 	struct pci_dev *pdev;
+ 	struct net_device *netdev;
+@@ -295,7 +310,6 @@ struct be_adapter {
+ 	u8 __iomem *pcicfg;	/* PCI config space */
+ 
+ 	struct mutex mbox_lock; /* For serializing mbox cmds to BE card */
+-
+ 	struct be_dma_mem mbox_mem;
+ 	/* Mbox mem is adjusted to align to 16 bytes. The allocated addr
+ 	 * is stored for freeing purpose */
+@@ -328,6 +342,8 @@ struct be_adapter {
+ 	u16 vlans_added;
+ 	u16 max_vlans;	/* Number of vlans supported */
+ 	u8 vlan_tag[VLAN_GROUP_ARRAY_LEN];
++	u8 vlan_prio_bmap;	/* Available Priority BitMap */
++	u16 recommended_prio;	/* Recommended Priority */
+ 	struct be_dma_mem mc_cmd_mem;
+ 
+ 	struct be_dma_mem stats_cmd;
+@@ -337,10 +353,9 @@ struct be_adapter {
+ 
+ 	/* Ethtool knobs and info */
+ 	char fw_ver[FW_VER_LEN];
+-	u8 vlan_prio_bmap;	/* Available Priority BitMap */
+-	u16 recommended_prio;	/* Recommended Priority */
+ 	u32 if_handle;		/* Used to configure filtering */
+ 	u32 pmac_id;		/* MAC addr handle used by BE card */
++	u32 beacon_state;	/* for set_phys_id */
+ 
+ 	bool eeh_err;
+ 	bool link_up;
+@@ -351,19 +366,19 @@ struct be_adapter {
+ 	u32 function_caps;
+ 	u32 rx_fc;		/* Rx flow control */
+ 	u32 tx_fc;		/* Tx flow control */
+-	u8 generation;		/* BladeEngine ASIC generation */
+-	bool sriov_enabled;
+-	u32 vf_if_handle[BE_MAX_VF];
+-	u8 autoneg;
+-	u32 vf_pmac_id[BE_MAX_VF];
+-	u32 flash_status;
+-	struct completion flash_compl;
+-	int link_speed;
+ 	bool ue_detected;
+ 	bool stats_cmd_sent;
++	int link_speed;
+ 	u8 port_type;
+ 	u8 transceiver;
+-+	struct be_vf_cfg *vf_cfg;
++	u8 autoneg;
++	u8 generation;		/* BladeEngine ASIC generation */
++	u32 flash_status;
++	struct completion flash_compl;
++
++	bool be3_native;
++	bool sriov_enabled;
++	struct be_vf_cfg *vf_cfg;
+ 	u8 is_virtfn;
+ 	u32 sli_family;
+ 	u8 hba_port_num;
+@@ -371,7 +386,6 @@ struct be_adapter {
+ };
+ 
+ #define be_physfn(adapter) (!adapter->is_virtfn)
+-	bool be3_native;
+ 
+ /* BladeEngine Generation numbers */
+ #define BE_GEN2 2
+@@ -510,6 +524,11 @@ static inline void be_vf_eth_addr_genera
+ 	memcpy(mac, adapter->netdev->dev_addr, 3);
+ }
+ 
++static inline bool be_multi_rxq(const struct be_adapter *adapter)
++{
++	return adapter->num_rx_qs > 1;
++}
++
+ extern void be_cq_notify(struct be_adapter *adapter, u16 qid, bool arm,
+ 		u16 num_popped);
+ extern void be_link_status_update(struct be_adapter *adapter, bool link_up);
+--- a/drivers/net/benet/be_cmds.c
++++ b/drivers/net/benet/be_cmds.c
+@@ -1622,7 +1622,6 @@ int be_cmd_multicast_set(struct be_adapt
+ 		struct dev_mc_list *mc;
+ 
+ 		req->num_mac = cpu_to_le16(mc_count);
+-
+ 		for (mc = mc_list, i = 0; mc; mc = mc->next, i++)
+ 			memcpy(req->mac[i].byte, mc->dmi_addr, ETH_ALEN);
+ 	} else {
+@@ -2257,6 +2256,39 @@ int be_cmd_get_phy_info(struct be_adapte
+ err:
+ 	spin_unlock_bh(&adapter->mcc_lock);
+ 	return status;
++}
++
++int be_cmd_set_qos(struct be_adapter *adapter, u32 bps, u32 domain)
++{
++	struct be_mcc_wrb *wrb;
++	struct be_cmd_req_set_qos *req;
++	int status;
++
++	spin_lock_bh(&adapter->mcc_lock);
++
++	wrb = wrb_from_mccq(adapter);
++	if (!wrb) {
++		status = -EBUSY;
++		goto err;
++	}
++
++	req = embedded_payload(wrb);
++
++	be_wrb_hdr_prepare(wrb, sizeof(*req), true, 0,
++				OPCODE_COMMON_SET_QOS);
++
++	be_cmd_hdr_prepare(&req->hdr, CMD_SUBSYSTEM_COMMON,
++			OPCODE_COMMON_SET_QOS, sizeof(*req));
++
++	req->hdr.domain = domain;
++	req->valid_bits = cpu_to_le32(BE_QOS_BITS_NIC);
++	req->max_bps_nic = cpu_to_le32(bps);
++
++	status = be_mcc_notify_wait(adapter);
++
++err:
++	spin_unlock_bh(&adapter->mcc_lock);
++	return status;
+ }
+ 
+ int be_cmd_get_cntl_attributes(struct be_adapter *adapter)
+--- a/drivers/net/benet/be_cmds.h
++++ b/drivers/net/benet/be_cmds.h
+@@ -166,6 +166,7 @@ struct be_mcc_mailbox {
+ #define OPCODE_COMMON_CQ_CREATE				12
+ #define OPCODE_COMMON_EQ_CREATE				13
+ #define OPCODE_COMMON_MCC_CREATE			21
++#define OPCODE_COMMON_SET_QOS				28
+ #define OPCODE_COMMON_MCC_CREATE_EXT			90
+ #define OPCODE_COMMON_SEEPROM_READ			30
+ #define OPCODE_COMMON_GET_CNTL_ATTRIBUTES               32
+@@ -1266,6 +1267,22 @@ struct be_cmd_resp_get_phy_info {
+ 	u32 future_use[4];
+ };
+ 
++/*********************** Set QOS ***********************/
++
++#define BE_QOS_BITS_NIC				1
++
++struct be_cmd_req_set_qos {
++	struct be_cmd_req_hdr hdr;
++	u32 valid_bits;
++	u32 max_bps_nic;
++	u32 rsvd[7];
++};
++
++struct be_cmd_resp_set_qos {
++	struct be_cmd_resp_hdr hdr;
++	u32 rsvd;
++};
++
+ /*********************** Controller Attributes ***********************/
+ struct be_cmd_req_cntl_attribs {
+ 	struct be_cmd_req_hdr hdr;
+@@ -1528,10 +1545,10 @@ extern int be_cmd_set_loopback(struct be
+ 				u8 loopback_type, u8 enable);
+ extern int be_cmd_get_phy_info(struct be_adapter *adapter,
+ 		struct be_dma_mem *cmd);
+-
++extern int be_cmd_set_qos(struct be_adapter *adapter, u32 bps, u32 domain);
+ extern void be_detect_dump_ue(struct be_adapter *adapter);
++extern int be_cmd_get_die_temperature(struct be_adapter *adapter);
+ extern int be_cmd_get_cntl_attributes(struct be_adapter *adapter);
+ extern int be_cmd_check_native_mode(struct be_adapter *adapter);
+-extern int be_cmd_get_die_temperature(struct be_adapter *adapter);
+ extern int be_cmd_get_reg_len(struct be_adapter *adapter, u32 *log_size);
+ extern void be_cmd_get_regs(struct be_adapter *adapter, u32 buf_len, void *buf);
+--- a/drivers/net/benet/be_ethtool.c
++++ b/drivers/net/benet/be_ethtool.c
+@@ -377,23 +377,23 @@ static int be_get_settings(struct net_de
+ 		be_link_status_update(adapter, link_up);
+ 		/* link_speed is in units of 10 Mbps */
+ 		if (link_speed) {
+-			ecmd->speed = link_speed*10;
++			ethtool_cmd_speed_set(ecmd, link_speed*10);
+ 		} else {
+ 			switch (mac_speed) {
+ 			case PHY_LINK_SPEED_10MBPS:
+-				ecmd->speed = SPEED_10;
++				ethtool_cmd_speed_set(ecmd, SPEED_10);
+ 				break;
+ 			case PHY_LINK_SPEED_100MBPS:
+-				ecmd->speed = SPEED_100;
++				ethtool_cmd_speed_set(ecmd, SPEED_100);
+ 				break;
+ 			case PHY_LINK_SPEED_1GBPS:
+-				ecmd->speed = SPEED_1000;
++				ethtool_cmd_speed_set(ecmd, SPEED_1000);
+ 				break;
+ 			case PHY_LINK_SPEED_10GBPS:
+-				ecmd->speed = SPEED_10000;
++				ethtool_cmd_speed_set(ecmd, SPEED_10000);
+ 				break;
+ 			case PHY_LINK_SPEED_ZERO:
+-				ecmd->speed = 0;
++				ethtool_cmd_speed_set(ecmd, 0);
+ 				break;
+ 			}
+ 		}
+@@ -436,14 +436,14 @@ static int be_get_settings(struct net_de
+ 		}
+ 
+ 		/* Save for future use */
+-		adapter->link_speed = ecmd->speed;
++		adapter->link_speed = ethtool_cmd_speed(ecmd);
+ 		adapter->port_type = ecmd->port;
+ 		adapter->transceiver = ecmd->transceiver;
+ 		adapter->autoneg = ecmd->autoneg;
+ 		dma_free_coherent(&adapter->pdev->dev, phy_cmd.size, phy_cmd.va,
+ 				  phy_cmd.dma);
+ 	} else {
+-		ecmd->speed = adapter->link_speed;
++		ethtool_cmd_speed_set(ecmd, adapter->link_speed);
+ 		ecmd->port = adapter->port_type;
+ 		ecmd->transceiver = adapter->transceiver;
+ 		ecmd->autoneg = adapter->autoneg;
+@@ -513,32 +513,6 @@ be_set_pauseparam(struct net_device *net
+ 	return status;
+ }
+ 
+-static int
+-be_phys_id(struct net_device *netdev, u32 data)
+-{
+-	struct be_adapter *adapter = netdev_priv(netdev);
+-	int status;
+-	u32 cur;
+-
+-	be_cmd_get_beacon_state(adapter, adapter->hba_port_num, &cur);
+-
+-	if (cur == BEACON_STATE_ENABLED)
+-		return 0;
+-
+-	if (data < 2)
+-		data = 2;
+-
+-	status = be_cmd_set_beacon_state(adapter, adapter->hba_port_num, 0, 0,
+-			BEACON_STATE_ENABLED);
+-	set_current_state(TASK_INTERRUPTIBLE);
+-	schedule_timeout(data*HZ);
+-
+-	status = be_cmd_set_beacon_state(adapter, adapter->hba_port_num, 0, 0,
+-			BEACON_STATE_DISABLED);
+-
+-	return status;
+-}
+-
+ static bool
+ be_is_wol_supported(struct be_adapter *adapter)
+ {
+@@ -731,7 +705,6 @@ const struct ethtool_ops be_ethtool_ops
+ 	.get_pauseparam = be_get_pauseparam,
+ 	.set_pauseparam = be_set_pauseparam,
+ 	.get_strings = be_get_stat_strings,
+-	.phys_id = be_phys_id,
+ 	.get_sset_count = be_get_sset_count,
+ 	.get_ethtool_stats = be_get_ethtool_stats,
+ 	.get_regs_len = be_get_reg_len,
+--- a/drivers/net/benet/be_main.c
++++ b/drivers/net/benet/be_main.c
+@@ -118,11 +118,6 @@ static char *ue_status_hi_desc[] = {
+ 	"Unknown"
+ };
+ 
+-static inline bool be_multi_rxq(struct be_adapter *adapter)
+-{
+-	return (adapter->num_rx_qs > 1);
+-}
+-
+ static void be_queue_free(struct be_adapter *adapter, struct be_queue_info *q)
+ {
+ 	struct be_dma_mem *mem = &q->dma_mem;
+@@ -819,11 +814,18 @@ static int be_change_mtu(struct net_devi
+  * A max of 64 (BE_NUM_VLANS_SUPPORTED) vlans can be configured in BE.
+  * If the user configures more, place BE in vlan promiscuous mode.
+  */
+-static int be_vid_config(struct be_adapter *adapter)
++static int be_vid_config(struct be_adapter *adapter, bool vf, u32 vf_num)
+ {
+ 	u16 vtag[BE_NUM_VLANS_SUPPORTED];
+ 	u16 ntags = 0, i;
+ 	int status = 0;
++	u32 if_handle;
++
++	if (vf) {
++		if_handle = adapter->vf_cfg[vf_num].vf_if_handle;
++		vtag[0] = cpu_to_le16(adapter->vf_cfg[vf_num].vf_vlan_tag);
++		status = be_cmd_vlan_config(adapter, if_handle, vtag, 1, 1, 0);
++	}
+ 
+ 	if (adapter->vlans_added <= adapter->max_vlans)  {
+ 		/* Construct VLAN Table to give to HW */
+@@ -839,6 +841,7 @@ static int be_vid_config(struct be_adapt
+ 		status = be_cmd_vlan_config(adapter, adapter->if_handle,
+ 					NULL, 0, 1, 1);
+ 	}
++
+ 	return status;
+ }
+ 
+@@ -853,27 +856,28 @@ static void be_vlan_add_vid(struct net_d
+ {
+ 	struct be_adapter *adapter = netdev_priv(netdev);
+ 
++	adapter->vlans_added++;
+ 	if (!be_physfn(adapter))
+ 		return;
+ 
+ 	adapter->vlan_tag[vid] = 1;
+-	adapter->vlans_added++;
+ 	if (adapter->vlans_added <= (adapter->max_vlans + 1))
+-		be_vid_config(adapter);
++		be_vid_config(adapter, false, 0);
+ }
+ 
+ static void be_vlan_rem_vid(struct net_device *netdev, u16 vid)
+ {
+ 	struct be_adapter *adapter = netdev_priv(netdev);
+ 
++	adapter->vlans_added--;
++	vlan_group_set_device(adapter->vlan_grp, vid, NULL);
++
+ 	if (!be_physfn(adapter))
+ 		return;
+ 
+ 	adapter->vlan_tag[vid] = 0;
+-	vlan_group_set_device(adapter->vlan_grp, vid, NULL);
+-	adapter->vlans_added--;
+ 	if (adapter->vlans_added <= adapter->max_vlans)
+-		be_vid_config(adapter);
++		be_vid_config(adapter, false, 0);
+ }
+ 
+ static void be_set_multicast_list(struct net_device *netdev)
+@@ -898,35 +902,12 @@ static void be_set_multicast_list(struct
+ 				&adapter->mc_cmd_mem);
+ 		goto done;
+ 	}
+-
+ 	be_cmd_multicast_set(adapter, adapter->if_handle, netdev->mc_list,
+ 		netdev->mc_count, &adapter->mc_cmd_mem);
+ done:
+ 	return;
+ }
+ 
+-static int be_set_vf_mac(struct net_device *netdev, int vf, u8 *mac)
+-{
+-	struct be_adapter *adapter = netdev_priv(netdev);
+-	int status;
+-
+-	if (!adapter->sriov_enabled)
+-		return -EPERM;
+-
+-	if (!is_valid_ether_addr(mac) || (vf >= num_vfs))
+-		return -EINVAL;
+-
+-	status = be_cmd_pmac_del(adapter, adapter->vf_if_handle[vf],
+-				adapter->vf_pmac_id[vf]);
+-
+-	status = be_cmd_pmac_add(adapter, mac, adapter->vf_if_handle[vf],
+-				&adapter->vf_pmac_id[vf]);
+-	if (!status)
+-		dev_err(&adapter->pdev->dev, "MAC %pM set on VF %d Failed\n",
+-				mac, vf);
+-	return status;
+-}
+-
+ static void be_rx_rate_update(struct be_rx_obj *rxo)
+ {
+ 	struct be_rx_stats *stats = &rxo->stats;
+@@ -983,9 +964,9 @@ get_rx_page_info(struct be_adapter *adap
+ 	BUG_ON(!rx_page_info->page);
+ 
+ 	if (rx_page_info->last_page_user) {
+-		dma_unmap_page(&adapter->pdev->dev,
+-			       dma_unmap_addr(rx_page_info, bus),
+-			       adapter->big_page_size, DMA_FROM_DEVICE);
++		pci_unmap_page(adapter->pdev,
++			       pci_unmap_addr(rx_page_info, bus),
++			       adapter->big_page_size, PCI_DMA_FROMDEVICE);
+ 		rx_page_info->last_page_user = false;
+ 	}
+ 
+@@ -1104,10 +1085,10 @@ static void be_rx_compl_process(struct b
+ 
+ 	skb_fill_rx_data(adapter, rxo, skb, rxcp);
+ 
+-	if (likely((netdev->features & NETIF_F_RXCSUM) && csum_passed(rxcp)))
++	if (csum_passed(rxcp))
+ 		skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 	else
+-		skb_checksum_none_assert(skb);
++		skb->ip_summed = CHECKSUM_NONE;
+ 
+ 	skb->truesize = skb->len + sizeof(struct sk_buff);
+ 	skb->protocol = eth_type_trans(skb, netdev);
+@@ -1172,7 +1153,6 @@ static void be_rx_compl_process_gro(stru
+ 	skb->data_len = rxcp->pkt_size;
+ 	skb->truesize += rxcp->pkt_size;
+ 	skb->ip_summed = CHECKSUM_UNNECESSARY;
+-
+ 	if (likely(!rxcp->vlanf))
+ 		napi_gro_frags(&eq_obj->napi);
+ 	else
+@@ -1323,7 +1303,7 @@ static void be_post_rx_frags(struct be_r
+ 		}
+ 		page_offset = page_info->page_offset;
+ 		page_info->page = pagep;
+-		dma_unmap_addr_set(page_info, bus, page_dmaaddr);
++		pci_unmap_addr_set(page_info, bus, page_dmaaddr);
+ 		frag_dmaaddr = page_dmaaddr + page_info->page_offset;
+ 
+ 		rxd = queue_head_node(rxq);
+@@ -1399,7 +1379,6 @@ static u16 be_tx_compl_process(struct be
+ 
+ 	kfree_skb(sent_skb);
+ 	return num_wrbs;
+-
+ }
+ 
+ static inline struct be_eq_entry *event_get(struct be_eq_obj *eq_obj)
+@@ -2298,7 +2277,7 @@ static int be_open(struct net_device *ne
+ 	be_link_status_update(adapter, link_up);
+ 
+ 	if (be_physfn(adapter)) {
+-		status = be_vid_config(adapter);
++		status = be_vid_config(adapter, false, 0);
+ 		if (status)
+ 			goto err;
+ 
+@@ -2427,16 +2406,16 @@ static int be_setup(struct be_adapter *a
+ 	if (be_physfn(adapter)) {
+ 		if (adapter->sriov_enabled) {
+ 			while (vf < num_vfs) {
+-				cap_flags = en_flags = BE_IF_FLAGS_UNTAGGED
+-						| BE_IF_FLAGS_BROADCAST;
++				cap_flags = en_flags = BE_IF_FLAGS_UNTAGGED |
++							BE_IF_FLAGS_BROADCAST;
+ 				status = be_cmd_if_create(adapter, cap_flags,
+ 						en_flags, mac, true,
+-						&adapter->vf_if_handle[vf],
++						&adapter->vf_cfg[vf].vf_if_handle,
+ 						NULL, vf+1);
+ 				if (status) {
+ 					dev_err(&adapter->pdev->dev,
+-						"Interface Create failed for VF %d\n",
+-						vf);
++						"Interface Create failed for"
++						" VF %d\n", vf);
+ 					goto if_destroy;
+ 				}
+ 				adapter->vf_cfg[vf].vf_pmac_id =
+@@ -2469,10 +2448,6 @@ static int be_setup(struct be_adapter *a
+ 
+ 	return 0;
+ 
+-mcc_q_destroy:
+-	if (be_physfn(adapter))
+-		be_vf_eth_addr_rem(adapter);
+-	be_mcc_queues_destroy(adapter);
+ rx_qs_destroy:
+ 	be_rx_queues_destroy(adapter);
+ tx_qs_destroy:
+@@ -2496,6 +2471,7 @@ static int be_clear(struct be_adapter *a
+ 	if (be_physfn(adapter) && adapter->sriov_enabled)
+ 		be_vf_eth_addr_rem(adapter);
+ 
++	be_mcc_queues_destroy(adapter);
+ 	be_rx_queues_destroy(adapter);
+ 	be_tx_queues_destroy(adapter);
+ 	adapter->eq_next_idx = 0;
+@@ -2828,8 +2804,7 @@ static struct net_device_ops be_netdev_o
+ 	.ndo_validate_addr	= eth_validate_addr,
+ 	.ndo_vlan_rx_register	= be_vlan_register,
+ 	.ndo_vlan_rx_add_vid	= be_vlan_add_vid,
+-	.ndo_vlan_rx_kill_vid	= be_vlan_rem_vid,
+-	.ndo_set_vf_mac		= be_set_vf_mac
++	.ndo_vlan_rx_kill_vid	= be_vlan_rem_vid
+ };
+ 
+ static void be_netdev_init(struct net_device *netdev)
+@@ -2838,17 +2813,14 @@ static void be_netdev_init(struct net_de
+ 	struct be_rx_obj *rxo;
+ 	int i;
+ 
+-	netdev->hw_features |= NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6 |
+-		NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM |
+-		NETIF_F_HW_VLAN_TX;
+-	if (be_multi_rxq(adapter))
+-		netdev->hw_features |= NETIF_F_RXHASH;
++	netdev->features |= NETIF_F_SG | NETIF_F_HW_VLAN_RX | NETIF_F_TSO |
++		NETIF_F_HW_VLAN_TX | NETIF_F_HW_VLAN_FILTER | NETIF_F_HW_CSUM |
++		NETIF_F_GRO | NETIF_F_TSO6;
+ 
+-	netdev->features |= netdev->hw_features |
+-		NETIF_F_HW_VLAN_RX | NETIF_F_HW_VLAN_FILTER;
++	netdev->vlan_features |= NETIF_F_SG | NETIF_F_TSO | NETIF_F_HW_CSUM;
+ 
+-	netdev->vlan_features |= NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6 |
+-		NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
++	if (lancer_chip(adapter))
++		netdev->vlan_features |= NETIF_F_TSO6;
+ 
+ 	netdev->flags |= IFF_MULTICAST;
+ 
+@@ -2971,6 +2943,7 @@ static int be_ctrl_init(struct be_adapte
+ 		status = -ENOMEM;
+ 		goto unmap_pci_bars;
+ 	}
++
+ 	mbox_mem_align->size = sizeof(struct be_mcc_mailbox);
+ 	mbox_mem_align->va = PTR_ALIGN(mbox_mem_alloc->va, 16);
+ 	mbox_mem_align->dma = PTR_ALIGN(mbox_mem_alloc->dma, 16);
+@@ -3303,15 +3276,15 @@ static int __devinit be_probe(struct pci
+ 		goto unsetup;
+ 	netif_carrier_off(netdev);
+ 
+- 	if (be_physfn(adapter) && adapter->sriov_enabled) {
++	if (be_physfn(adapter) && adapter->sriov_enabled) {
+ 		u8 mac_speed;
+ 		bool link_up;
+ 		u16 vf, lnk_speed;
+ 
+ 		if (!lancer_chip(adapter)) {
+- 			status = be_vf_eth_addr_config(adapter);
+- 			if (status)
+- 				goto unreg_netdev;
++			status = be_vf_eth_addr_config(adapter);
++			if (status)
++				goto unreg_netdev;
+ 		}
+ 
+ 		for (vf = 0; vf < num_vfs; vf++) {
+@@ -3322,7 +3295,7 @@ static int __devinit be_probe(struct pci
+ 			else
+ 				goto unreg_netdev;
+ 		}
+- 	}
++	}
+ 
+ 	dev_info(&pdev->dev, "%s port %d\n", nic_name(pdev), adapter->port_num);
+ 	/* By default all priorities are enabled.
+@@ -3333,6 +3306,8 @@ static int __devinit be_probe(struct pci
+ 	schedule_delayed_work(&adapter->work, msecs_to_jiffies(100));
+ 	return 0;
+ 
++unreg_netdev:
++	unregister_netdev(netdev);
+ unsetup:
+ 	be_clear(adapter);
+ msix_disable:
+@@ -3429,7 +3404,7 @@ static void be_shutdown(struct pci_dev *
+ 
+ 	cancel_delayed_work_sync(&adapter->work);
+ 
+-	netif_device_detach(netdev);
++	netif_device_detach(adapter->netdev);
+ 
+ 	if (adapter->wol)
+ 		be_setup_wol(adapter, true);
