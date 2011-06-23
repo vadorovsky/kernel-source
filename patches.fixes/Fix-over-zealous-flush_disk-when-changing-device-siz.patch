@@ -1,0 +1,195 @@
+Git-commit 93b270f76e7ef3b81001576860c2701931cdc78b Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Thu, 24 Feb 2011 17:25:47 +1100
+Subject: [PATCH] Fix over-zealous flush_disk when changing device size.
+Patch-mainline: 2.6.38
+References: should have been in -stable
+
+There are two cases when we call flush_disk.
+In one, the device has disappeared (check_disk_change) so any
+data will hold becomes irrelevant.
+In the oter, the device has changed size (check_disk_size_change)
+so data we hold may be irrelevant.
+
+In both cases it makes sense to discard any 'clean' buffers,
+so they will be read back from the device if needed.
+
+In the former case it makes sense to discard 'dirty' buffers
+as there will never be anywhere safe to write the data.  In the
+second case it *does*not* make sense to discard dirty buffers
+as that will lead to file system corruption when you simply enlarge
+the containing devices.
+
+flush_disk calls __invalidate_devices.
+__invalidate_device calls both invalidate_inodes and invalidate_bdev.
+
+invalidate_inodes *does* discard I_DIRTY inodes and this does lead
+to fs corruption.
+
+invalidate_bev *does*not* discard dirty pages, but I don't really care
+about that at present.
+
+So this patch adds a flag to __invalidate_device (calling it
+__invalidate_device2) to indicate whether dirty buffers should be
+killed, and this is passed to invalidate_inodes which can choose to
+skip dirty inodes.
+
+flusk_disk then passes true from check_disk_change and false from
+check_disk_size_change.
+
+dm avoids tripping over this problem by calling i_size_write directly
+rathher than using check_disk_size_change.
+
+md does use check_disk_size_change and so is affected.
+
+This regression was introduced by commit 608aeef17a which causes
+check_disk_size_change to call flush_disk, so it is suitable for any
+kernel since 2.6.27.
+
+Cc: stable@kernel.org
+Acked-by: Jeff Moyer <jmoyer@redhat.com>
+Cc: Andrew Patterson <andrew.patterson@hp.com>
+Cc: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: NeilBrown <neilb@suse.de>
+
+---
+ fs/block_dev.c |   20 ++++++++++++++------
+ fs/inode.c     |   26 ++++++++++++++++++++++++--
+ fs/internal.h  |    5 +++++
+ 3 files changed, 43 insertions(+), 8 deletions(-)
+
+--- linux-2.6.32-SLE11-SP1.orig/fs/block_dev.c
++++ linux-2.6.32-SLE11-SP1/fs/block_dev.c
+@@ -1029,6 +1029,7 @@ struct block_device *open_by_devnum(dev_
+ 
+ EXPORT_SYMBOL(open_by_devnum);
+ 
++extern int __invalidate_device2(struct block_device *, bool);
+ /**
+  * flush_disk - invalidates all buffer-cache entries on a disk
+  *
+@@ -1038,9 +1039,9 @@ EXPORT_SYMBOL(open_by_devnum);
+  * when a disk has been changed -- either by a media change or online
+  * resize.
+  */
+-static void flush_disk(struct block_device *bdev)
++static void flush_disk(struct block_device *bdev, bool kill_dirty)
+ {
+-	if (__invalidate_device(bdev)) {
++	if (__invalidate_device2(bdev, kill_dirty)) {
+ 		char name[BDEVNAME_SIZE] = "";
+ 
+ 		if (bdev->bd_disk)
+@@ -1077,7 +1078,7 @@ void check_disk_size_change(struct gendi
+ 		       "%s: detected capacity change from %lld to %lld\n",
+ 		       name, bdev_size, disk_size);
+ 		i_size_write(bdev->bd_inode, disk_size);
+-		flush_disk(bdev);
++		flush_disk(bdev, false);
+ 	}
+ }
+ EXPORT_SYMBOL(check_disk_size_change);
+@@ -1129,7 +1130,7 @@ int check_disk_change(struct block_devic
+ 	if (!bdops->media_changed(bdev->bd_disk))
+ 		return 0;
+ 
+-	flush_disk(bdev);
++	flush_disk(bdev, true);
+ 	if (bdops->revalidate_disk)
+ 		bdops->revalidate_disk(bdev->bd_disk);
+ 	return 1;
+@@ -1591,7 +1592,7 @@ void close_bdev_exclusive(struct block_d
+ 
+ EXPORT_SYMBOL(close_bdev_exclusive);
+ 
+-int __invalidate_device(struct block_device *bdev)
++int __invalidate_device2(struct block_device *bdev, bool kill_dirty)
+ {
+ 	struct super_block *sb = get_super(bdev);
+ 	int res = 0;
+@@ -1604,10 +1605,17 @@ int __invalidate_device(struct block_dev
+ 		 * hold).
+ 		 */
+ 		shrink_dcache_sb(sb);
+-		res = invalidate_inodes(sb);
++		if (kill_dirty)
++			res = invalidate_inodes(sb);
++		else
++			res = invalidate_clean_inodes(sb);
+ 		drop_super(sb);
+ 	}
+ 	invalidate_bdev(bdev);
+ 	return res;
+ }
++int __invalidate_device(struct block_device *bdev)
++{
++	return __invalidate_device2(bdev, true);
++}
+ EXPORT_SYMBOL(__invalidate_device);
+--- linux-2.6.32-SLE11-SP1.orig/fs/inode.c
++++ linux-2.6.32-SLE11-SP1/fs/inode.c
+@@ -373,7 +373,8 @@ static void dispose_list(struct list_hea
+ /*
+  * Invalidate all inodes for a device.
+  */
+-static int invalidate_list(struct list_head *head, struct list_head *dispose)
++static int invalidate_list(struct list_head *head, struct list_head *dispose,
++			   int kill_dirty)
+ {
+ 	struct list_head *next;
+ 	int busy = 0, count = 0;
+@@ -395,6 +396,10 @@ static int invalidate_list(struct list_h
+ 		if (tmp == head)
+ 			break;
+ 		inode = list_entry(tmp, struct inode, i_sb_list);
++		if (inode->i_state & I_DIRTY && !kill_dirty) {
++			busy = 1;
++			continue;
++		}
+ 		if (inode->i_state & I_NEW)
+ 			continue;
+ 		invalidate_inode_buffers(inode);
+@@ -429,7 +434,7 @@ int invalidate_inodes(struct super_block
+ 	spin_lock(&inode_lock);
+ 	inotify_unmount_inodes(&sb->s_inodes);
+ 	fsnotify_unmount_inodes(&sb->s_inodes);
+-	busy = invalidate_list(&sb->s_inodes, &throw_away);
++	busy = invalidate_list(&sb->s_inodes, &throw_away, true);
+ 	spin_unlock(&inode_lock);
+ 
+ 	dispose_list(&throw_away);
+@@ -438,6 +443,23 @@ int invalidate_inodes(struct super_block
+ 	return busy;
+ }
+ EXPORT_SYMBOL(invalidate_inodes);
++int invalidate_clean_inodes(struct super_block *sb)
++{
++	int busy;
++	LIST_HEAD(throw_away);
++
++	down_write(&iprune_sem);
++	spin_lock(&inode_lock);
++	inotify_unmount_inodes(&sb->s_inodes);
++	fsnotify_unmount_inodes(&sb->s_inodes);
++	busy = invalidate_list(&sb->s_inodes, &throw_away, false);
++	spin_unlock(&inode_lock);
++
++	dispose_list(&throw_away);
++	up_write(&iprune_sem);
++
++	return busy;
++}
+ 
+ static int can_unuse(struct inode *inode)
+ {
+--- linux-2.6.32-SLE11-SP1.orig/fs/internal.h
++++ linux-2.6.32-SLE11-SP1/fs/internal.h
+@@ -84,3 +84,8 @@ extern void mark_files_ro(struct super_b
+  * super.c
+  */
+ extern int do_remount_sb(struct super_block *, int, void *, int);
++
++/*
++ * inode.c
++ */
++extern int invalidate_clean_inodes(struct super_block *sb);
