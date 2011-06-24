@@ -1,0 +1,299 @@
+From: Bruce Rogers <brogers@suse.com>
+Subject: vhost backport final cleanup
+References: FATE#311977
+Patch-mainline: no
+
+Acked-by: Bruce Rogers <brogers@suse.com>
+---
+ drivers/vhost/net.c   |   14 ++-----
+ drivers/vhost/vhost.c |  100 ++++++++++++++------------------------------------
+ drivers/vhost/vhost.h |    6 +--
+ 3 files changed, 36 insertions(+), 84 deletions(-)
+
+Index: b/drivers/vhost/vhost.h
+===================================================================
+--- a/drivers/vhost/vhost.h
++++ b/drivers/vhost/vhost.h
+@@ -110,7 +110,7 @@ struct vhost_virtqueue {
+ 	 * vhost_work execution acts instead of rcu_read_lock() and the end of
+ 	 * vhost_work execution acts instead of rcu_read_unlock().
+ 	 * Writers use virtqueue mutex. */
+-	void __rcu *private_data;
++	void *private_data;
+ 	/* Log write descriptors */
+ 	void __user *log_base;
+ 	struct vhost_log *log;
+@@ -120,7 +120,7 @@ struct vhost_dev {
+ 	/* Readers use RCU to access memory table pointer
+ 	 * log base pointer and features.
+ 	 * Writers use mutex below.*/
+-	struct vhost_memory __rcu *memory;
++	struct vhost_memory *memory;
+ 	struct mm_struct *mm;
+ 	struct mutex mutex;
+ 	unsigned acked_features;
+@@ -182,7 +182,7 @@ static inline int vhost_has_feature(stru
+ 
+ 	/* TODO: check that we are running from vhost_worker or dev mutex is
+ 	 * held? */
+-	acked_features = rcu_dereference_index_check(dev->acked_features, 1);
++	acked_features = rcu_dereference(dev->acked_features);
+ 	return acked_features & (1 << bit);
+ }
+ 
+Index: b/drivers/vhost/net.c
+===================================================================
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -129,8 +129,7 @@ static void handle_tx(struct vhost_net *
+ 	size_t hdr_size;
+ 	struct socket *sock;
+ 
+-	/* TODO: check that we are running from vhost_worker? */
+-	sock = rcu_dereference_check(vq->private_data, 1);
++	sock = rcu_dereference(vq->private_data);
+ 	if (!sock)
+ 		return;
+ 
+@@ -308,7 +307,7 @@ static void handle_rx(struct vhost_net *
+ 	size_t vhost_hlen, sock_hlen;
+ 	size_t vhost_len, sock_len;
+ 	/* TODO: check that we are running from vhost_worker? */
+-	struct socket *sock = rcu_dereference_check(vq->private_data, 1);
++	struct socket *sock = rcu_dereference(vq->private_data);
+ 
+ 	if (!sock)
+ 		return;
+@@ -469,8 +468,7 @@ static void vhost_net_enable_vq(struct v
+ {
+ 	struct socket *sock;
+ 
+-	sock = rcu_dereference_protected(vq->private_data,
+-					 lockdep_is_held(&vq->mutex));
++	sock = vq->private_data;
+ 	if (!sock)
+ 		return;
+ 	if (vq == n->vqs + VHOST_NET_VQ_TX) {
+@@ -486,8 +484,7 @@ static struct socket *vhost_net_stop_vq(
+ 	struct socket *sock;
+ 
+ 	mutex_lock(&vq->mutex);
+-	sock = rcu_dereference_protected(vq->private_data,
+-					 lockdep_is_held(&vq->mutex));
++	sock = vq->private_data;
+ 	vhost_net_disable_vq(n, vq);
+ 	rcu_assign_pointer(vq->private_data, NULL);
+ 	mutex_unlock(&vq->mutex);
+@@ -625,8 +622,7 @@ static long vhost_net_set_backend(struct
+ 	}
+ 
+ 	/* start polling new socket */
+-	oldsock = rcu_dereference_protected(vq->private_data,
+-					    lockdep_is_held(&vq->mutex));
++	oldsock = vq->private_data;
+ 	if (sock != oldsock) {
+ 		vhost_net_disable_vq(n, vq);
+ 		rcu_assign_pointer(vq->private_data, sock);
+Index: b/drivers/vhost/vhost.c
+===================================================================
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@ -62,25 +62,22 @@ static int vhost_poll_wakeup(wait_queue_
+ 	return 0;
+ }
+ 
+-static void vhost_work_init(struct vhost_work *work, vhost_work_fn_t fn)
+-{
+-	INIT_LIST_HEAD(&work->node);
+-	work->fn = fn;
+-	init_waitqueue_head(&work->done);
+-	work->flushing = 0;
+-	work->queue_seq = work->done_seq = 0;
+-}
+-
+ /* Init poll structure */
+ void vhost_poll_init(struct vhost_poll *poll, vhost_work_fn_t fn,
+ 		     unsigned long mask, struct vhost_dev *dev)
+ {
++	struct vhost_work *work = &poll->work;
++
+ 	init_waitqueue_func_entry(&poll->wait, vhost_poll_wakeup);
+ 	init_poll_funcptr(&poll->table, vhost_poll_func);
+ 	poll->mask = mask;
+ 	poll->dev = dev;
+ 
+-	vhost_work_init(&poll->work, fn);
++	INIT_LIST_HEAD(&work->node);
++	work->fn = fn;
++	init_waitqueue_head(&work->done);
++	work->flushing = 0;
++	work->queue_seq = work->done_seq = 0;
+ }
+ 
+ /* Start polling a file. We add ourselves to file's wait queue. The caller must
+@@ -112,32 +109,29 @@ static bool vhost_work_seq_done(struct v
+ 	return left <= 0;
+ }
+ 
+-static void vhost_work_flush(struct vhost_dev *dev, struct vhost_work *work)
++/* Flush any work that has been scheduled. When calling this, don't hold any
++ * locks that are also used by the callback. */
++void vhost_poll_flush(struct vhost_poll *poll)
+ {
++	struct vhost_work *work = &poll->work;
+ 	unsigned seq;
+ 	int flushing;
+ 
+-	spin_lock_irq(&dev->work_lock);
++	spin_lock_irq(&poll->dev->work_lock);
+ 	seq = work->queue_seq;
+ 	work->flushing++;
+-	spin_unlock_irq(&dev->work_lock);
+-	wait_event(work->done, vhost_work_seq_done(dev, work, seq));
+-	spin_lock_irq(&dev->work_lock);
++	spin_unlock_irq(&poll->dev->work_lock);
++	wait_event(work->done, vhost_work_seq_done(poll->dev, work, seq));
++	spin_lock_irq(&poll->dev->work_lock);
+ 	flushing = --work->flushing;
+-	spin_unlock_irq(&dev->work_lock);
++	spin_unlock_irq(&poll->dev->work_lock);
+ 	BUG_ON(flushing < 0);
+ }
+ 
+-/* Flush any work that has been scheduled. When calling this, don't hold any
+- * locks that are also used by the callback. */
+-void vhost_poll_flush(struct vhost_poll *poll)
+-{
+-	vhost_work_flush(poll->dev, &poll->work);
+-}
+-
+-static inline void vhost_work_queue(struct vhost_dev *dev,
+-				    struct vhost_work *work)
++void vhost_poll_queue(struct vhost_poll *poll)
+ {
++	struct vhost_dev *dev = poll->dev;
++	struct vhost_work *work = &poll->work;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&dev->work_lock, flags);
+@@ -149,11 +143,6 @@ static inline void vhost_work_queue(stru
+ 	spin_unlock_irqrestore(&dev->work_lock, flags);
+ }
+ 
+-void vhost_poll_queue(struct vhost_poll *poll)
+-{
+-	vhost_work_queue(poll->dev, &poll->work);
+-}
+-
+ static void vhost_vq_reset(struct vhost_dev *dev,
+ 			   struct vhost_virtqueue *vq)
+ {
+@@ -305,31 +294,6 @@ long vhost_dev_check_owner(struct vhost_
+ 	return dev->mm == current->mm ? 0 : -EPERM;
+ }
+ 
+-struct vhost_attach_cgroups_struct {
+-	struct vhost_work work;
+-	struct task_struct *owner;
+-	int ret;
+-};
+-
+-static void vhost_attach_cgroups_work(struct vhost_work *work)
+-{
+-	struct vhost_attach_cgroups_struct *s;
+-
+-	s = container_of(work, struct vhost_attach_cgroups_struct, work);
+-	s->ret = cgroup_attach_task_all(s->owner, current);
+-}
+-
+-static int vhost_attach_cgroups(struct vhost_dev *dev)
+-{
+-	struct vhost_attach_cgroups_struct attach;
+-
+-	attach.owner = current;
+-	vhost_work_init(&attach.work, vhost_attach_cgroups_work);
+-	vhost_work_queue(dev, &attach.work);
+-	vhost_work_flush(dev, &attach.work);
+-	return attach.ret;
+-}
+-
+ /* Caller should have device mutex */
+ static long vhost_dev_set_owner(struct vhost_dev *dev)
+ {
+@@ -351,11 +315,10 @@ static long vhost_dev_set_owner(struct v
+ 	}
+ 
+ 	dev->worker = worker;
+-	wake_up_process(worker);	/* avoid contributing to loadavg */
+-
+-	err = vhost_attach_cgroups(dev);
++	err = cgroup_attach_task_current_cg(worker);
+ 	if (err)
+ 		goto err_cgroup;
++	wake_up_process(worker);	/* avoid contributing to loadavg */
+ 
+ 	err = vhost_dev_alloc_iovecs(dev);
+ 	if (err)
+@@ -386,7 +349,7 @@ long vhost_dev_reset_owner(struct vhost_
+ 	vhost_dev_cleanup(dev);
+ 
+ 	memory->nregions = 0;
+-	RCU_INIT_POINTER(dev->memory, memory);
++	dev->memory = memory;
+ 	return 0;
+ }
+ 
+@@ -420,9 +383,8 @@ void vhost_dev_cleanup(struct vhost_dev
+ 		fput(dev->log_file);
+ 	dev->log_file = NULL;
+ 	/* No one will access memory at this point */
+-	kfree(rcu_dereference_protected(dev->memory,
+-					lockdep_is_held(&dev->mutex)));
+-	RCU_INIT_POINTER(dev->memory, NULL);
++	kfree(dev->memory);
++	dev->memory = NULL;
+ 	WARN_ON(!list_empty(&dev->work_list));
+ 	if (dev->worker) {
+ 		kthread_stop(dev->worker);
+@@ -511,11 +473,7 @@ static int vq_access_ok(struct vhost_dev
+ /* Caller should have device mutex but not vq mutex */
+ int vhost_log_access_ok(struct vhost_dev *dev)
+ {
+-	struct vhost_memory *mp;
+-
+-	mp = rcu_dereference_protected(dev->memory,
+-				       lockdep_is_held(&dev->mutex));
+-	return memory_access_ok(dev, mp, 1);
++	return memory_access_ok(dev, dev->memory, 1);
+ }
+ 
+ /* Verify access for write logging. */
+@@ -526,8 +484,7 @@ static int vq_log_access_ok(struct vhost
+ 	struct vhost_memory *mp;
+ 	size_t s = vhost_has_feature(d, VIRTIO_RING_F_EVENT_IDX) ? 2 : 0;
+ 
+-	mp = rcu_dereference_protected(vq->dev->memory,
+-				       lockdep_is_held(&vq->mutex));
++	mp = vq->dev->memory;
+ 	return vq_memory_access_ok(log_base, mp,
+ 			    vhost_has_feature(vq->dev, VHOST_F_LOG_ALL)) &&
+ 		(!vq->log_used || log_access_ok(log_base, vq->log_addr,
+@@ -570,8 +527,7 @@ static long vhost_set_memory(struct vhos
+ 		kfree(newmem);
+ 		return -EFAULT;
+ 	}
+-	oldmem = rcu_dereference_protected(d->memory,
+-					   lockdep_is_held(&d->mutex));
++	oldmem = d->memory;
+ 	rcu_assign_pointer(d->memory, newmem);
+ 	synchronize_rcu();
+ 	kfree(oldmem);
+@@ -1050,7 +1006,7 @@ static int get_indirect(struct vhost_dev
+ 	count = indirect->len / sizeof desc;
+ 	/* Buffers are chained via a 16 bit next field, so
+ 	 * we can have at most 2^16 of these. */
+-	if (unlikely(count > USHRT_MAX + 1)) {
++	if (unlikely(count > USHORT_MAX + 1)) {
+ 		vq_err(vq, "Indirect buffer length too big: %d\n",
+ 		       indirect->len);
+ 		return -E2BIG;
