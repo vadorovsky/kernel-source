@@ -1,0 +1,281 @@
+From: Chris Mason <chris.mason@oracle.com>
+Date: Mon, 13 Jun 2011 20:00:16 -0400
+Patch-mainline: yes
+References: FATE#306586
+Subject: [PATCH] Btrfs: fix relocation races
+
+The recent commit to get rid of our trans_mutex introduced
+some races with block group relocation.  The problem is that relocation
+needs to do some record keeping about each root, and it was relying
+on the transaction mutex to coordinate things in subtle ways.
+
+This fix adds a mutex just for the relocation code and makes sure
+it doesn't have a big impact on normal operations.  The race is
+really fixed in btrfs_record_root_in_trans, which is where we
+step back and wait for the relocation code to finish accounting
+setup.
+
+Signed-off-by: Chris Mason <chris.mason@oracle.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/ctree.h       |   14 +++++++++
+ fs/btrfs/disk-io.c     |    1 
+ fs/btrfs/relocation.c  |   30 ++++++++++++++------
+ fs/btrfs/transaction.c |   73 ++++++++++++++++++++++++++++++++++++++++++++++---
+ 4 files changed, 105 insertions(+), 13 deletions(-)
+
+Index: linux-2.6.32-SLE11-SP2/fs/btrfs/ctree.h
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/btrfs/ctree.h
++++ linux-2.6.32-SLE11-SP2/fs/btrfs/ctree.h
+@@ -967,6 +967,12 @@ struct btrfs_fs_info {
+ 	struct srcu_struct subvol_srcu;
+ 
+ 	spinlock_t trans_lock;
++	/*
++	 * the reloc mutex goes with the trans lock, it is taken
++	 * during commit to protect us from the relocation code
++	 */
++	struct mutex reloc_mutex;
++
+ 	struct list_head trans_list;
+ 	struct list_head hashers;
+ 	struct list_head dead_roots;
+@@ -1172,6 +1178,14 @@ struct btrfs_root {
+ 	u32 type;
+ 
+ 	u64 highest_objectid;
++
++	/* btrfs_record_root_in_trans is a multi-step process,
++	 * and it can race with the balancing code.   But the
++	 * race is very small, and only the first time the root
++	 * is added to each transaction.  So in_trans_setup
++	 * is used to tell us when more checks are required
++	 */
++	unsigned long in_trans_setup;
+ 	int ref_cows;
+ 	int track_dirty;
+ 	int in_radix;
+Index: linux-2.6.32-SLE11-SP2/fs/btrfs/disk-io.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/btrfs/disk-io.c
++++ linux-2.6.32-SLE11-SP2/fs/btrfs/disk-io.c
+@@ -1716,6 +1716,7 @@ struct btrfs_root *open_ctree(struct sup
+ 	spin_lock_init(&fs_info->fs_roots_radix_lock);
+ 	spin_lock_init(&fs_info->delayed_iput_lock);
+ 	spin_lock_init(&fs_info->defrag_inodes_lock);
++	mutex_init(&fs_info->reloc_mutex);
+ 
+ 	init_completion(&fs_info->kobj_unregister);
+ 	fs_info->tree_root = tree_root;
+Index: linux-2.6.32-SLE11-SP2/fs/btrfs/relocation.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/btrfs/relocation.c
++++ linux-2.6.32-SLE11-SP2/fs/btrfs/relocation.c
+@@ -1367,7 +1367,7 @@ int btrfs_update_reloc_root(struct btrfs
+ 	int ret;
+ 
+ 	if (!root->reloc_root)
+-		return 0;
++		goto out;
+ 
+ 	reloc_root = root->reloc_root;
+ 	root_item = &reloc_root->root_item;
+@@ -1389,6 +1389,8 @@ int btrfs_update_reloc_root(struct btrfs
+ 	ret = btrfs_update_root(trans, root->fs_info->tree_root,
+ 				&reloc_root->root_key, root_item);
+ 	BUG_ON(ret);
++
++out:
+ 	return 0;
+ }
+ 
+@@ -2141,10 +2143,11 @@ int prepare_to_merge(struct reloc_contro
+ 	u64 num_bytes = 0;
+ 	int ret;
+ 
+-	spin_lock(&root->fs_info->trans_lock);
++	mutex_lock(&root->fs_info->reloc_mutex);
+ 	rc->merging_rsv_size += root->nodesize * (BTRFS_MAX_LEVEL - 1) * 2;
+ 	rc->merging_rsv_size += rc->nodes_relocated * 2;
+-	spin_unlock(&root->fs_info->trans_lock);
++	mutex_unlock(&root->fs_info->reloc_mutex);
++
+ again:
+ 	if (!err) {
+ 		num_bytes = rc->merging_rsv_size;
+@@ -2213,9 +2216,16 @@ int merge_reloc_roots(struct reloc_contr
+ 	int ret;
+ again:
+ 	root = rc->extent_root;
+-	spin_lock(&root->fs_info->trans_lock);
++
++	/*
++	 * this serializes us with btrfs_record_root_in_transaction,
++	 * we have to make sure nobody is in the middle of
++	 * adding their roots to the list while we are
++	 * doing this splice
++	 */
++	mutex_lock(&root->fs_info->reloc_mutex);
+ 	list_splice_init(&rc->reloc_roots, &reloc_roots);
+-	spin_unlock(&root->fs_info->trans_lock);
++	mutex_unlock(&root->fs_info->reloc_mutex);
+ 
+ 	while (!list_empty(&reloc_roots)) {
+ 		found = 1;
+@@ -3589,17 +3599,19 @@ next:
+ static void set_reloc_control(struct reloc_control *rc)
+ {
+ 	struct btrfs_fs_info *fs_info = rc->extent_root->fs_info;
+-	spin_lock(&fs_info->trans_lock);
++
++	mutex_lock(&fs_info->reloc_mutex);
+ 	fs_info->reloc_ctl = rc;
+-	spin_unlock(&fs_info->trans_lock);
++	mutex_unlock(&fs_info->reloc_mutex);
+ }
+ 
+ static void unset_reloc_control(struct reloc_control *rc)
+ {
+ 	struct btrfs_fs_info *fs_info = rc->extent_root->fs_info;
+-	spin_lock(&fs_info->trans_lock);
++
++	mutex_lock(&fs_info->reloc_mutex);
+ 	fs_info->reloc_ctl = NULL;
+-	spin_unlock(&fs_info->trans_lock);
++	mutex_unlock(&fs_info->reloc_mutex);
+ }
+ 
+ static int check_extent_flags(u64 flags)
+Index: linux-2.6.32-SLE11-SP2/fs/btrfs/transaction.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/fs/btrfs/transaction.c
++++ linux-2.6.32-SLE11-SP2/fs/btrfs/transaction.c
+@@ -125,28 +125,85 @@ static noinline int join_transaction(str
+  * to make sure the old root from before we joined the transaction is deleted
+  * when the transaction commits
+  */
+-int btrfs_record_root_in_trans(struct btrfs_trans_handle *trans,
++static int record_root_in_trans(struct btrfs_trans_handle *trans,
+ 			       struct btrfs_root *root)
+ {
+ 	if (root->ref_cows && root->last_trans < trans->transid) {
+ 		WARN_ON(root == root->fs_info->extent_root);
+ 		WARN_ON(root->commit_root != root->node);
+ 
++		/*
++		 * see below for in_trans_setup usage rules
++		 * we have the reloc mutex held now, so there
++		 * is only one writer in this function
++		 */
++		root->in_trans_setup = 1;
++
++		/* make sure readers find in_trans_setup before
++		 * they find our root->last_trans update
++		 */
++		smp_wmb();
++
+ 		spin_lock(&root->fs_info->fs_roots_radix_lock);
+ 		if (root->last_trans == trans->transid) {
+ 			spin_unlock(&root->fs_info->fs_roots_radix_lock);
+ 			return 0;
+ 		}
+-		root->last_trans = trans->transid;
+ 		radix_tree_tag_set(&root->fs_info->fs_roots_radix,
+ 			   (unsigned long)root->root_key.objectid,
+ 			   BTRFS_ROOT_TRANS_TAG);
+ 		spin_unlock(&root->fs_info->fs_roots_radix_lock);
++		root->last_trans = trans->transid;
++
++		/* this is pretty tricky.  We don't want to
++		 * take the relocation lock in btrfs_record_root_in_trans
++		 * unless we're really doing the first setup for this root in
++		 * this transaction.
++		 *
++		 * Normally we'd use root->last_trans as a flag to decide
++		 * if we want to take the expensive mutex.
++		 *
++		 * But, we have to set root->last_trans before we
++		 * init the relocation root, otherwise, we trip over warnings
++		 * in ctree.c.  The solution used here is to flag ourselves
++		 * with root->in_trans_setup.  When this is 1, we're still
++		 * fixing up the reloc trees and everyone must wait.
++		 *
++		 * When this is zero, they can trust root->last_trans and fly
++		 * through btrfs_record_root_in_trans without having to take the
++		 * lock.  smp_wmb() makes sure that all the writes above are
++		 * done before we pop in the zero below
++		 */
+ 		btrfs_init_reloc_root(trans, root);
++		smp_wmb();
++		root->in_trans_setup = 0;
+ 	}
+ 	return 0;
+ }
+ 
++
++int btrfs_record_root_in_trans(struct btrfs_trans_handle *trans,
++			       struct btrfs_root *root)
++{
++	if (!root->ref_cows)
++		return 0;
++
++	/*
++	 * see record_root_in_trans for comments about in_trans_setup usage
++	 * and barriers
++	 */
++	smp_rmb();
++	if (root->last_trans == trans->transid &&
++	    !root->in_trans_setup)
++		return 0;
++
++	mutex_lock(&root->fs_info->reloc_mutex);
++	record_root_in_trans(trans, root);
++	mutex_unlock(&root->fs_info->reloc_mutex);
++
++	return 0;
++}
++
+ /* wait for commit against the current transaction to become unblocked
+  * when this is done, it is safe to start a new transaction, but the current
+  * transaction might not be fully on disk.
+@@ -881,7 +938,7 @@ static noinline int create_pending_snaps
+ 	parent = dget_parent(dentry);
+ 	parent_inode = parent->d_inode;
+ 	parent_root = BTRFS_I(parent_inode)->root;
+-	btrfs_record_root_in_trans(trans, parent_root);
++	record_root_in_trans(trans, parent_root);
+ 
+ 	/*
+ 	 * insert the directory item
+@@ -899,7 +956,7 @@ static noinline int create_pending_snaps
+ 	ret = btrfs_update_inode(trans, parent_root, parent_inode);
+ 	BUG_ON(ret);
+ 
+-	btrfs_record_root_in_trans(trans, root);
++	record_root_in_trans(trans, root);
+ 	btrfs_set_root_last_snapshot(&root->root_item, trans->transid);
+ 	memcpy(new_root_item, &root->root_item, sizeof(*new_root_item));
+ 	btrfs_check_and_init_root_item(new_root_item);
+@@ -1254,6 +1311,13 @@ int btrfs_commit_transaction(struct btrf
+ 	wait_event(cur_trans->writer_wait,
+ 		   atomic_read(&cur_trans->num_writers) == 1);
+ 
++	/*
++	 * the reloc mutex makes sure that we stop
++	 * the balancing code from coming in and moving
++	 * extents around in the middle of the commit
++	 */
++	mutex_lock(&root->fs_info->reloc_mutex);
++
+ 	ret = create_pending_snapshots(trans, root->fs_info);
+ 	BUG_ON(ret);
+ 
+@@ -1319,6 +1383,7 @@ int btrfs_commit_transaction(struct btrf
+ 	root->fs_info->running_transaction = NULL;
+ 	root->fs_info->trans_no_join = 0;
+ 	spin_unlock(&root->fs_info->trans_lock);
++	mutex_unlock(&root->fs_info->reloc_mutex);
+ 
+ 	wake_up(&root->fs_info->transaction_wait);
+ 
