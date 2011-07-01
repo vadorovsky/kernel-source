@@ -1,0 +1,2318 @@
+From: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date: Fri, 2 Oct 2009 03:29:58 -0300
+Subject: perf tools: Rewrite and improve support for kernel modules
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v2.6.33-rc1
+Git-commit: 439d473b4777de510e1322168ac6f2f377ecd5bc
+
+Representing modules as struct map entries, backed by a DSO, etc,
+using /proc/modules to find where the module is loaded.
+
+DSOs now can have a short and long name, so that in verbose mode we
+can show exactly which .ko or vmlinux image was used.
+
+As kernel modules now are a DSO separate from the kernel, we can
+ask for just the hits for a particular set of kernel modules, just
+like we can do with shared libraries:
+
+[root@doppio linux-2.6-tip]# perf report -n --vmlinux
+/home/acme/git/build/tip-recvmmsg/vmlinux --modules --dsos \[drm\] | head -15
+    84.58%      13266             Xorg  [k] drm_clflush_pages
+     4.02%        630             Xorg  [k] trace_kmalloc.clone.0
+     3.95%        619             Xorg  [k] drm_ioctl
+     2.07%        324             Xorg  [k] drm_addbufs
+     1.68%        263             Xorg  [k] drm_gem_close_ioctl
+     0.77%        120             Xorg  [k] drm_setmaster_ioctl
+     0.70%        110             Xorg  [k] drm_lastclose
+     0.68%        106             Xorg  [k] drm_open
+     0.54%         85             Xorg  [k] drm_mm_search_free
+[root@doppio linux-2.6-tip]#
+
+Specifying --dsos /lib/modules/2.6.31-tip/kernel/drivers/gpu/drm/drm.ko
+would have the same effect. Allowing specifying just 'drm.ko' is left
+for another patch.
+
+Processing kallsyms so that per kernel module struct map are
+instantiated was also left for another patch. That will allow
+removing the module name from each of its symbols.
+
+struct symbol was reduced by removing the ->module backpointer and
+moving it (well now the map) to struct symbol_entry in perf top,
+that is its only user right now.
+
+The total linecount went down by ~500 lines.
+
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Frédéric Weisbecker <fweisbec@gmail.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Avi Kivity <avi@redhat.com>
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+ tools/perf/Makefile           |    2 -
+ tools/perf/builtin-annotate.c |   73 +++---
+ tools/perf/builtin-report.c   |   79 +++----
+ tools/perf/builtin-top.c      |   74 ++----
+ tools/perf/util/event.h       |    6 +-
+ tools/perf/util/module.c      |  545 -----------------------------------------
+ tools/perf/util/module.h      |   53 ----
+ tools/perf/util/sort.c        |   38 ++--
+ tools/perf/util/sort.h        |    7 +-
+ tools/perf/util/symbol.c      |  447 +++++++++++++++++++++++-----------
+ tools/perf/util/symbol.h      |   20 +-
+ tools/perf/util/thread.c      |   34 ++--
+ tools/perf/util/thread.h      |    4 +
+ 13 files changed, 453 insertions(+), 929 deletions(-)
+
+diff --git a/tools/perf/Makefile b/tools/perf/Makefile
+index 055290a..8e7509f 100644
+--- a/tools/perf/Makefile
++++ b/tools/perf/Makefile
+@@ -336,7 +336,6 @@ LIB_H += util/strlist.h
+ LIB_H += util/run-command.h
+ LIB_H += util/sigchain.h
+ LIB_H += util/symbol.h
+-LIB_H += util/module.h
+ LIB_H += util/color.h
+ LIB_H += util/values.h
+ LIB_H += util/sort.h
+@@ -364,7 +363,6 @@ LIB_OBJS += util/usage.o
+ LIB_OBJS += util/wrapper.o
+ LIB_OBJS += util/sigchain.o
+ LIB_OBJS += util/symbol.o
+-LIB_OBJS += util/module.o
+ LIB_OBJS += util/color.o
+ LIB_OBJS += util/pager.o
+ LIB_OBJS += util/header.o
+diff --git a/tools/perf/builtin-annotate.c b/tools/perf/builtin-annotate.c
+index df516dc..7d5a3b1 100644
+--- a/tools/perf/builtin-annotate.c
++++ b/tools/perf/builtin-annotate.c
+@@ -63,6 +63,7 @@ static void hist_hit(struct hist_entry *he, u64 ip)
+ 		return;
+ 
+ 	sym_size = sym->end - sym->start;
++	ip = he->map->map_ip(he->map, ip);
+ 	offset = ip - sym->start;
+ 
+ 	if (offset >= sym_size)
+@@ -80,7 +81,7 @@ static void hist_hit(struct hist_entry *he, u64 ip)
+ }
+ 
+ static int
+-hist_entry__add(struct thread *thread, struct map *map, struct dso *dso,
++hist_entry__add(struct thread *thread, struct map *map,
+ 		struct symbol *sym, u64 ip, char level)
+ {
+ 	struct rb_node **p = &hist.rb_node;
+@@ -89,7 +90,6 @@ hist_entry__add(struct thread *thread, struct map *map, struct dso *dso,
+ 	struct hist_entry entry = {
+ 		.thread	= thread,
+ 		.map	= map,
+-		.dso	= dso,
+ 		.sym	= sym,
+ 		.ip	= ip,
+ 		.level	= level,
+@@ -130,10 +130,10 @@ process_sample_event(event_t *event, unsigned long offset, unsigned long head)
+ {
+ 	char level;
+ 	int show = 0;
+-	struct dso *dso = NULL;
+ 	struct thread *thread;
+ 	u64 ip = event->ip.ip;
+ 	struct map *map = NULL;
++	struct symbol *sym = NULL;
+ 
+ 	thread = threads__findnew(event->ip.pid, &threads, &last_match);
+ 
+@@ -155,32 +155,35 @@ process_sample_event(event_t *event, unsigned long offset, unsigned long head)
+ 	if (event->header.misc & PERF_RECORD_MISC_KERNEL) {
+ 		show = SHOW_KERNEL;
+ 		level = 'k';
+-
+-		dso = kernel_dso;
+-
+-		dump_printf(" ...... dso: %s\n", dso->name);
+-
++		sym = kernel_maps__find_symbol(ip, &map);
++		dump_printf(" ...... dso: %s\n",
++			    map ? map->dso->long_name : "<not found>");
+ 	} else if (event->header.misc & PERF_RECORD_MISC_USER) {
+-
+ 		show = SHOW_USER;
+ 		level = '.';
+-
+ 		map = thread__find_map(thread, ip);
+ 		if (map != NULL) {
++got_map:
+ 			ip = map->map_ip(map, ip);
+-			dso = map->dso;
++			sym = map->dso->find_symbol(map->dso, ip);
+ 		} else {
+ 			/*
+ 			 * If this is outside of all known maps,
+ 			 * and is a negative address, try to look it
+ 			 * up in the kernel dso, as it might be a
+-			 * vsyscall (which executes in user-mode):
++			 * vsyscall or vdso (which executes in user-mode).
++			 *
++			 * XXX This is nasty, we should have a symbol list in
++			 * the "[vdso]" dso, but for now lets use the old
++			 * trick of looking in the whole kernel symbol list.
+ 			 */
+-			if ((long long)ip < 0)
+-				dso = kernel_dso;
++			if ((long long)ip < 0) {
++				map = kernel_map;
++				goto got_map;
++			}
+ 		}
+-		dump_printf(" ...... dso: %s\n", dso ? dso->name : "<not found>");
+-
++		dump_printf(" ...... dso: %s\n",
++			    map ? map->dso->long_name : "<not found>");
+ 	} else {
+ 		show = SHOW_HV;
+ 		level = 'H';
+@@ -188,12 +191,7 @@ process_sample_event(event_t *event, unsigned long offset, unsigned long head)
+ 	}
+ 
+ 	if (show & show_mask) {
+-		struct symbol *sym = NULL;
+-
+-		if (dso)
+-			sym = dso->find_symbol(dso, ip);
+-
+-		if (hist_entry__add(thread, map, dso, sym, ip, level)) {
++		if (hist_entry__add(thread, map, sym, ip, level)) {
+ 			fprintf(stderr,
+ 		"problem incrementing symbol count, skipping event\n");
+ 			return -1;
+@@ -313,7 +311,7 @@ process_event(event_t *event, unsigned long offset, unsigned long head)
+ }
+ 
+ static int
+-parse_line(FILE *file, struct symbol *sym, u64 start, u64 len)
++parse_line(FILE *file, struct symbol *sym, u64 len)
+ {
+ 	char *line = NULL, *tmp, *tmp2;
+ 	static const char *prev_line;
+@@ -363,7 +361,7 @@ parse_line(FILE *file, struct symbol *sym, u64 start, u64 len)
+ 		const char *color;
+ 		struct sym_ext *sym_ext = sym->priv;
+ 
+-		offset = line_ip - start;
++		offset = line_ip - sym->start;
+ 		if (offset < len)
+ 			hits = sym->hist[offset];
+ 
+@@ -442,7 +440,7 @@ static void free_source_line(struct symbol *sym, int len)
+ 
+ /* Get the filename:line for the colored entries */
+ static void
+-get_source_line(struct symbol *sym, u64 start, int len, const char *filename)
++get_source_line(struct symbol *sym, int len, const char *filename)
+ {
+ 	int i;
+ 	char cmd[PATH_MAX * 2];
+@@ -467,7 +465,7 @@ get_source_line(struct symbol *sym, u64 start, int len, const char *filename)
+ 		if (sym_ext[i].percent <= 0.5)
+ 			continue;
+ 
+-		offset = start + i;
++		offset = sym->start + i;
+ 		sprintf(cmd, "addr2line -e %s %016llx", filename, offset);
+ 		fp = popen(cmd, "r");
+ 		if (!fp)
+@@ -519,31 +517,23 @@ static void print_summary(const char *filename)
+ 
+ static void annotate_sym(struct dso *dso, struct symbol *sym)
+ {
+-	const char *filename = dso->name, *d_filename;
+-	u64 start, end, len;
++	const char *filename = dso->long_name, *d_filename;
++	u64 len;
+ 	char command[PATH_MAX*2];
+ 	FILE *file;
+ 
+ 	if (!filename)
+ 		return;
+-	if (sym->module)
+-		filename = sym->module->path;
+-	else if (dso == kernel_dso)
+-		filename = vmlinux_name;
+-
+-	start = sym->obj_start;
+-	if (!start)
+-		start = sym->start;
++
+ 	if (full_paths)
+ 		d_filename = filename;
+ 	else
+ 		d_filename = basename(filename);
+ 
+-	end = start + sym->end - sym->start + 1;
+ 	len = sym->end - sym->start;
+ 
+ 	if (print_line) {
+-		get_source_line(sym, start, len, filename);
++		get_source_line(sym, len, filename);
+ 		print_summary(filename);
+ 	}
+ 
+@@ -552,10 +542,11 @@ static void annotate_sym(struct dso *dso, struct symbol *sym)
+ 	printf("------------------------------------------------\n");
+ 
+ 	if (verbose >= 2)
+-		printf("annotating [%p] %30s : [%p] %30s\n", dso, dso->name, sym, sym->name);
++		printf("annotating [%p] %30s : [%p] %30s\n",
++		       dso, dso->long_name, sym, sym->name);
+ 
+ 	sprintf(command, "objdump --start-address=0x%016Lx --stop-address=0x%016Lx -dS %s|grep -v %s",
+-			(u64)start, (u64)end, filename, filename);
++		sym->start, sym->end, filename, filename);
+ 
+ 	if (verbose >= 3)
+ 		printf("doing: %s\n", command);
+@@ -565,7 +556,7 @@ static void annotate_sym(struct dso *dso, struct symbol *sym)
+ 		return;
+ 
+ 	while (!feof(file)) {
+-		if (parse_line(file, sym, start, len) < 0)
++		if (parse_line(file, sym, len) < 0)
+ 			break;
+ 	}
+ 
+diff --git a/tools/perf/builtin-report.c b/tools/perf/builtin-report.c
+index c1a54fc..3ed3baf 100644
+--- a/tools/perf/builtin-report.c
++++ b/tools/perf/builtin-report.c
+@@ -349,22 +349,17 @@ static int thread__set_comm_adjust(struct thread *self, const char *comm)
+ 
+ 
+ static struct symbol *
+-resolve_symbol(struct thread *thread, struct map **mapp,
+-	       struct dso **dsop, u64 *ipp)
++resolve_symbol(struct thread *thread, struct map **mapp, u64 *ipp)
+ {
+-	struct dso *dso = dsop ? *dsop : NULL;
+ 	struct map *map = mapp ? *mapp : NULL;
+ 	u64 ip = *ipp;
+ 
+-	if (!thread)
+-		return NULL;
+-
+-	if (dso)
+-		goto got_dso;
+-
+ 	if (map)
+ 		goto got_map;
+ 
++	if (!thread)
++		return NULL;
++
+ 	map = thread__find_map(thread, ip);
+ 	if (map != NULL) {
+ 		/*
+@@ -379,29 +374,29 @@ resolve_symbol(struct thread *thread, struct map **mapp,
+ 			*mapp = map;
+ got_map:
+ 		ip = map->map_ip(map, ip);
+-
+-		dso = map->dso;
+ 	} else {
+ 		/*
+ 		 * If this is outside of all known maps,
+ 		 * and is a negative address, try to look it
+ 		 * up in the kernel dso, as it might be a
+-		 * vsyscall (which executes in user-mode):
++		 * vsyscall or vdso (which executes in user-mode).
++		 *
++		 * XXX This is nasty, we should have a symbol list in
++		 * the "[vdso]" dso, but for now lets use the old
++		 * trick of looking in the whole kernel symbol list.
+ 		 */
+-		if ((long long)ip < 0)
+-		dso = kernel_dso;
++		if ((long long)ip < 0) {
++			map = kernel_map;
++			if (mapp)
++				*mapp = map;
++		}
+ 	}
+-	dump_printf(" ...... dso: %s\n", dso ? dso->name : "<not found>");
++	dump_printf(" ...... dso: %s\n",
++		    map ? map->dso->long_name : "<not found>");
+ 	dump_printf(" ...... map: %Lx -> %Lx\n", *ipp, ip);
+ 	*ipp  = ip;
+ 
+-	if (dsop)
+-		*dsop = dso;
+-
+-	if (!dso)
+-		return NULL;
+-got_dso:
+-	return dso->find_symbol(dso, ip);
++	return map ? map->dso->find_symbol(map->dso, ip) : NULL;
+ }
+ 
+ static int call__match(struct symbol *sym)
+@@ -413,7 +408,7 @@ static int call__match(struct symbol *sym)
+ }
+ 
+ static struct symbol **
+-resolve_callchain(struct thread *thread, struct map *map __used,
++resolve_callchain(struct thread *thread, struct map *map,
+ 		    struct ip_callchain *chain, struct hist_entry *entry)
+ {
+ 	u64 context = PERF_CONTEXT_MAX;
+@@ -430,8 +425,7 @@ resolve_callchain(struct thread *thread, struct map *map __used,
+ 
+ 	for (i = 0; i < chain->nr; i++) {
+ 		u64 ip = chain->ips[i];
+-		struct dso *dso = NULL;
+-		struct symbol *sym;
++		struct symbol *sym = NULL;
+ 
+ 		if (ip >= PERF_CONTEXT_MAX) {
+ 			context = ip;
+@@ -440,17 +434,15 @@ resolve_callchain(struct thread *thread, struct map *map __used,
+ 
+ 		switch (context) {
+ 		case PERF_CONTEXT_HV:
+-			dso = hypervisor_dso;
+ 			break;
+ 		case PERF_CONTEXT_KERNEL:
+-			dso = kernel_dso;
++			sym = kernel_maps__find_symbol(ip, &map);
+ 			break;
+ 		default:
++			sym = resolve_symbol(thread, &map, &ip);
+ 			break;
+ 		}
+ 
+-		sym = resolve_symbol(thread, NULL, &dso, &ip);
+-
+ 		if (sym) {
+ 			if (sort__has_parent && call__match(sym) &&
+ 			    !entry->parent)
+@@ -469,7 +461,7 @@ resolve_callchain(struct thread *thread, struct map *map __used,
+  */
+ 
+ static int
+-hist_entry__add(struct thread *thread, struct map *map, struct dso *dso,
++hist_entry__add(struct thread *thread, struct map *map,
+ 		struct symbol *sym, u64 ip, struct ip_callchain *chain,
+ 		char level, u64 count)
+ {
+@@ -480,7 +472,6 @@ hist_entry__add(struct thread *thread, struct map *map, struct dso *dso,
+ 	struct hist_entry entry = {
+ 		.thread	= thread,
+ 		.map	= map,
+-		.dso	= dso,
+ 		.sym	= sym,
+ 		.ip	= ip,
+ 		.level	= level,
+@@ -641,7 +632,7 @@ process_sample_event(event_t *event, unsigned long offset, unsigned long head)
+ {
+ 	char level;
+ 	int show = 0;
+-	struct dso *dso = NULL;
++	struct symbol *sym = NULL;
+ 	struct thread *thread;
+ 	u64 ip = event->ip.ip;
+ 	u64 period = 1;
+@@ -700,35 +691,35 @@ process_sample_event(event_t *event, unsigned long offset, unsigned long head)
+ 		show = SHOW_KERNEL;
+ 		level = 'k';
+ 
+-		dso = kernel_dso;
+-
+-		dump_printf(" ...... dso: %s\n", dso->name);
+-
++		sym = kernel_maps__find_symbol(ip, &map);
++		dump_printf(" ...... dso: %s\n",
++			    map ? map->dso->long_name : "<not found>");
+ 	} else if (cpumode == PERF_RECORD_MISC_USER) {
+ 
+ 		show = SHOW_USER;
+ 		level = '.';
++		sym = resolve_symbol(thread, &map, &ip);
+ 
+ 	} else {
+ 		show = SHOW_HV;
+ 		level = 'H';
+ 
+-		dso = hypervisor_dso;
+-
+ 		dump_printf(" ...... dso: [hypervisor]\n");
+ 	}
+ 
+ 	if (show & show_mask) {
+-		struct symbol *sym = resolve_symbol(thread, &map, &dso, &ip);
+-
+-		if (dso_list && (!dso || !dso->name ||
+-				 !strlist__has_entry(dso_list, dso->name)))
++		if (dso_list &&
++		    (!map || !map->dso ||
++		     !(strlist__has_entry(dso_list, map->dso->short_name) ||
++		       (map->dso->short_name != map->dso->long_name &&
++			strlist__has_entry(dso_list, map->dso->long_name)))))
+ 			return 0;
+ 
+-		if (sym_list && (!sym || !strlist__has_entry(sym_list, sym->name)))
++		if (sym_list && sym && !strlist__has_entry(sym_list, sym->name))
+ 			return 0;
+ 
+-		if (hist_entry__add(thread, map, dso, sym, ip, chain, level, period)) {
++		if (hist_entry__add(thread, map, sym, ip,
++				    chain, level, period)) {
+ 			eprintf("problem incrementing symbol count, skipping event\n");
+ 			return -1;
+ 		}
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index bf464ce..befef84 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -22,6 +22,7 @@
+ 
+ #include "util/symbol.h"
+ #include "util/color.h"
++#include "util/thread.h"
+ #include "util/util.h"
+ #include <linux/rbtree.h>
+ #include "util/parse-options.h"
+@@ -103,6 +104,7 @@ struct sym_entry {
+ 	unsigned long		snap_count;
+ 	double			weight;
+ 	int			skip;
++	struct map		*map;
+ 	struct source_line	*source;
+ 	struct source_line	*lines;
+ 	struct source_line	**lines_tail;
+@@ -116,12 +118,11 @@ struct sym_entry {
+ static void parse_source(struct sym_entry *syme)
+ {
+ 	struct symbol *sym;
+-	struct module *module;
+-	struct section *section = NULL;
++	struct map *map;
+ 	FILE *file;
+ 	char command[PATH_MAX*2];
+-	const char *path = vmlinux_name;
+-	u64 start, end, len;
++	const char *path;
++	u64 len;
+ 
+ 	if (!syme)
+ 		return;
+@@ -132,27 +133,15 @@ static void parse_source(struct sym_entry *syme)
+ 	}
+ 
+ 	sym = (struct symbol *)(syme + 1);
+-	module = sym->module;
++	map = syme->map;
++	path = map->dso->long_name;
+ 
+-	if (module)
+-		path = module->path;
+-	if (!path)
+-		return;
+-
+-	start = sym->obj_start;
+-	if (!start)
+-		start = sym->start;
+-
+-	if (module) {
+-		section = module->sections->find_section(module->sections, ".text");
+-		if (section)
+-			start -= section->vma;
+-	}
+-
+-	end = start + sym->end - sym->start + 1;
+ 	len = sym->end - sym->start;
+ 
+-	sprintf(command, "objdump --start-address=0x%016Lx --stop-address=0x%016Lx -dS %s", start, end, path);
++	sprintf(command,
++		"objdump --start-address=0x%016Lx "
++			 "--stop-address=0x%016Lx -dS %s",
++		sym->start, sym->end, path);
+ 
+ 	file = popen(command, "r");
+ 	if (!file)
+@@ -184,13 +173,11 @@ static void parse_source(struct sym_entry *syme)
+ 
+ 		if (strlen(src->line)>8 && src->line[8] == ':') {
+ 			src->eip = strtoull(src->line, NULL, 16);
+-			if (section)
+-				src->eip += section->vma;
++			src->eip += map->start;
+ 		}
+ 		if (strlen(src->line)>8 && src->line[16] == ':') {
+ 			src->eip = strtoull(src->line, NULL, 16);
+-			if (section)
+-				src->eip += section->vma;
++			src->eip += map->start;
+ 		}
+ 	}
+ 	pclose(file);
+@@ -242,16 +229,9 @@ static void lookup_sym_source(struct sym_entry *syme)
+ 	struct symbol *symbol = (struct symbol *)(syme + 1);
+ 	struct source_line *line;
+ 	char pattern[PATH_MAX];
+-	char *idx;
+ 
+ 	sprintf(pattern, "<%s>:", symbol->name);
+ 
+-	if (symbol->module) {
+-		idx = strstr(pattern, "\t");
+-		if (idx)
+-			*idx = 0;
+-	}
+-
+ 	pthread_mutex_lock(&syme->source_lock);
+ 	for (line = syme->lines; line; line = line->next) {
+ 		if (strstr(line->line, pattern)) {
+@@ -513,8 +493,8 @@ static void print_sym_table(void)
+ 		if (verbose)
+ 			printf(" - %016llx", sym->start);
+ 		printf(" : %s", sym->name);
+-		if (sym->module)
+-			printf("\t[%s]", sym->module->name);
++		if (syme->map->dso->name[0] == '[')
++			printf(" \t%s", syme->map->dso->name);
+ 		printf("\n");
+ 	}
+ }
+@@ -784,7 +764,7 @@ static const char *skip_symbols[] = {
+ 	NULL
+ };
+ 
+-static int symbol_filter(struct dso *self, struct symbol *sym)
++static int symbol_filter(struct map *map, struct symbol *sym)
+ {
+ 	struct sym_entry *syme;
+ 	const char *name = sym->name;
+@@ -806,7 +786,8 @@ static int symbol_filter(struct dso *self, struct symbol *sym)
+ 	    strstr(name, "_text_end"))
+ 		return 1;
+ 
+-	syme = dso__sym_priv(self, sym);
++	syme = dso__sym_priv(map->dso, sym);
++	syme->map = map;
+ 	pthread_mutex_init(&syme->source_lock, NULL);
+ 	if (!sym_filter_entry && sym_filter && !strcmp(name, sym_filter))
+ 		sym_filter_entry = syme;
+@@ -825,22 +806,14 @@ static int parse_symbols(void)
+ {
+ 	int use_modules = vmlinux_name ? 1 : 0;
+ 
+-	kernel_dso = dso__new("[kernel]", sizeof(struct sym_entry));
+-	if (kernel_dso == NULL)
++	if (dsos__load_kernel(vmlinux_name, sizeof(struct sym_entry),
++			      symbol_filter, verbose, use_modules) <= 0)
+ 		return -1;
+ 
+-	if (dso__load_kernel(kernel_dso, vmlinux_name, symbol_filter, verbose, use_modules) <= 0)
+-		goto out_delete_dso;
+-
+ 	if (dump_symtab)
+-		dso__fprintf(kernel_dso, stderr);
++		dsos__fprintf(stderr);
+ 
+ 	return 0;
+-
+-out_delete_dso:
+-	dso__delete(kernel_dso);
+-	kernel_dso = NULL;
+-	return -1;
+ }
+ 
+ /*
+@@ -848,10 +821,11 @@ out_delete_dso:
+  */
+ static void record_ip(u64 ip, int counter)
+ {
+-	struct symbol *sym = dso__find_symbol(kernel_dso, ip);
++	struct map *map;
++	struct symbol *sym = kernel_maps__find_symbol(ip, &map);
+ 
+ 	if (sym != NULL) {
+-		struct sym_entry *syme = dso__sym_priv(kernel_dso, sym);
++		struct sym_entry *syme = dso__sym_priv(map->dso, sym);
+ 
+ 		if (!syme->skip) {
+ 			syme->count[counter]++;
+diff --git a/tools/perf/util/event.h b/tools/perf/util/event.h
+index 4c69eb5..a39520e 100644
+--- a/tools/perf/util/event.h
++++ b/tools/perf/util/event.h
+@@ -3,6 +3,7 @@
+ 
+ #include "../perf.h"
+ #include "util.h"
++#include <linux/list.h>
+ #include <linux/rbtree.h>
+ 
+ enum {
+@@ -79,7 +80,10 @@ typedef union event_union {
+ } event_t;
+ 
+ struct map {
+-	struct rb_node		rb_node;
++	union {
++		struct rb_node	rb_node;
++		struct list_head node;
++	};
+ 	u64			start;
+ 	u64			end;
+ 	u64			pgoff;
+diff --git a/tools/perf/util/module.c b/tools/perf/util/module.c
+deleted file mode 100644
+index 0d8c85d..0000000
+--- a/tools/perf/util/module.c
++++ /dev/null
+@@ -1,545 +0,0 @@
+-#include "util.h"
+-#include "../perf.h"
+-#include "string.h"
+-#include "module.h"
+-
+-#include <libelf.h>
+-#include <libgen.h>
+-#include <gelf.h>
+-#include <elf.h>
+-#include <dirent.h>
+-#include <sys/utsname.h>
+-
+-static unsigned int crc32(const char *p, unsigned int len)
+-{
+-	int i;
+-	unsigned int crc = 0;
+-
+-	while (len--) {
+-		crc ^= *p++;
+-		for (i = 0; i < 8; i++)
+-			crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+-	}
+-	return crc;
+-}
+-
+-/* module section methods */
+-
+-struct sec_dso *sec_dso__new_dso(const char *name)
+-{
+-	struct sec_dso *self = malloc(sizeof(*self) + strlen(name) + 1);
+-
+-	if (self != NULL) {
+-		strcpy(self->name, name);
+-		self->secs = RB_ROOT;
+-		self->find_section = sec_dso__find_section;
+-	}
+-
+-	return self;
+-}
+-
+-static void sec_dso__delete_section(struct section *self)
+-{
+-	free(((void *)self));
+-}
+-
+-void sec_dso__delete_sections(struct sec_dso *self)
+-{
+-	struct section *pos;
+-	struct rb_node *next = rb_first(&self->secs);
+-
+-	while (next) {
+-		pos = rb_entry(next, struct section, rb_node);
+-		next = rb_next(&pos->rb_node);
+-		rb_erase(&pos->rb_node, &self->secs);
+-		sec_dso__delete_section(pos);
+-	}
+-}
+-
+-void sec_dso__delete_self(struct sec_dso *self)
+-{
+-	sec_dso__delete_sections(self);
+-	free(self);
+-}
+-
+-static void sec_dso__insert_section(struct sec_dso *self, struct section *sec)
+-{
+-	struct rb_node **p = &self->secs.rb_node;
+-	struct rb_node *parent = NULL;
+-	const u64 hash = sec->hash;
+-	struct section *s;
+-
+-	while (*p != NULL) {
+-		parent = *p;
+-		s = rb_entry(parent, struct section, rb_node);
+-		if (hash < s->hash)
+-			p = &(*p)->rb_left;
+-		else
+-			p = &(*p)->rb_right;
+-	}
+-	rb_link_node(&sec->rb_node, parent, p);
+-	rb_insert_color(&sec->rb_node, &self->secs);
+-}
+-
+-struct section *sec_dso__find_section(struct sec_dso *self, const char *name)
+-{
+-	struct rb_node *n;
+-	u64 hash;
+-	int len;
+-
+-	if (self == NULL)
+-		return NULL;
+-
+-	len = strlen(name);
+-	hash = crc32(name, len);
+-
+-	n = self->secs.rb_node;
+-
+-	while (n) {
+-		struct section *s = rb_entry(n, struct section, rb_node);
+-
+-		if (hash < s->hash)
+-			n = n->rb_left;
+-		else if (hash > s->hash)
+-			n = n->rb_right;
+-		else {
+-			if (!strcmp(name, s->name))
+-				return s;
+-			else
+-				n = rb_next(&s->rb_node);
+-		}
+-	}
+-
+-	return NULL;
+-}
+-
+-static size_t sec_dso__fprintf_section(struct section *self, FILE *fp)
+-{
+-	return fprintf(fp, "name:%s vma:%llx path:%s\n",
+-		       self->name, self->vma, self->path);
+-}
+-
+-size_t sec_dso__fprintf(struct sec_dso *self, FILE *fp)
+-{
+-	size_t ret = fprintf(fp, "dso: %s\n", self->name);
+-
+-	struct rb_node *nd;
+-	for (nd = rb_first(&self->secs); nd; nd = rb_next(nd)) {
+-		struct section *pos = rb_entry(nd, struct section, rb_node);
+-		ret += sec_dso__fprintf_section(pos, fp);
+-	}
+-
+-	return ret;
+-}
+-
+-static struct section *section__new(const char *name, const char *path)
+-{
+-	struct section *self = calloc(1, sizeof(*self));
+-
+-	if (!self)
+-		goto out_failure;
+-
+-	self->name = calloc(1, strlen(name) + 1);
+-	if (!self->name)
+-		goto out_failure;
+-
+-	self->path = calloc(1, strlen(path) + 1);
+-	if (!self->path)
+-		goto out_failure;
+-
+-	strcpy(self->name, name);
+-	strcpy(self->path, path);
+-	self->hash = crc32(self->name, strlen(name));
+-
+-	return self;
+-
+-out_failure:
+-	if (self) {
+-		if (self->name)
+-			free(self->name);
+-		if (self->path)
+-			free(self->path);
+-		free(self);
+-	}
+-
+-	return NULL;
+-}
+-
+-/* module methods */
+-
+-struct mod_dso *mod_dso__new_dso(const char *name)
+-{
+-	struct mod_dso *self = malloc(sizeof(*self) + strlen(name) + 1);
+-
+-	if (self != NULL) {
+-		strcpy(self->name, name);
+-		self->mods = RB_ROOT;
+-		self->find_module = mod_dso__find_module;
+-	}
+-
+-	return self;
+-}
+-
+-static void mod_dso__delete_module(struct module *self)
+-{
+-	free(((void *)self));
+-}
+-
+-void mod_dso__delete_modules(struct mod_dso *self)
+-{
+-	struct module *pos;
+-	struct rb_node *next = rb_first(&self->mods);
+-
+-	while (next) {
+-		pos = rb_entry(next, struct module, rb_node);
+-		next = rb_next(&pos->rb_node);
+-		rb_erase(&pos->rb_node, &self->mods);
+-		mod_dso__delete_module(pos);
+-	}
+-}
+-
+-void mod_dso__delete_self(struct mod_dso *self)
+-{
+-	mod_dso__delete_modules(self);
+-	free(self);
+-}
+-
+-static void mod_dso__insert_module(struct mod_dso *self, struct module *mod)
+-{
+-	struct rb_node **p = &self->mods.rb_node;
+-	struct rb_node *parent = NULL;
+-	const u64 hash = mod->hash;
+-	struct module *m;
+-
+-	while (*p != NULL) {
+-		parent = *p;
+-		m = rb_entry(parent, struct module, rb_node);
+-		if (hash < m->hash)
+-			p = &(*p)->rb_left;
+-		else
+-			p = &(*p)->rb_right;
+-	}
+-	rb_link_node(&mod->rb_node, parent, p);
+-	rb_insert_color(&mod->rb_node, &self->mods);
+-}
+-
+-struct module *mod_dso__find_module(struct mod_dso *self, const char *name)
+-{
+-	struct rb_node *n;
+-	u64 hash;
+-	int len;
+-
+-	if (self == NULL)
+-		return NULL;
+-
+-	len = strlen(name);
+-	hash = crc32(name, len);
+-
+-	n = self->mods.rb_node;
+-
+-	while (n) {
+-		struct module *m = rb_entry(n, struct module, rb_node);
+-
+-		if (hash < m->hash)
+-			n = n->rb_left;
+-		else if (hash > m->hash)
+-			n = n->rb_right;
+-		else {
+-			if (!strcmp(name, m->name))
+-				return m;
+-			else
+-				n = rb_next(&m->rb_node);
+-		}
+-	}
+-
+-	return NULL;
+-}
+-
+-static size_t mod_dso__fprintf_module(struct module *self, FILE *fp)
+-{
+-	return fprintf(fp, "name:%s path:%s\n", self->name, self->path);
+-}
+-
+-size_t mod_dso__fprintf(struct mod_dso *self, FILE *fp)
+-{
+-	struct rb_node *nd;
+-	size_t ret;
+-
+-	ret = fprintf(fp, "dso: %s\n", self->name);
+-
+-	for (nd = rb_first(&self->mods); nd; nd = rb_next(nd)) {
+-		struct module *pos = rb_entry(nd, struct module, rb_node);
+-
+-		ret += mod_dso__fprintf_module(pos, fp);
+-	}
+-
+-	return ret;
+-}
+-
+-static struct module *module__new(const char *name, const char *path)
+-{
+-	struct module *self = calloc(1, sizeof(*self));
+-
+-	if (!self)
+-		goto out_failure;
+-
+-	self->name = calloc(1, strlen(name) + 1);
+-	if (!self->name)
+-		goto out_failure;
+-
+-	self->path = calloc(1, strlen(path) + 1);
+-	if (!self->path)
+-		goto out_failure;
+-
+-	strcpy(self->name, name);
+-	strcpy(self->path, path);
+-	self->hash = crc32(self->name, strlen(name));
+-
+-	return self;
+-
+-out_failure:
+-	if (self) {
+-		if (self->name)
+-			free(self->name);
+-		if (self->path)
+-			free(self->path);
+-		free(self);
+-	}
+-
+-	return NULL;
+-}
+-
+-static int mod_dso__load_sections(struct module *mod)
+-{
+-	int count = 0, path_len;
+-	struct dirent *entry;
+-	char *line = NULL;
+-	char *dir_path;
+-	DIR *dir;
+-	size_t n;
+-
+-	path_len = strlen("/sys/module/");
+-	path_len += strlen(mod->name);
+-	path_len += strlen("/sections/");
+-
+-	dir_path = calloc(1, path_len + 1);
+-	if (dir_path == NULL)
+-		goto out_failure;
+-
+-	strcat(dir_path, "/sys/module/");
+-	strcat(dir_path, mod->name);
+-	strcat(dir_path, "/sections/");
+-
+-	dir = opendir(dir_path);
+-	if (dir == NULL)
+-		goto out_free;
+-
+-	while ((entry = readdir(dir))) {
+-		struct section *section;
+-		char *path, *vma;
+-		int line_len;
+-		FILE *file;
+-
+-		if (!strcmp(".", entry->d_name) || !strcmp("..", entry->d_name))
+-			continue;
+-
+-		path = calloc(1, path_len + strlen(entry->d_name) + 1);
+-		if (path == NULL)
+-			break;
+-		strcat(path, dir_path);
+-		strcat(path, entry->d_name);
+-
+-		file = fopen(path, "r");
+-		if (file == NULL) {
+-			free(path);
+-			break;
+-		}
+-
+-		line_len = getline(&line, &n, file);
+-		if (line_len < 0) {
+-			free(path);
+-			fclose(file);
+-			break;
+-		}
+-
+-		if (!line) {
+-			free(path);
+-			fclose(file);
+-			break;
+-		}
+-
+-		line[--line_len] = '\0'; /* \n */
+-
+-		vma = strstr(line, "0x");
+-		if (!vma) {
+-			free(path);
+-			fclose(file);
+-			break;
+-		}
+-		vma += 2;
+-
+-		section = section__new(entry->d_name, path);
+-		if (!section) {
+-			fprintf(stderr, "load_sections: allocation error\n");
+-			free(path);
+-			fclose(file);
+-			break;
+-		}
+-
+-		hex2u64(vma, &section->vma);
+-		sec_dso__insert_section(mod->sections, section);
+-
+-		free(path);
+-		fclose(file);
+-		count++;
+-	}
+-
+-	closedir(dir);
+-	free(line);
+-	free(dir_path);
+-
+-	return count;
+-
+-out_free:
+-	free(dir_path);
+-
+-out_failure:
+-	return count;
+-}
+-
+-static int mod_dso__load_module_paths(struct mod_dso *self)
+-{
+-	struct utsname uts;
+-	int count = 0, len, err = -1;
+-	char *line = NULL;
+-	FILE *file;
+-	char *dpath, *dir;
+-	size_t n;
+-
+-	if (uname(&uts) < 0)
+-		return err;
+-
+-	len = strlen("/lib/modules/");
+-	len += strlen(uts.release);
+-	len += strlen("/modules.dep");
+-
+-	dpath = calloc(1, len + 1);
+-	if (dpath == NULL)
+-		return err;
+-
+-	strcat(dpath, "/lib/modules/");
+-	strcat(dpath, uts.release);
+-	strcat(dpath, "/modules.dep");
+-
+-	file = fopen(dpath, "r");
+-	if (file == NULL)
+-		goto out_failure;
+-
+-	dir = dirname(dpath);
+-	if (!dir)
+-		goto out_failure;
+-	strcat(dir, "/");
+-
+-	while (!feof(file)) {
+-		struct module *module;
+-		char *name, *path, *tmp;
+-		FILE *modfile;
+-		int line_len;
+-
+-		line_len = getline(&line, &n, file);
+-		if (line_len < 0)
+-			break;
+-
+-		if (!line)
+-			break;
+-
+-		line[--line_len] = '\0'; /* \n */
+-
+-		path = strchr(line, ':');
+-		if (!path)
+-			break;
+-		*path = '\0';
+-
+-		path = strdup(line);
+-		if (!path)
+-			break;
+-
+-		if (!strstr(path, dir)) {
+-			if (strncmp(path, "kernel/", 7))
+-				break;
+-
+-			free(path);
+-			path = calloc(1, strlen(dir) + strlen(line) + 1);
+-			if (!path)
+-				break;
+-			strcat(path, dir);
+-			strcat(path, line);
+-		}
+-
+-		modfile = fopen(path, "r");
+-		if (modfile == NULL)
+-			break;
+-		fclose(modfile);
+-
+-		name = strdup(path);
+-		if (!name)
+-			break;
+-
+-		name = strtok(name, "/");
+-		tmp = name;
+-
+-		while (tmp) {
+-			tmp = strtok(NULL, "/");
+-			if (tmp)
+-				name = tmp;
+-		}
+-
+-		name = strsep(&name, ".");
+-		if (!name)
+-			break;
+-
+-		/* Quirk: replace '-' with '_' in all modules */
+-		for (len = strlen(name); len; len--) {
+-			if (*(name+len) == '-')
+-				*(name+len) = '_';
+-		}
+-
+-		module = module__new(name, path);
+-		if (!module)
+-			break;
+-		mod_dso__insert_module(self, module);
+-
+-		module->sections = sec_dso__new_dso("sections");
+-		if (!module->sections)
+-			break;
+-
+-		module->active = mod_dso__load_sections(module);
+-
+-		if (module->active > 0)
+-			count++;
+-	}
+-
+-	if (feof(file))
+-		err = count;
+-	else
+-		fprintf(stderr, "load_module_paths: modules.dep parsing failure!\n");
+-
+-out_failure:
+-	if (dpath)
+-		free(dpath);
+-	if (file)
+-		fclose(file);
+-	if (line)
+-		free(line);
+-
+-	return err;
+-}
+-
+-int mod_dso__load_modules(struct mod_dso *dso)
+-{
+-	int err;
+-
+-	err = mod_dso__load_module_paths(dso);
+-
+-	return err;
+-}
+diff --git a/tools/perf/util/module.h b/tools/perf/util/module.h
+deleted file mode 100644
+index 098e041..0000000
+--- a/tools/perf/util/module.h
++++ /dev/null
+@@ -1,53 +0,0 @@
+-#ifndef __PERF_MODULE_
+-#define __PERF_MODULE_ 1
+-
+-#include <linux/types.h>
+-#include "../types.h"
+-#include <linux/list.h>
+-#include <linux/rbtree.h>
+-
+-struct section {
+-	struct rb_node	rb_node;
+-	u64		hash;
+-	u64		vma;
+-	char		*name;
+-	char		*path;
+-};
+-
+-struct sec_dso {
+-	struct list_head node;
+-	struct rb_root	 secs;
+-	struct section    *(*find_section)(struct sec_dso *, const char *name);
+-	char		 name[0];
+-};
+-
+-struct module {
+-	struct rb_node	rb_node;
+-	u64		hash;
+-	char		*name;
+-	char		*path;
+-	struct sec_dso	*sections;
+-	int		active;
+-};
+-
+-struct mod_dso {
+-	struct list_head node;
+-	struct rb_root	 mods;
+-	struct module    *(*find_module)(struct mod_dso *, const char *name);
+-	char		 name[0];
+-};
+-
+-struct sec_dso *sec_dso__new_dso(const char *name);
+-void sec_dso__delete_sections(struct sec_dso *self);
+-void sec_dso__delete_self(struct sec_dso *self);
+-size_t sec_dso__fprintf(struct sec_dso *self, FILE *fp);
+-struct section *sec_dso__find_section(struct sec_dso *self, const char *name);
+-
+-struct mod_dso *mod_dso__new_dso(const char *name);
+-void mod_dso__delete_modules(struct mod_dso *self);
+-void mod_dso__delete_self(struct mod_dso *self);
+-size_t mod_dso__fprintf(struct mod_dso *self, FILE *fp);
+-struct module *mod_dso__find_module(struct mod_dso *self, const char *name);
+-int mod_dso__load_modules(struct mod_dso *dso);
+-
+-#endif /* __PERF_MODULE_ */
+diff --git a/tools/perf/util/sort.c b/tools/perf/util/sort.c
+index 50e75ab..40c9acd 100644
+--- a/tools/perf/util/sort.c
++++ b/tools/perf/util/sort.c
+@@ -129,20 +129,32 @@ sort__comm_print(FILE *fp, struct hist_entry *self, unsigned int width)
+ int64_t
+ sort__dso_cmp(struct hist_entry *left, struct hist_entry *right)
+ {
+-	struct dso *dso_l = left->dso;
+-	struct dso *dso_r = right->dso;
++	struct dso *dso_l = left->map ? left->map->dso : NULL;
++	struct dso *dso_r = right->map ? right->map->dso : NULL;
++	const char *dso_name_l, *dso_name_r;
+ 
+ 	if (!dso_l || !dso_r)
+ 		return cmp_null(dso_l, dso_r);
+ 
+-	return strcmp(dso_l->name, dso_r->name);
++	if (verbose) {
++		dso_name_l = dso_l->long_name;
++		dso_name_r = dso_r->long_name;
++	} else {
++		dso_name_l = dso_l->short_name;
++		dso_name_r = dso_r->short_name;
++	}
++
++	return strcmp(dso_name_l, dso_name_r);
+ }
+ 
+ size_t
+ sort__dso_print(FILE *fp, struct hist_entry *self, unsigned int width)
+ {
+-	if (self->dso)
+-		return repsep_fprintf(fp, "%-*s", width, self->dso->name);
++	if (self->map && self->map->dso) {
++		const char *dso_name = !verbose ? self->map->dso->short_name :
++						  self->map->dso->long_name;
++		return repsep_fprintf(fp, "%-*s", width, dso_name);
++	}
+ 
+ 	return repsep_fprintf(fp, "%*llx", width, (u64)self->ip);
+ }
+@@ -169,20 +181,16 @@ sort__sym_print(FILE *fp, struct hist_entry *self, unsigned int width __used)
+ {
+ 	size_t ret = 0;
+ 
+-	if (verbose)
+-		ret += repsep_fprintf(fp, "%#018llx %c ", (u64)self->ip,
+-				      dso__symtab_origin(self->dso));
++	if (verbose) {
++		char o = self->map ? dso__symtab_origin(self->map->dso) : '!';
++		ret += repsep_fprintf(fp, "%#018llx %c ", (u64)self->ip, o);
++	}
+ 
+ 	ret += repsep_fprintf(fp, "[%c] ", self->level);
+-	if (self->sym) {
++	if (self->sym)
+ 		ret += repsep_fprintf(fp, "%s", self->sym->name);
+-
+-		if (self->sym->module)
+-			ret += repsep_fprintf(fp, "\t[%s]",
+-					     self->sym->module->name);
+-	} else {
++	else
+ 		ret += repsep_fprintf(fp, "%#016llx", (u64)self->ip);
+-	}
+ 
+ 	return ret;
+ }
+diff --git a/tools/perf/util/sort.h b/tools/perf/util/sort.h
+index 4684fd6..13806d7 100644
+--- a/tools/perf/util/sort.h
++++ b/tools/perf/util/sort.h
+@@ -42,18 +42,15 @@ extern unsigned int threads__col_width;
+ 
+ struct hist_entry {
+ 	struct rb_node		rb_node;
+-
++	u64			count;
+ 	struct thread		*thread;
+ 	struct map		*map;
+-	struct dso		*dso;
+ 	struct symbol		*sym;
+-	struct symbol		*parent;
+ 	u64			ip;
+ 	char			level;
++	struct symbol		*parent;
+ 	struct callchain_node	callchain;
+ 	struct rb_root		sorted_chain;
+-
+-	u64			count;
+ };
+ 
+ /*
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index 559fb06..e882968 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -2,12 +2,14 @@
+ #include "../perf.h"
+ #include "string.h"
+ #include "symbol.h"
++#include "thread.h"
+ 
+ #include "debug.h"
+ 
+ #include <libelf.h>
+ #include <gelf.h>
+ #include <elf.h>
++#include <sys/utsname.h>
+ 
+ const char *sym_hist_filter;
+ 
+@@ -18,12 +20,15 @@ enum dso_origin {
+ 	DSO__ORIG_UBUNTU,
+ 	DSO__ORIG_BUILDID,
+ 	DSO__ORIG_DSO,
++	DSO__ORIG_KMODULE,
+ 	DSO__ORIG_NOT_FOUND,
+ };
+ 
+-static struct symbol *symbol__new(u64 start, u64 len,
+-				  const char *name, unsigned int priv_size,
+-				  u64 obj_start, int v)
++static void dsos__add(struct dso *dso);
++static struct dso *dsos__find(const char *name);
++
++static struct symbol *symbol__new(u64 start, u64 len, const char *name,
++				  unsigned int priv_size, int v)
+ {
+ 	size_t namelen = strlen(name) + 1;
+ 	struct symbol *self = calloc(1, priv_size + sizeof(*self) + namelen);
+@@ -32,10 +37,9 @@ static struct symbol *symbol__new(u64 start, u64 len,
+ 		return NULL;
+ 
+ 	if (v >= 2)
+-		printf("new symbol: %016Lx [%08lx]: %s, hist: %p, obj_start: %p\n",
+-			(u64)start, (unsigned long)len, name, self->hist, (void *)(unsigned long)obj_start);
++		printf("new symbol: %016Lx [%08lx]: %s, hist: %p\n",
++			start, (unsigned long)len, name, self->hist);
+ 
+-	self->obj_start= obj_start;
+ 	self->hist = NULL;
+ 	self->hist_sum = 0;
+ 
+@@ -60,12 +64,8 @@ static void symbol__delete(struct symbol *self, unsigned int priv_size)
+ 
+ static size_t symbol__fprintf(struct symbol *self, FILE *fp)
+ {
+-	if (!self->module)
+-		return fprintf(fp, " %llx-%llx %s\n",
++	return fprintf(fp, " %llx-%llx %s\n",
+ 		       self->start, self->end, self->name);
+-	else
+-		return fprintf(fp, " %llx-%llx %s \t[%s]\n",
+-		       self->start, self->end, self->name, self->module->name);
+ }
+ 
+ struct dso *dso__new(const char *name, unsigned int sym_priv_size)
+@@ -74,6 +74,8 @@ struct dso *dso__new(const char *name, unsigned int sym_priv_size)
+ 
+ 	if (self != NULL) {
+ 		strcpy(self->name, name);
++		self->long_name = self->name;
++		self->short_name = self->name;
+ 		self->syms = RB_ROOT;
+ 		self->sym_priv_size = sym_priv_size;
+ 		self->find_symbol = dso__find_symbol;
+@@ -100,6 +102,8 @@ static void dso__delete_symbols(struct dso *self)
+ void dso__delete(struct dso *self)
+ {
+ 	dso__delete_symbols(self);
++	if (self->long_name != self->name)
++		free(self->long_name);
+ 	free(self);
+ }
+ 
+@@ -147,7 +151,7 @@ struct symbol *dso__find_symbol(struct dso *self, u64 ip)
+ 
+ size_t dso__fprintf(struct dso *self, FILE *fp)
+ {
+-	size_t ret = fprintf(fp, "dso: %s\n", self->name);
++	size_t ret = fprintf(fp, "dso: %s\n", self->long_name);
+ 
+ 	struct rb_node *nd;
+ 	for (nd = rb_first(&self->syms); nd; nd = rb_next(nd)) {
+@@ -158,7 +162,8 @@ size_t dso__fprintf(struct dso *self, FILE *fp)
+ 	return ret;
+ }
+ 
+-static int dso__load_kallsyms(struct dso *self, symbol_filter_t filter, int v)
++static int dso__load_kallsyms(struct dso *self, struct map *map,
++			      symbol_filter_t filter, int v)
+ {
+ 	struct rb_node *nd, *prevnd;
+ 	char *line = NULL;
+@@ -200,12 +205,12 @@ static int dso__load_kallsyms(struct dso *self, symbol_filter_t filter, int v)
+ 		 * Well fix up the end later, when we have all sorted.
+ 		 */
+ 		sym = symbol__new(start, 0xdead, line + len + 2,
+-				  self->sym_priv_size, 0, v);
++				  self->sym_priv_size, v);
+ 
+ 		if (sym == NULL)
+ 			goto out_delete_line;
+ 
+-		if (filter && filter(self, sym))
++		if (filter && filter(map, sym))
+ 			symbol__delete(sym, self->sym_priv_size);
+ 		else {
+ 			dso__insert_symbol(self, sym);
+@@ -241,14 +246,15 @@ out_failure:
+ 	return -1;
+ }
+ 
+-static int dso__load_perf_map(struct dso *self, symbol_filter_t filter, int v)
++static int dso__load_perf_map(struct dso *self, struct map *map,
++			      symbol_filter_t filter, int v)
+ {
+ 	char *line = NULL;
+ 	size_t n;
+ 	FILE *file;
+ 	int nr_syms = 0;
+ 
+-	file = fopen(self->name, "r");
++	file = fopen(self->long_name, "r");
+ 	if (file == NULL)
+ 		goto out_failure;
+ 
+@@ -279,12 +285,12 @@ static int dso__load_perf_map(struct dso *self, symbol_filter_t filter, int v)
+ 			continue;
+ 
+ 		sym = symbol__new(start, size, line + len,
+-				  self->sym_priv_size, start, v);
++				  self->sym_priv_size, v);
+ 
+ 		if (sym == NULL)
+ 			goto out_delete_line;
+ 
+-		if (filter && filter(self, sym))
++		if (filter && filter(map, sym))
+ 			symbol__delete(sym, self->sym_priv_size);
+ 		else {
+ 			dso__insert_symbol(self, sym);
+@@ -410,7 +416,7 @@ static int dso__synthesize_plt_symbols(struct  dso *self, int v)
+ 	Elf *elf;
+ 	int nr = 0, symidx, fd, err = 0;
+ 
+-	fd = open(self->name, O_RDONLY);
++	fd = open(self->long_name, O_RDONLY);
+ 	if (fd < 0)
+ 		goto out;
+ 
+@@ -478,7 +484,7 @@ static int dso__synthesize_plt_symbols(struct  dso *self, int v)
+ 				 "%s@plt", elf_sym__name(&sym, symstrs));
+ 
+ 			f = symbol__new(plt_offset, shdr_plt.sh_entsize,
+-					sympltname, self->sym_priv_size, 0, v);
++					sympltname, self->sym_priv_size, v);
+ 			if (!f)
+ 				goto out_elf_end;
+ 
+@@ -496,7 +502,7 @@ static int dso__synthesize_plt_symbols(struct  dso *self, int v)
+ 				 "%s@plt", elf_sym__name(&sym, symstrs));
+ 
+ 			f = symbol__new(plt_offset, shdr_plt.sh_entsize,
+-					sympltname, self->sym_priv_size, 0, v);
++					sympltname, self->sym_priv_size, v);
+ 			if (!f)
+ 				goto out_elf_end;
+ 
+@@ -515,12 +521,13 @@ out_close:
+ 		return nr;
+ out:
+ 	fprintf(stderr, "%s: problems reading %s PLT info.\n",
+-		__func__, self->name);
++		__func__, self->long_name);
+ 	return 0;
+ }
+ 
+-static int dso__load_sym(struct dso *self, int fd, const char *name,
+-			 symbol_filter_t filter, int v, struct module *mod)
++static int dso__load_sym(struct dso *self, struct map *map, const char *name,
++			 int fd, symbol_filter_t filter, int kernel,
++			 int kmodule, int v)
+ {
+ 	Elf_Data *symstrs, *secstrs;
+ 	uint32_t nr_syms;
+@@ -532,7 +539,7 @@ static int dso__load_sym(struct dso *self, int fd, const char *name,
+ 	GElf_Sym sym;
+ 	Elf_Scn *sec, *sec_strndx;
+ 	Elf *elf;
+-	int nr = 0, kernel = !strcmp("[kernel]", self->name);
++	int nr = 0;
+ 
+ 	elf = elf_begin(fd, PERF_ELF_C_READ_MMAP, NULL);
+ 	if (elf == NULL) {
+@@ -589,8 +596,6 @@ static int dso__load_sym(struct dso *self, int fd, const char *name,
+ 		struct symbol *f;
+ 		const char *elf_name;
+ 		char *demangled;
+-		u64 obj_start;
+-		struct section *section = NULL;
+ 		int is_label = elf_sym__is_label(&sym);
+ 		const char *section_name;
+ 
+@@ -607,7 +612,6 @@ static int dso__load_sym(struct dso *self, int fd, const char *name,
+ 			continue;
+ 
+ 		section_name = elf_sec__name(&shdr, secstrs);
+-		obj_start = sym.st_value;
+ 
+ 		if (self->adjust_symbols) {
+ 			if (v >= 2)
+@@ -615,18 +619,8 @@ static int dso__load_sym(struct dso *self, int fd, const char *name,
+ 					(u64)sym.st_value, (u64)shdr.sh_addr, (u64)shdr.sh_offset);
+ 
+ 			sym.st_value -= shdr.sh_addr - shdr.sh_offset;
+-		}
+-
+-		if (mod) {
+-			section = mod->sections->find_section(mod->sections, section_name);
+-			if (section)
+-				sym.st_value += section->vma;
+-			else {
+-				fprintf(stderr, "dso__load_sym() module %s lookup of %s failed\n",
+-					mod->name, section_name);
+-				goto out_elf_end;
+-			}
+-		}
++		} else if (kmodule)
++			sym.st_value += shdr.sh_offset;
+ 		/*
+ 		 * We need to figure out if the object was created from C++ sources
+ 		 * DWARF DW_compile_unit has this, but we don't always have access
+@@ -638,15 +632,14 @@ static int dso__load_sym(struct dso *self, int fd, const char *name,
+ 			elf_name = demangled;
+ 
+ 		f = symbol__new(sym.st_value, sym.st_size, elf_name,
+-				self->sym_priv_size, obj_start, v);
++				self->sym_priv_size, v);
+ 		free(demangled);
+ 		if (!f)
+ 			goto out_elf_end;
+ 
+-		if (filter && filter(self, f))
++		if (filter && filter(map, f))
+ 			symbol__delete(f, self->sym_priv_size);
+ 		else {
+-			f->module = mod;
+ 			dso__insert_symbol(self, f);
+ 			nr++;
+ 		}
+@@ -671,7 +664,7 @@ static char *dso__read_build_id(struct dso *self, int v)
+ 	char *build_id = NULL, *bid;
+ 	unsigned char *raw;
+ 	Elf *elf;
+-	int fd = open(self->name, O_RDONLY);
++	int fd = open(self->long_name, O_RDONLY);
+ 
+ 	if (fd < 0)
+ 		goto out;
+@@ -680,7 +673,7 @@ static char *dso__read_build_id(struct dso *self, int v)
+ 	if (elf == NULL) {
+ 		if (v)
+ 			fprintf(stderr, "%s: cannot read %s ELF file.\n",
+-				__func__, self->name);
++				__func__, self->long_name);
+ 		goto out_close;
+ 	}
+ 
+@@ -709,7 +702,7 @@ static char *dso__read_build_id(struct dso *self, int v)
+ 		bid += 2;
+ 	}
+ 	if (v >= 2)
+-		printf("%s(%s): %s\n", __func__, self->name, build_id);
++		printf("%s(%s): %s\n", __func__, self->long_name, build_id);
+ out_elf_end:
+ 	elf_end(elf);
+ out_close:
+@@ -727,6 +720,7 @@ char dso__symtab_origin(const struct dso *self)
+ 		[DSO__ORIG_UBUNTU] =   'u',
+ 		[DSO__ORIG_BUILDID] =  'b',
+ 		[DSO__ORIG_DSO] =      'd',
++		[DSO__ORIG_KMODULE] =  'K',
+ 	};
+ 
+ 	if (self == NULL || self->origin == DSO__ORIG_NOT_FOUND)
+@@ -734,7 +728,7 @@ char dso__symtab_origin(const struct dso *self)
+ 	return origin[self->origin];
+ }
+ 
+-int dso__load(struct dso *self, symbol_filter_t filter, int v)
++int dso__load(struct dso *self, struct map *map, symbol_filter_t filter, int v)
+ {
+ 	int size = PATH_MAX;
+ 	char *name = malloc(size), *build_id = NULL;
+@@ -747,7 +741,7 @@ int dso__load(struct dso *self, symbol_filter_t filter, int v)
+ 	self->adjust_symbols = 0;
+ 
+ 	if (strncmp(self->name, "/tmp/perf-", 10) == 0) {
+-		ret = dso__load_perf_map(self, filter, v);
++		ret = dso__load_perf_map(self, map, filter, v);
+ 		self->origin = ret > 0 ? DSO__ORIG_JAVA_JIT :
+ 					 DSO__ORIG_NOT_FOUND;
+ 		return ret;
+@@ -760,10 +754,12 @@ more:
+ 		self->origin++;
+ 		switch (self->origin) {
+ 		case DSO__ORIG_FEDORA:
+-			snprintf(name, size, "/usr/lib/debug%s.debug", self->name);
++			snprintf(name, size, "/usr/lib/debug%s.debug",
++				 self->long_name);
+ 			break;
+ 		case DSO__ORIG_UBUNTU:
+-			snprintf(name, size, "/usr/lib/debug%s", self->name);
++			snprintf(name, size, "/usr/lib/debug%s",
++				 self->long_name);
+ 			break;
+ 		case DSO__ORIG_BUILDID:
+ 			build_id = dso__read_build_id(self, v);
+@@ -777,7 +773,7 @@ more:
+ 			self->origin++;
+ 			/* Fall thru */
+ 		case DSO__ORIG_DSO:
+-			snprintf(name, size, "%s", self->name);
++			snprintf(name, size, "%s", self->long_name);
+ 			break;
+ 
+ 		default:
+@@ -787,7 +783,7 @@ more:
+ 		fd = open(name, O_RDONLY);
+ 	} while (fd < 0);
+ 
+-	ret = dso__load_sym(self, fd, name, filter, v, NULL);
++	ret = dso__load_sym(self, map, name, fd, filter, 0, 0, v);
+ 	close(fd);
+ 
+ 	/*
+@@ -808,89 +804,247 @@ out:
+ 	return ret;
+ }
+ 
+-static int dso__load_module(struct dso *self, struct mod_dso *mods, const char *name,
+-			     symbol_filter_t filter, int v)
++static struct rb_root kernel_maps;
++struct map *kernel_map;
++
++static void kernel_maps__insert(struct map *map)
+ {
+-	struct module *mod = mod_dso__find_module(mods, name);
+-	int err = 0, fd;
++	maps__insert(&kernel_maps, map);
++}
+ 
+-	if (mod == NULL || !mod->active)
+-		return err;
++struct symbol *kernel_maps__find_symbol(u64 ip, struct map **mapp)
++{
++	/*
++	 * We can't have kernel_map in kernel_maps because it spans an address
++	 * space that includes the modules. The right way to fix this is to
++	 * create several maps, so that we don't have overlapping ranges with
++	 * modules. For now lets look first on the kernel dso.
++	 */
++	struct map *map = maps__find(&kernel_maps, ip);
++	struct symbol *sym;
++
++	if (map) {
++		ip = map->map_ip(map, ip);
++		sym = map->dso->find_symbol(map->dso, ip);
++	} else {
++		map = kernel_map;
++		sym = map->dso->find_symbol(map->dso, ip);
++	}
+ 
+-	fd = open(mod->path, O_RDONLY);
++	if (mapp)
++		*mapp = map;
+ 
+-	if (fd < 0)
++	return sym;
++}
++
++struct map *kernel_maps__find_by_dso_name(const char *name)
++{
++	struct rb_node *nd;
++
++	for (nd = rb_first(&kernel_maps); nd; nd = rb_next(nd)) {
++		struct map *map = rb_entry(nd, struct map, rb_node);
++
++		if (map->dso && strcmp(map->dso->name, name) == 0)
++			return map;
++	}
++
++	return NULL;
++}
++
++static int dso__load_module_sym(struct dso *self, struct map *map,
++				symbol_filter_t filter, int v)
++{
++	int err = 0, fd = open(self->long_name, O_RDONLY);
++
++	if (fd < 0) {
++		if (v)
++			fprintf(stderr, "%s: cannot open %s\n",
++				__func__, self->long_name);
+ 		return err;
++	}
+ 
+-	err = dso__load_sym(self, fd, name, filter, v, mod);
++	err = dso__load_sym(self, map, self->long_name, fd, filter, 0, 1, v);
+ 	close(fd);
+ 
+ 	return err;
+ }
+ 
+-int dso__load_modules(struct dso *self, symbol_filter_t filter, int v)
++static int dsos__load_modules_sym_dir(char *dirname,
++				      symbol_filter_t filter, int v)
+ {
+-	struct mod_dso *mods = mod_dso__new_dso("modules");
+-	struct module *pos;
+-	struct rb_node *next;
+-	int err, count = 0;
++	struct dirent *dent;
++	int nr_symbols = 0, err;
++	DIR *dir = opendir(dirname);
+ 
+-	err = mod_dso__load_modules(mods);
++	if (!dir) {
++		if (v)
++			fprintf(stderr, "%s: cannot open %s dir\n", __func__,
++				dirname);
++		return -1;
++	}
+ 
+-	if (err <= 0)
+-		return err;
++	while ((dent = readdir(dir)) != NULL) {
++		char path[PATH_MAX];
++
++		if (dent->d_type == DT_DIR) {
++			if (!strcmp(dent->d_name, ".") ||
++			    !strcmp(dent->d_name, ".."))
++				continue;
++
++			snprintf(path, sizeof(path), "%s/%s",
++				 dirname, dent->d_name);
++			err = dsos__load_modules_sym_dir(path, filter, v);
++			if (err < 0)
++				goto failure;
++		} else {
++			char *dot = strrchr(dent->d_name, '.'),
++			     dso_name[PATH_MAX];
++			struct map *map;
++			struct rb_node *last;
++
++			if (dot == NULL || strcmp(dot, ".ko"))
++				continue;
++			snprintf(dso_name, sizeof(dso_name), "[%.*s]",
++				 (int)(dot - dent->d_name), dent->d_name);
++
++			map = kernel_maps__find_by_dso_name(dso_name);
++			if (map == NULL)
++				continue;
++
++			snprintf(path, sizeof(path), "%s/%s",
++				 dirname, dent->d_name);
++
++			map->dso->long_name = strdup(path);
++			if (map->dso->long_name == NULL)
++				goto failure;
++
++			err = dso__load_module_sym(map->dso, map, filter, v);
++			if (err < 0)
++				goto failure;
++			last = rb_last(&map->dso->syms);
++			if (last) {
++				struct symbol *sym;
++				sym = rb_entry(last, struct symbol, rb_node);
++				map->end = map->start + sym->end;
++			}
++		}
++		nr_symbols += err;
++	}
+ 
+-	/*
+-	 * Iterate over modules, and load active symbols.
+-	 */
+-	next = rb_first(&mods->mods);
+-	while (next) {
+-		pos = rb_entry(next, struct module, rb_node);
+-		err = dso__load_module(self, mods, pos->name, filter, v);
++	return nr_symbols;
++failure:
++	closedir(dir);
++	return -1;
++}
+ 
+-		if (err < 0)
+-			break;
++static int dsos__load_modules_sym(symbol_filter_t filter, int v)
++{
++	struct utsname uts;
++	char modules_path[PATH_MAX];
+ 
+-		next = rb_next(&pos->rb_node);
+-		count += err;
+-	}
++	if (uname(&uts) < 0)
++		return -1;
+ 
+-	if (err < 0) {
+-		mod_dso__delete_modules(mods);
+-		mod_dso__delete_self(mods);
+-		return err;
+-	}
++	snprintf(modules_path, sizeof(modules_path), "/lib/modules/%s/kernel",
++		 uts.release);
+ 
+-	return count;
++	return dsos__load_modules_sym_dir(modules_path, filter, v);
+ }
+ 
+-static inline void dso__fill_symbol_holes(struct dso *self)
++/*
++ * Constructor variant for modules (where we know from /proc/modules where
++ * they are loaded) and for vmlinux, where only after we load all the
++ * symbols we'll know where it starts and ends.
++ */
++static struct map *map__new2(u64 start, struct dso *dso)
+ {
+-	struct symbol *prev = NULL;
+-	struct rb_node *nd;
++	struct map *self = malloc(sizeof(*self));
+ 
+-	for (nd = rb_last(&self->syms); nd; nd = rb_prev(nd)) {
+-		struct symbol *pos = rb_entry(nd, struct symbol, rb_node);
++	if (self != NULL) {
++		self->start = start;
++		/*
++		 * Will be filled after we load all the symbols
++		 */
++		self->end = 0;
++
++		self->pgoff = 0;
++		self->dso = dso;
++		self->map_ip = map__map_ip;
++		RB_CLEAR_NODE(&self->rb_node);
++	}
++	return self;
++}
++
++int dsos__load_modules(unsigned int sym_priv_size,
++		       symbol_filter_t filter, int v)
++{
++	char *line = NULL;
++	size_t n;
++	FILE *file = fopen("/proc/modules", "r");
++	struct map *map;
+ 
+-		if (prev) {
+-			u64 hole = 0;
+-			int alias = pos->start == prev->start;
++	if (file == NULL)
++		return -1;
+ 
+-			if (!alias)
+-				hole = prev->start - pos->end - 1;
++	while (!feof(file)) {
++		char name[PATH_MAX];
++		u64 start;
++		struct dso *dso;
++		char *sep;
++		int line_len;
+ 
+-			if (hole || alias) {
+-				if (alias)
+-					pos->end = prev->end;
+-				else if (hole)
+-					pos->end = prev->start - 1;
+-			}
++		line_len = getline(&line, &n, file);
++		if (line_len < 0)
++			break;
++
++		if (!line)
++			goto out_failure;
++
++		line[--line_len] = '\0'; /* \n */
++
++		sep = strrchr(line, 'x');
++		if (sep == NULL)
++			continue;
++
++		hex2u64(sep + 1, &start);
++
++		sep = strchr(line, ' ');
++		if (sep == NULL)
++			continue;
++
++		*sep = '\0';
++
++		snprintf(name, sizeof(name), "[%s]", line);
++		dso = dso__new(name, sym_priv_size);
++
++		if (dso == NULL)
++			goto out_delete_line;
++
++		map = map__new2(start, dso);
++		if (map == NULL) {
++			dso__delete(dso);
++			goto out_delete_line;
+ 		}
+-		prev = pos;
++
++		dso->origin = DSO__ORIG_KMODULE;
++		kernel_maps__insert(map);
++		dsos__add(dso);
+ 	}
++
++	free(line);
++	fclose(file);
++
++	v = 1;
++	return dsos__load_modules_sym(filter, v);
++
++out_delete_line:
++	free(line);
++out_failure:
++	return -1;
+ }
+ 
+-static int dso__load_vmlinux(struct dso *self, const char *vmlinux,
++static int dso__load_vmlinux(struct dso *self, struct map *map,
++			     const char *vmlinux,
+ 			     symbol_filter_t filter, int v)
+ {
+ 	int err, fd = open(vmlinux, O_RDONLY);
+@@ -898,28 +1052,36 @@ static int dso__load_vmlinux(struct dso *self, const char *vmlinux,
+ 	if (fd < 0)
+ 		return -1;
+ 
+-	err = dso__load_sym(self, fd, vmlinux, filter, v, NULL);
+-
+-	if (err > 0)
+-		dso__fill_symbol_holes(self);
++	err = dso__load_sym(self, map, self->long_name, fd, filter, 1, 0, v);
+ 
+ 	close(fd);
+ 
+ 	return err;
+ }
+ 
+-int dso__load_kernel(struct dso *self, const char *vmlinux,
+-		     symbol_filter_t filter, int v, int use_modules)
++int dsos__load_kernel(const char *vmlinux, unsigned int sym_priv_size,
++		      symbol_filter_t filter, int v, int use_modules)
+ {
+ 	int err = -1;
++	struct dso *dso = dso__new(vmlinux, sym_priv_size);
++
++	if (dso == NULL)
++		return -1;
++
++	dso->short_name = "[kernel]";
++	kernel_map = map__new2(0, dso);
++	if (kernel_map == NULL)
++		goto out_delete_dso;
++
++	kernel_map->map_ip = vdso__map_ip;
+ 
+ 	if (vmlinux) {
+-		err = dso__load_vmlinux(self, vmlinux, filter, v);
++		err = dso__load_vmlinux(dso, kernel_map, vmlinux, filter, v);
+ 		if (err > 0 && use_modules) {
+-			int syms = dso__load_modules(self, filter, v);
++			int syms = dsos__load_modules(sym_priv_size, filter, v);
+ 
+ 			if (syms < 0) {
+-				fprintf(stderr, "dso__load_modules failed!\n");
++				fprintf(stderr, "dsos__load_modules failed!\n");
+ 				return syms;
+ 			}
+ 			err += syms;
+@@ -927,18 +1089,34 @@ int dso__load_kernel(struct dso *self, const char *vmlinux,
+ 	}
+ 
+ 	if (err <= 0)
+-		err = dso__load_kallsyms(self, filter, v);
++		err = dso__load_kallsyms(dso, kernel_map, filter, v);
++
++	if (err > 0) {
++		struct rb_node *node = rb_first(&dso->syms);
++		struct symbol *sym = rb_entry(node, struct symbol, rb_node);
+ 
+-	if (err > 0)
+-		self->origin = DSO__ORIG_KERNEL;
++		kernel_map->start = sym->start;
++		node = rb_last(&dso->syms);
++		sym = rb_entry(node, struct symbol, rb_node);
++		kernel_map->end = sym->end;
++
++		dso->origin = DSO__ORIG_KERNEL;
++		/*
++		 * XXX See kernel_maps__find_symbol comment
++		 * kernel_maps__insert(kernel_map)
++		 */
++		dsos__add(dso);
++	}
+ 
+ 	return err;
++
++out_delete_dso:
++	dso__delete(dso);
++	return -1;
+ }
+ 
+ LIST_HEAD(dsos);
+-struct dso	*kernel_dso;
+ struct dso	*vdso;
+-struct dso	*hypervisor_dso;
+ 
+ const char	*vmlinux_name = "vmlinux";
+ int		modules;
+@@ -970,7 +1148,7 @@ struct dso *dsos__findnew(const char *name)
+ 	if (!dso)
+ 		goto out_delete_dso;
+ 
+-	nr = dso__load(dso, NULL, verbose);
++	nr = dso__load(dso, NULL, NULL, verbose);
+ 	if (nr < 0) {
+ 		eprintf("Failed to open: %s\n", name);
+ 		goto out_delete_dso;
+@@ -995,43 +1173,20 @@ void dsos__fprintf(FILE *fp)
+ 		dso__fprintf(pos, fp);
+ }
+ 
+-static struct symbol *vdso__find_symbol(struct dso *dso, u64 ip)
+-{
+-	return dso__find_symbol(dso, ip);
+-}
+-
+ int load_kernel(void)
+ {
+-	int err;
+-
+-	kernel_dso = dso__new("[kernel]", 0);
+-	if (!kernel_dso)
++	if (dsos__load_kernel(vmlinux_name, 0, NULL, verbose, modules) <= 0)
+ 		return -1;
+ 
+-	err = dso__load_kernel(kernel_dso, vmlinux_name, NULL, verbose, modules);
+-	if (err <= 0) {
+-		dso__delete(kernel_dso);
+-		kernel_dso = NULL;
+-	} else
+-		dsos__add(kernel_dso);
+-
+ 	vdso = dso__new("[vdso]", 0);
+ 	if (!vdso)
+ 		return -1;
+ 
+-	vdso->find_symbol = vdso__find_symbol;
+-
+ 	dsos__add(vdso);
+ 
+-	hypervisor_dso = dso__new("[hypervisor]", 0);
+-	if (!hypervisor_dso)
+-		return -1;
+-	dsos__add(hypervisor_dso);
+-
+-	return err;
++	return 0;
+ }
+ 
+-
+ void symbol__init(void)
+ {
+ 	elf_version(EV_CURRENT);
+diff --git a/tools/perf/util/symbol.h b/tools/perf/util/symbol.h
+index ee164f6..5339fd8 100644
+--- a/tools/perf/util/symbol.h
++++ b/tools/perf/util/symbol.h
+@@ -5,7 +5,6 @@
+ #include "types.h"
+ #include <linux/list.h>
+ #include <linux/rbtree.h>
+-#include "module.h"
+ #include "event.h"
+ 
+ #ifdef HAVE_CPLUS_DEMANGLE
+@@ -36,10 +35,8 @@ struct symbol {
+ 	struct rb_node	rb_node;
+ 	u64		start;
+ 	u64		end;
+-	u64		obj_start;
+ 	u64		hist_sum;
+ 	u64		*hist;
+-	struct module	*module;
+ 	void		*priv;
+ 	char		name[0];
+ };
+@@ -52,12 +49,14 @@ struct dso {
+ 	unsigned char	 adjust_symbols;
+ 	unsigned char	 slen_calculated;
+ 	unsigned char	 origin;
++	const char	 *short_name;
++	char	 	 *long_name;
+ 	char		 name[0];
+ };
+ 
+ extern const char *sym_hist_filter;
+ 
+-typedef int (*symbol_filter_t)(struct dso *self, struct symbol *sym);
++typedef int (*symbol_filter_t)(struct map *map, struct symbol *sym);
+ 
+ struct dso *dso__new(const char *name, unsigned int sym_priv_size);
+ void dso__delete(struct dso *self);
+@@ -69,10 +68,12 @@ static inline void *dso__sym_priv(struct dso *self, struct symbol *sym)
+ 
+ struct symbol *dso__find_symbol(struct dso *self, u64 ip);
+ 
+-int dso__load_kernel(struct dso *self, const char *vmlinux,
+-		     symbol_filter_t filter, int verbose, int modules);
+-int dso__load_modules(struct dso *self, symbol_filter_t filter, int verbose);
+-int dso__load(struct dso *self, symbol_filter_t filter, int verbose);
++int dsos__load_kernel(const char *vmlinux, unsigned int sym_priv_size,
++		      symbol_filter_t filter, int verbose, int modules);
++int dsos__load_modules(unsigned int sym_priv_size, symbol_filter_t filter,
++		       int verbose);
++int dso__load(struct dso *self, struct map *map, symbol_filter_t filter,
++	      int verbose);
+ struct dso *dsos__findnew(const char *name);
+ void dsos__fprintf(FILE *fp);
+ 
+@@ -84,9 +85,8 @@ int load_kernel(void);
+ void symbol__init(void);
+ 
+ extern struct list_head dsos;
+-extern struct dso *kernel_dso;
++extern struct map *kernel_map;
+ extern struct dso *vdso;
+-extern struct dso *hypervisor_dso;
+ extern const char *vmlinux_name;
+ extern int   modules;
+ #endif /* __PERF_SYMBOL */
+diff --git a/tools/perf/util/thread.c b/tools/perf/util/thread.c
+index 9d0945c..3b56aeb 100644
+--- a/tools/perf/util/thread.c
++++ b/tools/perf/util/thread.c
+@@ -16,6 +16,7 @@ static struct thread *thread__new(pid_t pid)
+ 		if (self->comm)
+ 			snprintf(self->comm, 32, ":%d", self->pid);
+ 		self->maps = RB_ROOT;
++		INIT_LIST_HEAD(&self->removed_maps);
+ 	}
+ 
+ 	return self;
+@@ -32,13 +33,20 @@ int thread__set_comm(struct thread *self, const char *comm)
+ static size_t thread__fprintf(struct thread *self, FILE *fp)
+ {
+ 	struct rb_node *nd;
+-	size_t ret = fprintf(fp, "Thread %d %s\n", self->pid, self->comm);
++	struct map *pos;
++	size_t ret = fprintf(fp, "Thread %d %s\nCurrent maps:\n",
++			     self->pid, self->comm);
+ 
+ 	for (nd = rb_first(&self->maps); nd; nd = rb_next(nd)) {
+-		struct map *pos = rb_entry(nd, struct map, rb_node);
++		pos = rb_entry(nd, struct map, rb_node);
+ 		ret += map__fprintf(pos, fp);
+ 	}
+ 
++	ret = fprintf(fp, "Removed maps:\n");
++
++	list_for_each_entry(pos, &self->removed_maps, node)
++		ret += map__fprintf(pos, fp);
++
+ 	return ret;
+ }
+ 
+@@ -112,21 +120,13 @@ static void thread__remove_overlappings(struct thread *self, struct map *map)
+ 			map__fprintf(pos, stdout);
+ 		}
+ 
+-		if (map->start <= pos->start && map->end > pos->start)
+-			pos->start = map->end;
+-
+-		if (map->end >= pos->end && map->start < pos->end)
+-			pos->end = map->start;
+-
+-		if (verbose >= 2) {
+-			printf("after collision:\n");
+-			map__fprintf(pos, stdout);
+-		}
+-
+-		if (pos->start >= pos->end) {
+-			rb_erase(&pos->rb_node, &self->maps);
+-			free(pos);
+-		}
++		rb_erase(&pos->rb_node, &self->maps);
++		/*
++		 * We may have references to this map, for instance in some
++		 * hist_entry instances, so just move them to a separate
++		 * list.
++		 */
++		list_add_tail(&pos->node, &self->removed_maps);
+ 	}
+ }
+ 
+diff --git a/tools/perf/util/thread.h b/tools/perf/util/thread.h
+index bbb37c1..845d9b6 100644
+--- a/tools/perf/util/thread.h
++++ b/tools/perf/util/thread.h
+@@ -8,6 +8,7 @@
+ struct thread {
+ 	struct rb_node		rb_node;
+ 	struct rb_root		maps;
++	struct list_head	removed_maps;
+ 	pid_t			pid;
+ 	char			shortname[3];
+ 	char			*comm;
+@@ -25,6 +26,9 @@ size_t threads__fprintf(FILE *fp, struct rb_root *threads);
+ void maps__insert(struct rb_root *maps, struct map *map);
+ struct map *maps__find(struct rb_root *maps, u64 ip);
+ 
++struct symbol *kernel_maps__find_symbol(const u64 ip, struct map **mapp);
++struct map *kernel_maps__find_by_dso_name(const char *name);
++
+ static inline struct map *thread__find_map(struct thread *self, u64 ip)
+ {
+ 	return self ? maps__find(&self->maps, ip) : NULL;
+
