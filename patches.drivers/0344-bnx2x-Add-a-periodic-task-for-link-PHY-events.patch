@@ -1,0 +1,569 @@
+From yanivr@broadcom.com  Tue Jul  5 16:00:50 2011
+From: Yaniv Rosner <yanivr@broadcom.com>
+Date: Tue, 14 Jun 2011 01:34:33 +0000
+Subject: [PATCH 344/348] bnx2x: Add a periodic task for link PHY events
+Git-commit: 3deb8167ea66974b0bc8c13c8ee0beafc02a73a1
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/davem/net-next-2.6.git
+Patch-mainline: v3.1 (probably)
+References: FATE#311458 FATE#311459 FATE#311460 FATE#311461 FATE#311462 bnc#698050
+
+Upstream commit: 3deb8167ea66974b0bc8c13c8ee0beafc02a73a1
+
+Signed-off-by: Yaniv Rosner <yanivr@broadcom.com>
+Signed-off-by: Vladislav Zolotarov <vladz@broadcom.com>
+Signed-off-by: Eilon Greenstein <eilong@broadcom.com>
+Signed-off-by: David S. Miller <davem@conan.davemloft.net>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+ drivers/net/bnx2x/bnx2x.h      |    3 +
+ drivers/net/bnx2x/bnx2x_cmn.c  |   11 ++-
+ drivers/net/bnx2x/bnx2x_link.c |  211 ++++++++++++++++++++++++++++++++++++++-
+ drivers/net/bnx2x/bnx2x_link.h |   11 ++-
+ drivers/net/bnx2x/bnx2x_main.c |   74 ++++++++++++--
+ drivers/net/bnx2x/bnx2x_reg.h  |    2 +
+ 6 files changed, 294 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/net/bnx2x/bnx2x.h b/drivers/net/bnx2x/bnx2x.h
+index 0967a6b..616460a 100644
+--- a/drivers/net/bnx2x/bnx2x.h
++++ b/drivers/net/bnx2x/bnx2x.h
+@@ -1171,6 +1171,8 @@ struct bnx2x {
+ 
+ 	struct delayed_work	sp_task;
+ 	struct delayed_work	reset_task;
++
++	struct delayed_work	period_task;
+ 	struct timer_list	timer;
+ 	int			current_interval;
+ 
+@@ -1930,4 +1932,5 @@ static const u32 dmae_reg_go_c[] = {
+ };
+ 
+ void bnx2x_set_ethtool_ops(struct net_device *netdev);
++void bnx2x_notify_link_changed(struct bnx2x *bp);
+ #endif /* bnx2x.h */
+diff --git a/drivers/net/bnx2x/bnx2x_cmn.c b/drivers/net/bnx2x/bnx2x_cmn.c
+index d0181d6..d7d36ba 100644
+--- a/drivers/net/bnx2x/bnx2x_cmn.c
++++ b/drivers/net/bnx2x/bnx2x_cmn.c
+@@ -1729,9 +1729,16 @@ int bnx2x_nic_load(struct bnx2x *bp, int load_mode)
+ 
+ 	if ((load_code == FW_MSG_CODE_DRV_LOAD_COMMON) ||
+ 	    (load_code == FW_MSG_CODE_DRV_LOAD_COMMON_CHIP) ||
+-	    (load_code == FW_MSG_CODE_DRV_LOAD_PORT))
++	    (load_code == FW_MSG_CODE_DRV_LOAD_PORT)) {
+ 		bp->port.pmf = 1;
+-	else
++		/*
++		 * We need the barrier to ensure the ordering between the
++		 * writing to bp->port.pmf here and reading it from the
++		 * bnx2x_periodic_task().
++		 */
++		smp_mb();
++		queue_delayed_work(bnx2x_wq, &bp->period_task, 0);
++	} else
+ 		bp->port.pmf = 0;
+ 	DP(NETIF_MSG_LINK, "pmf %d\n", bp->port.pmf);
+ 
+diff --git a/drivers/net/bnx2x/bnx2x_link.c b/drivers/net/bnx2x/bnx2x_link.c
+index 241b1e4..47d8004 100644
+--- a/drivers/net/bnx2x/bnx2x_link.c
++++ b/drivers/net/bnx2x/bnx2x_link.c
+@@ -296,6 +296,23 @@ static u32 bnx2x_bits_dis(struct bnx2x *bp, u32 reg, u32 bits)
+ /******************************************************************/
+ /*			EPIO/GPIO section			  */
+ /******************************************************************/
++static void bnx2x_get_epio(struct bnx2x *bp, u32 epio_pin, u32 *en)
++{
++	u32 epio_mask, gp_oenable;
++	*en = 0;
++	/* Sanity check */
++	if (epio_pin > 31) {
++		DP(NETIF_MSG_LINK, "Invalid EPIO pin %d to get\n", epio_pin);
++		return;
++	}
++
++	epio_mask = 1 << epio_pin;
++	/* Set this EPIO to output */
++	gp_oenable = REG_RD(bp, MCP_REG_MCPR_GP_OENABLE);
++	REG_WR(bp, MCP_REG_MCPR_GP_OENABLE, gp_oenable & ~epio_mask);
++
++	*en = (REG_RD(bp, MCP_REG_MCPR_GP_INPUTS) & epio_mask) >> epio_pin;
++}
+ static void bnx2x_set_epio(struct bnx2x *bp, u32 epio_pin, u32 en)
+ {
+ 	u32 epio_mask, gp_output, gp_oenable;
+@@ -334,6 +351,20 @@ static void bnx2x_set_cfg_pin(struct bnx2x *bp, u32 pin_cfg, u32 val)
+ 	}
+ }
+ 
++static u32 bnx2x_get_cfg_pin(struct bnx2x *bp, u32 pin_cfg, u32 *val)
++{
++	if (pin_cfg == PIN_CFG_NA)
++		return -EINVAL;
++	if (pin_cfg >= PIN_CFG_EPIO0) {
++		bnx2x_get_epio(bp, pin_cfg - PIN_CFG_EPIO0, val);
++	} else {
++		u8 gpio_num = (pin_cfg - PIN_CFG_GPIO0_P0) & 0x3;
++		u8 gpio_port = (pin_cfg - PIN_CFG_GPIO0_P0) >> 2;
++		*val = bnx2x_get_gpio(bp, gpio_num, gpio_port);
++	}
++	return 0;
++
++}
+ /******************************************************************/
+ /*				ETS section			  */
+ /******************************************************************/
+@@ -2537,6 +2568,12 @@ static int bnx2x_bmac1_enable(struct link_params *params,
+ 	REG_WR_DMAE(bp, bmac_addr + BIGMAC_REGISTER_RX_LLFC_MSG_FLDS,
+ 		    wb_data, 2);
+ 
++	if (vars->phy_flags & PHY_TX_ERROR_CHECK_FLAG) {
++		REG_RD_DMAE(bp, bmac_addr + BIGMAC_REGISTER_RX_LSS_STATUS,
++			    wb_data, 2);
++		if (wb_data[0] > 0)
++			return -ESRCH;
++	}
+ 	return 0;
+ }
+ 
+@@ -2602,6 +2639,16 @@ static int bnx2x_bmac2_enable(struct link_params *params,
+ 	udelay(30);
+ 	bnx2x_update_pfc_bmac2(params, vars, is_lb);
+ 
++	if (vars->phy_flags & PHY_TX_ERROR_CHECK_FLAG) {
++		REG_RD_DMAE(bp, bmac_addr + BIGMAC2_REGISTER_RX_LSS_STAT,
++			    wb_data, 2);
++		if (wb_data[0] > 0) {
++			DP(NETIF_MSG_LINK, "Got bad LSS status 0x%x\n",
++				       wb_data[0]);
++			return -ESRCH;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -6081,7 +6128,7 @@ static int bnx2x_update_link_down(struct link_params *params,
+ 
+ 	DP(NETIF_MSG_LINK, "Port %x: Link is down\n", port);
+ 	bnx2x_set_led(params, vars, LED_MODE_OFF, 0);
+-
++	vars->phy_flags &= ~PHY_PHYSICAL_LINK_FLAG;
+ 	/* indicate no mac active */
+ 	vars->mac_type = MAC_TYPE_NONE;
+ 
+@@ -6126,6 +6173,7 @@ static int bnx2x_update_link_up(struct link_params *params,
+ 	int rc = 0;
+ 
+ 	vars->link_status |= LINK_STATUS_LINK_UP;
++	vars->phy_flags |= PHY_PHYSICAL_LINK_FLAG;
+ 
+ 	if (vars->flow_ctrl & BNX2X_FLOW_CTRL_TX)
+ 		vars->link_status |=
+@@ -6135,9 +6183,15 @@ static int bnx2x_update_link_up(struct link_params *params,
+ 		vars->link_status |=
+ 			LINK_STATUS_RX_FLOW_CONTROL_ENABLED;
+ 	if (USES_WARPCORE(bp)) {
+-		if (link_10g)
+-			bnx2x_xmac_enable(params, vars, 0);
+-		else
++		if (link_10g) {
++			if (bnx2x_xmac_enable(params, vars, 0) ==
++			    -ESRCH) {
++				DP(NETIF_MSG_LINK, "Found errors on XMAC\n");
++				vars->link_up = 0;
++				vars->phy_flags |= PHY_HALF_OPEN_CONN_FLAG;
++				vars->link_status &= ~LINK_STATUS_LINK_UP;
++			}
++		} else
+ 			bnx2x_umac_enable(params, vars, 0);
+ 		bnx2x_set_led(params, vars,
+ 			      LED_MODE_OPER, vars->line_speed);
+@@ -6145,7 +6199,13 @@ static int bnx2x_update_link_up(struct link_params *params,
+ 	if ((CHIP_IS_E1x(bp) ||
+ 	     CHIP_IS_E2(bp))) {
+ 		if (link_10g) {
+-			bnx2x_bmac_enable(params, vars, 0);
++			if (bnx2x_bmac_enable(params, vars, 0) ==
++			    -ESRCH) {
++				DP(NETIF_MSG_LINK, "Found errors on BMAC\n");
++				vars->link_up = 0;
++				vars->phy_flags |= PHY_HALF_OPEN_CONN_FLAG;
++				vars->link_status &= ~LINK_STATUS_LINK_UP;
++			}
+ 
+ 			bnx2x_set_led(params, vars,
+ 				      LED_MODE_OPER, SPEED_10000);
+@@ -6199,7 +6259,7 @@ int bnx2x_link_update(struct link_params *params, struct link_vars *vars)
+ 	u8 is_mi_int = 0;
+ 	u16 ext_phy_line_speed = 0, prev_line_speed = vars->line_speed;
+ 	u8 active_external_phy = INT_PHY;
+-
++	vars->phy_flags &= ~PHY_HALF_OPEN_CONN_FLAG;
+ 	for (phy_index = INT_PHY; phy_index < params->num_phys;
+ 	      phy_index++) {
+ 		phy_vars[phy_index].flow_ctrl = 0;
+@@ -8109,6 +8169,10 @@ static u8 bnx2x_8706_config_init(struct bnx2x_phy *phy,
+ 	u32 tx_en_mode;
+ 	u16 cnt, val, tmp1;
+ 	struct bnx2x *bp = params->bp;
++
++	/* SPF+ PHY: Set flag to check for Tx error */
++	vars->phy_flags = PHY_TX_ERROR_CHECK_FLAG;
++
+ 	bnx2x_set_gpio(bp, MISC_REGISTERS_GPIO_2,
+ 		       MISC_REGISTERS_GPIO_OUTPUT_HIGH, params->port);
+ 	/* HW reset */
+@@ -8292,6 +8356,9 @@ static int bnx2x_8726_config_init(struct bnx2x_phy *phy,
+ 	struct bnx2x *bp = params->bp;
+ 	DP(NETIF_MSG_LINK, "Initializing BCM8726\n");
+ 
++	/* SPF+ PHY: Set flag to check for Tx error */
++	vars->phy_flags = PHY_TX_ERROR_CHECK_FLAG;
++
+ 	bnx2x_cl45_write(bp, phy, MDIO_PMA_DEVAD, MDIO_PMA_REG_CTRL, 1<<15);
+ 	bnx2x_wait_reset_complete(bp, phy, params);
+ 
+@@ -8460,6 +8527,9 @@ static int bnx2x_8727_config_init(struct bnx2x_phy *phy,
+ 	struct bnx2x *bp = params->bp;
+ 	/* Enable PMD link, MOD_ABS_FLT, and 1G link alarm */
+ 
++	/* SPF+ PHY: Set flag to check for Tx error */
++	vars->phy_flags = PHY_TX_ERROR_CHECK_FLAG;
++
+ 	bnx2x_wait_reset_complete(bp, phy, params);
+ 	rx_alarm_ctrl_val = (1<<2) | (1<<5) ;
+ 	/* Should be 0x6 to enable XS on Tx side. */
+@@ -11832,6 +11902,135 @@ int bnx2x_common_init_phy(struct bnx2x *bp, u32 shmem_base_path[],
+ 	return rc;
+ }
+ 
++static void bnx2x_check_over_curr(struct link_params *params,
++				  struct link_vars *vars)
++{
++	struct bnx2x *bp = params->bp;
++	u32 cfg_pin;
++	u8 port = params->port;
++	u32 pin_val;
++
++	cfg_pin = (REG_RD(bp, params->shmem_base +
++			  offsetof(struct shmem_region,
++			       dev_info.port_hw_config[port].e3_cmn_pin_cfg1)) &
++		   PORT_HW_CFG_E3_OVER_CURRENT_MASK) >>
++		PORT_HW_CFG_E3_OVER_CURRENT_SHIFT;
++
++	/* Ignore check if no external input PIN available */
++	if (bnx2x_get_cfg_pin(bp, cfg_pin, &pin_val) != 0)
++		return;
++
++	if (!pin_val) {
++		if ((vars->phy_flags & PHY_OVER_CURRENT_FLAG) == 0) {
++			netdev_err(bp->dev, "Error:  Power fault on Port %d has"
++					    " been detected and the power to "
++					    "that SFP+ module has been removed"
++					    " to prevent failure of the card."
++					    " Please remove the SFP+ module and"
++					    " restart the system to clear this"
++					    " error.\n",
++			 params->port);
++			vars->phy_flags |= PHY_OVER_CURRENT_FLAG;
++		}
++	} else
++		vars->phy_flags &= ~PHY_OVER_CURRENT_FLAG;
++}
++
++static void bnx2x_analyze_link_error(struct link_params *params,
++				     struct link_vars *vars, u32 lss_status)
++{
++	struct bnx2x *bp = params->bp;
++	/* Compare new value with previous value */
++	u8 led_mode;
++	u32 half_open_conn = (vars->phy_flags & PHY_HALF_OPEN_CONN_FLAG) > 0;
++
++	/*DP(NETIF_MSG_LINK, "CHECK LINK: %x half_open:%x-> lss:%x\n",
++		       vars->link_up,
++		       half_open_conn, lss_status);*/
++
++	if ((lss_status ^ half_open_conn) == 0)
++		return;
++
++	/* If values differ */
++	DP(NETIF_MSG_LINK, "Link changed:%x %x->%x\n", vars->link_up,
++		       half_open_conn, lss_status);
++
++	/*
++	 * a. Update shmem->link_status accordingly
++	 * b. Update link_vars->link_up
++	 */
++	if (lss_status) {
++		vars->link_status &= ~LINK_STATUS_LINK_UP;
++		vars->link_up = 0;
++		vars->phy_flags |= PHY_HALF_OPEN_CONN_FLAG;
++		/*
++		 * Set LED mode to off since the PHY doesn't know about these
++		 * errors
++		 */
++		led_mode = LED_MODE_OFF;
++	} else {
++		vars->link_status |= LINK_STATUS_LINK_UP;
++		vars->link_up = 1;
++		vars->phy_flags &= ~PHY_HALF_OPEN_CONN_FLAG;
++		led_mode = LED_MODE_OPER;
++	}
++	/* Update the LED according to the link state */
++	bnx2x_set_led(params, vars, led_mode, SPEED_10000);
++
++	/* Update link status in the shared memory */
++	bnx2x_update_mng(params, vars->link_status);
++
++	/* C. Trigger General Attention */
++	vars->periodic_flags |= PERIODIC_FLAGS_LINK_EVENT;
++	bnx2x_notify_link_changed(bp);
++}
++
++static void bnx2x_check_half_open_conn(struct link_params *params,
++				       struct link_vars *vars)
++{
++	struct bnx2x *bp = params->bp;
++	u32 lss_status = 0;
++	u32 mac_base;
++	/* In case link status is physically up @ 10G do */
++	if ((vars->phy_flags & PHY_PHYSICAL_LINK_FLAG) == 0)
++		return;
++
++	if (!CHIP_IS_E3(bp) &&
++	    (REG_RD(bp, MISC_REG_RESET_REG_2) &
++		   (MISC_REGISTERS_RESET_REG_2_RST_BMAC0 << params->port))) {
++		/* Check E1X / E2 BMAC */
++		u32 lss_status_reg;
++		u32 wb_data[2];
++		mac_base = params->port ? NIG_REG_INGRESS_BMAC1_MEM :
++			NIG_REG_INGRESS_BMAC0_MEM;
++		/*  Read BIGMAC_REGISTER_RX_LSS_STATUS */
++		if (CHIP_IS_E2(bp))
++			lss_status_reg = BIGMAC2_REGISTER_RX_LSS_STAT;
++		else
++			lss_status_reg = BIGMAC_REGISTER_RX_LSS_STATUS;
++
++		REG_RD_DMAE(bp, mac_base + lss_status_reg, wb_data, 2);
++		lss_status = (wb_data[0] > 0);
++
++		bnx2x_analyze_link_error(params, vars, lss_status);
++	}
++}
++
++void bnx2x_period_func(struct link_params *params, struct link_vars *vars)
++{
++	struct bnx2x *bp = params->bp;
++	if (!params) {
++		DP(NETIF_MSG_LINK, "Ininitliazed params !\n");
++		return;
++	}
++	/* DP(NETIF_MSG_LINK, "Periodic called vars->phy_flags 0x%x speed 0x%x
++	 RESET_REG_2 0x%x\n", vars->phy_flags, vars->line_speed,
++	  REG_RD(bp, MISC_REG_RESET_REG_2)); */
++	bnx2x_check_half_open_conn(params, vars);
++	if (CHIP_IS_E3(bp))
++		bnx2x_check_over_curr(params, vars);
++}
++
+ u8 bnx2x_hw_lock_required(struct bnx2x *bp, u32 shmem_base, u32 shmem2_base)
+ {
+ 	u8 phy_index;
+diff --git a/drivers/net/bnx2x/bnx2x_link.h b/drivers/net/bnx2x/bnx2x_link.h
+index 3d9c46b..6f299c2 100644
+--- a/drivers/net/bnx2x/bnx2x_link.h
++++ b/drivers/net/bnx2x/bnx2x_link.h
+@@ -271,6 +271,10 @@ struct link_vars {
+ 	u8 phy_flags;
+ #define PHY_XGXS_FLAG			(1<<0)
+ #define PHY_SGMII_FLAG			(1<<1)
++#define PHY_PHYSICAL_LINK_FLAG		(1<<2)
++#define PHY_HALF_OPEN_CONN_FLAG		(1<<3)
++#define PHY_OVER_CURRENT_FLAG		(1<<4)
++#define PHY_TX_ERROR_CHECK_FLAG		(1<<5)
+ 
+ 	u8 mac_type;
+ #define MAC_TYPE_NONE		0
+@@ -292,7 +296,9 @@ struct link_vars {
+ 	u32 link_status;
+ 	u8 fault_detected;
+ 	u8 rsrv1;
+-	u16 rsrv2;
++	u16 periodic_flags;
++#define PERIODIC_FLAGS_LINK_EVENT	0x0001
++
+ 	u32 aeu_int_mask;
+ };
+ 
+@@ -478,4 +484,7 @@ void bnx2x_init_mod_abs_int(struct bnx2x *bp, struct link_vars *vars,
+ 
+ int bnx2x_sfp_module_detection(struct bnx2x_phy *phy,
+ 			       struct link_params *params);
++
++void bnx2x_period_func(struct link_params *params, struct link_vars *vars);
++
+ #endif /* BNX2X_LINK_H */
+diff --git a/drivers/net/bnx2x/bnx2x_main.c b/drivers/net/bnx2x/bnx2x_main.c
+index 05ff639..c6490f8 100644
+--- a/drivers/net/bnx2x/bnx2x_main.c
++++ b/drivers/net/bnx2x/bnx2x_main.c
+@@ -1563,6 +1563,7 @@ void bnx2x_int_disable_sync(struct bnx2x *bp, int disable_hw)
+ 
+ 	/* make sure sp_task is not running */
+ 	cancel_delayed_work(&bp->sp_task);
++	cancel_delayed_work(&bp->period_task);
+ 	flush_workqueue(bnx2x_wq);
+ }
+ 
+@@ -2150,7 +2151,8 @@ u8 bnx2x_initial_phy_init(struct bnx2x *bp, int load_mode)
+ 		if (CHIP_REV_IS_SLOW(bp) && bp->link_vars.link_up) {
+ 			bnx2x_stats_handle(bp, STATS_EVENT_LINK_UP);
+ 			bnx2x_link_report(bp);
+-		}
++		} else
++			queue_delayed_work(bnx2x_wq, &bp->period_task, 0);
+ 		bp->link_params.req_line_speed[cfx_idx] = req_line_speed;
+ 		return rc;
+ 	}
+@@ -2524,6 +2526,15 @@ static void bnx2x_pmf_update(struct bnx2x *bp)
+ 	bp->port.pmf = 1;
+ 	DP(NETIF_MSG_LINK, "pmf %d\n", bp->port.pmf);
+ 
++	/*
++	 * We need the mb() to ensure the ordering between the writing to
++	 * bp->port.pmf here and reading it from the bnx2x_periodic_task().
++	 */
++	smp_mb();
++
++	/* queue a periodic task */
++	queue_delayed_work(bnx2x_wq, &bp->period_task, 0);
++
+ 	bnx2x_dcbx_pmf_update(bp);
+ 
+ 	/* enable nig attention */
+@@ -3242,8 +3253,7 @@ static inline void bnx2x_attn_int_deasserted0(struct bnx2x *bp, u32 attn)
+ 		bnx2x_fan_failure(bp);
+ 	}
+ 
+-	if (attn & (AEU_INPUTS_ATTN_BITS_GPIO3_FUNCTION_0 |
+-		    AEU_INPUTS_ATTN_BITS_GPIO3_FUNCTION_1)) {
++	if ((attn & bp->link_vars.aeu_int_mask) && bp->port.pmf) {
+ 		bnx2x_acquire_phy_lock(bp);
+ 		bnx2x_handle_module_detect_int(&bp->link_params);
+ 		bnx2x_release_phy_lock(bp);
+@@ -3360,16 +3370,26 @@ static inline void bnx2x_attn_int_deasserted3(struct bnx2x *bp, u32 attn)
+ 			if ((bp->port.pmf == 0) && (val & DRV_STATUS_PMF))
+ 				bnx2x_pmf_update(bp);
+ 
+-			/* Always call it here: bnx2x_link_report() will
+-			 * prevent the link indication duplication.
+-			 */
+-			bnx2x__link_status_update(bp);
+-
+ 			if (bp->port.pmf &&
+ 			    (val & DRV_STATUS_DCBX_NEGOTIATION_RESULTS))
+ 				/* start dcbx state machine */
+ 				bnx2x_dcbx_set_params(bp,
+ 					BNX2X_DCBX_STATE_NEG_RECEIVED);
++			if (bp->link_vars.periodic_flags &
++			    PERIODIC_FLAGS_LINK_EVENT) {
++				/*  sync with link */
++				bnx2x_acquire_phy_lock(bp);
++				bp->link_vars.periodic_flags &=
++					~PERIODIC_FLAGS_LINK_EVENT;
++				bnx2x_release_phy_lock(bp);
++				if (IS_MF(bp))
++					bnx2x_link_sync_notify(bp);
++				bnx2x_link_report(bp);
++			}
++			/* Always call it here: bnx2x_link_report() will
++			 * prevent the link indication duplication.
++			 */
++			bnx2x__link_status_update(bp);
+ 		} else if (attn & BNX2X_MC_ASSERT_BITS) {
+ 
+ 			BNX2X_ERR("MC assert!\n");
+@@ -8041,6 +8061,37 @@ reset_task_exit:
+ 
+ /* end of nic load/unload */
+ 
++static void bnx2x_period_task(struct work_struct *work)
++{
++	struct bnx2x *bp = container_of(work, struct bnx2x, period_task.work);
++
++	if (!netif_running(bp->dev))
++		goto period_task_exit;
++
++	if (CHIP_REV_IS_SLOW(bp)) {
++		BNX2X_ERR("period task called on emulation, ignoring\n");
++		goto period_task_exit;
++	}
++
++	bnx2x_acquire_phy_lock(bp);
++	/*
++	 * The barrier is needed to ensure the ordering between the writing to
++	 * the bp->port.pmf in the bnx2x_nic_load() or bnx2x_pmf_update() and
++	 * the reading here.
++	 */
++	smp_mb();
++	if (bp->port.pmf) {
++		bnx2x_period_func(&bp->link_params, &bp->link_vars);
++
++		/* Re-queue task in 1 sec */
++		queue_delayed_work(bnx2x_wq, &bp->period_task, 1*HZ);
++	}
++
++	bnx2x_release_phy_lock(bp);
++period_task_exit:
++	return;
++}
++
+ /*
+  * Init service functions
+  */
+@@ -9170,7 +9221,7 @@ static int __devinit bnx2x_init_bp(struct bnx2x *bp)
+ 
+ 	INIT_DELAYED_WORK(&bp->sp_task, bnx2x_sp_task);
+ 	INIT_DELAYED_WORK(&bp->reset_task, bnx2x_reset_task);
+-
++	INIT_DELAYED_WORK(&bp->period_task, bnx2x_period_task);
+ 	rc = bnx2x_get_hwinfo(bp);
+ 	if (rc)
+ 		return rc;
+@@ -10444,6 +10495,11 @@ static void __exit bnx2x_cleanup(void)
+ 	destroy_workqueue(bnx2x_wq);
+ }
+ 
++void bnx2x_notify_link_changed(struct bnx2x *bp)
++{
++	REG_WR(bp, MISC_REG_AEU_GENERAL_ATTN_12 + BP_FUNC(bp)*sizeof(u32), 1);
++}
++
+ module_init(bnx2x_init);
+ module_exit(bnx2x_cleanup);
+ 
+diff --git a/drivers/net/bnx2x/bnx2x_reg.h b/drivers/net/bnx2x/bnx2x_reg.h
+index d0cf072..2511f99 100644
+--- a/drivers/net/bnx2x/bnx2x_reg.h
++++ b/drivers/net/bnx2x/bnx2x_reg.h
+@@ -5559,6 +5559,7 @@
+ #define BIGMAC_REGISTER_CNT_MAX_SIZE				 (0x05<<3)
+ #define BIGMAC_REGISTER_RX_CONTROL				 (0x21<<3)
+ #define BIGMAC_REGISTER_RX_LLFC_MSG_FLDS			 (0x46<<3)
++#define BIGMAC_REGISTER_RX_LSS_STATUS				 (0x43<<3)
+ #define BIGMAC_REGISTER_RX_MAX_SIZE				 (0x23<<3)
+ #define BIGMAC_REGISTER_RX_STAT_GR64				 (0x26<<3)
+ #define BIGMAC_REGISTER_RX_STAT_GRIPJ				 (0x42<<3)
+@@ -5574,6 +5575,7 @@
+ #define BIGMAC2_REGISTER_PFC_CONTROL				 (0x06<<3)
+ #define BIGMAC2_REGISTER_RX_CONTROL				 (0x3A<<3)
+ #define BIGMAC2_REGISTER_RX_LLFC_MSG_FLDS			 (0x62<<3)
++#define BIGMAC2_REGISTER_RX_LSS_STAT				 (0x3E<<3)
+ #define BIGMAC2_REGISTER_RX_MAX_SIZE				 (0x3C<<3)
+ #define BIGMAC2_REGISTER_RX_STAT_GR64				 (0x40<<3)
+ #define BIGMAC2_REGISTER_RX_STAT_GRIPJ				 (0x5f<<3)
+-- 
+1.6.4.GIT
+
