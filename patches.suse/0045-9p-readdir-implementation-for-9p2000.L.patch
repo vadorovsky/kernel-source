@@ -1,0 +1,413 @@
+From: Sripathi Kodi <sripathik@in.ibm.com>
+Subject: [PATCH 045/111]     9p: readdir implementation for 9p2000.L
+Git-commit: 7751bdb3a095ad32dd4fcff3443cf8dd4cb1e748
+Patch-Mainline: 2.6.36
+References: FATE#311639
+
+    This patch implements the kernel part of readdir() implementation for 9p2000.L
+
+Change from V3: Instead of inode, server now sends qids for each dirent
+
+        SYNOPSIS
+
+        size[4] Treaddir tag[2] fid[4] offset[8] count[4]
+        size[4] Rreaddir tag[2] count[4] data[count]
+
+        DESCRIPTION
+
+        The readdir request asks the server to read the directory specified
+by 'fid' at an offset specified by 'offset' and return as many dirent
+structures as possible that fit into count bytes. Each dirent structure is laid
+out as follows.
+
+                qid.type[1]
+                  the type of the file (directory, etc.), represented as a bit
+                  vector corresponding to the high 8 bits of the file's mode
+                  word.
+
+                qid.vers[4]
+                  version number for given path
+
+                qid.path[8]
+                  the file server's unique identification for the file
+
+                offset[8]
+                  offset into the next dirent.
+
+                type[1]
+                  type of this directory entry.
+
+                name[256]
+                  name of this directory entry.
+
+        This patch adds v9fs_dir_readdir_dotl() as the readdir() call for
+9p2000.L. This function sends P9_TREADDIR command to the server. In response
+the server sends a buffer filled with dirent structures. This is different
+from the existing v9fs_dir_readdir() call which receives stat structures
+from the server.
+
+        This results in significant speedup of readdir() on large directories.
+        For example, doing 'ls >/dev/null' on a directory with 10000 files on my
+        laptop takes 1.088 seconds with the existing code, but only takes 0.339
+        seconds with the new readdir.
+
+	upstream commit: 7751bdb3a095ad32dd4fcff3443cf8dd4cb1e748
+
+    Signed-off-by: Sripathi Kodi <sripathik@in.ibm.com>
+    Reviewed-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+    Signed-off-by: Eric Van Hensbergen <ericvh@gmail.com>
+Signed-off-by: Harsh Prateek Bora <harsh@linux.vnet.ibm.com>
+Acked-by: Bruce Rogers <brogers@suse.com>
+---
+ fs/9p/vfs_dir.c         |  134 +++++++++++++++++++++++++++++++++++++++++------
+ include/net/9p/9p.h     |   17 ++++++
+ include/net/9p/client.h |   18 ++++++
+ net/9p/client.c         |   47 ++++++++++++++++
+ net/9p/protocol.c       |   27 +++++++++
+ 5 files changed, 227 insertions(+), 16 deletions(-)
+
+diff --git a/fs/9p/vfs_dir.c b/fs/9p/vfs_dir.c
+index be9a756..7616a2e 100644
+--- a/fs/9p/vfs_dir.c
++++ b/fs/9p/vfs_dir.c
+@@ -86,29 +86,19 @@ static void p9stat_init(struct p9_wstat *stbuf)
+ }
+ 
+ /**
+- * v9fs_dir_readdir - read a directory
++ * v9fs_alloc_rdir_buf - Allocate buffer used for read and readdir
+  * @filp: opened file structure
+- * @dirent: directory structure ???
+- * @filldir: function to populate directory structure ???
++ * @buflen: Length in bytes of buffer to allocate
+  *
+  */
+ 
+-static int v9fs_dir_readdir(struct file *filp, void *dirent, filldir_t filldir)
++static int v9fs_alloc_rdir_buf(struct file *filp, int buflen)
+ {
+-	int over;
+-	struct p9_wstat st;
+-	int err = 0;
+-	struct p9_fid *fid;
+-	int buflen;
+-	int reclen = 0;
+ 	struct p9_rdir *rdir;
++	struct p9_fid *fid;
++	int err = 0;
+ 
+-	P9_DPRINTK(P9_DEBUG_VFS, "name %s\n", filp->f_path.dentry->d_name.name);
+ 	fid = filp->private_data;
+-
+-	buflen = fid->clnt->msize - P9_IOHDRSZ;
+-
+-	/* allocate rdir on demand */
+ 	if (!fid->rdir) {
+ 		rdir = kmalloc(sizeof(struct p9_rdir) + buflen, GFP_KERNEL);
+ 
+@@ -127,6 +117,36 @@ static int v9fs_dir_readdir(struct file *filp, void *dirent, filldir_t filldir)
+ 		spin_unlock(&filp->f_dentry->d_lock);
+ 		kfree(rdir);
+ 	}
++exit:
++	return err;
++}
++
++/**
++ * v9fs_dir_readdir - read a directory
++ * @filp: opened file structure
++ * @dirent: directory structure ???
++ * @filldir: function to populate directory structure ???
++ *
++ */
++
++static int v9fs_dir_readdir(struct file *filp, void *dirent, filldir_t filldir)
++{
++	int over;
++	struct p9_wstat st;
++	int err = 0;
++	struct p9_fid *fid;
++	int buflen;
++	int reclen = 0;
++	struct p9_rdir *rdir;
++
++	P9_DPRINTK(P9_DEBUG_VFS, "name %s\n", filp->f_path.dentry->d_name.name);
++	fid = filp->private_data;
++
++	buflen = fid->clnt->msize - P9_IOHDRSZ;
++
++	err = v9fs_alloc_rdir_buf(filp, buflen);
++	if (err)
++		goto exit;
+ 	rdir = (struct p9_rdir *) fid->rdir;
+ 
+ 	err = mutex_lock_interruptible(&rdir->mutex);
+@@ -175,6 +195,88 @@ exit:
+ 	return err;
+ }
+ 
++/**
++ * v9fs_dir_readdir_dotl - read a directory
++ * @filp: opened file structure
++ * @dirent: buffer to fill dirent structures
++ * @filldir: function to populate dirent structures
++ *
++ */
++static int v9fs_dir_readdir_dotl(struct file *filp, void *dirent,
++						filldir_t filldir)
++{
++	int over;
++	int err = 0;
++	struct p9_fid *fid;
++	int buflen;
++	struct p9_rdir *rdir;
++	struct p9_dirent curdirent;
++	u64 oldoffset = 0;
++
++	P9_DPRINTK(P9_DEBUG_VFS, "name %s\n", filp->f_path.dentry->d_name.name);
++	fid = filp->private_data;
++
++	buflen = fid->clnt->msize - P9_READDIRHDRSZ;
++
++	err = v9fs_alloc_rdir_buf(filp, buflen);
++	if (err)
++		goto exit;
++	rdir = (struct p9_rdir *) fid->rdir;
++
++	err = mutex_lock_interruptible(&rdir->mutex);
++	if (err)
++		return err;
++
++	while (err == 0) {
++		if (rdir->tail == rdir->head) {
++			err = p9_client_readdir(fid, rdir->buf, buflen,
++								filp->f_pos);
++			if (err <= 0)
++				goto unlock_and_exit;
++
++			rdir->head = 0;
++			rdir->tail = err;
++		}
++
++		while (rdir->head < rdir->tail) {
++
++			err = p9dirent_read(rdir->buf + rdir->head,
++						buflen - rdir->head, &curdirent,
++						fid->clnt->proto_version);
++			if (err < 0) {
++				P9_DPRINTK(P9_DEBUG_VFS, "returned %d\n", err);
++				err = -EIO;
++				goto unlock_and_exit;
++			}
++
++			/* d_off in dirent structure tracks the offset into
++			 * the next dirent in the dir. However, filldir()
++			 * expects offset into the current dirent. Hence
++			 * while calling filldir send the offset from the
++			 * previous dirent structure.
++			 */
++			over = filldir(dirent, curdirent.d_name,
++					strlen(curdirent.d_name),
++					oldoffset, v9fs_qid2ino(&curdirent.qid),
++					curdirent.d_type);
++			oldoffset = curdirent.d_off;
++
++			if (over) {
++				err = 0;
++				goto unlock_and_exit;
++			}
++
++			filp->f_pos = curdirent.d_off;
++			rdir->head += err;
++		}
++	}
++
++unlock_and_exit:
++	mutex_unlock(&rdir->mutex);
++exit:
++	return err;
++}
++
+ 
+ /**
+  * v9fs_dir_release - close a directory
+@@ -206,7 +308,7 @@ const struct file_operations v9fs_dir_operations = {
+ const struct file_operations v9fs_dir_operations_dotl = {
+ 	.read = generic_read_dir,
+ 	.llseek = generic_file_llseek,
+-	.readdir = v9fs_dir_readdir,
++	.readdir = v9fs_dir_readdir_dotl,
+ 	.open = v9fs_file_open,
+ 	.release = v9fs_dir_release,
+ };
+diff --git a/include/net/9p/9p.h b/include/net/9p/9p.h
+index 156c26b..f1b0b31 100644
+--- a/include/net/9p/9p.h
++++ b/include/net/9p/9p.h
+@@ -133,6 +133,8 @@ enum p9_msg_t {
+ 	P9_RSTATFS,
+ 	P9_TRENAME = 20,
+ 	P9_RRENAME,
++	P9_TREADDIR = 40,
++	P9_RREADDIR,
+ 	P9_TVERSION = 100,
+ 	P9_RVERSION,
+ 	P9_TAUTH = 102,
+@@ -275,6 +277,9 @@ enum p9_qid_t {
+ /* ample room for Twrite/Rread header */
+ #define P9_IOHDRSZ	24
+ 
++/* Room for readdir header */
++#define P9_READDIRHDRSZ	24
++
+ /**
+  * struct p9_str - length prefixed string type
+  * @len: length of the string
+@@ -485,6 +490,18 @@ struct p9_rwrite {
+ 	u32 count;
+ };
+ 
++struct p9_treaddir {
++	u32 fid;
++	u64 offset;
++	u32 count;
++};
++
++struct p9_rreaddir {
++	u32 count;
++	u8 *data;
++};
++
++
+ struct p9_tclunk {
+ 	u32 fid;
+ };
+diff --git a/include/net/9p/client.h b/include/net/9p/client.h
+index 7dd3ed8..2ec9368 100644
+--- a/include/net/9p/client.h
++++ b/include/net/9p/client.h
+@@ -195,6 +195,21 @@ struct p9_fid {
+ 	struct list_head dlist;	/* list of all fids attached to a dentry */
+ };
+ 
++/**
++ * struct p9_dirent - directory entry structure
++ * @qid: The p9 server qid for this dirent
++ * @d_off: offset to the next dirent
++ * @d_type: type of file
++ * @d_name: file name
++ */
++
++struct p9_dirent {
++	struct p9_qid qid;
++	u64 d_off;
++	unsigned char d_type;
++	char d_name[256];
++};
++
+ int p9_client_statfs(struct p9_fid *fid, struct p9_rstatfs *sb);
+ int p9_client_rename(struct p9_fid *fid, struct p9_fid *newdirfid, char *name);
+ int p9_client_version(struct p9_client *);
+@@ -217,6 +232,9 @@ int p9_client_read(struct p9_fid *fid, char *data, char __user *udata,
+ 							u64 offset, u32 count);
+ int p9_client_write(struct p9_fid *fid, char *data, const char __user *udata,
+ 							u64 offset, u32 count);
++int p9_client_readdir(struct p9_fid *fid, char *data, u32 count, u64 offset);
++int p9dirent_read(char *buf, int len, struct p9_dirent *dirent,
++							int proto_version);
+ struct p9_wstat *p9_client_stat(struct p9_fid *fid);
+ int p9_client_wstat(struct p9_fid *fid, struct p9_wstat *wst);
+ 
+diff --git a/net/9p/client.c b/net/9p/client.c
+index 8596aa7..5398b98 100644
+--- a/net/9p/client.c
++++ b/net/9p/client.c
+@@ -1431,3 +1431,50 @@ error:
+ }
+ EXPORT_SYMBOL(p9_client_rename);
+ 
++int p9_client_readdir(struct p9_fid *fid, char *data, u32 count, u64 offset)
++{
++	int err, rsize, total;
++	struct p9_client *clnt;
++	struct p9_req_t *req;
++	char *dataptr;
++
++	P9_DPRINTK(P9_DEBUG_9P, ">>> TREADDIR fid %d offset %llu count %d\n",
++				fid->fid, (long long unsigned) offset, count);
++
++	err = 0;
++	clnt = fid->clnt;
++	total = 0;
++
++	rsize = fid->iounit;
++	if (!rsize || rsize > clnt->msize-P9_READDIRHDRSZ)
++		rsize = clnt->msize - P9_READDIRHDRSZ;
++
++	if (count < rsize)
++		rsize = count;
++
++	req = p9_client_rpc(clnt, P9_TREADDIR, "dqd", fid->fid, offset, rsize);
++	if (IS_ERR(req)) {
++		err = PTR_ERR(req);
++		goto error;
++	}
++
++	err = p9pdu_readf(req->rc, clnt->proto_version, "D", &count, &dataptr);
++	if (err) {
++		p9pdu_dump(1, req->rc);
++		goto free_and_error;
++	}
++
++	P9_DPRINTK(P9_DEBUG_9P, "<<< RREADDIR count %d\n", count);
++
++	if (data)
++		memmove(data, dataptr, count);
++
++	p9_free_req(clnt, req);
++	return count;
++
++free_and_error:
++	p9_free_req(clnt, req);
++error:
++	return err;
++}
++EXPORT_SYMBOL(p9_client_readdir);
+diff --git a/net/9p/protocol.c b/net/9p/protocol.c
+index d6bc02f..dc9759f 100644
+--- a/net/9p/protocol.c
++++ b/net/9p/protocol.c
+@@ -579,3 +579,30 @@ void p9pdu_reset(struct p9_fcall *pdu)
+ 	pdu->offset = 0;
+ 	pdu->size = 0;
+ }
++
++int p9dirent_read(char *buf, int len, struct p9_dirent *dirent,
++						int proto_version)
++{
++	struct p9_fcall fake_pdu;
++	int ret;
++	char *nameptr;
++
++	fake_pdu.size = len;
++	fake_pdu.capacity = len;
++	fake_pdu.sdata = buf;
++	fake_pdu.offset = 0;
++
++	ret = p9pdu_readf(&fake_pdu, proto_version, "Qqbs", &dirent->qid,
++			&dirent->d_off, &dirent->d_type, &nameptr);
++	if (ret) {
++		P9_DPRINTK(P9_DEBUG_9P, "<<< p9dirent_read failed: %d\n", ret);
++		p9pdu_dump(1, &fake_pdu);
++		goto out;
++	}
++
++	strcpy(dirent->d_name, nameptr);
++
++out:
++	return fake_pdu.offset;
++}
++EXPORT_SYMBOL(p9dirent_read);
+-- 
+1.7.1.1
+
