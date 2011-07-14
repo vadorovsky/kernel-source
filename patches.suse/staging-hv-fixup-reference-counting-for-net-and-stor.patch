@@ -1,0 +1,492 @@
+From 920d318e51bd191d263ed3a6961ffc1823ed4132 Mon Sep 17 00:00:00 2001
+From: K. Y. Srinivasan <kys@microsoft.com>
+Date: Fri, 1 Jul 2011 08:58:19 -0700
+Subject: [PATCH 2/2] Staging: hv: Fixup reference counting for both net and stor devices
+
+Fixup reference counting for both net and stor devices.
+
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Signed-off-by: <ohering@suse.de>
+---
+ drivers/staging/hv/hyperv.h         |    3 
+ drivers/staging/hv/hyperv_net.h     |   13 +++
+ drivers/staging/hv/hyperv_storage.h |   21 ++++--
+ drivers/staging/hv/netvsc.c         |  125 ++++++++++++++----------------------
+ drivers/staging/hv/storvsc.c        |   83 +++++++++--------------
+ drivers/staging/hv/storvsc_drv.c    |    2 
+ drivers/staging/hv/vmbus_drv.c      |    1 
+ 7 files changed, 117 insertions(+), 131 deletions(-)
+
+--- a/drivers/staging/hv/hyperv.h
++++ b/drivers/staging/hv/hyperv.h
+@@ -835,6 +835,9 @@ struct hv_device {
+ 
+ 	struct vmbus_channel *channel;
+ 
++	/* This lock protects the device extension field */
++	spinlock_t ext_lock;
++
+ 	/* Device extension; */
+ 	void *ext;
+ };
+--- a/drivers/staging/hv/hyperv_net.h
++++ b/drivers/staging/hv/hyperv_net.h
+@@ -369,8 +369,11 @@ struct nvsp_message {
+ struct netvsc_device {
+ 	struct hv_device *dev;
+ 
+-	atomic_t refcnt;
++	int refcnt;
+ 	atomic_t num_outstanding_sends;
++	bool destroy;
++	bool drain_notify;
++	wait_queue_head_t waiting_to_drain;
+ 	/*
+ 	 * List of free preallocated hv_netvsc_packet to represent receive
+ 	 * packet
+@@ -1051,6 +1054,14 @@ struct rndis_filter_packet {
+ #define NDIS_PACKET_TYPE_FUNCTIONAL	0x00000400
+ #define NDIS_PACKET_TYPE_MAC_FRAME	0x00000800
+ 
++static inline void netvsc_wait_to_drain(struct netvsc_device *dev)
++{
++	dev->drain_notify = true;
++	wait_event(dev->waiting_to_drain,
++		atomic_read(&dev->num_outstanding_sends) == 0);
++	dev->drain_notify = false;
++}
++
+ 
+ 
+ #endif /* _HYPERV_NET_H */
+--- a/drivers/staging/hv/hyperv_storage.h
++++ b/drivers/staging/hv/hyperv_storage.h
+@@ -265,8 +265,8 @@ struct storvsc_device {
+ 	struct hv_device *device;
+ 
+ 	/* 0 indicates the device is being destroyed */
+-	atomic_t ref_count;
+-
++	int	 ref_count;
++	bool	 destroy;
+ 	bool	 drain_notify;
+ 	atomic_t num_outstanding_req;
+ 
+@@ -287,16 +287,20 @@ struct storvsc_device {
+ };
+ 
+ 
+-/* Get the stordevice object iff exists and its refcount > 1 */
+-static inline struct storvsc_device *get_stor_device(struct hv_device *device)
++static inline struct storvsc_device *get_out_stor_device(
++					struct hv_device *device)
+ {
+ 	struct storvsc_device *stor_device;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&device->ext_lock, flags);
+ 	stor_device = (struct storvsc_device *)device->ext;
+-	if (stor_device && atomic_read(&stor_device->ref_count) > 1)
+-		atomic_inc(&stor_device->ref_count);
++	if (stor_device && (stor_device->ref_count) &&
++		!stor_device->destroy)
++		stor_device->ref_count++;
+ 	else
+ 		stor_device = NULL;
++	spin_unlock_irqrestore(&device->ext_lock, flags);
+ 
+ 	return stor_device;
+ }
+@@ -305,10 +309,13 @@ static inline struct storvsc_device *get
+ static inline void put_stor_device(struct hv_device *device)
+ {
+ 	struct storvsc_device *stor_device;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&device->ext_lock, flags);
+ 	stor_device = (struct storvsc_device *)device->ext;
+ 
+-	atomic_dec(&stor_device->ref_count);
++	stor_device->ref_count--;
++	spin_unlock_irqrestore(&device->ext_lock, flags);
+ }
+ 
+ static inline void storvsc_wait_to_drain(struct storvsc_device *dev)
+--- a/drivers/staging/hv/netvsc.c
++++ b/drivers/staging/hv/netvsc.c
+@@ -40,8 +40,10 @@ static struct netvsc_device *alloc_net_d
+ 	if (!net_device)
+ 		return NULL;
+ 
+-	/* Set to 2 to allow both inbound and outbound traffic */
+-	atomic_cmpxchg(&net_device->refcnt, 0, 2);
++	net_device->refcnt = 1;
++	net_device->drain_notify = false;
++	net_device->destroy = false;
++	init_waitqueue_head(&net_device->waiting_to_drain);
+ 
+ 	net_device->dev = device;
+ 	device->ext = net_device;
+@@ -49,82 +51,60 @@ static struct netvsc_device *alloc_net_d
+ 	return net_device;
+ }
+ 
+-static void free_net_device(struct netvsc_device *device)
+-{
+-	WARN_ON(atomic_read(&device->refcnt) != 0);
+-	device->dev->ext = NULL;
+-	kfree(device);
+-}
+-
+-
+-/* Get the net device object iff exists and its refcount > 1 */
+ static struct netvsc_device *get_outbound_net_device(struct hv_device *device)
+ {
+ 	struct netvsc_device *net_device;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&device->ext_lock, flags);
+ 	net_device = device->ext;
+-	if (net_device && atomic_read(&net_device->refcnt) > 1)
+-		atomic_inc(&net_device->refcnt);
++	if (net_device && (net_device->refcnt) &&
++		!net_device->destroy)
++		net_device->refcnt++;
+ 	else
+ 		net_device = NULL;
++	spin_unlock_irqrestore(&device->ext_lock, flags);
+ 
+ 	return net_device;
+ }
+ 
+-/* Get the net device object iff exists and its refcount > 0 */
+ static struct netvsc_device *get_inbound_net_device(struct hv_device *device)
+ {
+ 	struct netvsc_device *net_device;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&device->ext_lock, flags);
+ 	net_device = device->ext;
+-	if (net_device && atomic_read(&net_device->refcnt))
+-		atomic_inc(&net_device->refcnt);
+-	else
+-		net_device = NULL;
+-
+-	return net_device;
+-}
+-
+-static void put_net_device(struct hv_device *device)
+-{
+-	struct netvsc_device *net_device;
+-
+-	net_device = device->ext;
+-
+-	atomic_dec(&net_device->refcnt);
+-}
+ 
+-static struct netvsc_device *release_outbound_net_device(
+-		struct hv_device *device)
+-{
+-	struct netvsc_device *net_device;
++	if (!net_device)
++		goto cleanup;
+ 
+-	net_device = device->ext;
+-	if (net_device == NULL)
+-		return NULL;
++	/*
++	 * If the device is being destroyed; allow incoming
++	 * traffic only to cleanup outstanding requests.
++	 */
++	if (net_device->destroy &&
++		(atomic_read(&net_device->num_outstanding_sends) == 0))
++		goto cleanup;
+ 
+-	/* Busy wait until the ref drop to 2, then set it to 1 */
+-	while (atomic_cmpxchg(&net_device->refcnt, 2, 1) != 2)
+-		udelay(100);
++	net_device->refcnt++;
+ 
++cleanup:
++	spin_unlock_irqrestore(&device->ext_lock, flags);
+ 	return net_device;
+ }
+ 
+-static struct netvsc_device *release_inbound_net_device(
+-		struct hv_device *device)
++static void put_net_device(struct hv_device *device)
+ {
+ 	struct netvsc_device *net_device;
++	unsigned long flags;
+ 
+-	net_device = device->ext;
+-	if (net_device == NULL)
+-		return NULL;
++	spin_lock_irqsave(&device->ext_lock, flags);
+ 
+-	/* Busy wait until the ref drop to 1, then set it to 0 */
+-	while (atomic_cmpxchg(&net_device->refcnt, 1, 0) != 1)
+-		udelay(100);
++	net_device = device->ext;
+ 
+-	device->ext = NULL;
+-	return net_device;
++	net_device->refcnt--;
++	spin_unlock_irqrestore(&device->ext_lock, flags);
+ }
+ 
+ static int netvsc_destroy_recv_buf(struct netvsc_device *net_device)
+@@ -404,27 +384,27 @@ int netvsc_device_remove(struct hv_devic
+ {
+ 	struct netvsc_device *net_device;
+ 	struct hv_netvsc_packet *netvsc_packet, *pos;
++	unsigned long flags;
+ 
+-	/* Stop outbound traffic ie sends and receives completions */
+-	net_device = release_outbound_net_device(device);
+-	if (!net_device) {
+-		dev_err(&device->device, "No net device present!!");
+-		return -ENODEV;
+-	}
+-
+-	/* Wait for all send completions */
+-	while (atomic_read(&net_device->num_outstanding_sends)) {
+-		dev_err(&device->device,
+-			"waiting for %d requests to complete...",
+-			atomic_read(&net_device->num_outstanding_sends));
+-		udelay(100);
+-	}
++	/*
++	 * Since we currently hold a reference on the net_device,
++	 * it is safe to de-reference the ext pointer.
++	 */
++	net_device = (struct netvsc_device *)device->ext;
++	net_device->refcnt--;
++	net_device->destroy = true;
+ 
++	/*
++	 * At this point, all outbound traffic is disabled. Wait
++	 * for outstanding sends to drain out.
++	 */
++	netvsc_wait_to_drain(net_device);
+ 	netvsc_disconnect_vsp(net_device);
+ 
+-	/* Stop inbound traffic ie receives and sends completions */
+-	net_device = release_inbound_net_device(device);
+-
++	spin_lock_irqsave(&device->ext_lock, flags);
++	net_device->refcnt = 0;
++	device->ext = NULL;
++	spin_unlock_irqrestore(&device->ext_lock, flags);
+ 	/* At this point, no one should be accessing netDevice except in here */
+ 	dev_notice(&device->device, "net device safe to remove");
+ 
+@@ -438,7 +418,7 @@ int netvsc_device_remove(struct hv_devic
+ 		kfree(netvsc_packet);
+ 	}
+ 
+-	free_net_device(net_device);
++	kfree(net_device);
+ 	return 0;
+ }
+ 
+@@ -478,7 +458,9 @@ static void netvsc_send_completion(struc
+ 		nvsc_packet->completion.send.send_completion(
+ 			nvsc_packet->completion.send.send_completion_ctx);
+ 
+-		atomic_dec(&net_device->num_outstanding_sends);
++		if (atomic_dec_and_test(&net_device->num_outstanding_sends) &&
++			net_device->drain_notify)
++			wake_up(&net_device->waiting_to_drain);
+ 	} else {
+ 		dev_err(&device->device, "Unknown send completion packet type- "
+ 			   "%d received!!", nvsp_packet->hdr.msg_type);
+@@ -977,10 +959,7 @@ cleanup:
+ 			kfree(packet);
+ 		}
+ 
+-		release_outbound_net_device(device);
+-		release_inbound_net_device(device);
+-
+-		free_net_device(net_device);
++		kfree(net_device);
+ 	}
+ 
+ 	return ret;
+--- a/drivers/staging/hv/storvsc.c
++++ b/drivers/staging/hv/storvsc.c
+@@ -40,10 +40,8 @@ static inline struct storvsc_device *all
+ 	if (!stor_device)
+ 		return NULL;
+ 
+-	/* Set to 2 to allow both inbound and outbound traffics */
+-	/* (ie get_stor_device() and must_get_stor_device()) to proceed. */
+-	atomic_cmpxchg(&stor_device->ref_count, 0, 2);
+-
++	stor_device->ref_count = 1;
++	stor_device->destroy = false;
+ 	init_waitqueue_head(&stor_device->waiting_to_drain);
+ 	stor_device->device = device;
+ 	device->ext = stor_device;
+@@ -56,49 +54,28 @@ static inline void free_stor_device(stru
+ 	kfree(device);
+ }
+ 
+-/* Get the stordevice object iff exists and its refcount > 0 */
+-static inline struct storvsc_device *must_get_stor_device(
+-					struct hv_device *device)
+-{
+-	struct storvsc_device *stor_device;
+-
+-	stor_device = (struct storvsc_device *)device->ext;
+-	if (stor_device && atomic_read(&stor_device->ref_count))
+-		atomic_inc(&stor_device->ref_count);
+-	else
+-		stor_device = NULL;
+-
+-	return stor_device;
+-}
+-
+-/* Drop ref count to 1 to effectively disable get_stor_device() */
+-static inline struct storvsc_device *release_stor_device(
++static inline struct storvsc_device *get_in_stor_device(
+ 					struct hv_device *device)
+ {
+ 	struct storvsc_device *stor_device;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&device->ext_lock, flags);
+ 	stor_device = (struct storvsc_device *)device->ext;
++	if (!stor_device)
++		goto cleanup;
+ 
+-	/* Busy wait until the ref drop to 2, then set it to 1 */
+-	while (atomic_cmpxchg(&stor_device->ref_count, 2, 1) != 2)
+-		udelay(100);
+-
+-	return stor_device;
+-}
+-
+-/* Drop ref count to 0. No one can use stor_device object. */
+-static inline struct storvsc_device *final_release_stor_device(
+-			struct hv_device *device)
+-{
+-	struct storvsc_device *stor_device;
+-
+-	stor_device = (struct storvsc_device *)device->ext;
+-
+-	/* Busy wait until the ref drop to 1, then set it to 0 */
+-	while (atomic_cmpxchg(&stor_device->ref_count, 1, 0) != 1)
+-		udelay(100);
++	/*
++	 * If the device is being destroyed; allow incoming
++	 * traffic only to cleanup outstanding requests.
++	 */
++	if (stor_device->destroy &&
++		 (atomic_read(&stor_device->num_outstanding_req) == 0))
++		goto cleanup;
++	stor_device->ref_count++;
++cleanup:
++	spin_unlock_irqrestore(&device->ext_lock, flags);
+ 
+-	device->ext = NULL;
+ 	return stor_device;
+ }
+ 
+@@ -109,7 +86,7 @@ static int storvsc_channel_init(struct h
+ 	struct vstor_packet *vstor_packet;
+ 	int ret, t;
+ 
+-	stor_device = get_stor_device(device);
++	stor_device = get_out_stor_device(device);
+ 	if (!stor_device)
+ 		return -ENODEV;
+ 
+@@ -236,9 +213,7 @@ static void storvsc_on_io_completion(str
+ 	struct storvsc_device *stor_device;
+ 	struct vstor_packet *stor_pkt;
+ 
+-	stor_device = must_get_stor_device(device);
+-	if (!stor_device)
+-		return;
++	stor_device = (struct storvsc_device *)device->ext;
+ 
+ 	stor_pkt = &request->vstor_packet;
+ 
+@@ -283,7 +258,6 @@ static void storvsc_on_io_completion(str
+ 		wake_up(&stor_device->waiting_to_drain);
+ 
+ 
+-	put_stor_device(device);
+ }
+ 
+ static void storvsc_on_receive(struct hv_device *device,
+@@ -312,7 +286,7 @@ static void storvsc_on_channel_callback(
+ 	int ret;
+ 
+ 
+-	stor_device = must_get_stor_device(device);
++	stor_device = get_in_stor_device(device);
+ 	if (!stor_device)
+ 		return;
+ 
+@@ -406,8 +380,16 @@ int storvsc_dev_add(struct hv_device *de
+ int storvsc_dev_remove(struct hv_device *device)
+ {
+ 	struct storvsc_device *stor_device;
++	unsigned long flags;
++
++	/*
++	 * Since we currently hold a reference on the stor
++	 * device, it is safe to dereference the ext
++	 * pointer.
++	 */
++	stor_device = (struct storvsc_device *)device->ext;
+ 
+-	stor_device = release_stor_device(device);
++	stor_device->destroy = true;
+ 
+ 	/*
+ 	 * At this point, all outbound traffic should be disable. We
+@@ -417,7 +399,10 @@ int storvsc_dev_remove(struct hv_device
+ 
+ 	storvsc_wait_to_drain(stor_device);
+ 
+-	stor_device = final_release_stor_device(device);
++	spin_lock_irqsave(&device->ext_lock, flags);
++	stor_device->ref_count = 0;
++	device->ext = NULL;
++	spin_unlock_irqrestore(&device->ext_lock, flags);
+ 
+ 	/* Close the channel */
+ 	vmbus_close(device->channel);
+@@ -434,7 +419,7 @@ int storvsc_do_io(struct hv_device *devi
+ 	int ret = 0;
+ 
+ 	vstor_packet = &request->vstor_packet;
+-	stor_device = get_stor_device(device);
++	stor_device = get_out_stor_device(device);
+ 
+ 	if (!stor_device)
+ 		return -ENODEV;
+--- a/drivers/staging/hv/storvsc_drv.c
++++ b/drivers/staging/hv/storvsc_drv.c
+@@ -346,7 +346,7 @@ static int storvsc_host_reset(struct hv_
+ 	int ret, t;
+ 
+ 
+-	stor_device = get_stor_device(device);
++	stor_device = get_out_stor_device(device);
+ 	if (!stor_device)
+ 		return -ENODEV;
+ 
+--- a/drivers/staging/hv/vmbus_drv.c
++++ b/drivers/staging/hv/vmbus_drv.c
+@@ -572,6 +572,7 @@ struct hv_device *vmbus_child_device_cre
+ 		return NULL;
+ 	}
+ 
++	spin_lock_init(&child_device_obj->ext_lock);
+ 	child_device_obj->channel = channel;
+ 	/*
+ 	 * Get the human readable device type name and stash it away.
