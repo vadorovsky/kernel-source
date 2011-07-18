@@ -1,0 +1,250 @@
+From: Haicheng Li <haicheng.li@linux.intel.com>
+Subject: mem-hotplug: avoid multiple zones sharing same boot strapping boot_pageset
+References: fate#311831,bnc#703100
+Patch-Mainline: v2.6.35-rc1
+Git-commit: 1f522509c77a5dea8dc384b735314f03908a6415
+
+Signed-off-by: Thomas Renninger <trenn@suse.de>
+
+trenn: After I finished the backport, I compared it with RedHat code and
+slightly adjusted setup_zone_pageset() function.
+
+
+For each new populated zone of hotadded node, need to update its pagesets
+with dynamically allocated per_cpu_pageset struct for all possible CPUs:
+
+    1) Detach zone->pageset from the shared boot_pageset
+       at end of __build_all_zonelists().
+
+    2) Use mutex to protect zone->pageset when it's still
+       shared in onlined_pages()
+
+Otherwises, multiple zones of different nodes would share same boot strapping
+boot_pageset for same CPU, which will finally cause below kernel panic:
+
+  ------------[ cut here ]------------
+  kernel BUG at mm/page_alloc.c:1239!
+  invalid opcode: 0000 [#1] SMP
+  ...
+  Call Trace:
+   [<ffffffff811300c1>] __alloc_pages_nodemask+0x131/0x7b0
+   [<ffffffff81162e67>] alloc_pages_current+0x87/0xd0
+   [<ffffffff81128407>] __page_cache_alloc+0x67/0x70
+   [<ffffffff811325f0>] __do_page_cache_readahead+0x120/0x260
+   [<ffffffff81132751>] ra_submit+0x21/0x30
+   [<ffffffff811329c6>] ondemand_readahead+0x166/0x2c0
+   [<ffffffff81132ba0>] page_cache_async_readahead+0x80/0xa0
+   [<ffffffff8112a0e4>] generic_file_aio_read+0x364/0x670
+   [<ffffffff81266cfa>] nfs_file_read+0xca/0x130
+   [<ffffffff8117b20a>] do_sync_read+0xfa/0x140
+   [<ffffffff8117bf75>] vfs_read+0xb5/0x1a0
+   [<ffffffff8117c151>] sys_read+0x51/0x80
+   [<ffffffff8103c032>] system_call_fastpath+0x16/0x1b
+  RIP  [<ffffffff8112ff13>] get_page_from_freelist+0x883/0x900
+   RSP <ffff88000d1e78a8>
+  ---[ end trace 4bda28328b9990db ]
+
+[akpm@linux-foundation.org: merge fix]
+Signed-off-by: Haicheng Li <haicheng.li@linux.intel.com>
+Signed-off-by: Wu Fengguang <fengguang.wu@intel.com>
+Reviewed-by: Andi Kleen <andi.kleen@intel.com>
+Reviewed-by: Christoph Lameter <cl@linux-foundation.org>
+Cc: Mel Gorman <mel@csn.ul.ie>
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+---
+ include/linux/mmzone.h |    2 +-
+ init/main.c            |    2 +-
+ kernel/cpu.c           |    2 +-
+ mm/memory_hotplug.c    |   18 +++++++++++++-----
+ mm/page_alloc.c        |   43 +++++++++++++++++++++++++++++++++++++++----
+ 5 files changed, 55 insertions(+), 12 deletions(-)
+
+Index: linux-2.6.32-SLE11-SP2/include/linux/mmzone.h
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/include/linux/mmzone.h
++++ linux-2.6.32-SLE11-SP2/include/linux/mmzone.h
+@@ -659,7 +659,7 @@ typedef struct pglist_data {
+ 
+ void get_zone_counts(unsigned long *active, unsigned long *inactive,
+ 			unsigned long *free);
+-void build_all_zonelists(void);
++void build_all_zonelists(void *data);
+ void wakeup_kswapd(struct zone *zone, int order, enum zone_type classzone_idx);
+ int zone_watermark_ok(struct zone *z, int order, unsigned long mark,
+ 		int classzone_idx, int alloc_flags);
+Index: linux-2.6.32-SLE11-SP2/init/main.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/init/main.c
++++ linux-2.6.32-SLE11-SP2/init/main.c
+@@ -585,7 +585,7 @@ asmlinkage void __init start_kernel(void
+ 	setup_per_cpu_areas();
+ 	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */
+ 
+-	build_all_zonelists();
++	build_all_zonelists(NULL);
+ 	page_alloc_init();
+ 
+ 	printk(KERN_NOTICE "Kernel command line: %s\n", boot_command_line);
+Index: linux-2.6.32-SLE11-SP2/kernel/cpu.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/kernel/cpu.c
++++ linux-2.6.32-SLE11-SP2/kernel/cpu.c
+@@ -352,7 +352,7 @@ int __cpuinit cpu_up(unsigned int cpu)
+ 	}
+ 
+ 	if (pgdat->node_zonelists->_zonerefs->zone == NULL)
+-		build_all_zonelists();
++		build_all_zonelists(NULL);
+ #endif
+ 
+ 	cpu_maps_update_begin();
+Index: linux-2.6.32-SLE11-SP2/mm/memory_hotplug.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/mm/memory_hotplug.c
++++ linux-2.6.32-SLE11-SP2/mm/memory_hotplug.c
+@@ -389,6 +389,11 @@ int online_pages(unsigned long pfn, unsi
+ 	int nid;
+ 	int ret;
+ 	struct memory_notify arg;
++	/*
++	 * mutex to protect zone->pageset when it's still shared
++	 * in onlined_pages()
++	 */
++	static DEFINE_MUTEX(zone_pageset_mutex);
+ 
+ 	arg.start_pfn = pfn;
+ 	arg.nr_pages = nr_pages;
+@@ -415,12 +420,14 @@ int online_pages(unsigned long pfn, unsi
+ 	 * This means the page allocator ignores this zone.
+ 	 * So, zonelist must be updated after online.
+ 	 */
++	mutex_lock(&zone_pageset_mutex);
+ 	if (!populated_zone(zone))
+ 		need_zonelists_rebuild = 1;
+ 
+ 	ret = walk_system_ram_range(pfn, nr_pages, &onlined_pages,
+ 		online_pages_range);
+ 	if (ret) {
++		mutex_unlock(&zone_pageset_mutex);
+ 		printk(KERN_DEBUG "online_pages %lx at %lx failed\n",
+ 			nr_pages, pfn);
+ 		memory_notify(MEM_CANCEL_ONLINE, &arg);
+@@ -429,8 +436,12 @@ int online_pages(unsigned long pfn, unsi
+ 
+ 	zone->present_pages += onlined_pages;
+ 	zone->zone_pgdat->node_present_pages += onlined_pages;
++	if (need_zonelists_rebuild)
++		build_all_zonelists(zone);
++	else
++		zone_pcp_update(zone);
+ 
+-	zone_pcp_update(zone);
++	mutex_unlock(&zone_pageset_mutex);
+ 	setup_per_zone_wmarks();
+ 	calculate_zone_inactive_ratio(zone);
+ 	if (onlined_pages) {
+@@ -438,10 +449,7 @@ int online_pages(unsigned long pfn, unsi
+ 		node_set_state(zone_to_nid(zone), N_HIGH_MEMORY);
+ 	}
+ 
+-	if (need_zonelists_rebuild)
+-		build_all_zonelists();
+-	else
+-		vm_total_pages = nr_free_pagecache_pages();
++	vm_total_pages = nr_free_pagecache_pages();
+ 
+ 	writeback_set_ratelimit();
+ 
+Index: linux-2.6.32-SLE11-SP2/mm/page_alloc.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/mm/page_alloc.c
++++ linux-2.6.32-SLE11-SP2/mm/page_alloc.c
+@@ -2665,7 +2665,7 @@ int numa_zonelist_order_handler(ctl_tabl
+ 				NUMA_ZONELIST_ORDER_LEN);
+ 			user_zonelist_order = oldval;
+ 		} else if (oldval != user_zonelist_order)
+-			build_all_zonelists();
++			build_all_zonelists(NULL);
+ 	}
+ 	return 0;
+ }
+@@ -3005,8 +3005,10 @@ static void build_zonelist_cache(pg_data
+ 
+ #endif	/* CONFIG_NUMA */
+ 
++static void setup_zone_pageset(struct zone *zone);
++
+ /* return values int ....just for stop_machine() */
+-static int __build_all_zonelists(void *dummy)
++static __init_refok int __build_all_zonelists(void *data)
+ {
+ 	int nid;
+ 
+@@ -3020,6 +3022,14 @@ static int __build_all_zonelists(void *d
+ 		build_zonelist_cache(pgdat);
+ 	}
+ 
++#ifdef CONFIG_MEMORY_HOTPLUG
++	/* Setup real pagesets for the new zone */
++	if (data) {
++		struct zone *zone = data;
++		setup_zone_pageset(zone);
++	}
++#endif
++
+ #ifdef CONFIG_HAVE_MEMORYLESS_NODES
+ 	/*
+ 	 * We now know the "local memory node" for each node--
+@@ -3039,7 +3049,11 @@ static int __build_all_zonelists(void *d
+ 	return 0;
+ }
+ 
+-void build_all_zonelists(void)
++/*
++ * Called with zonelists_mutex held always
++ * unless system_state == SYSTEM_BOOTING.
++ */
++void build_all_zonelists(void *data)
+ {
+ 	set_zonelist_order();
+ 
+@@ -3050,7 +3064,7 @@ void build_all_zonelists(void)
+ 	} else {
+ 		/* we have to stop all cpus to guarantee there is no user
+ 		   of zonelist */
+-		stop_machine(__build_all_zonelists, NULL, NULL);
++		stop_machine(__build_all_zonelists, data, NULL);
+ 		/* cpuset refresh routine should be here */
+ 	}
+ 	vm_total_pages = nr_free_pagecache_pages();
+@@ -3503,6 +3517,27 @@ void __init setup_per_cpu_pageset(void)
+ 
+ #endif
+ 
++static __meminit void setup_zone_pageset(struct zone *zone)
++{
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		struct per_cpu_pageset *pset;
++		pset = zone_pcp(zone, cpu);
++
++#ifdef CONFIG_NUMA
++		if (unlikely(cpu_online(cpu) && pset == &boot_pageset[cpu])) {
++			pset = kmalloc_node(sizeof(struct per_cpu_pageset),
++					    GFP_NOWAIT, cpu_to_node(cpu));
++			zone_pcp(zone, cpu) = pset;
++		}
++#endif
++		setup_pageset(pset, zone_batchsize(zone));
++	}
++
++	return;
++}
++
+ static noinline __init_refok
+ int zone_wait_table_init(struct zone *zone, unsigned long zone_size_pages)
+ {

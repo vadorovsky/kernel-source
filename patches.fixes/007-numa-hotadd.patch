@@ -1,0 +1,145 @@
+From: Haicheng Li <haicheng.li@linux.intel.com>
+Subject: mem-hotplug: fix potential race while building zonelist for new populated zone
+References: fate#311831,bnc#703100
+Patch-Mainline: v2.6.35-rc1
+Git-commit: 4eaf3f64397c3db3c5785eee508270d62a9fabd9
+
+Signed-off-by: Thomas Renninger <trenn@suse.de>
+
+Add global mutex zonelists_mutex to fix the possible race:
+
+     CPU0                                  CPU1                    CPU2
+(1) zone->present_pages += online_pages;
+(2)                                       build_all_zonelists();
+(3)                                                               alloc_page();
+(4)                                                               free_page();
+(5) build_all_zonelists();
+(6)   __build_all_zonelists();
+(7)     zone->pageset = alloc_percpu();
+
+In step (3,4), zone->pageset still points to boot_pageset, so bad
+things may happen if 2+ nodes are in this state. Even if only 1 node
+is accessing the boot_pageset, (3) may still consume too much memory
+to fail the memory allocations in step (7).
+
+Besides, atomic operation ensures alloc_percpu() in step (7) will never fail
+since there is a new fresh memory block added in step(6).
+
+[haicheng.li@linux.intel.com: hold zonelists_mutex when build_all_zonelists]
+Signed-off-by: Haicheng Li <haicheng.li@linux.intel.com>
+Signed-off-by: Wu Fengguang <fengguang.wu@intel.com>
+Reviewed-by: Andi Kleen <andi.kleen@intel.com>
+Cc: Christoph Lameter <cl@linux-foundation.org>
+Cc: Mel Gorman <mel@csn.ul.ie>
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+---
+ include/linux/mmzone.h |    1 +
+ kernel/cpu.c           |    5 ++++-
+ mm/memory_hotplug.c    |   11 +++--------
+ mm/page_alloc.c        |   11 ++++++++++-
+ 4 files changed, 18 insertions(+), 10 deletions(-)
+
+Index: linux-2.6.32-SLE11-SP2/include/linux/mmzone.h
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/include/linux/mmzone.h
++++ linux-2.6.32-SLE11-SP2/include/linux/mmzone.h
+@@ -657,6 +657,7 @@ typedef struct pglist_data {
+ 
+ #include <linux/memory_hotplug.h>
+ 
++extern struct mutex zonelists_mutex;
+ void get_zone_counts(unsigned long *active, unsigned long *inactive,
+ 			unsigned long *free);
+ void build_all_zonelists(void *data);
+Index: linux-2.6.32-SLE11-SP2/kernel/cpu.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/kernel/cpu.c
++++ linux-2.6.32-SLE11-SP2/kernel/cpu.c
+@@ -351,8 +351,11 @@ int __cpuinit cpu_up(unsigned int cpu)
+ 		return -ENOMEM;
+ 	}
+ 
+-	if (pgdat->node_zonelists->_zonerefs->zone == NULL)
++	if (pgdat->node_zonelists->_zonerefs->zone == NULL) {
++		mutex_lock(&zonelists_mutex);
+ 		build_all_zonelists(NULL);
++		mutex_unlock(&zonelists_mutex);
++	}
+ #endif
+ 
+ 	cpu_maps_update_begin();
+Index: linux-2.6.32-SLE11-SP2/mm/memory_hotplug.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/mm/memory_hotplug.c
++++ linux-2.6.32-SLE11-SP2/mm/memory_hotplug.c
+@@ -389,11 +389,6 @@ int online_pages(unsigned long pfn, unsi
+ 	int nid;
+ 	int ret;
+ 	struct memory_notify arg;
+-	/*
+-	 * mutex to protect zone->pageset when it's still shared
+-	 * in onlined_pages()
+-	 */
+-	static DEFINE_MUTEX(zone_pageset_mutex);
+ 
+ 	arg.start_pfn = pfn;
+ 	arg.nr_pages = nr_pages;
+@@ -420,14 +415,14 @@ int online_pages(unsigned long pfn, unsi
+ 	 * This means the page allocator ignores this zone.
+ 	 * So, zonelist must be updated after online.
+ 	 */
+-	mutex_lock(&zone_pageset_mutex);
++	mutex_lock(&zonelists_mutex);
+ 	if (!populated_zone(zone))
+ 		need_zonelists_rebuild = 1;
+ 
+ 	ret = walk_system_ram_range(pfn, nr_pages, &onlined_pages,
+ 		online_pages_range);
+ 	if (ret) {
+-		mutex_unlock(&zone_pageset_mutex);
++		mutex_unlock(&zonelists_mutex);
+ 		printk(KERN_DEBUG "online_pages %lx at %lx failed\n",
+ 			nr_pages, pfn);
+ 		memory_notify(MEM_CANCEL_ONLINE, &arg);
+@@ -441,7 +436,7 @@ int online_pages(unsigned long pfn, unsi
+ 	else
+ 		zone_pcp_update(zone);
+ 
+-	mutex_unlock(&zone_pageset_mutex);
++	mutex_unlock(&zonelists_mutex);
+ 	setup_per_zone_wmarks();
+ 	calculate_zone_inactive_ratio(zone);
+ 	if (onlined_pages) {
+Index: linux-2.6.32-SLE11-SP2/mm/page_alloc.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/mm/page_alloc.c
++++ linux-2.6.32-SLE11-SP2/mm/page_alloc.c
+@@ -2664,8 +2664,11 @@ int numa_zonelist_order_handler(ctl_tabl
+ 			strncpy((char*)table->data, saved_string,
+ 				NUMA_ZONELIST_ORDER_LEN);
+ 			user_zonelist_order = oldval;
+-		} else if (oldval != user_zonelist_order)
++		} else if (oldval != user_zonelist_order) {
++			mutex_lock(&zonelists_mutex);
+ 			build_all_zonelists(NULL);
++			mutex_unlock(&zonelists_mutex);
++		}
+ 	}
+ 	return 0;
+ }
+@@ -3007,6 +3010,12 @@ static void build_zonelist_cache(pg_data
+ 
+ static void setup_zone_pageset(struct zone *zone);
+ 
++/*
++ * Global mutex to protect against size modification of zonelists
++ * as well as to serialize pageset setup for the new populated zone.
++ */
++DEFINE_MUTEX(zonelists_mutex);
++
+ /* return values int ....just for stop_machine() */
+ static __init_refok int __build_all_zonelists(void *data)
+ {

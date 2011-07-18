@@ -1,0 +1,247 @@
+From: David Rientjes <rientjes@google.com>
+Subject: slab: add memory hotplug support
+References: fate#311831,bnc#703100
+Patch-Mainline: v2.6.35-rc1
+Git-commit: 8f9f8d9e8080a2ff46caa7decef47810d093d252
+
+Signed-off-by: Thomas Renninger <trenn@suse.de>
+
+Slab lacks any memory hotplug support for nodes that are hotplugged
+without cpus being hotplugged.  This is possible at least on x86
+CONFIG_MEMORY_HOTPLUG_SPARSE kernels where SRAT entries are marked
+ACPI_SRAT_MEM_HOT_PLUGGABLE and the regions of RAM represent a seperate
+node.  It can also be done manually by writing the start address to
+/sys/devices/system/memory/probe for kernels that have
+CONFIG_ARCH_MEMORY_PROBE set, which is how this patch was tested, and
+then onlining the new memory region.
+
+When a node is hotadded, a nodelist for that node is allocated and
+initialized for each slab cache.  If this isn't completed due to a lack
+of memory, the hotadd is aborted: we have a reasonable expectation that
+kmalloc_node(nid) will work for all caches if nid is online and memory is
+available.
+
+Since nodelists must be allocated and initialized prior to the new node's
+memory actually being online, the struct kmem_list3 is allocated off-node
+due to kmalloc_node()'s fallback.
+
+When an entire node would be offlined, its nodelists are subsequently
+drained.  If slab objects still exist and cannot be freed, the offline is
+aborted.  It is possible that objects will be allocated between this
+drain and page isolation, so it's still possible that the offline will
+still fail, however.
+
+Acked-by: Christoph Lameter <cl@linux-foundation.org>
+Signed-off-by: David Rientjes <rientjes@google.com>
+Signed-off-by: Pekka Enberg <penberg@cs.helsinki.fi>
+
+---
+ mm/slab.c |  157 +++++++++++++++++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 125 insertions(+), 32 deletions(-)
+
+Index: linux-2.6.32-SLE11-SP2/mm/slab.c
+===================================================================
+--- linux-2.6.32-SLE11-SP2.orig/mm/slab.c
++++ linux-2.6.32-SLE11-SP2/mm/slab.c
+@@ -115,6 +115,7 @@
+ #include	<linux/reciprocal_div.h>
+ #include	<linux/debugobjects.h>
+ #include	<linux/kmemcheck.h>
++#include	<linux/memory.h>
+ 
+ #include	<asm/cacheflush.h>
+ #include	<asm/tlbflush.h>
+@@ -1116,6 +1117,52 @@ static inline int cache_free_alien(struc
+ }
+ #endif
+ 
++/*
++ * Allocates and initializes nodelists for a node on each slab cache, used for
++ * either memory or cpu hotplug.  If memory is being hot-added, the kmem_list3
++ * will be allocated off-node since memory is not yet online for the new node.
++ * When hotplugging memory or a cpu, existing nodelists are not replaced if
++ * already in use.
++ *
++ * Must hold cache_chain_mutex.
++ */
++static int init_cache_nodelists_node(int node)
++{
++	struct kmem_cache *cachep;
++	struct kmem_list3 *l3;
++	const int memsize = sizeof(struct kmem_list3);
++
++	list_for_each_entry(cachep, &cache_chain, next) {
++		/*
++		 * Set up the size64 kmemlist for cpu before we can
++		 * begin anything. Make sure some other cpu on this
++		 * node has not already allocated this
++		 */
++		if (!cachep->nodelists[node]) {
++			l3 = kmalloc_node(memsize, GFP_KERNEL, node);
++			if (!l3)
++				return -ENOMEM;
++			kmem_list3_init(l3);
++			l3->next_reap = jiffies + REAPTIMEOUT_LIST3 +
++			    ((unsigned long)cachep) % REAPTIMEOUT_LIST3;
++
++			/*
++			 * The l3s don't come and go as CPUs come and
++			 * go.  cache_chain_mutex is sufficient
++			 * protection here.
++			 */
++			cachep->nodelists[node] = l3;
++		}
++
++		spin_lock_irq(&cachep->nodelists[node]->list_lock);
++		cachep->nodelists[node]->free_limit =
++			(1 + nr_cpus_node(node)) *
++			cachep->batchcount + cachep->num;
++		spin_unlock_irq(&cachep->nodelists[node]->list_lock);
++	}
++	return 0;
++}
++
+ static void __cpuinit cpuup_canceled(long cpu)
+ {
+ 	struct kmem_cache *cachep;
+@@ -1186,7 +1233,7 @@ static int __cpuinit cpuup_prepare(long
+ 	struct kmem_cache *cachep;
+ 	struct kmem_list3 *l3 = NULL;
+ 	int node = cpu_to_mem(cpu);
+-	const int memsize = sizeof(struct kmem_list3);
++	int err;
+ 
+ 	/*
+ 	 * We need to do this right in the beginning since
+@@ -1194,35 +1241,9 @@ static int __cpuinit cpuup_prepare(long
+ 	 * kmalloc_node allows us to add the slab to the right
+ 	 * kmem_list3 and not this cpu's kmem_list3
+ 	 */
+-
+-	list_for_each_entry(cachep, &cache_chain, next) {
+-		/*
+-		 * Set up the size64 kmemlist for cpu before we can
+-		 * begin anything. Make sure some other cpu on this
+-		 * node has not already allocated this
+-		 */
+-		if (!cachep->nodelists[node]) {
+-			l3 = kmalloc_node(memsize, GFP_KERNEL, node);
+-			if (!l3)
+-				goto bad;
+-			kmem_list3_init(l3);
+-			l3->next_reap = jiffies + REAPTIMEOUT_LIST3 +
+-			    ((unsigned long)cachep) % REAPTIMEOUT_LIST3;
+-
+-			/*
+-			 * The l3s don't come and go as CPUs come and
+-			 * go.  cache_chain_mutex is sufficient
+-			 * protection here.
+-			 */
+-			cachep->nodelists[node] = l3;
+-		}
+-
+-		spin_lock_irq(&cachep->nodelists[node]->list_lock);
+-		cachep->nodelists[node]->free_limit =
+-			(1 + nr_cpus_node(node)) *
+-			cachep->batchcount + cachep->num;
+-		spin_unlock_irq(&cachep->nodelists[node]->list_lock);
+-	}
++	err = init_cache_nodelists_node(node);
++	if (err < 0)
++		goto bad;
+ 
+ 	/*
+ 	 * Now we can go ahead with allocating the shared arrays and
+@@ -1343,11 +1364,75 @@ static struct notifier_block __cpuinitda
+ 	&cpuup_callback, NULL, 0
+ };
+ 
++#if defined(CONFIG_NUMA) && defined(CONFIG_MEMORY_HOTPLUG)
++/*
++ * Drains freelist for a node on each slab cache, used for memory hot-remove.
++ * Returns -EBUSY if all objects cannot be drained so that the node is not
++ * removed.
++ *
++ * Must hold cache_chain_mutex.
++ */
++static int __meminit drain_cache_nodelists_node(int node)
++{
++	struct kmem_cache *cachep;
++	int ret = 0;
++
++	list_for_each_entry(cachep, &cache_chain, next) {
++		struct kmem_list3 *l3;
++
++		l3 = cachep->nodelists[node];
++		if (!l3)
++			continue;
++
++		drain_freelist(cachep, l3, l3->free_objects);
++
++		if (!list_empty(&l3->slabs_full) ||
++		    !list_empty(&l3->slabs_partial)) {
++			ret = -EBUSY;
++			break;
++		}
++	}
++	return ret;
++}
++
++static int __meminit slab_memory_callback(struct notifier_block *self,
++					unsigned long action, void *arg)
++{
++	struct memory_notify *mnb = arg;
++	int ret = 0;
++	int nid;
++
++	nid = mnb->status_change_nid;
++	if (nid < 0)
++		goto out;
++
++	switch (action) {
++	case MEM_GOING_ONLINE:
++		mutex_lock(&cache_chain_mutex);
++		ret = init_cache_nodelists_node(nid);
++		mutex_unlock(&cache_chain_mutex);
++		break;
++	case MEM_GOING_OFFLINE:
++		mutex_lock(&cache_chain_mutex);
++		ret = drain_cache_nodelists_node(nid);
++		mutex_unlock(&cache_chain_mutex);
++		break;
++	case MEM_ONLINE:
++	case MEM_OFFLINE:
++	case MEM_CANCEL_ONLINE:
++	case MEM_CANCEL_OFFLINE:
++		break;
++	}
++out:
++	return ret ? notifier_from_errno(ret) : NOTIFY_OK;
++}
++#endif /* CONFIG_NUMA && CONFIG_MEMORY_HOTPLUG */
++
+ /*
+  * swap the static kmem_list3 with kmalloced memory
+  */
+-static void init_list(struct kmem_cache *cachep, struct kmem_list3 *list,
+-			int nodeid)
++static void __init init_list(struct kmem_cache *cachep, struct kmem_list3 *list,
++				int nodeid)
+ {
+ 	struct kmem_list3 *ptr;
+ 
+@@ -1592,6 +1677,14 @@ void __init kmem_cache_init_late(void)
+ 	 */
+ 	register_cpu_notifier(&cpucache_notifier);
+ 
++#ifdef CONFIG_NUMA
++	/*
++	 * Register a memory hotplug callback that initializes and frees
++	 * nodelists.
++	 */
++	hotplug_memory_notifier(slab_memory_callback, SLAB_CALLBACK_PRI);
++#endif
++
+ 	/*
+ 	 * The reap timers are started later, with a module init call: That part
+ 	 * of the kernel is not yet operational.
