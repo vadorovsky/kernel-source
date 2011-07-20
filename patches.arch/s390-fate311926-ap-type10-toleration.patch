@@ -1,0 +1,230 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: ap: Toleration for ap bus devices with device type 10.
+References: bnc#703653,LTC#69692,FATE#311926
+Patch-mainline: 3.1
+
+Description: This feature implements toleration of ap bus devices with
+             device type 10 and treat them like CEX3A or CEX3C cards.
+
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/crypto/Kconfig       |    2 
+ drivers/s390/crypto/ap_bus.c |  100 +++++++++++++++++++++++++++++++------------
+ drivers/s390/crypto/ap_bus.h |   20 ++++++++
+ 3 files changed, 96 insertions(+), 26 deletions(-)
+
+--- a/drivers/crypto/Kconfig
++++ b/drivers/crypto/Kconfig
+@@ -74,6 +74,8 @@ config ZCRYPT
+ 	  + PCI-X Cryptographic Coprocessor (PCIXCC)
+ 	  + Crypto Express2 Coprocessor (CEX2C)
+ 	  + Crypto Express2 Accelerator (CEX2A)
++	  + Crypto Express3 Coprocessor (CEX3C)
++	  + Crypto Express3 Accelerator (CEX3A)
+ 
+ config ZCRYPT_MONOLITHIC
+ 	bool "Monolithic zcrypt module"
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@ -6,6 +6,7 @@
+  *	      Martin Schwidefsky <schwidefsky@de.ibm.com>
+  *	      Ralph Wuerthner <rwuerthn@de.ibm.com>
+  *	      Felix Beck <felix.beck@de.ibm.com>
++ *	      Holger Dengler <hd@linux.vnet.ibm.com>
+  *
+  * Adjunct processor bus.
+  *
+@@ -227,47 +228,52 @@ ap_queue_interruption_control(ap_qid_t q
+ }
+ #endif
+ 
+-static inline struct ap_queue_status __ap_4096_commands_available(ap_qid_t qid,
+-								  int *support)
++#ifdef CONFIG_64BIT
++static inline struct ap_queue_status
++__ap_query_functions(ap_qid_t qid, unsigned int *functions)
+ {
+ 	register unsigned long reg0 asm ("0") = 0UL | qid | (1UL << 23);
+-	register struct ap_queue_status reg1 asm ("1");
+-	register unsigned long reg2 asm ("2") = 0UL;
++	register struct ap_queue_status reg1 asm ("1") = AP_QUEUE_STATUS_INVALID;
++	register unsigned long reg2 asm ("2");
+ 
+ 	asm volatile(
+ 		".long 0xb2af0000\n"
+-		"0: la    %1,0\n"
+-		"1:\n"
+-		EX_TABLE(0b, 1b)
+-		: "+d" (reg0), "=d" (reg1), "=d" (reg2)
++		"0:\n"
++		EX_TABLE(0b, 0b)
++		: "+d" (reg0), "+d" (reg1), "=d" (reg2)
+ 		:
+ 		: "cc");
+ 
+-	if (reg2 & 0x6000000000000000ULL)
+-		*support = 1;
+-	else
+-		*support = 0;
+-
++	*functions = (unsigned int)(reg2 >> 32);
+ 	return reg1;
+ }
++#endif
+ 
+ /**
+- * ap_4096_commands_availablen(): Check for availability of 4096 bit RSA
+- * support.
++ * ap_query_functions(): Query supported functions.
+  * @qid: The AP queue number
++ * @functions: Pointer to functions field.
+  *
+- * Returns 1 if 4096 bit RSA keys are support fo the AP, returns 0 if not.
++ * Returns
++ *   0        on success.
++ *   -ENODEV  if queue not valid.
++ *   -EBUSY   if device busy.
++ *   -EINVAL  if query function is not supported
+  */
+-int ap_4096_commands_available(ap_qid_t qid)
++static int ap_query_functions(ap_qid_t qid, unsigned int *functions)
+ {
++#ifdef CONFIG_64BIT
+ 	struct ap_queue_status status;
+-	int i, support = 0;
+-	status = __ap_4096_commands_available(qid, &support);
++	int i;
++	status = __ap_query_functions(qid, functions);
+ 
+ 	for (i = 0; i < AP_MAX_RESET; i++) {
++		if (ap_queue_status_invalid_test(&status))
++			return -ENODEV;
++
+ 		switch (status.response_code) {
+ 		case AP_RESPONSE_NORMAL:
+-			return support;
++			return 0;
+ 		case AP_RESPONSE_RESET_IN_PROGRESS:
+ 		case AP_RESPONSE_BUSY:
+ 			break;
+@@ -275,7 +281,7 @@ int ap_4096_commands_available(ap_qid_t
+ 		case AP_RESPONSE_DECONFIGURED:
+ 		case AP_RESPONSE_CHECKSTOPPED:
+ 		case AP_RESPONSE_INVALID_ADDRESS:
+-			return 0;
++			return -ENODEV;
+ 		case AP_RESPONSE_OTHERWISE_CHANGED:
+ 			break;
+ 		default:
+@@ -283,10 +289,31 @@ int ap_4096_commands_available(ap_qid_t
+ 		}
+ 		if (i < AP_MAX_RESET - 1) {
+ 			udelay(5);
+-			status = __ap_4096_commands_available(qid, &support);
++			status = __ap_query_functions(qid, functions);
+ 		}
+ 	}
+-	return support;
++	return -EBUSY;
++#else
++	return -EINVAL;
++#endif
++}
++
++/**
++ * ap_4096_commands_availablen(): Check for availability of 4096 bit RSA
++ * support.
++ * @qid: The AP queue number
++ *
++ * Returns 1 if 4096 bit RSA keys are support fo the AP, returns 0 if not.
++ */
++int ap_4096_commands_available(ap_qid_t qid)
++{
++	unsigned int functions;
++
++	if (ap_query_functions(qid, &functions))
++		return 0;
++
++	return test_ap_facility(functions, 1) &&
++	       test_ap_facility(functions, 2);
+ }
+ EXPORT_SYMBOL(ap_4096_commands_available);
+ 
+@@ -1139,6 +1166,7 @@ static void ap_scan_bus(struct work_stru
+ 	struct device *dev;
+ 	ap_qid_t qid;
+ 	int queue_depth, device_type;
++	unsigned int device_functions;
+ 	int rc, i;
+ 
+ 	if (ap_select_domain() != 0)
+@@ -1187,10 +1215,30 @@ static void ap_scan_bus(struct work_stru
+ 		INIT_LIST_HEAD(&ap_dev->list);
+ 		setup_timer(&ap_dev->timeout, ap_request_timeout,
+ 			    (unsigned long) ap_dev);
+-		if (device_type == 0)
+-			ap_probe_device_type(ap_dev);
+-		else
++		switch (device_type) {
++		case 0:
++			if (ap_probe_device_type(ap_dev)) {
++				kfree(ap_dev);
++				continue;
++			}
++			break;
++		case 10:
++			if (ap_query_functions(qid, &device_functions)) {
++				kfree(ap_dev);
++				continue;
++			}
++			if (test_ap_facility(device_functions, 3))
++				ap_dev->device_type = AP_DEVICE_TYPE_CEX3C;
++			else if (test_ap_facility(device_functions, 4))
++				ap_dev->device_type = AP_DEVICE_TYPE_CEX3A;
++			else {
++				kfree(ap_dev);
++				continue;
++			}
++			break;
++		default:
+ 			ap_dev->device_type = device_type;
++		}
+ 
+ 		ap_dev->device.bus = &ap_bus_type;
+ 		ap_dev->device.parent = ap_root_device;
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@ -6,6 +6,7 @@
+  *	      Martin Schwidefsky <schwidefsky@de.ibm.com>
+  *	      Ralph Wuerthner <rwuerthn@de.ibm.com>
+  *	      Felix Beck <felix.beck@de.ibm.com>
++ *	      Holger Dengler <hd@linux.vnet.ibm.com>
+  *
+  * Adjunct processor bus header file.
+  *
+@@ -74,6 +75,25 @@ struct ap_queue_status {
+ 	unsigned int pad2		: 16;
+ };
+ 
++#define AP_QUEUE_STATUS_INVALID \
++		{ 1, 1, 1, 0xF, 1, 0xFF, 0xFFFF }
++
++static inline
++int ap_queue_status_invalid_test(struct ap_queue_status *status)
++{
++	struct ap_queue_status invalid = AP_QUEUE_STATUS_INVALID;
++	return !(memcmp(status, &invalid, sizeof(struct ap_queue_status)));
++}
++
++#define MAX_AP_FACILITY 31
++
++static inline int test_ap_facility(unsigned int function, unsigned int nr)
++{
++	if (nr > MAX_AP_FACILITY)
++		return 0;
++	return function & (unsigned int)(0x80000000 >> nr);
++}
++
+ #define AP_RESPONSE_NORMAL		0x00
+ #define AP_RESPONSE_Q_NOT_AVAIL		0x01
+ #define AP_RESPONSE_RESET_IN_PROGRESS	0x02
