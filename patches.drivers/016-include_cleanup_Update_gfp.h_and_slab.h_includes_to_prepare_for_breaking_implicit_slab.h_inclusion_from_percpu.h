@@ -2,7 +2,7 @@ From: "Lee, Chun-Yi" <jlee@suse.com>
 Subject: [PATCHv2 16/33] include cleanup: Update gfp.h and slab.h includes to prepare for breaking implicit slab.h inclusion from percpu.h
 Patch-mainline: 2.6.34
 Git-commit: 5a0e3ad6af8660be21ca98a971cd00f331318c05
-References: bnc#699087, fate#3311862
+References: bnc#699087, fate#311862
 
 From: Tejun Heo <tj@kernel.org>
 
