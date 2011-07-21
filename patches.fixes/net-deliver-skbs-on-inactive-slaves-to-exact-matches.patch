@@ -1,0 +1,133 @@
+From: John Fastabend <john.r.fastabend@intel.com>
+Subject: net: deliver skbs on inactive slaves to exact matches
+Patch-mainline: 2.6.35
+Git-commit: 597a264b1a9c7e36d1728f677c66c5c1f7e3b837
+References: bnc#649355
+Acked-by: Jiri Bohac <jbohac@suse.cz>
+    
+Currently, the accelerated receive path for VLAN's will
+drop packets if the real device is an inactive slave and
+is not one of the special pkts tested for in
+skb_bond_should_drop().  This behavior is different then
+the non-accelerated path and for pkts over a bonded vlan.
+
+For example,
+
+vlanx -> bond0 -> ethx
+
+will be dropped in the vlan path and not delivered to any
+packet handlers at all.  However,
+
+bond0 -> vlanx -> ethx
+
+and
+
+bond0 -> ethx
+
+will be delivered to handlers that match the exact dev,
+because the VLAN path checks the real_dev which is not a
+slave and netif_recv_skb() doesn't drop frames but only
+delivers them to exact matches.
+
+This patch adds a sk_buff flag which is used for tagging
+skbs that would previously been dropped and allows the
+skb to continue to skb_netif_recv().  Here we add
+logic to check for the deliver_no_wcard flag and if it
+is set only deliver to handlers that match exactly.  This
+makes both paths above consistent and gives pkt handlers
+a way to identify skbs that come from inactive slaves.
+Without this patch in some configurations skbs will be
+delivered to handlers with exact matches and in others
+be dropped out right in the vlan path.
+
+I have tested the following 4 configurations in failover modes
+and load balancing modes.
+
+# bond0 -> ethx
+
+# vlanx -> bond0 -> ethx
+
+# bond0 -> vlanx -> ethx
+
+# bond0 -> ethx
+	|
+vlanx -> --
+
+Signed-off-by: John Fastabend <john.r.fastabend@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -379,6 +379,7 @@ struct sk_buff {
+ #ifdef CONFIG_IPV6_NDISC_NODETYPE
+ 	__u8			ndisc_nodetype:2;
+ #endif
++	__u8			deliver_no_wcard:1;
+ #ifdef	CONFIG_NETVM
+ 	__u8			emergency:1;
+ #endif
+diff --git a/net/8021q/vlan_core.c b/net/8021q/vlan_core.c
+index a9a19f9..fa1c705 100644
+--- a/net/8021q/vlan_core.c
++++ b/net/8021q/vlan_core.c
+@@ -15,7 +15,7 @@ int __vlan_hwaccel_rx(struct sk_buff *skb, struct vlan_group *grp,
+ 		return NET_RX_DROP;
+ 
+ 	if (skb_bond_should_drop(skb))
+-		goto drop;
++		skb->deliver_no_wcard = 1;
+ 
+ 	skb->iif = skb->dev->ifindex;
+ 	skb->vlan_tci = vlan_tci;
+@@ -89,7 +89,7 @@ static int vlan_gro_common(struct napi_struct *napi, struct vlan_group *grp,
+ 	u16 vlan_id;
+ 
+ 	if (skb_bond_should_drop(skb))
+-		goto drop;
++		skb->deliver_no_wcard = 1;
+ 
+ 	skb->iif = skb->dev->ifindex;
+ 	skb->vlan_tci = vlan_tci;
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 840e109..cee7aff 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2466,6 +2466,7 @@ int netif_receive_skb(struct sk_buff *skb)
+ 	struct net_device *orig_dev;
+ 	struct net_device *null_or_orig;
+ 	struct net_device *orig_or_bond;
++	struct net_device *master;
+ 	int ret = NET_RX_DROP;
+ 	__be16 type;
+ 	unsigned long pflags = current->flags;
+@@ -2499,13 +2500,25 @@ int netif_receive_skb(struct sk_buff *skb)
+ 	skb_reset_transport_header(skb);
+ 	skb->mac_len = skb->network_header - skb->mac_header;
+ 
+++	/*
+++	 * bonding note: skbs received on inactive slaves should only
+++	 * be delivered to pkt handlers that are exact matches.  Also
+++	 * the deliver_no_wcard flag will be set.  If packet handlers
+++	 * are sensitive to duplicate packets these skbs will need to
+++	 * be dropped at the handler.  The vlan accel path may have
+++	 * already set the deliver_no_wcard flag.
+++	 */
+ 	null_or_orig = NULL;
+ 	orig_dev = skb->dev;
+-	if (orig_dev->master) {
+-		if (skb_bond_should_drop(skb))
++	master = ACCESS_ONCE(orig_dev->master);
++	if (skb->deliver_no_wcard)
++		null_or_orig = orig_dev;
++	else if (master) {
++		if (skb_bond_should_drop(skb)) {
++			skb->deliver_no_wcard = 1;
+ 			null_or_orig = orig_dev; /* deliver only exact match */
+-		else
+-			skb->dev = orig_dev->master;
++		} else
++			skb->dev = master;
+ 	}
+ 
+ 	__get_cpu_var(netdev_rx_stat).total++;
