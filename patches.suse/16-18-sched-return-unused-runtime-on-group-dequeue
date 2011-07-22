@@ -1,8 +1,8 @@
-Subject: [patch 14/15] sched: return unused runtime on voluntary sleep
+Subject: sched: return unused runtime on group dequeue
 From: Paul Turner <pjt@google.com>
-Date: Tue, 03 May 2011 02:29:00 -0700
-Patch-mainline: no
-References:
+Date: Thu, 21 Jul 2011 09:43:41 -0700
+Patch-mainline: not yet
+References: FATE#311682
 
 When a local cfs_rq blocks we return the majority of its remaining quota to the
 global bandwidth pool for use by other runqueues.
@@ -50,24 +50,24 @@ Signed-off-by: Paul Turner <pjt@google.com>
 Acked-by: Mike Galbraith <mgalbraith@suse.de>
 
 ---
- kernel/sched.c      |   15 +++++++
- kernel/sched_fair.c |  102 ++++++++++++++++++++++++++++++++++++++++++++++++++--
- 2 files changed, 113 insertions(+), 4 deletions(-)
+ kernel/sched.c      |   15 ++++++-
+ kernel/sched_fair.c |  108 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 122 insertions(+), 1 deletion(-)
 
 Index: linux-2.6.32-SLE11-SP2/kernel/sched.c
 ===================================================================
 --- linux-2.6.32-SLE11-SP2.orig/kernel/sched.c
 +++ linux-2.6.32-SLE11-SP2/kernel/sched.c
-@@ -254,7 +254,7 @@ struct cfs_bandwidth {
- 	s64 hierarchal_quota;
+@@ -253,7 +253,7 @@ struct cfs_bandwidth {
+ 	u64 runtime_expires;
  
- 	int idle;
+ 	int idle, timer_active;
 -	struct hrtimer period_timer;
 +	struct hrtimer period_timer, slack_timer;
  	struct list_head throttled_cfs_rq;
  
  	/* statistics */
-@@ -447,6 +447,16 @@ static inline struct cfs_bandwidth *tg_c
+@@ -446,6 +446,16 @@ static inline struct cfs_bandwidth *tg_c
  
  static inline u64 default_cfs_period(void);
  static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun);
@@ -84,63 +84,52 @@ Index: linux-2.6.32-SLE11-SP2/kernel/sched.c
  
  static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
  {
-@@ -479,6 +489,8 @@ static void init_cfs_bandwidth(struct cf
+@@ -478,6 +488,8 @@ static void init_cfs_bandwidth(struct cf
  	INIT_LIST_HEAD(&cfs_b->throttled_cfs_rq);
  	hrtimer_init(&cfs_b->period_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
  	cfs_b->period_timer.function = sched_cfs_period_timer;
 +	hrtimer_init(&cfs_b->slack_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 +	cfs_b->slack_timer.function = sched_cfs_slack_timer;
- 
  }
  
-@@ -507,6 +519,7 @@ static void start_cfs_bandwidth(struct c
+ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+@@ -513,6 +525,7 @@ static void __start_cfs_bandwidth(struct
  static void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
  {
  	hrtimer_cancel(&cfs_b->period_timer);
 +	hrtimer_cancel(&cfs_b->slack_timer);
  }
  #else
- #ifdef CONFIG_FAIR_GROUP_SCHED
+ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
 Index: linux-2.6.32-SLE11-SP2/kernel/sched_fair.c
 ===================================================================
 --- linux-2.6.32-SLE11-SP2.orig/kernel/sched_fair.c
 +++ linux-2.6.32-SLE11-SP2/kernel/sched_fair.c
-@@ -1416,20 +1416,25 @@ static void throttle_cfs_rq(struct cfs_r
- 	spin_unlock(&cfs_b->lock);
+@@ -1039,6 +1039,8 @@ static void clear_buddies(struct cfs_rq
+ 		__clear_buddies_next(se);
  }
  
-+static void return_cfs_rq_quota(struct cfs_rq *cfs_rq);
++static void return_cfs_rq_runtime(struct cfs_rq *cfs_rq);
 +
- /* conditionally throttle active cfs_rq's from put_prev_entity() */
- static void check_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ static void
+ dequeue_entity(struct cfs_rq *cfs_rq, struct sched_entity *se, int flags)
  {
--	if (!cfs_rq->runtime_enabled || cfs_rq->runtime_remaining > 0)
-+	if (!cfs_rq->runtime_enabled)
- 		return;
+@@ -1077,6 +1079,9 @@ dequeue_entity(struct cfs_rq *cfs_rq, st
+ 	if (!(flags & DEQUEUE_SLEEP))
+ 		se->vruntime -= cfs_rq->min_vruntime;
  
- 	/*
- 	 * it's possible active load balance has forced a throttled cfs_rq to
--	 * run again, we don't want to re-throttled in this case.
-+	 * run again, we don't want to re-throttle in this case.
- 	 */
- 	if (cfs_rq_throttled(cfs_rq))
- 		return;
- 
--	throttle_cfs_rq(cfs_rq);
-+	if (cfs_rq->runtime_remaining <= 0)
-+		throttle_cfs_rq(cfs_rq);
-+	else if (!cfs_rq->load.weight)
-+		return_cfs_rq_quota(cfs_rq);
++	/* return excess runtime on last dequeue */
++	return_cfs_rq_runtime(cfs_rq);
++
+ 	update_min_vruntime(cfs_rq);
+ 	update_cfs_shares(cfs_rq);
  }
- 
- /*
-@@ -1595,6 +1600,97 @@ out_unlock:
- out:
+@@ -1641,6 +1646,108 @@ out_unlock:
  	return idle;
  }
-+
+ 
 +/* a cfs_rq won't donate quota below this amount */
-+static const u64 min_cfs_rq_quota = 1 * NSEC_PER_MSEC;
++static const u64 min_cfs_rq_runtime = 1 * NSEC_PER_MSEC;
 +/* minimum remaining period time to redistribute slack quota */
 +static const u64 min_bandwidth_expiration = 2 * NSEC_PER_MSEC;
 +/* how long we wait to gather additional slack before distributing */
@@ -152,7 +141,7 @@ Index: linux-2.6.32-SLE11-SP2/kernel/sched_fair.c
 +	struct hrtimer *refresh_timer = &cfs_b->period_timer;
 +	u64 remaining;
 +
-+	/* if the call back is running a quota refresh is occurring */
++	/* if the call-back is running a quota refresh is already occurring */
 +	if (hrtimer_callback_running(refresh_timer))
 +		return 1;
 +
@@ -176,31 +165,43 @@ Index: linux-2.6.32-SLE11-SP2/kernel/sched_fair.c
 +				ns_to_ktime(cfs_bandwidth_slack_period));
 +}
 +
-+static void return_cfs_rq_quota(struct cfs_rq *cfs_rq)
++/* we know any runtime found here is valid as update_curr() precedes return */
++static void __return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
 +{
 +	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
-+	s64 slack_runtime = cfs_rq->runtime_remaining - min_cfs_rq_quota;
-+
-+	if (!cfs_rq->runtime_enabled || cfs_rq->load.weight)
-+		return;
++	s64 slack_runtime = cfs_rq->runtime_remaining - min_cfs_rq_runtime;
 +
 +	if (slack_runtime <= 0)
 +		return;
 +
 +	spin_lock(&cfs_b->lock);
 +	if (cfs_b->quota != RUNTIME_INF &&
-+	    cfs_b->runtime_expires == cfs_rq->runtime_expires) {
++	    cfs_rq->runtime_expires == cfs_b->runtime_expires) {
 +		cfs_b->runtime += slack_runtime;
 +
++		/* we are under rq->lock, defer unthrottling using a timer */
 +		if (cfs_b->runtime > sched_cfs_bandwidth_slice() &&
 +		    !list_empty(&cfs_b->throttled_cfs_rq))
 +			start_cfs_slack_bandwidth(cfs_b);
 +	}
 +	spin_unlock(&cfs_b->lock);
 +
++	/* even if it's not valid for return we don't want to try again */
 +	cfs_rq->runtime_remaining -= slack_runtime;
 +}
 +
++static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
++{
++	if (!cfs_rq->runtime_enabled || !cfs_rq->nr_running)
++		return;
++
++	__return_cfs_rq_runtime(cfs_rq);
++}
++
++/*
++ * This is done with a timer (instead of inline with bandwidth return) since
++ * it's necessary to juggle rq->locks to unthrottle their respective cfs_rqs.
++ */
 +static void do_sched_cfs_slack_timer(struct cfs_bandwidth *cfs_b)
 +{
 +	u64 runtime = 0, slice = sched_cfs_bandwidth_slice();
@@ -229,6 +230,14 @@ Index: linux-2.6.32-SLE11-SP2/kernel/sched_fair.c
 +	spin_unlock(&cfs_b->lock);
 +}
 +
- #else
- static void account_cfs_rq_runtime(struct cfs_rq *cfs_rq,
- 		unsigned long delta_exec) {}
+ /*
+  * When a group wakes up we want to make sure that its quota is not already
+  * expired/exceeded, otherwise it may be allowed to steal additional ticks of
+@@ -1682,6 +1789,7 @@ static void account_cfs_rq_runtime(struc
+ 				     unsigned long delta_exec) {}
+ static void check_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
+ static void check_enqueue_throttle(struct cfs_rq *cfs_rq) {}
++static void return_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
+ 
+ static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq)
+ {
