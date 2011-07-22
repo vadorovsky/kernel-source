@@ -1,0 +1,360 @@
+From: Frederic Weisbecker <fweisbec@gmail.com>
+Date: Wed, 9 Sep 2009 19:22:48 +0200
+Subject: hw-breakpoints: Rewrite the hw-breakpoints layer on top of perf events
+Patch-mainline: v2.6.33-rc1
+
+This patch rebase the implementation of the breakpoints API on top of
+perf events instances.
+
+Each breakpoints are now perf events that handle the
+register scheduling, thread/cpu attachment, etc..
+
+The new layering is now made as follows:
+
+       ptrace       kgdb      ftrace   perf syscall
+          \          |          /         /
+           \         |         /         /
+                                        /
+            Core breakpoint API        /
+                                      /
+                     |               /
+                     |              /
+
+              Breakpoints perf events
+
+                     |
+                     |
+
+               Breakpoints PMU ---- Debug Register constraints handling
+                                    (Part of core breakpoint API)
+                     |
+                     |
+
+             Hardware debug registers
+
+Reasons of this rewrite:
+
+- Use the centralized/optimized pmu registers scheduling,
+  implying an easier arch integration
+- More powerful register handling: perf attributes (pinned/flexible
+  events, exclusive/non-exclusive, tunable period, etc...)
+
+Impact:
+
+- New perf ABI: the hardware breakpoints counters
+- Ptrace breakpoints setting remains tricky and still needs some per
+  thread breakpoints references.
+
+Todo (in the order):
+
+- Support breakpoints perf counter events for perf tools (ie: implement
+  perf_bpcounter_event())
+- Support from perf tools
+
+Changes in v2:
+
+- Follow the perf "event " rename
+- The ptrace regression have been fixed (ptrace breakpoint perf events
+  weren't released when a task ended)
+- Drop the struct hw_breakpoint and store generic fields in
+  perf_event_attr.
+- Separate core and arch specific headers, drop
+  asm-generic/hw_breakpoint.h and create linux/hw_breakpoint.h
+- Use new generic len/type for breakpoint
+- Handle off case: when breakpoints api is not supported by an arch
+
+Changes in v3:
+
+- Fix broken CONFIG_KVM, we need to propagate the breakpoint api
+  changes to kvm when we exit the guest and restore the bp registers
+  to the host.
+
+Changes in v4:
+
+- Drop the hw_breakpoint_restore() stub as it is only used by KVM
+- EXPORT_SYMBOL_GPL hw_breakpoint_restore() as KVM can be built as a
+  module
+- Restore the breakpoints unconditionally on kvm guest exit:
+  TIF_DEBUG_THREAD doesn't anymore cover every cases of running
+  breakpoints and vcpu->arch.switch_db_regs might not always be
+  set when the guest used debug registers.
+  (Waiting for a reliable optimization)
+
+Changes in v5:
+
+- Split-up the asm-generic/hw-breakpoint.h moving to
+  linux/hw_breakpoint.h into a separate patch
+- Optimize the breakpoints restoring while switching from kvm guest
+  to host. We only want to restore the state if we have active
+  breakpoints to the host, otherwise we don't care about messed-up
+  address registers.
+- Add asm/hw_breakpoint.h to Kbuild
+- Fix bad breakpoint type in trace_selftest.c
+
+Changes in v6:
+
+- Fix wrong header inclusion in trace.h (triggered a build
+  error with CONFIG_FTRACE_SELFTEST
+
+Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+Cc: Prasad <prasad@linux.vnet.ibm.com>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Ingo Molnar <mingo@elte.hu>
+Cc: Jan Kiszka <jan.kiszka@web.de>
+Cc: Jiri Slaby <jirislaby@gmail.com>
+Cc: Li Zefan <lizf@cn.fujitsu.com>
+Cc: Avi Kivity <avi@redhat.com>
+Cc: Paul Mackerras <paulus@samba.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Masami Hiramatsu <mhiramat@redhat.com>
+Cc: Paul Mundt <lethal@linux-sh.org>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+Automatically created from "patches.suse/hw-breakpoints-rewrite-the-hw-breakpoints-layer-on-top-of-perf-events" by xen-port-patches.py
+
+--- sle11sp2-2011-07-15.orig/arch/x86/Kconfig	2011-07-15 12:52:12.000000000 +0200
++++ sle11sp2-2011-07-15/arch/x86/Kconfig	2011-06-14 00:00:00.000000000 +0200
+@@ -24,7 +24,7 @@ config X86
+ 	select HAVE_UNSTABLE_SCHED_CLOCK
+ 	select HAVE_IDE
+ 	select HAVE_OPROFILE
+-	select HAVE_PERF_EVENTS if (!M386 && !M486 && !XEN)
++	select HAVE_PERF_EVENTS if (!M386 && !M486)
+ 	select HAVE_IOREMAP_PROT
+ 	select HAVE_KPROBES
+ 	select ARCH_WANT_OPTIONAL_GPIOLIB
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ sle11sp2-2011-07-15/arch/x86/include/mach-xen/asm/perf_event.h	2010-11-22 13:16:04.000000000 +0100
+@@ -0,0 +1,17 @@
++#ifndef _ASM_X86_PERF_EVENT_H
++#define _ASM_X86_PERF_EVENT_H
++
++#ifdef CONFIG_PERF_EVENTS
++
++/*
++ * Abuse bit 3 of the cpu eflags register to indicate proper PEBS IP fixups.
++ * This flag is otherwise unused and ABI specified to be 0, so nobody should
++ * care what we do with it.
++ */
++#define PERF_EFLAGS_EXACT	(1UL << 3)
++
++#endif
++
++static inline void init_hw_perf_events(void) {}
++
++#endif /* _ASM_X86_PERF_EVENT_H */
+--- sle11sp2-2011-07-15.orig/arch/x86/include/mach-xen/asm/processor.h	2011-07-15 14:08:31.000000000 +0200
++++ sle11sp2-2011-07-15/arch/x86/include/mach-xen/asm/processor.h	2011-07-15 14:14:20.000000000 +0200
+@@ -445,6 +445,8 @@ extern unsigned int xstate_size;
+ extern void free_thread_xstate(struct task_struct *);
+ extern struct kmem_cache *task_xstate_cachep;
+ 
++struct perf_event;
++
+ struct thread_struct {
+ 	/* Cached TLS descriptors: */
+ 	struct desc_struct	tls_array[GDT_ENTRY_TLS_ENTRIES];
+@@ -465,12 +467,10 @@ struct thread_struct {
+ 	unsigned long		fs;
+ #endif
+ 	unsigned long		gs;
+-	/* Hardware debugging registers: */
+-	unsigned long		debugreg[HBP_NUM];
+-	unsigned long		debugreg6;
+-	unsigned long		debugreg7;
+-	/* Hardware breakpoint info */
+-	struct hw_breakpoint	*hbp[HBP_NUM];
++	/* Save middle states of ptrace breakpoints */
++	struct perf_event	*ptrace_bps[HBP_NUM];
++	/* Debug status used for traps, single steps, etc... */
++	unsigned long           debugreg6;
+ 	/* Fault info: */
+ 	unsigned long		cr2;
+ 	unsigned long		trap_no;
+--- sle11sp2-2011-07-15.orig/arch/x86/kernel/cpu/Makefile	2011-06-14 12:26:33.000000000 +0200
++++ sle11sp2-2011-07-15/arch/x86/kernel/cpu/Makefile	2011-06-14 14:18:51.000000000 +0200
+@@ -34,7 +34,7 @@ obj-$(CONFIG_CPU_FREQ)			+= cpufreq/
+ 
+ obj-$(CONFIG_X86_LOCAL_APIC)		+= perfctr-watchdog.o
+ 
+-disabled-obj-$(CONFIG_XEN) := hypervisor.o perfctr-watchdog.o sched.o vmware.o
++disabled-obj-$(CONFIG_XEN) := hypervisor.o perfctr-watchdog.o perf_event.o sched.o vmware.o
+ 
+ quiet_cmd_mkcapflags = MKCAP   $@
+       cmd_mkcapflags = $(PERL) $(srctree)/$(src)/mkcapflags.pl $< $@
+--- sle11sp2-2011-07-15.orig/arch/x86/kernel/cpu/common-xen.c	2011-06-28 13:17:04.000000000 +0200
++++ sle11sp2-2011-07-15/arch/x86/kernel/cpu/common-xen.c	2011-06-28 13:58:30.000000000 +0200
+@@ -950,6 +950,10 @@ void __init identify_boot_cpu(void)
+ 	init_hw_perf_events();
+ }
+ 
++#ifdef CONFIG_XEN
++void set_perf_event_pending(void) {}
++#endif
++
+ void __cpuinit identify_secondary_cpu(struct cpuinfo_x86 *c)
+ {
+ 	BUG_ON(c == &boot_cpu_data);
+--- sle11sp2-2011-07-15.orig/arch/x86/kernel/process-xen.c	2011-07-15 14:12:29.000000000 +0200
++++ sle11sp2-2011-07-15/arch/x86/kernel/process-xen.c	2011-07-15 14:14:04.000000000 +0200
+@@ -10,6 +10,7 @@
+ #include <linux/clockchips.h>
+ #include <linux/random.h>
+ #include <trace/events/power.h>
++#include <linux/hw_breakpoint.h>
+ #include <asm/system.h>
+ #include <asm/apic.h>
+ #include <asm/syscalls.h>
+@@ -18,7 +19,6 @@
+ #include <asm/i387.h>
+ #include <asm/ds.h>
+ #include <asm/debugreg.h>
+-#include <asm/hw_breakpoint.h>
+ #include <xen/evtchn.h>
+ 
+ unsigned long idle_halt;
+@@ -46,9 +46,6 @@ int arch_dup_task_struct(struct task_str
+ void free_thread_xstate(struct task_struct *tsk)
+ {
+ 	fpu_free(&tsk->thread.fpu);
+-	if (unlikely(test_tsk_thread_flag(tsk, TIF_DEBUG)))
+-		flush_thread_hw_breakpoint(tsk);
+- 
+ 	WARN(tsk->thread.ds_ctx, "leaking DS context\n");
+ }
+ 
+@@ -95,8 +92,7 @@ void flush_thread(void)
+ {
+ 	struct task_struct *tsk = current;
+ 
+-	if (unlikely(test_tsk_thread_flag(tsk, TIF_DEBUG)))
+-		flush_thread_hw_breakpoint(tsk);
++	flush_ptrace_hw_breakpoint(tsk);
+ 	memset(tsk->thread.tls_array, 0, sizeof(tsk->thread.tls_array));
+ 	/*
+ 	 * Forget coprocessor state..
+--- sle11sp2-2011-07-15.orig/arch/x86/kernel/process_32-xen.c	2011-07-15 14:12:21.000000000 +0200
++++ sle11sp2-2011-07-15/arch/x86/kernel/process_32-xen.c	2011-07-15 14:14:06.000000000 +0200
+@@ -61,7 +61,6 @@
+ #include <asm/syscalls.h>
+ #include <asm/ds.h>
+ #include <asm/debugreg.h>
+-#include <asm/hw_breakpoint.h>
+ 
+ asmlinkage void ret_from_fork(void) __asm__("ret_from_fork");
+ asmlinkage void cstar_ret_from_fork(void) __asm__("cstar_ret_from_fork");
+@@ -269,9 +268,8 @@ int copy_thread(unsigned long clone_flag
+ 	if (test_tsk_thread_flag(tsk, TIF_CSTAR))
+ 		p->thread.ip = (unsigned long) cstar_ret_from_fork;
+ 	err = -ENOMEM;
+-	if (unlikely(test_tsk_thread_flag(tsk, TIF_DEBUG)))
+-		if (copy_thread_hw_breakpoint(tsk, p, clone_flags))
+-			goto out;
++
++	memset(p->thread.ptrace_bps, 0, sizeof(p->thread.ptrace_bps));
+ 
+ 	if (unlikely(test_tsk_thread_flag(tsk, TIF_IO_BITMAP))) {
+ 		p->thread.io_bitmap_ptr = kmemdup(tsk->thread.io_bitmap_ptr,
+@@ -294,13 +292,10 @@ int copy_thread(unsigned long clone_flag
+ 
+ 	p->thread.iopl = current->thread.iopl;
+ 
+-out:
+ 	if (err && p->thread.io_bitmap_ptr) {
+ 		kfree(p->thread.io_bitmap_ptr);
+ 		p->thread.io_bitmap_max = 0;
+ 	}
+-	if (err)
+-		flush_thread_hw_breakpoint(p);
+ 
+ 	clear_tsk_thread_flag(p, TIF_DS_AREA_MSR);
+ 	p->thread.ds_ctx = NULL;
+@@ -503,23 +498,6 @@ __switch_to(struct task_struct *prev_p, 
+ 		lazy_load_gs(next->gs);
+ 
+ 	percpu_write(current_task, next_p);
+-	/*
+-	 * There's a problem with moving the arch_install_thread_hw_breakpoint()
+-	 * call before current is updated.  Suppose a kernel breakpoint is
+-	 * triggered in between the two, the hw-breakpoint handler will see that
+-	 * the 'current' task does not have TIF_DEBUG flag set and will think it
+-	 * is leftover from an old task (lazy switching) and will erase it. Then
+-	 * until the next context switch, no user-breakpoints will be installed.
+-	 *
+-	 * The real problem is that it's impossible to update both current and
+-	 * physical debug registers at the same instant, so there will always be
+-	 * a window in which they disagree and a breakpoint might get triggered.
+-	 * Since we use lazy switching, we are forced to assume that a
+-	 * disagreement means that current is correct and the exception is due
+-	 * to lazy debug register switching.
+-	 */
+-	if (unlikely(test_tsk_thread_flag(next_p, TIF_DEBUG)))
+-		arch_install_thread_hw_breakpoint(next_p);
+ 
+ 	return prev_p;
+ }
+--- sle11sp2-2011-07-15.orig/arch/x86/kernel/process_64-xen.c	2011-07-15 14:12:22.000000000 +0200
++++ sle11sp2-2011-07-15/arch/x86/kernel/process_64-xen.c	2011-07-15 14:14:07.000000000 +0200
+@@ -58,7 +58,6 @@
+ #include <asm/syscalls.h>
+ #include <asm/ds.h>
+ #include <asm/debugreg.h>
+-#include <asm/hw_breakpoint.h>
+ 
+ asmlinkage extern void ret_from_fork(void);
+ 
+@@ -253,8 +252,6 @@ void release_thread(struct task_struct *
+ 			BUG();
+ 		}
+ 	}
+-	if (unlikely(dead_task->thread.debugreg7))
+-		flush_thread_hw_breakpoint(dead_task);
+ }
+ 
+ static inline void set_32bit_tls(struct task_struct *t, int tls, u32 addr)
+@@ -316,9 +313,7 @@ int copy_thread(unsigned long clone_flag
+ 	savesegment(ds, p->thread.ds);
+ 
+ 	err = -ENOMEM;
+-	if (unlikely(test_tsk_thread_flag(me, TIF_DEBUG)))
+-		if (copy_thread_hw_breakpoint(me, p, clone_flags))
+-			goto out;
++	memset(p->thread.ptrace_bps, 0, sizeof(p->thread.ptrace_bps));
+ 
+ 	if (unlikely(test_tsk_thread_flag(me, TIF_IO_BITMAP))) {
+ 		p->thread.io_bitmap_ptr = kmalloc(IO_BITMAP_BYTES, GFP_KERNEL);
+@@ -359,8 +354,6 @@ out:
+ 		kfree(p->thread.io_bitmap_ptr);
+ 		p->thread.io_bitmap_max = 0;
+ 	}
+-	if (err)
+-		flush_thread_hw_breakpoint(p);
+ 
+ 	return err;
+ }
+@@ -572,23 +565,6 @@ __switch_to(struct task_struct *prev_p, 
+ 	 */
+ 	if (preload_fpu)
+ 		__math_state_restore();
+-	/*
+-	 * There's a problem with moving the arch_install_thread_hw_breakpoint()
+-	 * call before current is updated.  Suppose a kernel breakpoint is
+-	 * triggered in between the two, the hw-breakpoint handler will see that
+-	 * the 'current' task does not have TIF_DEBUG flag set and will think it
+-	 * is leftover from an old task (lazy switching) and will erase it. Then
+-	 * until the next context switch, no user-breakpoints will be installed.
+-	 *
+-	 * The real problem is that it's impossible to update both current and
+-	 * physical debug registers at the same instant, so there will always be
+-	 * a window in which they disagree and a breakpoint might get triggered.
+-	 * Since we use lazy switching, we are forced to assume that a
+-	 * disagreement means that current is correct and the exception is due
+-	 * to lazy debug register switching.
+-	 */
+-	if (unlikely(test_tsk_thread_flag(next_p, TIF_DEBUG)))
+-		arch_install_thread_hw_breakpoint(next_p);
+ 
+ 	return prev_p;
+ }
