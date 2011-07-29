@@ -1,0 +1,262 @@
+From: Frederic Weisbecker <fweisbec@gmail.com>
+Subject: hw-breakpoints: Get the number of available registers on boot dynamically
+Date: Fri Apr 23 05:59:55 2010 +0200
+Git-commit: feef47d0cb530e8419dfa0b48141b538b89b1b1a
+Patch-mainline: v2.6.35-rc1
+References: FATE#311653, BNC#702123
+Signed-off-by: Tony Jones <tonyj@suse.de>
+
+    hw-breakpoints: Get the number of available registers on boot dynamically
+    
+    The breakpoint generic layer assumes that archs always know in advance
+    the static number of address registers available to host breakpoints
+    through the HBP_NUM macro.
+    
+    However this is not true for every archs. For example Arm needs to get
+    this information dynamically to handle the compatiblity between
+    different versions.
+    
+    To solve this, this patch proposes to drop the static HBP_NUM macro
+    and let the arch provide the number of available slots through a
+    new hw_breakpoint_slots() function. For archs that have
+    CONFIG_HAVE_MIXED_BREAKPOINTS_REGS selected, it will be called once
+    as the number of registers fits for instruction and data breakpoints
+    together.
+    For the others it will be called first to get the number of
+    instruction breakpoint registers and another time to get the
+    data breakpoint registers, the targeted type is given as a
+    parameter of hw_breakpoint_slots().
+
+    [Prasad: Removed SH architecture related code changes]
+    
+    Reported-by: Will Deacon <will.deacon@arm.com>
+    Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+    Acked-by: Paul Mundt <lethal@linux-sh.org>
+    Cc: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+    Cc: K. Prasad <prasad@linux.vnet.ibm.com>
+    Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Jason Wessel <jason.wessel@windriver.com>
+    Cc: Ingo Molnar <mingo@elte.hu>
+
+---
+ arch/x86/include/asm/hw_breakpoint.h |    5 +++
+ include/linux/hw_breakpoint.h        |   10 ++++++
+ kernel/hw_breakpoint.c               |   53 +++++++++++++++++++++++++++--------
+ kernel/trace/trace_ksym.c            |   26 ++++-------------
+ 4 files changed, 63 insertions(+), 31 deletions(-)
+
+--- a/arch/x86/include/asm/hw_breakpoint.h
++++ b/arch/x86/include/asm/hw_breakpoint.h
+@@ -42,6 +42,11 @@ struct arch_hw_breakpoint {
+ /* Total number of available HW breakpoint registers */
+ #define HBP_NUM 4
+ 
++static inline int hw_breakpoint_slots(int type)
++{
++	return HBP_NUM;
++}
++
+ struct perf_event;
+ struct pmu;
+ 
+--- a/include/linux/hw_breakpoint.h
++++ b/include/linux/hw_breakpoint.h
+@@ -17,6 +17,16 @@ enum {
+ 	HW_BREAKPOINT_INVALID   = HW_BREAKPOINT_RW | HW_BREAKPOINT_X,
+ };
+ 
++enum bp_type_idx {
++	TYPE_INST 	= 0,
++#ifdef CONFIG_HAVE_MIXED_BREAKPOINTS_REGS
++	TYPE_DATA	= 0,
++#else
++	TYPE_DATA	= 1,
++#endif
++	TYPE_MAX
++};
++
+ #ifdef __KERNEL__
+ 
+ #include <linux/perf_event.h>
+--- a/kernel/hw_breakpoint.c
++++ b/kernel/hw_breakpoint.c
+@@ -40,20 +40,12 @@
+ #include <linux/percpu.h>
+ #include <linux/sched.h>
+ #include <linux/init.h>
++#include <linux/slab.h>
+ #include <linux/cpu.h>
+ #include <linux/smp.h>
+ 
+ #include <linux/hw_breakpoint.h>
+ 
+-enum bp_type_idx {
+-	TYPE_INST 	= 0,
+-#ifdef CONFIG_HAVE_MIXED_BREAKPOINTS_REGS
+-	TYPE_DATA	= 0,
+-#else
+-	TYPE_DATA	= 1,
+-#endif
+-	TYPE_MAX
+-};
+ 
+ /*
+  * Constraints data
+@@ -63,11 +55,15 @@ enum bp_type_idx {
+ static DEFINE_PER_CPU(unsigned int, nr_cpu_bp_pinned[TYPE_MAX]);
+ 
+ /* Number of pinned task breakpoints in a cpu */
+-static DEFINE_PER_CPU(unsigned int, nr_task_bp_pinned[TYPE_MAX][HBP_NUM]);
++static DEFINE_PER_CPU(unsigned int, *nr_task_bp_pinned[TYPE_MAX]);
+ 
+ /* Number of non-pinned cpu/task breakpoints in a cpu */
+ static DEFINE_PER_CPU(unsigned int, nr_bp_flexible[TYPE_MAX]);
+ 
++static int nr_slots[TYPE_MAX];
++
++static int constraints_initialized;
++
+ /* Gather the number of total pinned and un-pinned bp in a cpuset */
+ struct bp_busy_slots {
+ 	unsigned int pinned;
+@@ -99,7 +95,7 @@ static unsigned int max_task_bp_pinned(i
+ 	int i;
+ 	unsigned int *tsk_pinned = per_cpu(nr_task_bp_pinned[type], cpu);
+ 
+-	for (i = HBP_NUM -1; i >= 0; i--) {
++	for (i = nr_slots[type] - 1; i >= 0; i--) {
+ 		if (tsk_pinned[i] > 0)
+ 			return i + 1;
+ 	}
+@@ -292,6 +288,10 @@ static int __reserve_bp_slot(struct perf
+ 	enum bp_type_idx type;
+ 	int weight;
+ 
++	/* We couldn't initialize breakpoint constraints on boot */
++	if (!constraints_initialized)
++		return -ENOMEM;
++
+ 	/* Basic checks */
+ 	if (bp->attr.bp_type == HW_BREAKPOINT_EMPTY ||
+ 	    bp->attr.bp_type == HW_BREAKPOINT_INVALID)
+@@ -304,7 +304,7 @@ static int __reserve_bp_slot(struct perf
+ 	fetch_this_slot(&slots, weight);
+ 
+ 	/* Flexible counters need to keep at least one slot */
+-	if (slots.pinned + (!!slots.flexible) > HBP_NUM)
++	if (slots.pinned + (!!slots.flexible) > nr_slots[type])
+ 		return -ENOSPC;
+ 
+ 	toggle_bp_slot(bp, true, type, weight);
+@@ -547,7 +547,36 @@ static struct notifier_block hw_breakpoi
+ 
+ static int __init init_hw_breakpoint(void)
+ {
++	unsigned int **task_bp_pinned;
++	int cpu, err_cpu;
++	int i;
++
++	for (i = 0; i < TYPE_MAX; i++)
++		nr_slots[i] = hw_breakpoint_slots(i);
++
++	for_each_possible_cpu(cpu) {
++		for (i = 0; i < TYPE_MAX; i++) {
++			task_bp_pinned = &per_cpu(nr_task_bp_pinned[i], cpu);
++			*task_bp_pinned = kzalloc(sizeof(int) * nr_slots[i],
++						  GFP_KERNEL);
++			if (!*task_bp_pinned)
++				goto err_alloc;
++		}
++	}
++
++	constraints_initialized = 1;
++
+ 	return register_die_notifier(&hw_breakpoint_exceptions_nb);
++
++ err_alloc:
++	for_each_possible_cpu(err_cpu) {
++		if (err_cpu == cpu)
++			break;
++		for (i = 0; i < TYPE_MAX; i++)
++			kfree(per_cpu(nr_task_bp_pinned[i], cpu));
++	}
++
++	return -ENOMEM;
+ }
+ core_initcall(init_hw_breakpoint);
+ 
+--- a/kernel/trace/trace_ksym.c
++++ b/kernel/trace/trace_ksym.c
+@@ -32,12 +32,6 @@
+ #include <linux/hw_breakpoint.h>
+ #include <asm/hw_breakpoint.h>
+ 
+-/*
+- * For now, let us restrict the no. of symbols traced simultaneously to number
+- * of available hardware breakpoint registers.
+- */
+-#define KSYM_TRACER_MAX HBP_NUM
+-
+ #define KSYM_TRACER_OP_LEN 3 /* rw- */
+ 
+ struct trace_ksym {
+@@ -51,7 +45,6 @@ struct trace_ksym {
+ 
+ static struct trace_array *ksym_trace_array;
+ 
+-static unsigned int ksym_filter_entry_count;
+ static unsigned int ksym_tracing_enabled;
+ 
+ static HLIST_HEAD(ksym_filter_head);
+@@ -180,13 +173,6 @@ int process_new_ksym_entry(char *ksymnam
+ 	struct trace_ksym *entry;
+ 	int ret = -ENOMEM;
+ 
+-	if (ksym_filter_entry_count >= KSYM_TRACER_MAX) {
+-		printk(KERN_ERR "ksym_tracer: Maximum limit:(%d) reached. No"
+-		" new requests for tracing can be accepted now.\n",
+-			KSYM_TRACER_MAX);
+-		return -ENOSPC;
+-	}
+-
+ 	entry = kzalloc(sizeof(struct trace_ksym), GFP_KERNEL);
+ 	if (!entry)
+ 		return -ENOMEM;
+@@ -202,13 +188,17 @@ int process_new_ksym_entry(char *ksymnam
+ 
+ 	if (IS_ERR(entry->ksym_hbp)) {
+ 		ret = PTR_ERR(entry->ksym_hbp);
+-		printk(KERN_INFO "ksym_tracer request failed. Try again"
+-					" later!!\n");
++		if (ret == -ENOSPC) {
++			printk(KERN_ERR "ksym_tracer: Maximum limit reached."
++			" No new requests for tracing can be accepted now.\n");
++		} else {
++			printk(KERN_INFO "ksym_tracer request failed. Try again"
++					 " later!!\n");
++		}
+ 		goto err;
+ 	}
+ 
+ 	hlist_add_head_rcu(&(entry->ksym_hlist), &ksym_filter_head);
+-	ksym_filter_entry_count++;
+ 
+ 	return 0;
+ 
+@@ -263,7 +253,6 @@ static void __ksym_trace_reset(void)
+ 	hlist_for_each_entry_safe(entry, node, node1, &ksym_filter_head,
+ 								ksym_hlist) {
+ 		unregister_wide_hw_breakpoint(entry->ksym_hbp);
+-		ksym_filter_entry_count--;
+ 		hlist_del_rcu(&(entry->ksym_hlist));
+ 		synchronize_rcu();
+ 		kfree(entry);
+@@ -339,7 +328,6 @@ static ssize_t ksym_trace_filter_write(s
+ 				goto out;
+ 		}
+ 		/* Error or "symbol:---" case: drop it */
+-		ksym_filter_entry_count--;
+ 		hlist_del_rcu(&(entry->ksym_hlist));
+ 		synchronize_rcu();
+ 		kfree(entry);
