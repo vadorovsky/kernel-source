@@ -1,0 +1,607 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Fri, 17 Jun 2011 14:18:39 -0700
+Subject: [PATCH 258/273] isci: preallocate requests
+Git-commit: db0562509800a2d4cb5cb14a66413c30484f165c
+References: FATE#311808,bnc#709528
+Patch-Mainline: 3.0
+
+the dma_pool interface is optimized for object_size << page_size which
+is not the case with isci_request objects and the dma_pool routines show
+up in the top of the profile.
+
+The old io_request_table which tracked whether tci slots were in-flight
+or not is replaced with an IREQ_ACTIVE flag per request.
+
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/isci/host.c          |   70 ++++++++++++++++-------------
+ drivers/scsi/isci/host.h          |   11 +----
+ drivers/scsi/isci/remote_device.c |    9 +++-
+ drivers/scsi/isci/request.c       |   89 ++++++++++++-------------------------
+ drivers/scsi/isci/request.h       |   26 ++---------
+ drivers/scsi/isci/task.c          |   19 +++-----
+ 6 files changed, 85 insertions(+), 139 deletions(-)
+
+diff --git a/drivers/scsi/isci/host.c b/drivers/scsi/isci/host.c
+index c99fab5..0884ae3 100644
+--- a/drivers/scsi/isci/host.c
++++ b/drivers/scsi/isci/host.c
+@@ -255,14 +255,14 @@ static bool scic_sds_controller_error_isr(struct scic_sds_controller *scic)
+ static void scic_sds_controller_task_completion(struct scic_sds_controller *scic,
+ 						u32 completion_entry)
+ {
+-	u32 index;
+-	struct scic_sds_request *sci_req;
+-
+-	index = SCU_GET_COMPLETION_INDEX(completion_entry);
+-	sci_req = scic->io_request_table[index];
++	u32 index = SCU_GET_COMPLETION_INDEX(completion_entry);
++	struct isci_host *ihost = scic_to_ihost(scic);
++	struct isci_request *ireq = ihost->reqs[index];
++	struct scic_sds_request *sci_req = &ireq->sci;
+ 
+ 	/* Make sure that we really want to process this IO request */
+-	if (sci_req && sci_req->io_tag != SCI_CONTROLLER_INVALID_IO_TAG &&
++	if (test_bit(IREQ_ACTIVE, &ireq->flags) &&
++	    sci_req->io_tag != SCI_CONTROLLER_INVALID_IO_TAG &&
+ 	    ISCI_TAG_SEQ(sci_req->io_tag) == scic->io_request_sequence[index])
+ 		/* Yep this is a valid io request pass it along to the io request handler */
+ 		scic_sds_io_request_tc_completion(sci_req, completion_entry);
+@@ -280,7 +280,7 @@ static void scic_sds_controller_sdma_completion(struct scic_sds_controller *scic
+ 	switch (scu_get_command_request_type(completion_entry)) {
+ 	case SCU_CONTEXT_COMMAND_REQUEST_TYPE_POST_TC:
+ 	case SCU_CONTEXT_COMMAND_REQUEST_TYPE_DUMP_TC:
+-		io_request = scic->io_request_table[index];
++		io_request = &scic_to_ihost(scic)->reqs[index]->sci;
+ 		dev_warn(scic_to_dev(scic),
+ 			 "%s: SCIC SDS Completion type SDMA %x for io request "
+ 			 "%p\n",
+@@ -418,7 +418,7 @@ static void scic_sds_controller_event_completion(struct scic_sds_controller *sci
+ 		break;
+ 
+ 	case SCU_EVENT_TYPE_TRANSPORT_ERROR:
+-		io_request = scic->io_request_table[index];
++		io_request = &ihost->reqs[index]->sci;
+ 		scic_sds_io_request_event_handler(io_request, completion_entry);
+ 		break;
+ 
+@@ -426,7 +426,7 @@ static void scic_sds_controller_event_completion(struct scic_sds_controller *sci
+ 		switch (scu_get_event_specifier(completion_entry)) {
+ 		case SCU_EVENT_SPECIFIC_SMP_RESPONSE_NO_PE:
+ 		case SCU_EVENT_SPECIFIC_TASK_TIMEOUT:
+-			io_request = scic->io_request_table[index];
++			io_request = &ihost->reqs[index]->sci;
+ 			if (io_request != NULL)
+ 				scic_sds_io_request_event_handler(io_request, completion_entry);
+ 			else
+@@ -1187,9 +1187,6 @@ static void isci_host_completion_routine(unsigned long data)
+ 		spin_lock_irq(&isci_host->scic_lock);
+ 		isci_free_tag(isci_host, request->sci.io_tag);
+ 		spin_unlock_irq(&isci_host->scic_lock);
+-
+-		/* Free the request object. */
+-		isci_request_free(isci_host, request);
+ 	}
+ 	list_for_each_entry_safe(request, next_request, &errored_request_list,
+ 				 completed_node) {
+@@ -1227,9 +1224,6 @@ static void isci_host_completion_routine(unsigned long data)
+ 			list_del_init(&request->dev_node);
+ 			isci_free_tag(isci_host, request->sci.io_tag);
+ 			spin_unlock_irq(&isci_host->scic_lock);
+-
+-			/* Free the request object. */
+-			isci_request_free(isci_host, request);
+ 		}
+ 	}
+ 
+@@ -2469,13 +2463,6 @@ int isci_host_init(struct isci_host *isci_host)
+ 	if (err)
+ 		return err;
+ 
+-	isci_host->dma_pool = dmam_pool_create(DRV_NAME, &isci_host->pdev->dev,
+-					       sizeof(struct isci_request),
+-					       SLAB_HWCACHE_ALIGN, 0);
+-
+-	if (!isci_host->dma_pool)
+-		return -ENOMEM;
+-
+ 	for (i = 0; i < SCI_MAX_PORTS; i++)
+ 		isci_port_init(&isci_host->ports[i], isci_host, i);
+ 
+@@ -2489,6 +2476,25 @@ int isci_host_init(struct isci_host *isci_host)
+ 		INIT_LIST_HEAD(&idev->node);
+ 	}
+ 
++	for (i = 0; i < SCI_MAX_IO_REQUESTS; i++) {
++		struct isci_request *ireq;
++		dma_addr_t dma;
++
++		ireq = dmam_alloc_coherent(&isci_host->pdev->dev,
++					   sizeof(struct isci_request), &dma,
++					   GFP_KERNEL);
++		if (!ireq)
++			return -ENOMEM;
++
++		ireq->sci.tc = &isci_host->sci.task_context_table[i];
++		ireq->sci.owning_controller = &isci_host->sci;
++		spin_lock_init(&ireq->state_lock);
++		ireq->request_daddr = dma;
++		ireq->isci_host = isci_host;
++
++		isci_host->reqs[i] = ireq;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -2602,12 +2608,13 @@ struct scic_sds_request *scic_request_by_tag(struct scic_sds_controller *scic, u
+ 	task_index = ISCI_TAG_TCI(io_tag);
+ 
+ 	if (task_index < scic->task_context_entries) {
+-		if (scic->io_request_table[task_index] != NULL) {
++		struct isci_request *ireq = scic_to_ihost(scic)->reqs[task_index];
++
++		if (test_bit(IREQ_ACTIVE, &ireq->flags)) {
+ 			task_sequence = ISCI_TAG_SEQ(io_tag);
+ 
+-			if (task_sequence == scic->io_request_sequence[task_index]) {
+-				return scic->io_request_table[task_index];
+-			}
++			if (task_sequence == scic->io_request_sequence[task_index])
++				return &ireq->sci;
+ 		}
+ 	}
+ 
+@@ -2820,7 +2827,7 @@ enum sci_status scic_controller_start_io(struct scic_sds_controller *scic,
+ 	if (status != SCI_SUCCESS)
+ 		return status;
+ 
+-	scic->io_request_table[ISCI_TAG_TCI(req->io_tag)] = req;
++	set_bit(IREQ_ACTIVE, &sci_req_to_ireq(req)->flags);
+ 	scic_sds_controller_post_request(scic, scic_sds_request_get_post_context(req));
+ 	return SCI_SUCCESS;
+ }
+@@ -2897,7 +2904,7 @@ enum sci_status scic_controller_complete_io(
+ 			return status;
+ 
+ 		index = ISCI_TAG_TCI(request->io_tag);
+-		scic->io_request_table[index] = NULL;
++		clear_bit(IREQ_ACTIVE, &sci_req_to_ireq(request)->flags);
+ 		return SCI_SUCCESS;
+ 	default:
+ 		dev_warn(scic_to_dev(scic), "invalid state to complete I/O");
+@@ -2915,7 +2922,7 @@ enum sci_status scic_controller_continue_io(struct scic_sds_request *sci_req)
+ 		return SCI_FAILURE_INVALID_STATE;
+ 	}
+ 
+-	scic->io_request_table[ISCI_TAG_TCI(sci_req->io_tag)] = sci_req;
++	set_bit(IREQ_ACTIVE, &sci_req_to_ireq(sci_req)->flags);
+ 	scic_sds_controller_post_request(scic, scic_sds_request_get_post_context(sci_req));
+ 	return SCI_SUCCESS;
+ }
+@@ -2934,6 +2941,7 @@ enum sci_task_status scic_controller_start_task(
+ 	struct scic_sds_remote_device *rdev,
+ 	struct scic_sds_request *req)
+ {
++	struct isci_request *ireq = sci_req_to_ireq(req);
+ 	enum sci_status status;
+ 
+ 	if (scic->sm.current_state_id != SCIC_READY) {
+@@ -2947,7 +2955,7 @@ enum sci_task_status scic_controller_start_task(
+ 	status = scic_sds_remote_device_start_task(scic, rdev, req);
+ 	switch (status) {
+ 	case SCI_FAILURE_RESET_DEVICE_PARTIAL_SUCCESS:
+-		scic->io_request_table[ISCI_TAG_TCI(req->io_tag)] = req;
++		set_bit(IREQ_ACTIVE, &ireq->flags);
+ 
+ 		/*
+ 		 * We will let framework know this task request started successfully,
+@@ -2956,7 +2964,7 @@ enum sci_task_status scic_controller_start_task(
+ 		 */
+ 		return SCI_SUCCESS;
+ 	case SCI_SUCCESS:
+-		scic->io_request_table[ISCI_TAG_TCI(req->io_tag)] = req;
++		set_bit(IREQ_ACTIVE, &ireq->flags);
+ 
+ 		scic_sds_controller_post_request(scic,
+ 			scic_sds_request_get_post_context(req));
+diff --git a/drivers/scsi/isci/host.h b/drivers/scsi/isci/host.h
+index d8164f5..446fade 100644
+--- a/drivers/scsi/isci/host.h
++++ b/drivers/scsi/isci/host.h
+@@ -166,14 +166,6 @@ struct scic_sds_controller {
+ 	struct scic_sds_remote_device *device_table[SCI_MAX_REMOTE_DEVICES];
+ 
+ 	/**
+-	 * This field is the array of IO request objects that are currently active for
+-	 * this controller object.  This table is used as a fast lookup of the io
+-	 * request object that need to handle completion queue notifications.  The
+-	 * table is TCi based.
+-	 */
+-	struct scic_sds_request *io_request_table[SCI_MAX_IO_REQUESTS];
+-
+-	/**
+ 	 * This field is the free RNi data structure
+ 	 */
+ 	struct scic_remote_node_table available_remote_nodes;
+@@ -298,7 +290,6 @@ struct isci_host {
+ 	union scic_oem_parameters oem_parameters;
+ 
+ 	int id; /* unique within a given pci device */
+-	struct dma_pool *dma_pool;
+ 	struct isci_phy phys[SCI_MAX_PHYS];
+ 	struct isci_port ports[SCI_MAX_PORTS + 1]; /* includes dummy port */
+ 	struct sas_ha_struct sas_ha;
+@@ -315,7 +306,7 @@ struct isci_host {
+ 	struct list_head requests_to_complete;
+ 	struct list_head requests_to_errorback;
+ 	spinlock_t scic_lock;
+-
++	struct isci_request *reqs[SCI_MAX_IO_REQUESTS];
+ 	struct isci_remote_device devices[SCI_MAX_REMOTE_DEVICES];
+ };
+ 
+diff --git a/drivers/scsi/isci/remote_device.c b/drivers/scsi/isci/remote_device.c
+index c5ce0f0..5a86bb1 100644
+--- a/drivers/scsi/isci/remote_device.c
++++ b/drivers/scsi/isci/remote_device.c
+@@ -136,16 +136,19 @@ static void rnc_destruct_done(void *_dev)
+ static enum sci_status scic_sds_remote_device_terminate_requests(struct scic_sds_remote_device *sci_dev)
+ {
+ 	struct scic_sds_controller *scic = sci_dev->owning_port->owning_controller;
++	struct isci_host *ihost = scic_to_ihost(scic);
+ 	u32 i, request_count = sci_dev->started_request_count;
+ 	enum sci_status status  = SCI_SUCCESS;
+ 
+ 	for (i = 0; i < SCI_MAX_IO_REQUESTS && i < request_count; i++) {
+-		struct scic_sds_request *sci_req;
++		struct isci_request *ireq = ihost->reqs[i];
++		struct scic_sds_request *sci_req = &ireq->sci;
+ 		enum sci_status s;
+ 
+-		sci_req = scic->io_request_table[i];
+-		if (!sci_req || sci_req->target_device != sci_dev)
++		if (!test_bit(IREQ_ACTIVE, &ireq->flags) ||
++		    sci_req->target_device != sci_dev)
+ 			continue;
++
+ 		s = scic_controller_terminate_request(scic, sci_dev, sci_req);
+ 		if (s != SCI_SUCCESS)
+ 			status = s;
+diff --git a/drivers/scsi/isci/request.c b/drivers/scsi/isci/request.c
+index 27376ba..3c7ed4e 100644
+--- a/drivers/scsi/isci/request.c
++++ b/drivers/scsi/isci/request.c
+@@ -3017,13 +3017,10 @@ static const struct sci_base_state scic_sds_request_state_table[] = {
+ static void
+ scic_sds_general_request_construct(struct scic_sds_controller *scic,
+ 				   struct scic_sds_remote_device *sci_dev,
+-				   u16 io_tag,
+ 				   struct scic_sds_request *sci_req)
+ {
+ 	sci_init_sm(&sci_req->sm, scic_sds_request_state_table, SCI_REQ_INIT);
+ 
+-	sci_req->io_tag = io_tag;
+-	sci_req->owning_controller = scic;
+ 	sci_req->target_device = sci_dev;
+ 	sci_req->protocol = SCIC_NO_PROTOCOL;
+ 	sci_req->saved_rx_frame_index = SCU_INVALID_FRAME_INDEX;
+@@ -3031,20 +3028,18 @@ scic_sds_general_request_construct(struct scic_sds_controller *scic,
+ 	sci_req->sci_status   = SCI_SUCCESS;
+ 	sci_req->scu_status   = 0;
+ 	sci_req->post_context = 0xFFFFFFFF;
+-	sci_req->tc = &scic->task_context_table[ISCI_TAG_TCI(io_tag)];
+-	WARN_ONCE(io_tag == SCI_CONTROLLER_INVALID_IO_TAG, "straggling invalid tag usage\n");
+ }
+ 
+ static enum sci_status
+ scic_io_request_construct(struct scic_sds_controller *scic,
+ 			  struct scic_sds_remote_device *sci_dev,
+-			  u16 io_tag, struct scic_sds_request *sci_req)
++			  struct scic_sds_request *sci_req)
+ {
+ 	struct domain_device *dev = sci_dev_to_domain(sci_dev);
+ 	enum sci_status status = SCI_SUCCESS;
+ 
+ 	/* Build the common part of the request */
+-	scic_sds_general_request_construct(scic, sci_dev, io_tag, sci_req);
++	scic_sds_general_request_construct(scic, sci_dev, sci_req);
+ 
+ 	if (sci_dev->rnc.remote_node_index == SCIC_SDS_REMOTE_NODE_CONTEXT_INVALID_INDEX)
+ 		return SCI_FAILURE_INVALID_REMOTE_DEVICE;
+@@ -3071,7 +3066,7 @@ enum sci_status scic_task_request_construct(struct scic_sds_controller *scic,
+ 	enum sci_status status = SCI_SUCCESS;
+ 
+ 	/* Build the common part of the request */
+-	scic_sds_general_request_construct(scic, sci_dev, io_tag, sci_req);
++	scic_sds_general_request_construct(scic, sci_dev, sci_req);
+ 
+ 	if (dev->dev_type == SAS_END_DEV ||
+ 	    dev->dev_type == SATA_DEV || (dev->tproto & SAS_PROTOCOL_STP)) {
+@@ -3291,8 +3286,7 @@ static enum sci_status isci_smp_request_build(struct isci_request *ireq)
+  */
+ static enum sci_status isci_io_request_build(struct isci_host *isci_host,
+ 					     struct isci_request *request,
+-					     struct isci_remote_device *isci_device,
+-					     u16 tag)
++					     struct isci_remote_device *isci_device)
+ {
+ 	enum sci_status status = SCI_SUCCESS;
+ 	struct sas_task *task = isci_request_access_task(request);
+@@ -3325,11 +3319,8 @@ static enum sci_status isci_io_request_build(struct isci_host *isci_host,
+ 			return SCI_FAILURE_INSUFFICIENT_RESOURCES;
+ 	}
+ 
+-	/* build the common request object. For now,
+-	 * we will let the core allocate the IO tag.
+-	 */
+ 	status = scic_io_request_construct(&isci_host->sci, sci_device,
+-					   tag, &request->sci);
++					   &request->sci);
+ 
+ 	if (status != SCI_SUCCESS) {
+ 		dev_warn(&isci_host->pdev->dev,
+@@ -3359,65 +3350,51 @@ static enum sci_status isci_io_request_build(struct isci_host *isci_host,
+ 	return SCI_SUCCESS;
+ }
+ 
+-static struct isci_request *isci_request_alloc_core(struct isci_host *ihost,
+-						    gfp_t gfp_flags)
++static struct isci_request *isci_request_from_tag(struct isci_host *ihost, u16 tag)
+ {
+-	dma_addr_t handle;
+ 	struct isci_request *ireq;
+ 
+-	ireq = dma_pool_alloc(ihost->dma_pool, gfp_flags, &handle);
+-	if (!ireq) {
+-		dev_warn(&ihost->pdev->dev,
+-			 "%s: dma_pool_alloc returned NULL\n", __func__);
+-		return NULL;
+-	}
+-
+-	/* initialize the request object.	*/
+-	spin_lock_init(&ireq->state_lock);
+-	ireq->request_daddr = handle;
+-	ireq->isci_host = ihost;
++	ireq = ihost->reqs[ISCI_TAG_TCI(tag)];
++	ireq->sci.io_tag = tag;
+ 	ireq->io_request_completion = NULL;
+ 	ireq->flags = 0;
+ 	ireq->num_sg_entries = 0;
+ 	INIT_LIST_HEAD(&ireq->completed_node);
+ 	INIT_LIST_HEAD(&ireq->dev_node);
+-
+ 	isci_request_change_state(ireq, allocated);
+ 
+ 	return ireq;
+ }
+ 
+-static struct isci_request *isci_request_alloc_io(struct isci_host *ihost,
+-						  struct sas_task *task,
+-						  gfp_t gfp_flags)
++static struct isci_request *isci_io_request_from_tag(struct isci_host *ihost,
++						     struct sas_task *task,
++						     u16 tag)
+ {
+ 	struct isci_request *ireq;
+ 
+-	ireq = isci_request_alloc_core(ihost, gfp_flags);
+-	if (ireq) {
+-		ireq->ttype_ptr.io_task_ptr = task;
+-		ireq->ttype = io_task;
+-		task->lldd_task = ireq;
+-	}
++	ireq = isci_request_from_tag(ihost, tag);
++	ireq->ttype_ptr.io_task_ptr = task;
++	ireq->ttype = io_task;
++	task->lldd_task = ireq;
++
+ 	return ireq;
+ }
+ 
+-struct isci_request *isci_request_alloc_tmf(struct isci_host *ihost,
+-					    struct isci_tmf *isci_tmf,
+-					    gfp_t gfp_flags)
++struct isci_request *isci_tmf_request_from_tag(struct isci_host *ihost,
++					       struct isci_tmf *isci_tmf,
++					       u16 tag)
+ {
+ 	struct isci_request *ireq;
+ 
+-	ireq = isci_request_alloc_core(ihost, gfp_flags);
+-	if (ireq) {
+-		ireq->ttype_ptr.tmf_task_ptr = isci_tmf;
+-		ireq->ttype = tmf_task;
+-	}
++	ireq = isci_request_from_tag(ihost, tag);
++	ireq->ttype_ptr.tmf_task_ptr = isci_tmf;
++	ireq->ttype = tmf_task;
++
+ 	return ireq;
+ }
+ 
+ int isci_request_execute(struct isci_host *ihost, struct isci_remote_device *idev,
+-			 struct sas_task *task, u16 tag, gfp_t gfp_flags)
++			 struct sas_task *task, u16 tag)
+ {
+ 	enum sci_status status = SCI_FAILURE_UNSUPPORTED_PROTOCOL;
+ 	struct isci_request *ireq;
+@@ -3425,17 +3402,15 @@ int isci_request_execute(struct isci_host *ihost, struct isci_remote_device *ide
+ 	int ret = 0;
+ 
+ 	/* do common allocation and init of request object. */
+-	ireq = isci_request_alloc_io(ihost, task, gfp_flags);
+-	if (!ireq)
+-		goto out;
++	ireq = isci_io_request_from_tag(ihost, task, tag);
+ 
+-	status = isci_io_request_build(ihost, ireq, idev, tag);
++	status = isci_io_request_build(ihost, ireq, idev);
+ 	if (status != SCI_SUCCESS) {
+ 		dev_warn(&ihost->pdev->dev,
+ 			 "%s: request_construct failed - status = 0x%x\n",
+ 			 __func__,
+ 			 status);
+-		goto out;
++		return status;
+ 	}
+ 
+ 	spin_lock_irqsave(&ihost->scic_lock, flags);
+@@ -3468,7 +3443,7 @@ int isci_request_execute(struct isci_host *ihost, struct isci_remote_device *ide
+ 			 "%s: failed request start (0x%x)\n",
+ 			 __func__, status);
+ 		spin_unlock_irqrestore(&ihost->scic_lock, flags);
+-		goto out;
++		return status;
+ 	}
+ 
+ 	/* Either I/O started OK, or the core has signaled that
+@@ -3518,13 +3493,5 @@ int isci_request_execute(struct isci_host *ihost, struct isci_remote_device *ide
+ 		status = SCI_SUCCESS;
+ 	}
+ 
+- out:
+-	if (status != SCI_SUCCESS) {
+-		/* release dma memory on failure. */
+-		isci_request_free(ihost, ireq);
+-		ireq = NULL;
+-		ret = SCI_FAILURE;
+-	}
+-
+ 	return ret;
+ }
+diff --git a/drivers/scsi/isci/request.h b/drivers/scsi/isci/request.h
+index f440e42..7628dec 100644
+--- a/drivers/scsi/isci/request.h
++++ b/drivers/scsi/isci/request.h
+@@ -257,6 +257,7 @@ struct isci_request {
+ 	#define IREQ_COMPLETE_IN_TARGET 0
+ 	#define IREQ_TERMINATED 1
+ 	#define IREQ_TMF 2
++	#define IREQ_ACTIVE 3
+ 	unsigned long flags;
+ 
+ 	union ttype_ptr_union {
+@@ -590,33 +591,16 @@ isci_request_change_started_to_aborted(struct isci_request *isci_request,
+ 						       completion_ptr,
+ 						       aborted);
+ }
+-/**
+- * isci_request_free() - This function frees the request object.
+- * @isci_host: This parameter specifies the ISCI host object
+- * @isci_request: This parameter points to the isci_request object
+- *
+- */
+-static inline void isci_request_free(struct isci_host *isci_host,
+-				     struct isci_request *isci_request)
+-{
+-	if (!isci_request)
+-		return;
+-
+-	/* release the dma memory if we fail. */
+-	dma_pool_free(isci_host->dma_pool,
+-		      isci_request,
+-		      isci_request->request_daddr);
+-}
+ 
+ #define isci_request_access_task(req) ((req)->ttype_ptr.io_task_ptr)
+ 
+ #define isci_request_access_tmf(req) ((req)->ttype_ptr.tmf_task_ptr)
+ 
+-struct isci_request *isci_request_alloc_tmf(struct isci_host *ihost,
+-					    struct isci_tmf *isci_tmf,
+-					    gfp_t gfp_flags);
++struct isci_request *isci_tmf_request_from_tag(struct isci_host *ihost,
++					       struct isci_tmf *isci_tmf,
++					       u16 tag);
+ int isci_request_execute(struct isci_host *ihost, struct isci_remote_device *idev,
+-			 struct sas_task *task, u16 tag, gfp_t gfp_flags);
++			 struct sas_task *task, u16 tag);
+ void isci_terminate_pending_requests(struct isci_host *ihost,
+ 				     struct isci_remote_device *idev);
+ enum sci_status
+diff --git a/drivers/scsi/isci/task.c b/drivers/scsi/isci/task.c
+index d1a4671..d2dba83 100644
+--- a/drivers/scsi/isci/task.c
++++ b/drivers/scsi/isci/task.c
+@@ -203,7 +203,7 @@ int isci_task_execute_task(struct sas_task *task, int num, gfp_t gfp_flags)
+ 				spin_unlock_irqrestore(&task->task_state_lock, flags);
+ 
+ 				/* build and send the request. */
+-				status = isci_request_execute(ihost, idev, task, tag, gfp_flags);
++				status = isci_request_execute(ihost, idev, task, tag);
+ 
+ 				if (status != SCI_SUCCESS) {
+ 
+@@ -252,7 +252,7 @@ static struct isci_request *isci_task_request_build(struct isci_host *ihost,
+ 	dev = idev->domain_dev;
+ 
+ 	/* do common allocation and init of request object. */
+-	ireq = isci_request_alloc_tmf(ihost, isci_tmf, GFP_ATOMIC);
++	ireq = isci_tmf_request_from_tag(ihost, isci_tmf, tag);
+ 	if (!ireq)
+ 		return NULL;
+ 
+@@ -266,7 +266,7 @@ static struct isci_request *isci_task_request_build(struct isci_host *ihost,
+ 			 "status = 0x%x\n",
+ 			 __func__,
+ 			 status);
+-		goto errout;
++		return NULL;
+ 	}
+ 
+ 	/* XXX convert to get this from task->tproto like other drivers */
+@@ -274,7 +274,7 @@ static struct isci_request *isci_task_request_build(struct isci_host *ihost,
+ 		isci_tmf->proto = SAS_PROTOCOL_SSP;
+ 		status = scic_task_request_construct_ssp(&ireq->sci);
+ 		if (status != SCI_SUCCESS)
+-			goto errout;
++			return NULL;
+ 	}
+ 
+ 	if (dev->dev_type == SATA_DEV || (dev->tproto & SAS_PROTOCOL_STP)) {
+@@ -282,12 +282,9 @@ static struct isci_request *isci_task_request_build(struct isci_host *ihost,
+ 		status = isci_sata_management_task_request_build(ireq);
+ 
+ 		if (status != SCI_SUCCESS)
+-			goto errout;
++			return NULL;
+ 	}
+ 	return ireq;
+- errout:
+-	isci_request_free(ihost, ireq);
+-	return NULL;
+ }
+ 
+ int isci_task_execute_tmf(struct isci_host *ihost,
+@@ -349,7 +346,7 @@ int isci_task_execute_tmf(struct isci_host *ihost,
+ 			 status,
+ 			 ireq);
+ 		spin_unlock_irqrestore(&ihost->scic_lock, flags);
+-		goto err_ireq;
++		goto err_tci;
+ 	}
+ 
+ 	if (tmf->cb_state_func != NULL)
+@@ -401,8 +398,6 @@ int isci_task_execute_tmf(struct isci_host *ihost,
+ 
+ 	return ret;
+ 
+- err_ireq:
+-	isci_request_free(ihost, ireq);
+  err_tci:
+ 	spin_lock_irqsave(&ihost->scic_lock, flags);
+ 	isci_tci_free(ihost, ISCI_TAG_TCI(tag));
+@@ -516,8 +511,6 @@ static void isci_request_cleanup_completed_loiterer(
+ 		spin_lock_irqsave(&isci_host->scic_lock, flags);
+ 		list_del_init(&isci_request->dev_node);
+ 		spin_unlock_irqrestore(&isci_host->scic_lock, flags);
+-
+-		isci_request_free(isci_host, isci_request);
+ 	}
+ }
+ 
+-- 
+1.6.0.2
+

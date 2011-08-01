@@ -1,0 +1,208 @@
+From: Edmund Nadolski <edmund.nadolski@intel.com>
+Date: Thu, 19 May 2011 11:59:10 +0000
+Subject: [PATCH 217/273] isci: replace isci_timer list with proper embedded timers
+Git-commit: 5553ba2be0f3e3741e1a885a33d2b89921f9fd48
+References: FATE#311808,bnc#709528
+Patch-Mainline: 3.0
+
+Rather than preallocating a list of timers and doling them out at runtime,
+embed a struct timerlist in each object that needs one.  A struct sci_timer
+interface is introduced to manage the timer cancellation semantics which
+currently need to guarantee the timer is cancelled while holding
+spin_lock(ihost->scic_lock).  Since the timeout functions also need to acquire
+the lock it currently prevents the driver from using del_timer_sync() for
+runtime cancellations.
+
+del_timer_sync() is used however before the objects go out of scope.
+
+Signed-off-by: Edmund Nadolski <edmund.nadolski@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/isci/host.c |    7 +++++++
+ drivers/scsi/isci/isci.h |   33 +++++++++++++++++++++++++++++++++
+ drivers/scsi/isci/port.c |   39 ++++++++++++++++++---------------------
+ drivers/scsi/isci/port.h |    6 ++----
+ 4 files changed, 60 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/scsi/isci/host.c b/drivers/scsi/isci/host.c
+index 6cd7648..a3269b6 100644
+--- a/drivers/scsi/isci/host.c
++++ b/drivers/scsi/isci/host.c
+@@ -1359,6 +1359,13 @@ void isci_host_deinit(struct isci_host *ihost)
+ 
+ 	wait_for_stop(ihost);
+ 	scic_controller_reset(&ihost->sci);
++
++	/* Cancel any/all outstanding port timers */
++	for (i = 0; i < ihost->sci.logical_port_entries; i++) {
++		struct scic_sds_port *sci_port = &ihost->ports[i].sci;
++		del_timer_sync(&sci_port->timer.timer);
++	}
++
+ 	isci_timer_list_destroy(ihost);
+ }
+ 
+diff --git a/drivers/scsi/isci/isci.h b/drivers/scsi/isci/isci.h
+index 69826ea..2fe5557 100644
+--- a/drivers/scsi/isci/isci.h
++++ b/drivers/scsi/isci/isci.h
+@@ -551,4 +551,37 @@ extern unsigned char max_concurr_spinup;
+ irqreturn_t isci_msix_isr(int vec, void *data);
+ irqreturn_t isci_intx_isr(int vec, void *data);
+ irqreturn_t isci_error_isr(int vec, void *data);
++
++/*
++ * Each timer is associated with a cancellation flag that is set when
++ * del_timer() is called and checked in the timer callback function. This
++ * is needed since del_timer_sync() cannot be called with scic_lock held.
++ * For deinit however, del_timer_sync() is used without holding the lock.
++ */
++struct sci_timer {
++	struct timer_list	timer;
++	bool			cancel;
++};
++
++static inline
++void sci_init_timer(struct sci_timer *tmr, void (*fn)(unsigned long))
++{
++	tmr->timer.function = fn;
++	tmr->timer.data = (unsigned long) tmr;
++	tmr->cancel = 0;
++	init_timer(&tmr->timer);
++}
++
++static inline void sci_mod_timer(struct sci_timer *tmr, unsigned long msec)
++{
++	tmr->cancel = 0;
++	mod_timer(&tmr->timer, jiffies + msecs_to_jiffies(msec));
++}
++
++static inline void sci_del_timer(struct sci_timer *tmr)
++{
++	tmr->cancel = 1;
++	del_timer(&tmr->timer);
++}
++
+ #endif  /* __ISCI_H__ */
+diff --git a/drivers/scsi/isci/port.c b/drivers/scsi/isci/port.c
+index 3050415..3da9048 100644
+--- a/drivers/scsi/isci/port.c
++++ b/drivers/scsi/isci/port.c
+@@ -926,17 +926,19 @@ bool scic_sds_port_link_detected(
+ 	return true;
+ }
+ 
+-/**
+- * This method is provided to timeout requests for port operations. Mostly its
+- *    for the port reset operation.
+- *
+- *
+- */
+-static void scic_sds_port_timeout_handler(void *port)
++static void port_timeout(unsigned long data)
+ {
+-	struct scic_sds_port *sci_port = port;
++	struct sci_timer *tmr = (struct sci_timer *)data;
++	struct scic_sds_port *sci_port = container_of(tmr, typeof(*sci_port), timer);
++	struct isci_host *ihost = scic_to_ihost(sci_port->owning_controller);
++	unsigned long flags;
+ 	u32 current_state;
+ 
++	spin_lock_irqsave(&ihost->scic_lock, flags);
++
++	if (tmr->cancel)
++		goto done;
++
+ 	current_state = sci_base_state_machine_get_state(&sci_port->state_machine);
+ 
+ 	if (current_state == SCI_BASE_PORT_STATE_RESETTING) {
+@@ -965,6 +967,9 @@ static void scic_sds_port_timeout_handler(void *port)
+ 			"%s: SCIC Port 0x%p is processing a timeout operation "
+ 			"in state %d.\n", __func__, sci_port, current_state);
+ 	}
++
++done:
++	spin_unlock_irqrestore(&ihost->scic_lock, flags);
+ }
+ 
+ /* --------------------------------------------------------------------------- */
+@@ -1259,7 +1264,6 @@ static void scic_sds_port_ready_substate_configuring_exit(struct sci_base_state_
+ enum sci_status scic_sds_port_start(struct scic_sds_port *sci_port)
+ {
+ 	struct scic_sds_controller *scic = sci_port->owning_controller;
+-	struct isci_host *ihost = scic_to_ihost(scic);
+ 	enum sci_status status = SCI_SUCCESS;
+ 	enum scic_sds_port_states state;
+ 	u32 phy_mask;
+@@ -1280,14 +1284,6 @@ enum sci_status scic_sds_port_start(struct scic_sds_port *sci_port)
+ 		return SCI_FAILURE_UNSUPPORTED_PORT_CONFIGURATION;
+ 	}
+ 
+-	sci_port->timer_handle =
+-		isci_timer_create(ihost,
+-				  sci_port,
+-				  scic_sds_port_timeout_handler);
+-
+-	if (!sci_port->timer_handle)
+-		return SCI_FAILURE_INSUFFICIENT_RESOURCES;
+-
+ 	if (sci_port->reserved_rni == SCU_DUMMY_INDEX) {
+ 		u16 rni = scic_sds_remote_node_table_allocate_remote_node(
+ 				&scic->available_remote_nodes, 1);
+@@ -1390,7 +1386,7 @@ static enum sci_status scic_port_hard_reset(struct scic_sds_port *sci_port, u32
+ 	if (status != SCI_SUCCESS)
+ 		return status;
+ 
+-	isci_timer_start(sci_port->timer_handle, timeout);
++	sci_mod_timer(&sci_port->timer, timeout);
+ 	sci_port->not_ready_reason = SCIC_PORT_NOT_READY_HARD_RESET_REQUESTED;
+ 
+ 	port_state_machine_change(sci_port,
+@@ -1757,14 +1753,14 @@ static void scic_sds_port_resetting_state_exit(struct sci_base_state_machine *sm
+ {
+ 	struct scic_sds_port *sci_port = container_of(sm, typeof(*sci_port), state_machine);
+ 
+-	isci_timer_stop(sci_port->timer_handle);
++	sci_del_timer(&sci_port->timer);
+ }
+ 
+ static void scic_sds_port_stopping_state_exit(struct sci_base_state_machine *sm)
+ {
+ 	struct scic_sds_port *sci_port = container_of(sm, typeof(*sci_port), state_machine);
+ 
+-	isci_timer_stop(sci_port->timer_handle);
++	sci_del_timer(&sci_port->timer);
+ 
+ 	scic_sds_port_destroy_dummy_resources(sci_port);
+ }
+@@ -1831,7 +1827,8 @@ void scic_sds_port_construct(struct scic_sds_port *sci_port, u8 index,
+ 	sci_port->reserved_rni = SCU_DUMMY_INDEX;
+ 	sci_port->reserved_tci = SCU_DUMMY_INDEX;
+ 
+-	sci_port->timer_handle = NULL;
++	sci_init_timer(&sci_port->timer, port_timeout);
++
+ 	sci_port->port_task_scheduler_registers = NULL;
+ 
+ 	for (index = 0; index < SCI_MAX_PHYS; index++)
+diff --git a/drivers/scsi/isci/port.h b/drivers/scsi/isci/port.h
+index af540e5..9a69128 100644
+--- a/drivers/scsi/isci/port.h
++++ b/drivers/scsi/isci/port.h
+@@ -139,10 +139,8 @@ struct scic_sds_port {
+ 	 */
+ 	struct scic_sds_controller *owning_controller;
+ 
+-	/**
+-	 * This field contains the port start/stop timer handle.
+-	 */
+-	void *timer_handle;
++	/* timer used for port start/stop operations */
++	struct sci_timer	timer;
+ 
+ 	/**
+ 	 * This field is the pointer to the port task scheduler registers
+-- 
+1.6.0.2
+

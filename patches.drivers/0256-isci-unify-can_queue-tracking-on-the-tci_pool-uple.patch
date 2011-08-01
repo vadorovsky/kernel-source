@@ -1,0 +1,1779 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Tue, 28 Jun 2011 13:47:09 -0700
+Subject: [PATCH 256/273] isci: unify can_queue tracking on the tci_pool, uplevel tag assignment
+Git-commit: 312e0c2455c18716cf640d4336dcb1e9e5053818
+References: FATE#311808,bnc#709528
+Patch-Mainline: 3.0
+
+The tci_pool tracks our outstanding command slots which are also the 'index'
+portion of our tags.  Grabbing the tag early in ->lldd_execute_task let's us
+drop the isci_host_can_queue() and ->was_tag_assigned_by_user infrastructure.
+->was_tag_assigned_by_user required the task context to be duplicated in
+request-local buffer.  With the tci established early we can build the
+task_context directly into its final location and skip a memcpy.
+
+With the task context buffer at a known address at request construction we
+have the opportunity/obligation to also fix sgl handling.  This rework feels
+like it belongs in another patch but the sgl handling and task_context are too
+intertwined.
+1/ fix the 'ab' pair embedded in the task context to point to the 'cd' pair in
+   the task context (previously we were prematurely linking to the staging
+   buffer).
+2/ fix the broken iteration of pio sgls that assumes all sgls are relative to
+   the request, and does a dangerous looking reverse lookup of physical
+   address to virtual address.
+
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/isci/host.c    |  265 ++++++------------------
+ drivers/scsi/isci/host.h    |   55 +-----
+ drivers/scsi/isci/port.c    |   61 ++----
+ drivers/scsi/isci/port.h    |    2 +-
+ drivers/scsi/isci/request.c |  469 +++++++++++++++----------------------------
+ drivers/scsi/isci/request.h |   58 +-----
+ drivers/scsi/isci/task.c    |   80 ++++----
+ 7 files changed, 303 insertions(+), 687 deletions(-)
+
+diff --git a/drivers/scsi/isci/host.c b/drivers/scsi/isci/host.c
+index b08455f..c99fab5 100644
+--- a/drivers/scsi/isci/host.c
++++ b/drivers/scsi/isci/host.c
+@@ -1018,33 +1018,11 @@ done:
+ 	spin_unlock_irqrestore(&ihost->scic_lock, flags);
+ }
+ 
+-static void isci_tci_free(struct isci_host *ihost, u16 tci)
+-{
+-	u16 tail = ihost->tci_tail & (SCI_MAX_IO_REQUESTS-1);
+-
+-	ihost->tci_pool[tail] = tci;
+-	ihost->tci_tail = tail + 1;
+-}
+-
+-static u16 isci_tci_alloc(struct isci_host *ihost)
+-{
+-	u16 head = ihost->tci_head & (SCI_MAX_IO_REQUESTS-1);
+-	u16 tci = ihost->tci_pool[head];
+-
+-	ihost->tci_head = head + 1;
+-	return tci;
+-}
+-
+ static u16 isci_tci_active(struct isci_host *ihost)
+ {
+ 	return CIRC_CNT(ihost->tci_head, ihost->tci_tail, SCI_MAX_IO_REQUESTS);
+ }
+ 
+-static u16 isci_tci_space(struct isci_host *ihost)
+-{
+-	return CIRC_SPACE(ihost->tci_head, ihost->tci_tail, SCI_MAX_IO_REQUESTS);
+-}
+-
+ static enum sci_status scic_controller_start(struct scic_sds_controller *scic,
+ 					     u32 timeout)
+ {
+@@ -1205,6 +1183,11 @@ static void isci_host_completion_routine(unsigned long data)
+ 				task->task_done(task);
+ 			}
+ 		}
++
++		spin_lock_irq(&isci_host->scic_lock);
++		isci_free_tag(isci_host, request->sci.io_tag);
++		spin_unlock_irq(&isci_host->scic_lock);
++
+ 		/* Free the request object. */
+ 		isci_request_free(isci_host, request);
+ 	}
+@@ -1242,6 +1225,7 @@ static void isci_host_completion_routine(unsigned long data)
+ 			* of pending requests.
+ 			*/
+ 			list_del_init(&request->dev_node);
++			isci_free_tag(isci_host, request->sci.io_tag);
+ 			spin_unlock_irq(&isci_host->scic_lock);
+ 
+ 			/* Free the request object. */
+@@ -2375,6 +2359,7 @@ static int scic_controller_mem_init(struct scic_sds_controller *scic)
+ 	if (!scic->task_context_table)
+ 		return -ENOMEM;
+ 
++	scic->task_context_dma = dma;
+ 	writel(lower_32_bits(dma), &scic->smu_registers->host_task_table_lower);
+ 	writel(upper_32_bits(dma), &scic->smu_registers->host_task_table_upper);
+ 
+@@ -2409,11 +2394,9 @@ int isci_host_init(struct isci_host *isci_host)
+ 
+ 	spin_lock_init(&isci_host->state_lock);
+ 	spin_lock_init(&isci_host->scic_lock);
+-	spin_lock_init(&isci_host->queue_lock);
+ 	init_waitqueue_head(&isci_host->eventq);
+ 
+ 	isci_host_change_state(isci_host, isci_starting);
+-	isci_host->can_queue = ISCI_CAN_QUEUE_VAL;
+ 
+ 	status = scic_controller_construct(&isci_host->sci, scu_base(isci_host),
+ 					   smu_base(isci_host));
+@@ -2611,51 +2594,6 @@ void scic_sds_controller_post_request(
+ 	writel(request, &scic->smu_registers->post_context_port);
+ }
+ 
+-/**
+- * This method will copy the soft copy of the task context into the physical
+- *    memory accessible by the controller.
+- * @scic: This parameter specifies the controller for which to copy
+- *    the task context.
+- * @sci_req: This parameter specifies the request for which the task
+- *    context is being copied.
+- *
+- * After this call is made the SCIC_SDS_IO_REQUEST object will always point to
+- * the physical memory version of the task context. Thus, all subsequent
+- * updates to the task context are performed in the TC table (i.e. DMAable
+- * memory). none
+- */
+-void scic_sds_controller_copy_task_context(
+-	struct scic_sds_controller *scic,
+-	struct scic_sds_request *sci_req)
+-{
+-	struct scu_task_context *task_context_buffer;
+-
+-	task_context_buffer = scic_sds_controller_get_task_context_buffer(
+-		scic, sci_req->io_tag);
+-
+-	memcpy(task_context_buffer,
+-	       sci_req->task_context_buffer,
+-	       offsetof(struct scu_task_context, sgl_snapshot_ac));
+-
+-	/*
+-	 * Now that the soft copy of the TC has been copied into the TC
+-	 * table accessible by the silicon.  Thus, any further changes to
+-	 * the TC (e.g. TC termination) occur in the appropriate location. */
+-	sci_req->task_context_buffer = task_context_buffer;
+-}
+-
+-struct scu_task_context *scic_sds_controller_get_task_context_buffer(struct scic_sds_controller *scic,
+-								     u16 io_tag)
+-{
+-	u16 tci = ISCI_TAG_TCI(io_tag);
+-
+-	if (tci < scic->task_context_entries) {
+-		return &scic->task_context_table[tci];
+-	}
+-
+-	return NULL;
+-}
+-
+ struct scic_sds_request *scic_request_by_tag(struct scic_sds_controller *scic, u16 io_tag)
+ {
+ 	u16 task_index;
+@@ -2801,6 +2739,60 @@ void scic_sds_controller_release_frame(
+ 			&scic->scu_registers->sdma.unsolicited_frame_get_pointer);
+ }
+ 
++void isci_tci_free(struct isci_host *ihost, u16 tci)
++{
++	u16 tail = ihost->tci_tail & (SCI_MAX_IO_REQUESTS-1);
++
++	ihost->tci_pool[tail] = tci;
++	ihost->tci_tail = tail + 1;
++}
++
++static u16 isci_tci_alloc(struct isci_host *ihost)
++{
++	u16 head = ihost->tci_head & (SCI_MAX_IO_REQUESTS-1);
++	u16 tci = ihost->tci_pool[head];
++
++	ihost->tci_head = head + 1;
++	return tci;
++}
++
++static u16 isci_tci_space(struct isci_host *ihost)
++{
++	return CIRC_SPACE(ihost->tci_head, ihost->tci_tail, SCI_MAX_IO_REQUESTS);
++}
++
++u16 isci_alloc_tag(struct isci_host *ihost)
++{
++	if (isci_tci_space(ihost)) {
++		u16 tci = isci_tci_alloc(ihost);
++		u8 seq = ihost->sci.io_request_sequence[tci];
++
++		return ISCI_TAG(seq, tci);
++	}
++
++	return SCI_CONTROLLER_INVALID_IO_TAG;
++}
++
++enum sci_status isci_free_tag(struct isci_host *ihost, u16 io_tag)
++{
++	struct scic_sds_controller *scic = &ihost->sci;
++	u16 tci = ISCI_TAG_TCI(io_tag);
++	u16 seq = ISCI_TAG_SEQ(io_tag);
++
++	/* prevent tail from passing head */
++	if (isci_tci_active(ihost) == 0)
++		return SCI_FAILURE_INVALID_IO_TAG;
++
++	if (seq == scic->io_request_sequence[tci]) {
++		scic->io_request_sequence[tci] = (seq+1) & (SCI_MAX_SEQ-1);
++
++		isci_tci_free(ihost, tci);
++
++		return SCI_SUCCESS;
++	}
++	return SCI_FAILURE_INVALID_IO_TAG;
++}
++
+ /**
+  * scic_controller_start_io() - This method is called by the SCI user to
+  *    send/start an IO request. If the method invocation is successful, then
+@@ -2811,27 +2803,11 @@ void scic_sds_controller_release_frame(
+  *    IO request.
+  * @io_request: the handle to the io request object to start.
+  * @io_tag: This parameter specifies a previously allocated IO tag that the
+- *    user desires to be utilized for this request. This parameter is optional.
+- *     The user is allowed to supply SCI_CONTROLLER_INVALID_IO_TAG as the value
+- *    for this parameter.
+- *
+- * - IO tags are a protected resource.  It is incumbent upon the SCI Core user
+- * to ensure that each of the methods that may allocate or free available IO
+- * tags are handled in a mutually exclusive manner.  This method is one of said
+- * methods requiring proper critical code section protection (e.g. semaphore,
+- * spin-lock, etc.). - For SATA, the user is required to manage NCQ tags.  As a
+- * result, it is expected the user will have set the NCQ tag field in the host
+- * to device register FIS prior to calling this method.  There is also a
+- * requirement for the user to call scic_stp_io_set_ncq_tag() prior to invoking
+- * the scic_controller_start_io() method. scic_controller_allocate_tag() for
+- * more information on allocating a tag. Indicate if the controller
+- * successfully started the IO request. SCI_SUCCESS if the IO request was
+- * successfully started. Determine the failure situations and return values.
++ *    user desires to be utilized for this request.
+  */
+ enum sci_status scic_controller_start_io(struct scic_sds_controller *scic,
+ 					 struct scic_sds_remote_device *rdev,
+-					 struct scic_sds_request *req,
+-					 u16 io_tag)
++					 struct scic_sds_request *req)
+ {
+ 	enum sci_status status;
+ 
+@@ -2902,17 +2878,6 @@ enum sci_status scic_controller_terminate_request(
+  * @remote_device: The handle to the remote device object for which to complete
+  *    the IO request.
+  * @io_request: the handle to the io request object to complete.
+- *
+- * - IO tags are a protected resource.  It is incumbent upon the SCI Core user
+- * to ensure that each of the methods that may allocate or free available IO
+- * tags are handled in a mutually exclusive manner.  This method is one of said
+- * methods requiring proper critical code section protection (e.g. semaphore,
+- * spin-lock, etc.). - If the IO tag for a request was allocated, by the SCI
+- * Core user, using the scic_controller_allocate_io_tag() method, then it is
+- * the responsibility of the caller to invoke the scic_controller_free_io_tag()
+- * method to free the tag (i.e. this method will not free the IO tag). Indicate
+- * if the controller successfully completed the IO request. SCI_SUCCESS if the
+- * completion process was successful.
+  */
+ enum sci_status scic_controller_complete_io(
+ 	struct scic_sds_controller *scic,
+@@ -2963,31 +2928,11 @@ enum sci_status scic_controller_continue_io(struct scic_sds_request *sci_req)
+  * @remote_device: the handle to the remote device object for which to start
+  *    the task management request.
+  * @task_request: the handle to the task request object to start.
+- * @io_tag: This parameter specifies a previously allocated IO tag that the
+- *    user desires to be utilized for this request.  Note this not the io_tag
+- *    of the request being managed.  It is to be utilized for the task request
+- *    itself. This parameter is optional.  The user is allowed to supply
+- *    SCI_CONTROLLER_INVALID_IO_TAG as the value for this parameter.
+- *
+- * - IO tags are a protected resource.  It is incumbent upon the SCI Core user
+- * to ensure that each of the methods that may allocate or free available IO
+- * tags are handled in a mutually exclusive manner.  This method is one of said
+- * methods requiring proper critical code section protection (e.g. semaphore,
+- * spin-lock, etc.). - The user must synchronize this task with completion
+- * queue processing.  If they are not synchronized then it is possible for the
+- * io requests that are being managed by the task request can complete before
+- * starting the task request. scic_controller_allocate_tag() for more
+- * information on allocating a tag. Indicate if the controller successfully
+- * started the IO request. SCI_TASK_SUCCESS if the task request was
+- * successfully started. SCI_TASK_FAILURE_REQUIRES_SCSI_ABORT This value is
+- * returned if there is/are task(s) outstanding that require termination or
+- * completion before this request can succeed.
+  */
+ enum sci_task_status scic_controller_start_task(
+ 	struct scic_sds_controller *scic,
+ 	struct scic_sds_remote_device *rdev,
+-	struct scic_sds_request *req,
+-	u16 task_tag)
++	struct scic_sds_request *req)
+ {
+ 	enum sci_status status;
+ 
+@@ -3022,85 +2967,3 @@ enum sci_task_status scic_controller_start_task(
+ 
+ 	return status;
+ }
+-
+-/**
+- * scic_controller_allocate_io_tag() - This method will allocate a tag from the
+- *    pool of free IO tags. Direct allocation of IO tags by the SCI Core user
+- *    is optional. The scic_controller_start_io() method will allocate an IO
+- *    tag if this method is not utilized and the tag is not supplied to the IO
+- *    construct routine.  Direct allocation of IO tags may provide additional
+- *    performance improvements in environments capable of supporting this usage
+- *    model.  Additionally, direct allocation of IO tags also provides
+- *    additional flexibility to the SCI Core user.  Specifically, the user may
+- *    retain IO tags across the lives of multiple IO requests.
+- * @controller: the handle to the controller object for which to allocate the
+- *    tag.
+- *
+- * IO tags are a protected resource.  It is incumbent upon the SCI Core user to
+- * ensure that each of the methods that may allocate or free available IO tags
+- * are handled in a mutually exclusive manner.  This method is one of said
+- * methods requiring proper critical code section protection (e.g. semaphore,
+- * spin-lock, etc.). An unsigned integer representing an available IO tag.
+- * SCI_CONTROLLER_INVALID_IO_TAG This value is returned if there are no
+- * currently available tags to be allocated. All return other values indicate a
+- * legitimate tag.
+- */
+-u16 scic_controller_allocate_io_tag(struct scic_sds_controller *scic)
+-{
+-	struct isci_host *ihost = scic_to_ihost(scic);
+-
+-	if (isci_tci_space(ihost)) {
+-		u16 tci = isci_tci_alloc(ihost);
+-		u8 seq = scic->io_request_sequence[tci];
+-
+-		return ISCI_TAG(seq, tci);
+-	}
+-
+-	return SCI_CONTROLLER_INVALID_IO_TAG;
+-}
+-
+-/**
+- * scic_controller_free_io_tag() - This method will free an IO tag to the pool
+- *    of free IO tags. This method provides the SCI Core user more flexibility
+- *    with regards to IO tags.  The user may desire to keep an IO tag after an
+- *    IO request has completed, because they plan on re-using the tag for a
+- *    subsequent IO request.  This method is only legal if the tag was
+- *    allocated via scic_controller_allocate_io_tag().
+- * @controller: This parameter specifies the handle to the controller object
+- *    for which to free/return the tag.
+- * @io_tag: This parameter represents the tag to be freed to the pool of
+- *    available tags.
+- *
+- * - IO tags are a protected resource.  It is incumbent upon the SCI Core user
+- * to ensure that each of the methods that may allocate or free available IO
+- * tags are handled in a mutually exclusive manner.  This method is one of said
+- * methods requiring proper critical code section protection (e.g. semaphore,
+- * spin-lock, etc.). - If the IO tag for a request was allocated, by the SCI
+- * Core user, using the scic_controller_allocate_io_tag() method, then it is
+- * the responsibility of the caller to invoke this method to free the tag. This
+- * method returns an indication of whether the tag was successfully put back
+- * (freed) to the pool of available tags. SCI_SUCCESS This return value
+- * indicates the tag was successfully placed into the pool of available IO
+- * tags. SCI_FAILURE_INVALID_IO_TAG This value is returned if the supplied tag
+- * is not a valid IO tag value.
+- */
+-enum sci_status scic_controller_free_io_tag(struct scic_sds_controller *scic,
+-					    u16 io_tag)
+-{
+-	struct isci_host *ihost = scic_to_ihost(scic);
+-	u16 tci = ISCI_TAG_TCI(io_tag);
+-	u16 seq = ISCI_TAG_SEQ(io_tag);
+-
+-	/* prevent tail from passing head */
+-	if (isci_tci_active(ihost) == 0)
+-		return SCI_FAILURE_INVALID_IO_TAG;
+-
+-	if (seq == scic->io_request_sequence[tci]) {
+-		scic->io_request_sequence[tci] = (seq+1) & (SCI_MAX_SEQ-1);
+-
+-		isci_tci_free(ihost, ISCI_TAG_TCI(io_tag));
+-
+-		return SCI_SUCCESS;
+-	}
+-	return SCI_FAILURE_INVALID_IO_TAG;
+-}
+diff --git a/drivers/scsi/isci/host.h b/drivers/scsi/isci/host.h
+index a54397e..d8164f5 100644
+--- a/drivers/scsi/isci/host.h
++++ b/drivers/scsi/isci/host.h
+@@ -192,6 +192,7 @@ struct scic_sds_controller {
+ 	 * context table.  This data is shared between the hardware and software.
+ 	 */
+ 	struct scu_task_context *task_context_table;
++	dma_addr_t task_context_dma;
+ 
+ 	/**
+ 	 * This field is a pointer to the memory allocated by the driver for the
+@@ -302,12 +303,8 @@ struct isci_host {
+ 	struct isci_port ports[SCI_MAX_PORTS + 1]; /* includes dummy port */
+ 	struct sas_ha_struct sas_ha;
+ 
+-	int can_queue;
+-	spinlock_t queue_lock;
+ 	spinlock_t state_lock;
+-
+ 	struct pci_dev *pdev;
+-
+ 	enum isci_status status;
+ 	#define IHOST_START_PENDING 0
+ 	#define IHOST_STOP_PENDING 1
+@@ -451,36 +448,6 @@ static inline void isci_host_change_state(struct isci_host *isci_host,
+ 
+ }
+ 
+-static inline int isci_host_can_queue(struct isci_host *isci_host, int num)
+-{
+-	int ret = 0;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&isci_host->queue_lock, flags);
+-	if ((isci_host->can_queue - num) < 0) {
+-		dev_dbg(&isci_host->pdev->dev,
+-			"%s: isci_host->can_queue = %d\n",
+-			__func__,
+-			isci_host->can_queue);
+-		ret = -SAS_QUEUE_FULL;
+-
+-	} else
+-		isci_host->can_queue -= num;
+-
+-	spin_unlock_irqrestore(&isci_host->queue_lock, flags);
+-
+-	return ret;
+-}
+-
+-static inline void isci_host_can_dequeue(struct isci_host *isci_host, int num)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&isci_host->queue_lock, flags);
+-	isci_host->can_queue += num;
+-	spin_unlock_irqrestore(&isci_host->queue_lock, flags);
+-}
+-
+ static inline void wait_for_start(struct isci_host *ihost)
+ {
+ 	wait_event(ihost->eventq, !test_bit(IHOST_START_PENDING, &ihost->flags));
+@@ -646,10 +613,6 @@ union scu_remote_node_context *scic_sds_controller_get_remote_node_context_buffe
+ struct scic_sds_request *scic_request_by_tag(struct scic_sds_controller *scic,
+ 					     u16 io_tag);
+ 
+-struct scu_task_context *scic_sds_controller_get_task_context_buffer(
+-	struct scic_sds_controller *scic,
+-	u16 io_tag);
+-
+ void scic_sds_controller_power_control_queue_insert(
+ 	struct scic_sds_controller *scic,
+ 	struct scic_sds_phy *sci_phy);
+@@ -681,6 +644,9 @@ void scic_sds_controller_register_setup(struct scic_sds_controller *scic);
+ enum sci_status scic_controller_continue_io(struct scic_sds_request *sci_req);
+ int isci_host_scan_finished(struct Scsi_Host *, unsigned long);
+ void isci_host_scan_start(struct Scsi_Host *);
++u16 isci_alloc_tag(struct isci_host *ihost);
++enum sci_status isci_free_tag(struct isci_host *ihost, u16 io_tag);
++void isci_tci_free(struct isci_host *ihost, u16 tci);
+ 
+ int isci_host_init(struct isci_host *);
+ 
+@@ -708,14 +674,12 @@ void scic_controller_disable_interrupts(
+ enum sci_status scic_controller_start_io(
+ 	struct scic_sds_controller *scic,
+ 	struct scic_sds_remote_device *remote_device,
+-	struct scic_sds_request *io_request,
+-	u16 io_tag);
++	struct scic_sds_request *io_request);
+ 
+ enum sci_task_status scic_controller_start_task(
+ 	struct scic_sds_controller *scic,
+ 	struct scic_sds_remote_device *remote_device,
+-	struct scic_sds_request *task_request,
+-	u16 io_tag);
++	struct scic_sds_request *task_request);
+ 
+ enum sci_status scic_controller_terminate_request(
+ 	struct scic_sds_controller *scic,
+@@ -727,13 +691,6 @@ enum sci_status scic_controller_complete_io(
+ 	struct scic_sds_remote_device *remote_device,
+ 	struct scic_sds_request *io_request);
+ 
+-u16 scic_controller_allocate_io_tag(
+-	struct scic_sds_controller *scic);
+-
+-enum sci_status scic_controller_free_io_tag(
+-	struct scic_sds_controller *scic,
+-	u16 io_tag);
+-
+ void scic_sds_port_configuration_agent_construct(
+ 	struct scic_sds_port_configuration_agent *port_agent);
+ 
+diff --git a/drivers/scsi/isci/port.c b/drivers/scsi/isci/port.c
+index 5f4a4e3..0e84e29 100644
+--- a/drivers/scsi/isci/port.c
++++ b/drivers/scsi/isci/port.c
+@@ -695,35 +695,21 @@ static void scic_sds_port_construct_dummy_rnc(struct scic_sds_port *sci_port, u1
+  */
+ static void scic_sds_port_construct_dummy_task(struct scic_sds_port *sci_port, u16 tag)
+ {
++	struct scic_sds_controller *scic = sci_port->owning_controller;
+ 	struct scu_task_context *task_context;
+ 
+-	task_context = scic_sds_controller_get_task_context_buffer(sci_port->owning_controller, tag);
+-
++	task_context = &scic->task_context_table[ISCI_TAG_TCI(tag)];
+ 	memset(task_context, 0, sizeof(struct scu_task_context));
+ 
+-	task_context->abort = 0;
+-	task_context->priority = 0;
+ 	task_context->initiator_request = 1;
+ 	task_context->connection_rate = 1;
+-	task_context->protocol_engine_index = 0;
+ 	task_context->logical_port_index = sci_port->physical_port_index;
+ 	task_context->protocol_type = SCU_TASK_CONTEXT_PROTOCOL_SSP;
+ 	task_context->task_index = ISCI_TAG_TCI(tag);
+ 	task_context->valid = SCU_TASK_CONTEXT_VALID;
+ 	task_context->context_type = SCU_TASK_CONTEXT_TYPE;
+-
+ 	task_context->remote_node_index = sci_port->reserved_rni;
+-	task_context->command_code = 0;
+-
+-	task_context->link_layer_control = 0;
+ 	task_context->do_not_dma_ssp_good_response = 1;
+-	task_context->strict_ordering = 0;
+-	task_context->control_frame = 0;
+-	task_context->timeout_enable = 0;
+-	task_context->block_guard_enable = 0;
+-
+-	task_context->address_modifier = 0;
+-
+ 	task_context->task_phase = 0x01;
+ }
+ 
+@@ -731,15 +717,15 @@ static void scic_sds_port_destroy_dummy_resources(struct scic_sds_port *sci_port
+ {
+ 	struct scic_sds_controller *scic = sci_port->owning_controller;
+ 
+-	if (sci_port->reserved_tci != SCU_DUMMY_INDEX)
+-		scic_controller_free_io_tag(scic, sci_port->reserved_tci);
++	if (sci_port->reserved_tag != SCI_CONTROLLER_INVALID_IO_TAG)
++		isci_free_tag(scic_to_ihost(scic), sci_port->reserved_tag);
+ 
+ 	if (sci_port->reserved_rni != SCU_DUMMY_INDEX)
+ 		scic_sds_remote_node_table_release_remote_node_index(&scic->available_remote_nodes,
+ 								     1, sci_port->reserved_rni);
+ 
+ 	sci_port->reserved_rni = SCU_DUMMY_INDEX;
+-	sci_port->reserved_tci = SCU_DUMMY_INDEX;
++	sci_port->reserved_tag = SCI_CONTROLLER_INVALID_IO_TAG;
+ }
+ 
+ /**
+@@ -1119,18 +1105,17 @@ scic_sds_port_suspend_port_task_scheduler(struct scic_sds_port *port)
+  */
+ static void scic_sds_port_post_dummy_request(struct scic_sds_port *sci_port)
+ {
+-	u32 command;
+-	struct scu_task_context *task_context;
+ 	struct scic_sds_controller *scic = sci_port->owning_controller;
+-	u16 tci = sci_port->reserved_tci;
+-
+-	task_context = scic_sds_controller_get_task_context_buffer(scic, tci);
++	u16 tag = sci_port->reserved_tag;
++	struct scu_task_context *tc;
++	u32 command;
+ 
+-	task_context->abort = 0;
++	tc = &scic->task_context_table[ISCI_TAG_TCI(tag)];
++	tc->abort = 0;
+ 
+ 	command = SCU_CONTEXT_COMMAND_REQUEST_TYPE_POST_TC |
+ 		  sci_port->physical_port_index << SCU_CONTEXT_COMMAND_LOGICAL_PORT_SHIFT |
+-		  tci;
++		  ISCI_TAG_TCI(tag);
+ 
+ 	scic_sds_controller_post_request(scic, command);
+ }
+@@ -1145,17 +1130,16 @@ static void scic_sds_port_post_dummy_request(struct scic_sds_port *sci_port)
+ static void scic_sds_port_abort_dummy_request(struct scic_sds_port *sci_port)
+ {
+ 	struct scic_sds_controller *scic = sci_port->owning_controller;
+-	u16 tci = sci_port->reserved_tci;
++	u16 tag = sci_port->reserved_tag;
+ 	struct scu_task_context *tc;
+ 	u32 command;
+ 
+-	tc = scic_sds_controller_get_task_context_buffer(scic, tci);
+-
++	tc = &scic->task_context_table[ISCI_TAG_TCI(tag)];
+ 	tc->abort = 1;
+ 
+ 	command = SCU_CONTEXT_COMMAND_REQUEST_POST_TC_ABORT |
+ 		  sci_port->physical_port_index << SCU_CONTEXT_COMMAND_LOGICAL_PORT_SHIFT |
+-		  tci;
++		  ISCI_TAG_TCI(tag);
+ 
+ 	scic_sds_controller_post_request(scic, command);
+ }
+@@ -1333,15 +1317,16 @@ enum sci_status scic_sds_port_start(struct scic_sds_port *sci_port)
+ 		sci_port->reserved_rni = rni;
+ 	}
+ 
+-	if (sci_port->reserved_tci == SCU_DUMMY_INDEX) {
+-		/* Allocate a TCI and remove the sequence nibble */
+-		u16 tci = scic_controller_allocate_io_tag(scic);
++	if (sci_port->reserved_tag == SCI_CONTROLLER_INVALID_IO_TAG) {
++		struct isci_host *ihost = scic_to_ihost(scic);
++		u16 tag;
+ 
+-		if (tci != SCU_DUMMY_INDEX)
+-			scic_sds_port_construct_dummy_task(sci_port, tci);
+-		else
++		tag = isci_alloc_tag(ihost);
++		if (tag == SCI_CONTROLLER_INVALID_IO_TAG)
+ 			status = SCI_FAILURE_INSUFFICIENT_RESOURCES;
+-		sci_port->reserved_tci = tci;
++		else
++			scic_sds_port_construct_dummy_task(sci_port, tag);
++		sci_port->reserved_tag = tag;
+ 	}
+ 
+ 	if (status == SCI_SUCCESS) {
+@@ -1859,7 +1844,7 @@ void scic_sds_port_construct(struct scic_sds_port *sci_port, u8 index,
+ 	sci_port->assigned_device_count = 0;
+ 
+ 	sci_port->reserved_rni = SCU_DUMMY_INDEX;
+-	sci_port->reserved_tci = SCU_DUMMY_INDEX;
++	sci_port->reserved_tag = SCI_CONTROLLER_INVALID_IO_TAG;
+ 
+ 	sci_init_timer(&sci_port->timer, port_timeout);
+ 
+diff --git a/drivers/scsi/isci/port.h b/drivers/scsi/isci/port.h
+index 45c01f8..a44e541 100644
+--- a/drivers/scsi/isci/port.h
++++ b/drivers/scsi/isci/port.h
+@@ -108,7 +108,7 @@ struct scic_sds_port {
+ 	u8 active_phy_mask;
+ 
+ 	u16 reserved_rni;
+-	u16 reserved_tci;
++	u16 reserved_tag;
+ 
+ 	/**
+ 	 * This field contains the count of the io requests started on this port
+diff --git a/drivers/scsi/isci/request.c b/drivers/scsi/isci/request.c
+index 08a7340..55859d5 100644
+--- a/drivers/scsi/isci/request.c
++++ b/drivers/scsi/isci/request.c
+@@ -61,42 +61,50 @@
+ #include "scu_event_codes.h"
+ #include "sas.h"
+ 
+-/**
+- * This method returns the sgl element pair for the specificed sgl_pair index.
+- * @sci_req: This parameter specifies the IO request for which to retrieve
+- *    the Scatter-Gather List element pair.
+- * @sgl_pair_index: This parameter specifies the index into the SGL element
+- *    pair to be retrieved.
+- *
+- * This method returns a pointer to an struct scu_sgl_element_pair.
+- */
+-static struct scu_sgl_element_pair *scic_sds_request_get_sgl_element_pair(
+-	struct scic_sds_request *sci_req,
+-	u32 sgl_pair_index
+-	) {
+-	struct scu_task_context *task_context;
++static struct scu_sgl_element_pair *to_sgl_element_pair(struct scic_sds_request *sci_req,
++							int idx)
++{
++	if (idx == 0)
++		return &sci_req->tc->sgl_pair_ab;
++	else if (idx == 1)
++		return &sci_req->tc->sgl_pair_cd;
++	else if (idx < 0)
++		return NULL;
++	else
++		return &sci_req->sg_table[idx - 2];
++}
+ 
+-	task_context = (struct scu_task_context *)sci_req->task_context_buffer;
++static dma_addr_t to_sgl_element_pair_dma(struct scic_sds_controller *scic,
++					  struct scic_sds_request *sci_req, u32 idx)
++{
++	u32 offset;
+ 
+-	if (sgl_pair_index == 0) {
+-		return &task_context->sgl_pair_ab;
+-	} else if (sgl_pair_index == 1) {
+-		return &task_context->sgl_pair_cd;
++	if (idx == 0) {
++		offset = (void *) &sci_req->tc->sgl_pair_ab -
++			 (void *) &scic->task_context_table[0];
++		return scic->task_context_dma + offset;
++	} else if (idx == 1) {
++		offset = (void *) &sci_req->tc->sgl_pair_cd -
++			 (void *) &scic->task_context_table[0];
++		return scic->task_context_dma + offset;
+ 	}
+ 
+-	return &sci_req->sg_table[sgl_pair_index - 2];
++	return scic_io_request_get_dma_addr(sci_req, &sci_req->sg_table[idx - 2]);
++}
++
++static void init_sgl_element(struct scu_sgl_element *e, struct scatterlist *sg)
++{
++	e->length = sg_dma_len(sg);
++	e->address_upper = upper_32_bits(sg_dma_address(sg));
++	e->address_lower = lower_32_bits(sg_dma_address(sg));
++	e->address_modifier = 0;
+ }
+ 
+-/**
+- * This function will build the SGL list for an IO request.
+- * @sci_req: This parameter specifies the IO request for which to build
+- *    the Scatter-Gather List.
+- *
+- */
+ static void scic_sds_request_build_sgl(struct scic_sds_request *sds_request)
+ {
+ 	struct isci_request *isci_request = sci_req_to_ireq(sds_request);
+ 	struct isci_host *isci_host = isci_request->isci_host;
++	struct scic_sds_controller *scic = &isci_host->sci;
+ 	struct sas_task *task = isci_request_access_task(isci_request);
+ 	struct scatterlist *sg = NULL;
+ 	dma_addr_t dma_addr;
+@@ -108,25 +116,19 @@ static void scic_sds_request_build_sgl(struct scic_sds_request *sds_request)
+ 		sg = task->scatter;
+ 
+ 		while (sg) {
+-			scu_sg = scic_sds_request_get_sgl_element_pair(
+-					sds_request,
+-					sg_idx);
+-
+-			SCU_SGL_COPY(scu_sg->A, sg);
+-
++			scu_sg = to_sgl_element_pair(sds_request, sg_idx);
++			init_sgl_element(&scu_sg->A, sg);
+ 			sg = sg_next(sg);
+-
+ 			if (sg) {
+-				SCU_SGL_COPY(scu_sg->B, sg);
++				init_sgl_element(&scu_sg->B, sg);
+ 				sg = sg_next(sg);
+ 			} else
+-				SCU_SGL_ZERO(scu_sg->B);
++				memset(&scu_sg->B, 0, sizeof(scu_sg->B));
+ 
+ 			if (prev_sg) {
+-				dma_addr =
+-					scic_io_request_get_dma_addr(
+-							sds_request,
+-							scu_sg);
++				dma_addr = to_sgl_element_pair_dma(scic,
++								   sds_request,
++								   sg_idx);
+ 
+ 				prev_sg->next_pair_upper =
+ 					upper_32_bits(dma_addr);
+@@ -138,8 +140,7 @@ static void scic_sds_request_build_sgl(struct scic_sds_request *sds_request)
+ 			sg_idx++;
+ 		}
+ 	} else {	/* handle when no sg */
+-		scu_sg = scic_sds_request_get_sgl_element_pair(sds_request,
+-							       sg_idx);
++		scu_sg = to_sgl_element_pair(sds_request, sg_idx);
+ 
+ 		dma_addr = dma_map_single(&isci_host->pdev->dev,
+ 					  task->scatter,
+@@ -246,35 +247,12 @@ static void scu_ssp_reqeust_construct_task_context(
+ 	/* task_context->type.ssp.tag = sci_req->io_tag; */
+ 	task_context->task_phase = 0x01;
+ 
+-	if (sds_request->was_tag_assigned_by_user) {
+-		/*
+-		 * Build the task context now since we have already read
+-		 * the data
+-		 */
+-		sds_request->post_context =
+-			(SCU_CONTEXT_COMMAND_REQUEST_TYPE_POST_TC |
+-			 (scic_sds_controller_get_protocol_engine_group(
+-							controller) <<
+-			  SCU_CONTEXT_COMMAND_PROTOCOL_ENGINE_GROUP_SHIFT) |
+-			 (scic_sds_port_get_index(target_port) <<
+-			  SCU_CONTEXT_COMMAND_LOGICAL_PORT_SHIFT) |
+-			  ISCI_TAG_TCI(sds_request->io_tag));
+-	} else {
+-		/*
+-		 * Build the task context now since we have already read
+-		 * the data
+-		 *
+-		 * I/O tag index is not assigned because we have to wait
+-		 * until we get a TCi
+-		 */
+-		sds_request->post_context =
+-			(SCU_CONTEXT_COMMAND_REQUEST_TYPE_POST_TC |
+-			 (scic_sds_controller_get_protocol_engine_group(
+-							owning_controller) <<
+-			  SCU_CONTEXT_COMMAND_PROTOCOL_ENGINE_GROUP_SHIFT) |
+-			 (scic_sds_port_get_index(target_port) <<
+-			  SCU_CONTEXT_COMMAND_LOGICAL_PORT_SHIFT));
+-	}
++	sds_request->post_context = (SCU_CONTEXT_COMMAND_REQUEST_TYPE_POST_TC |
++				     (scic_sds_controller_get_protocol_engine_group(controller) <<
++				      SCU_CONTEXT_COMMAND_PROTOCOL_ENGINE_GROUP_SHIFT) |
++				     (scic_sds_port_get_index(target_port) <<
++				      SCU_CONTEXT_COMMAND_LOGICAL_PORT_SHIFT) |
++				     ISCI_TAG_TCI(sds_request->io_tag));
+ 
+ 	/*
+ 	 * Copy the physical address for the command buffer to the
+@@ -302,14 +280,11 @@ static void scu_ssp_reqeust_construct_task_context(
+  * @sci_req:
+  *
+  */
+-static void scu_ssp_io_request_construct_task_context(
+-	struct scic_sds_request *sci_req,
+-	enum dma_data_direction dir,
+-	u32 len)
++static void scu_ssp_io_request_construct_task_context(struct scic_sds_request *sci_req,
++						      enum dma_data_direction dir,
++						      u32 len)
+ {
+-	struct scu_task_context *task_context;
+-
+-	task_context = scic_sds_request_get_task_context(sci_req);
++	struct scu_task_context *task_context = sci_req->tc;
+ 
+ 	scu_ssp_reqeust_construct_task_context(sci_req, task_context);
+ 
+@@ -347,12 +322,9 @@ static void scu_ssp_io_request_construct_task_context(
+  *    constructed.
+  *
+  */
+-static void scu_ssp_task_request_construct_task_context(
+-	struct scic_sds_request *sci_req)
++static void scu_ssp_task_request_construct_task_context(struct scic_sds_request *sci_req)
+ {
+-	struct scu_task_context *task_context;
+-
+-	task_context = scic_sds_request_get_task_context(sci_req);
++	struct scu_task_context *task_context = sci_req->tc;
+ 
+ 	scu_ssp_reqeust_construct_task_context(sci_req, task_context);
+ 
+@@ -421,35 +393,12 @@ static void scu_sata_reqeust_construct_task_context(
+ 	/* Set the first word of the H2D REG FIS */
+ 	task_context->type.words[0] = *(u32 *)&sci_req->stp.cmd;
+ 
+-	if (sci_req->was_tag_assigned_by_user) {
+-		/*
+-		 * Build the task context now since we have already read
+-		 * the data
+-		 */
+-		sci_req->post_context =
+-			(SCU_CONTEXT_COMMAND_REQUEST_TYPE_POST_TC |
+-			 (scic_sds_controller_get_protocol_engine_group(
+-							controller) <<
+-			  SCU_CONTEXT_COMMAND_PROTOCOL_ENGINE_GROUP_SHIFT) |
+-			 (scic_sds_port_get_index(target_port) <<
+-			  SCU_CONTEXT_COMMAND_LOGICAL_PORT_SHIFT) |
+-			  ISCI_TAG_TCI(sci_req->io_tag));
+-	} else {
+-		/*
+-		 * Build the task context now since we have already read
+-		 * the data.
+-		 * I/O tag index is not assigned because we have to wait
+-		 * until we get a TCi.
+-		 */
+-		sci_req->post_context =
+-			(SCU_CONTEXT_COMMAND_REQUEST_TYPE_POST_TC |
+-			 (scic_sds_controller_get_protocol_engine_group(
+-							controller) <<
+-			  SCU_CONTEXT_COMMAND_PROTOCOL_ENGINE_GROUP_SHIFT) |
+-			 (scic_sds_port_get_index(target_port) <<
+-			  SCU_CONTEXT_COMMAND_LOGICAL_PORT_SHIFT));
+-	}
+-
++	sci_req->post_context = (SCU_CONTEXT_COMMAND_REQUEST_TYPE_POST_TC |
++				 (scic_sds_controller_get_protocol_engine_group(controller) <<
++				  SCU_CONTEXT_COMMAND_PROTOCOL_ENGINE_GROUP_SHIFT) |
++				 (scic_sds_port_get_index(target_port) <<
++				  SCU_CONTEXT_COMMAND_LOGICAL_PORT_SHIFT) |
++				 ISCI_TAG_TCI(sci_req->io_tag));
+ 	/*
+ 	 * Copy the physical address for the command buffer to the SCU Task
+ 	 * Context. We must offset the command buffer by 4 bytes because the
+@@ -467,22 +416,9 @@ static void scu_sata_reqeust_construct_task_context(
+ 	task_context->response_iu_lower = 0;
+ }
+ 
+-
+-
+-/**
+- * scu_stp_raw_request_construct_task_context -
+- * @sci_req: This parameter specifies the STP request object for which to
+- *    construct a RAW command frame task context.
+- * @task_context: This parameter specifies the SCU specific task context buffer
+- *    to construct.
+- *
+- * This method performs the operations common to all SATA/STP requests
+- * utilizing the raw frame method. none
+- */
+-static void scu_stp_raw_request_construct_task_context(struct scic_sds_stp_request *stp_req,
+-						       struct scu_task_context *task_context)
++static void scu_stp_raw_request_construct_task_context(struct scic_sds_request *sci_req)
+ {
+-	struct scic_sds_request *sci_req = to_sci_req(stp_req);
++	struct scu_task_context *task_context = sci_req->tc;
+ 
+ 	scu_sata_reqeust_construct_task_context(sci_req, task_context);
+ 
+@@ -500,8 +436,7 @@ scic_sds_stp_pio_request_construct(struct scic_sds_request *sci_req,
+ 	struct scic_sds_stp_request *stp_req = &sci_req->stp.req;
+ 	struct scic_sds_stp_pio_request *pio = &stp_req->type.pio;
+ 
+-	scu_stp_raw_request_construct_task_context(stp_req,
+-						   sci_req->task_context_buffer);
++	scu_stp_raw_request_construct_task_context(sci_req);
+ 
+ 	pio->current_transfer_bytes = 0;
+ 	pio->ending_error = 0;
+@@ -512,13 +447,10 @@ scic_sds_stp_pio_request_construct(struct scic_sds_request *sci_req,
+ 
+ 	if (copy_rx_frame) {
+ 		scic_sds_request_build_sgl(sci_req);
+-		/* Since the IO request copy of the TC contains the same data as
+-		 * the actual TC this pointer is vaild for either.
+-		 */
+-		pio->request_current.sgl_pair = &sci_req->task_context_buffer->sgl_pair_ab;
++		pio->request_current.sgl_index = 0;
+ 	} else {
+ 		/* The user does not want the data copied to the SGL buffer location */
+-		pio->request_current.sgl_pair = NULL;
++		pio->request_current.sgl_index = -1;
+ 	}
+ 
+ 	return SCI_SUCCESS;
+@@ -541,7 +473,7 @@ static void scic_sds_stp_optimized_request_construct(struct scic_sds_request *sc
+ 						     u32 len,
+ 						     enum dma_data_direction dir)
+ {
+-	struct scu_task_context *task_context = sci_req->task_context_buffer;
++	struct scu_task_context *task_context = sci_req->tc;
+ 
+ 	/* Build the STP task context structure */
+ 	scu_sata_reqeust_construct_task_context(sci_req, task_context);
+@@ -587,8 +519,7 @@ scic_io_request_construct_sata(struct scic_sds_request *sci_req,
+ 
+ 		if (tmf->tmf_code == isci_tmf_sata_srst_high ||
+ 		    tmf->tmf_code == isci_tmf_sata_srst_low) {
+-			scu_stp_raw_request_construct_task_context(&sci_req->stp.req,
+-								   sci_req->task_context_buffer);
++			scu_stp_raw_request_construct_task_context(sci_req);
+ 			return SCI_SUCCESS;
+ 		} else {
+ 			dev_err(scic_to_dev(sci_req->owning_controller),
+@@ -611,8 +542,7 @@ scic_io_request_construct_sata(struct scic_sds_request *sci_req,
+ 
+ 	/* non data */
+ 	if (task->data_dir == DMA_NONE) {
+-		scu_stp_raw_request_construct_task_context(&sci_req->stp.req,
+-							   sci_req->task_context_buffer);
++		scu_stp_raw_request_construct_task_context(sci_req);
+ 		return SCI_SUCCESS;
+ 	}
+ 
+@@ -701,8 +631,7 @@ enum sci_status scic_task_request_construct_sata(struct scic_sds_request *sci_re
+ 
+ 		if (tmf->tmf_code == isci_tmf_sata_srst_high ||
+ 		    tmf->tmf_code == isci_tmf_sata_srst_low) {
+-			scu_stp_raw_request_construct_task_context(&sci_req->stp.req,
+-								   sci_req->task_context_buffer);
++			scu_stp_raw_request_construct_task_context(sci_req);
+ 		} else {
+ 			dev_err(scic_to_dev(sci_req->owning_controller),
+ 				"%s: Request 0x%p received un-handled SAT "
+@@ -749,9 +678,9 @@ static u32 sci_req_tx_bytes(struct scic_sds_request *sci_req)
+ 
+ enum sci_status scic_sds_request_start(struct scic_sds_request *sci_req)
+ {
+-	struct scic_sds_controller *scic = sci_req->owning_controller;
+-	struct scu_task_context *task_context;
+ 	enum sci_base_request_states state;
++	struct scu_task_context *tc = sci_req->tc;
++	struct scic_sds_controller *scic = sci_req->owning_controller;
+ 
+ 	state = sci_req->sm.current_state_id;
+ 	if (state != SCI_REQ_CONSTRUCTED) {
+@@ -761,61 +690,39 @@ enum sci_status scic_sds_request_start(struct scic_sds_request *sci_req)
+ 		return SCI_FAILURE_INVALID_STATE;
+ 	}
+ 
+-	/* if necessary, allocate a TCi for the io request object and then will,
+-	 * if necessary, copy the constructed TC data into the actual TC buffer.
+-	 * If everything is successful the post context field is updated with
+-	 * the TCi so the controller can post the request to the hardware.
+-	 */
+-	if (sci_req->io_tag == SCI_CONTROLLER_INVALID_IO_TAG)
+-		sci_req->io_tag = scic_controller_allocate_io_tag(scic);
+-
+-	/* Record the IO Tag in the request */
+-	if (sci_req->io_tag != SCI_CONTROLLER_INVALID_IO_TAG) {
+-		task_context = sci_req->task_context_buffer;
+-
+-		task_context->task_index = ISCI_TAG_TCI(sci_req->io_tag);
+-
+-		switch (task_context->protocol_type) {
+-		case SCU_TASK_CONTEXT_PROTOCOL_SMP:
+-		case SCU_TASK_CONTEXT_PROTOCOL_SSP:
+-			/* SSP/SMP Frame */
+-			task_context->type.ssp.tag = sci_req->io_tag;
+-			task_context->type.ssp.target_port_transfer_tag =
+-				0xFFFF;
+-			break;
++	tc->task_index = ISCI_TAG_TCI(sci_req->io_tag);
+ 
+-		case SCU_TASK_CONTEXT_PROTOCOL_STP:
+-			/* STP/SATA Frame
+-			 * task_context->type.stp.ncq_tag = sci_req->ncq_tag;
+-			 */
+-			break;
+-
+-		case SCU_TASK_CONTEXT_PROTOCOL_NONE:
+-			/* / @todo When do we set no protocol type? */
+-			break;
++	switch (tc->protocol_type) {
++	case SCU_TASK_CONTEXT_PROTOCOL_SMP:
++	case SCU_TASK_CONTEXT_PROTOCOL_SSP:
++		/* SSP/SMP Frame */
++		tc->type.ssp.tag = sci_req->io_tag;
++		tc->type.ssp.target_port_transfer_tag = 0xFFFF;
++		break;
+ 
+-		default:
+-			/* This should never happen since we build the IO
+-			 * requests */
+-			break;
+-		}
++	case SCU_TASK_CONTEXT_PROTOCOL_STP:
++		/* STP/SATA Frame
++		 * tc->type.stp.ncq_tag = sci_req->ncq_tag;
++		 */
++		break;
+ 
+-		/*
+-		 * Check to see if we need to copy the task context buffer
+-		 * or have been building into the task context buffer */
+-		if (sci_req->was_tag_assigned_by_user == false)
+-			scic_sds_controller_copy_task_context(scic, sci_req);
++	case SCU_TASK_CONTEXT_PROTOCOL_NONE:
++		/* / @todo When do we set no protocol type? */
++		break;
+ 
+-		/* Add to the post_context the io tag value */
+-		sci_req->post_context |= ISCI_TAG_TCI(sci_req->io_tag);
++	default:
++		/* This should never happen since we build the IO
++		 * requests */
++		break;
++	}
+ 
+-		/* Everything is good go ahead and change state */
+-		sci_change_state(&sci_req->sm, SCI_REQ_STARTED);
++	/* Add to the post_context the io tag value */
++	sci_req->post_context |= ISCI_TAG_TCI(sci_req->io_tag);
+ 
+-		return SCI_SUCCESS;
+-	}
++	/* Everything is good go ahead and change state */
++	sci_change_state(&sci_req->sm, SCI_REQ_STARTED);
+ 
+-	return SCI_FAILURE_INSUFFICIENT_RESOURCES;
++	return SCI_SUCCESS;
+ }
+ 
+ enum sci_status
+@@ -880,9 +787,6 @@ enum sci_status scic_sds_request_complete(struct scic_sds_request *sci_req)
+ 		      "isci: request completion from wrong state (%d)\n", state))
+ 		return SCI_FAILURE_INVALID_STATE;
+ 
+-	if (!sci_req->was_tag_assigned_by_user)
+-		scic_controller_free_io_tag(scic, sci_req->io_tag);
+-
+ 	if (sci_req->saved_rx_frame_index != SCU_INVALID_FRAME_INDEX)
+ 		scic_sds_controller_release_frame(scic,
+ 						  sci_req->saved_rx_frame_index);
+@@ -1244,51 +1148,40 @@ void scic_stp_io_request_set_ncq_tag(struct scic_sds_request *req,
+ 	 * @note This could be made to return an error to the user if the user
+ 	 *       attempts to set the NCQ tag in the wrong state.
+ 	 */
+-	req->task_context_buffer->type.stp.ncq_tag = ncq_tag;
++	req->tc->type.stp.ncq_tag = ncq_tag;
+ }
+ 
+-/**
+- *
+- * @sci_req:
+- *
+- * Get the next SGL element from the request. - Check on which SGL element pair
+- * we are working - if working on SLG pair element A - advance to element B -
+- * else - check to see if there are more SGL element pairs for this IO request
+- * - if there are more SGL element pairs - advance to the next pair and return
+- * element A struct scu_sgl_element*
+- */
+-static struct scu_sgl_element *scic_sds_stp_request_pio_get_next_sgl(struct scic_sds_stp_request *stp_req)
++static struct scu_sgl_element *pio_sgl_next(struct scic_sds_stp_request *stp_req)
+ {
+-	struct scu_sgl_element *current_sgl;
++	struct scu_sgl_element *sgl;
++	struct scu_sgl_element_pair *sgl_pair;
+ 	struct scic_sds_request *sci_req = to_sci_req(stp_req);
+ 	struct scic_sds_request_pio_sgl *pio_sgl = &stp_req->type.pio.request_current;
+ 
+-	if (pio_sgl->sgl_set == SCU_SGL_ELEMENT_PAIR_A) {
+-		if (pio_sgl->sgl_pair->B.address_lower == 0 &&
+-		    pio_sgl->sgl_pair->B.address_upper == 0) {
+-			current_sgl = NULL;
++	sgl_pair = to_sgl_element_pair(sci_req, pio_sgl->sgl_index);
++	if (!sgl_pair)
++		sgl = NULL;
++	else if (pio_sgl->sgl_set == SCU_SGL_ELEMENT_PAIR_A) {
++		if (sgl_pair->B.address_lower == 0 &&
++		    sgl_pair->B.address_upper == 0) {
++			sgl = NULL;
+ 		} else {
+ 			pio_sgl->sgl_set = SCU_SGL_ELEMENT_PAIR_B;
+-			current_sgl = &pio_sgl->sgl_pair->B;
++			sgl = &sgl_pair->B;
+ 		}
+ 	} else {
+-		if (pio_sgl->sgl_pair->next_pair_lower == 0 &&
+-		    pio_sgl->sgl_pair->next_pair_upper == 0) {
+-			current_sgl = NULL;
++		if (sgl_pair->next_pair_lower == 0 &&
++		    sgl_pair->next_pair_upper == 0) {
++			sgl = NULL;
+ 		} else {
+-			u64 phys_addr;
+-
+-			phys_addr = pio_sgl->sgl_pair->next_pair_upper;
+-			phys_addr <<= 32;
+-			phys_addr |= pio_sgl->sgl_pair->next_pair_lower;
+-
+-			pio_sgl->sgl_pair = scic_request_get_virt_addr(sci_req, phys_addr);
++			pio_sgl->sgl_index++;
+ 			pio_sgl->sgl_set = SCU_SGL_ELEMENT_PAIR_A;
+-			current_sgl = &pio_sgl->sgl_pair->A;
++			sgl_pair = to_sgl_element_pair(sci_req, pio_sgl->sgl_index);
++			sgl = &sgl_pair->A;
+ 		}
+ 	}
+ 
+-	return current_sgl;
++	return sgl;
+ }
+ 
+ static enum sci_status
+@@ -1328,21 +1221,19 @@ static enum sci_status scic_sds_stp_request_pio_data_out_trasmit_data_frame(
+ 	struct scic_sds_request *sci_req,
+ 	u32 length)
+ {
+-	struct scic_sds_controller *scic = sci_req->owning_controller;
+ 	struct scic_sds_stp_request *stp_req = &sci_req->stp.req;
+-	struct scu_task_context *task_context;
++	struct scu_task_context *task_context = sci_req->tc;
++	struct scu_sgl_element_pair *sgl_pair;
+ 	struct scu_sgl_element *current_sgl;
+ 
+ 	/* Recycle the TC and reconstruct it for sending out DATA FIS containing
+ 	 * for the data from current_sgl+offset for the input length
+ 	 */
+-	task_context = scic_sds_controller_get_task_context_buffer(scic,
+-								   sci_req->io_tag);
+-
++	sgl_pair = to_sgl_element_pair(sci_req, stp_req->type.pio.request_current.sgl_index);
+ 	if (stp_req->type.pio.request_current.sgl_set == SCU_SGL_ELEMENT_PAIR_A)
+-		current_sgl = &stp_req->type.pio.request_current.sgl_pair->A;
++		current_sgl = &sgl_pair->A;
+ 	else
+-		current_sgl = &stp_req->type.pio.request_current.sgl_pair->B;
++		current_sgl = &sgl_pair->B;
+ 
+ 	/* update the TC */
+ 	task_context->command_iu_upper = current_sgl->address_upper;
+@@ -1362,18 +1253,21 @@ static enum sci_status scic_sds_stp_request_pio_data_out_transmit_data(struct sc
+ 	u32 remaining_bytes_in_current_sgl = 0;
+ 	enum sci_status status = SCI_SUCCESS;
+ 	struct scic_sds_stp_request *stp_req = &sci_req->stp.req;
++	struct scu_sgl_element_pair *sgl_pair;
+ 
+ 	sgl_offset = stp_req->type.pio.request_current.sgl_offset;
++	sgl_pair = to_sgl_element_pair(sci_req, stp_req->type.pio.request_current.sgl_index);
++	if (WARN_ONCE(!sgl_pair, "%s: null sgl element", __func__))
++		return SCI_FAILURE;
+ 
+ 	if (stp_req->type.pio.request_current.sgl_set == SCU_SGL_ELEMENT_PAIR_A) {
+-		current_sgl = &(stp_req->type.pio.request_current.sgl_pair->A);
+-		remaining_bytes_in_current_sgl = stp_req->type.pio.request_current.sgl_pair->A.length - sgl_offset;
++		current_sgl = &sgl_pair->A;
++		remaining_bytes_in_current_sgl = sgl_pair->A.length - sgl_offset;
+ 	} else {
+-		current_sgl = &(stp_req->type.pio.request_current.sgl_pair->B);
+-		remaining_bytes_in_current_sgl = stp_req->type.pio.request_current.sgl_pair->B.length - sgl_offset;
++		current_sgl = &sgl_pair->B;
++		remaining_bytes_in_current_sgl = sgl_pair->B.length - sgl_offset;
+ 	}
+ 
+-
+ 	if (stp_req->type.pio.pio_transfer_bytes > 0) {
+ 		if (stp_req->type.pio.pio_transfer_bytes >= remaining_bytes_in_current_sgl) {
+ 			/* recycle the TC and send the H2D Data FIS from (current sgl + sgl_offset) and length = remaining_bytes_in_current_sgl */
+@@ -1382,7 +1276,7 @@ static enum sci_status scic_sds_stp_request_pio_data_out_transmit_data(struct sc
+ 				stp_req->type.pio.pio_transfer_bytes -= remaining_bytes_in_current_sgl;
+ 
+ 				/* update the current sgl, sgl_offset and save for future */
+-				current_sgl = scic_sds_stp_request_pio_get_next_sgl(stp_req);
++				current_sgl = pio_sgl_next(stp_req);
+ 				sgl_offset = 0;
+ 			}
+ 		} else if (stp_req->type.pio.pio_transfer_bytes < remaining_bytes_in_current_sgl) {
+@@ -1945,7 +1839,7 @@ scic_sds_io_request_frame_handler(struct scic_sds_request *sci_req,
+ 			return status;
+ 		}
+ 
+-		if (stp_req->type.pio.request_current.sgl_pair == NULL) {
++		if (stp_req->type.pio.request_current.sgl_index < 0) {
+ 			sci_req->saved_rx_frame_index = frame_index;
+ 			stp_req->type.pio.pio_transfer_bytes = 0;
+ 		} else {
+@@ -2977,8 +2871,6 @@ static void isci_request_io_request_complete(struct isci_host *isci_host,
+ 	 * task to recognize the already completed case.
+ 	 */
+ 	request->terminated = true;
+-
+-	isci_host_can_dequeue(isci_host, 1);
+ }
+ 
+ static void scic_sds_request_started_state_enter(struct sci_base_state_machine *sm)
+@@ -3039,7 +2931,7 @@ static void scic_sds_request_aborting_state_enter(struct sci_base_state_machine
+ 	struct scic_sds_request *sci_req = container_of(sm, typeof(*sci_req), sm);
+ 
+ 	/* Setting the abort bit in the Task Context is required by the silicon. */
+-	sci_req->task_context_buffer->abort = 1;
++	sci_req->tc->abort = 1;
+ }
+ 
+ static void scic_sds_stp_request_started_non_data_await_h2d_completion_enter(struct sci_base_state_machine *sm)
+@@ -3069,7 +2961,7 @@ static void scic_sds_stp_request_started_soft_reset_await_h2d_asserted_completio
+ static void scic_sds_stp_request_started_soft_reset_await_h2d_diagnostic_completion_enter(struct sci_base_state_machine *sm)
+ {
+ 	struct scic_sds_request *sci_req = container_of(sm, typeof(*sci_req), sm);
+-	struct scu_task_context *task_context;
++	struct scu_task_context *tc = sci_req->tc;
+ 	struct host_to_dev_fis *h2d_fis;
+ 	enum sci_status status;
+ 
+@@ -3078,9 +2970,7 @@ static void scic_sds_stp_request_started_soft_reset_await_h2d_diagnostic_complet
+ 	h2d_fis->control = 0;
+ 
+ 	/* Clear the TC control bit */
+-	task_context = scic_sds_controller_get_task_context_buffer(
+-		sci_req->owning_controller, sci_req->io_tag);
+-	task_context->control_frame = 0;
++	tc->control_frame = 0;
+ 
+ 	status = scic_controller_continue_io(sci_req);
+ 	WARN_ONCE(status != SCI_SUCCESS, "isci: continue io failure\n");
+@@ -3141,18 +3031,10 @@ scic_sds_general_request_construct(struct scic_sds_controller *scic,
+ 	sci_req->sci_status   = SCI_SUCCESS;
+ 	sci_req->scu_status   = 0;
+ 	sci_req->post_context = 0xFFFFFFFF;
++	sci_req->tc = &scic->task_context_table[ISCI_TAG_TCI(io_tag)];
+ 
+ 	sci_req->is_task_management_request = false;
+-
+-	if (io_tag == SCI_CONTROLLER_INVALID_IO_TAG) {
+-		sci_req->was_tag_assigned_by_user = false;
+-		sci_req->task_context_buffer = &sci_req->tc;
+-	} else {
+-		sci_req->was_tag_assigned_by_user = true;
+-
+-		sci_req->task_context_buffer =
+-			scic_sds_controller_get_task_context_buffer(scic, io_tag);
+-	}
++	WARN_ONCE(io_tag == SCI_CONTROLLER_INVALID_IO_TAG, "straggling invalid tag usage\n");
+ }
+ 
+ static enum sci_status
+@@ -3178,8 +3060,7 @@ scic_io_request_construct(struct scic_sds_controller *scic,
+ 	else
+ 		return SCI_FAILURE_UNSUPPORTED_PROTOCOL;
+ 
+-	memset(sci_req->task_context_buffer, 0,
+-	       offsetof(struct scu_task_context, sgl_pair_ab));
++	memset(sci_req->tc, 0, offsetof(struct scu_task_context, sgl_pair_ab));
+ 
+ 	return status;
+ }
+@@ -3197,7 +3078,7 @@ enum sci_status scic_task_request_construct(struct scic_sds_controller *scic,
+ 	if (dev->dev_type == SAS_END_DEV ||
+ 	    dev->dev_type == SATA_DEV || (dev->tproto & SAS_PROTOCOL_STP)) {
+ 		sci_req->is_task_management_request = true;
+-		memset(sci_req->task_context_buffer, 0, sizeof(struct scu_task_context));
++		memset(sci_req->tc, 0, sizeof(struct scu_task_context));
+ 	} else
+ 		status = SCI_FAILURE_UNSUPPORTED_PROTOCOL;
+ 
+@@ -3299,7 +3180,7 @@ scic_io_request_construct_smp(struct device *dev,
+ 
+ 	/* byte swap the smp request. */
+ 
+-	task_context = scic_sds_request_get_task_context(sci_req);
++	task_context = sci_req->tc;
+ 
+ 	sci_dev = scic_sds_request_get_device(sci_req);
+ 	sci_port = scic_sds_request_get_port(sci_req);
+@@ -3354,33 +3235,12 @@ scic_io_request_construct_smp(struct device *dev,
+ 	 */
+ 	task_context->task_phase = 0;
+ 
+-	if (sci_req->was_tag_assigned_by_user) {
+-		/*
+-		 * Build the task context now since we have already read
+-		 * the data
+-		 */
+-		sci_req->post_context =
+-			(SCU_CONTEXT_COMMAND_REQUEST_TYPE_POST_TC |
+-			 (scic_sds_controller_get_protocol_engine_group(scic) <<
+-			  SCU_CONTEXT_COMMAND_PROTOCOL_ENGINE_GROUP_SHIFT) |
+-			 (scic_sds_port_get_index(sci_port) <<
+-			  SCU_CONTEXT_COMMAND_LOGICAL_PORT_SHIFT) |
+-			  ISCI_TAG_TCI(sci_req->io_tag));
+-	} else {
+-		/*
+-		 * Build the task context now since we have already read
+-		 * the data.
+-		 * I/O tag index is not assigned because we have to wait
+-		 * until we get a TCi.
+-		 */
+-		sci_req->post_context =
+-			(SCU_CONTEXT_COMMAND_REQUEST_TYPE_POST_TC |
+-			 (scic_sds_controller_get_protocol_engine_group(scic) <<
+-			  SCU_CONTEXT_COMMAND_PROTOCOL_ENGINE_GROUP_SHIFT) |
+-			 (scic_sds_port_get_index(sci_port) <<
+-			  SCU_CONTEXT_COMMAND_LOGICAL_PORT_SHIFT));
+-	}
+-
++	sci_req->post_context = (SCU_CONTEXT_COMMAND_REQUEST_TYPE_POST_TC |
++				 (scic_sds_controller_get_protocol_engine_group(scic) <<
++				  SCU_CONTEXT_COMMAND_PROTOCOL_ENGINE_GROUP_SHIFT) |
++				 (scic_sds_port_get_index(sci_port) <<
++				  SCU_CONTEXT_COMMAND_LOGICAL_PORT_SHIFT) |
++				 ISCI_TAG_TCI(sci_req->io_tag));
+ 	/*
+ 	 * Copy the physical address for the command buffer to the SCU Task
+ 	 * Context command buffer should not contain command header.
+@@ -3431,10 +3291,10 @@ static enum sci_status isci_smp_request_build(struct isci_request *ireq)
+  *
+  * SCI_SUCCESS on successfull completion, or specific failure code.
+  */
+-static enum sci_status isci_io_request_build(
+-	struct isci_host *isci_host,
+-	struct isci_request *request,
+-	struct isci_remote_device *isci_device)
++static enum sci_status isci_io_request_build(struct isci_host *isci_host,
++					     struct isci_request *request,
++					     struct isci_remote_device *isci_device,
++					     u16 tag)
+ {
+ 	enum sci_status status = SCI_SUCCESS;
+ 	struct sas_task *task = isci_request_access_task(request);
+@@ -3471,8 +3331,7 @@ static enum sci_status isci_io_request_build(
+ 	 * we will let the core allocate the IO tag.
+ 	 */
+ 	status = scic_io_request_construct(&isci_host->sci, sci_device,
+-					   SCI_CONTROLLER_INVALID_IO_TAG,
+-					   &request->sci);
++					   tag, &request->sci);
+ 
+ 	if (status != SCI_SUCCESS) {
+ 		dev_warn(&isci_host->pdev->dev,
+@@ -3564,7 +3423,7 @@ struct isci_request *isci_request_alloc_tmf(struct isci_host *ihost,
+ }
+ 
+ int isci_request_execute(struct isci_host *ihost, struct isci_remote_device *idev,
+-			 struct sas_task *task, gfp_t gfp_flags)
++			 struct sas_task *task, u16 tag, gfp_t gfp_flags)
+ {
+ 	enum sci_status status = SCI_FAILURE_UNSUPPORTED_PROTOCOL;
+ 	struct isci_request *ireq;
+@@ -3576,7 +3435,7 @@ int isci_request_execute(struct isci_host *ihost, struct isci_remote_device *ide
+ 	if (!ireq)
+ 		goto out;
+ 
+-	status = isci_io_request_build(ihost, ireq, idev);
++	status = isci_io_request_build(ihost, ireq, idev, tag);
+ 	if (status != SCI_SUCCESS) {
+ 		dev_warn(&ihost->pdev->dev,
+ 			 "%s: request_construct failed - status = 0x%x\n",
+@@ -3599,18 +3458,16 @@ int isci_request_execute(struct isci_host *ihost, struct isci_remote_device *ide
+ 			 */
+ 			status = scic_controller_start_task(&ihost->sci,
+ 							    &idev->sci,
+-							    &ireq->sci,
+-							    SCI_CONTROLLER_INVALID_IO_TAG);
++							    &ireq->sci);
+ 		} else {
+ 			status = SCI_FAILURE;
+ 		}
+ 	} else {
+-
+ 		/* send the request, let the core assign the IO TAG.	*/
+ 		status = scic_controller_start_io(&ihost->sci, &idev->sci,
+-						  &ireq->sci,
+-						  SCI_CONTROLLER_INVALID_IO_TAG);
++						  &ireq->sci);
+ 	}
++
+ 	if (status != SCI_SUCCESS &&
+ 	    status != SCI_FAILURE_REMOTE_DEVICE_RESET_REQUIRED) {
+ 		dev_warn(&ihost->pdev->dev,
+@@ -3647,23 +3504,23 @@ int isci_request_execute(struct isci_host *ihost, struct isci_remote_device *ide
+ 	if (status ==
+ 	    SCI_FAILURE_REMOTE_DEVICE_RESET_REQUIRED) {
+ 		/* Signal libsas that we need the SCSI error
+-		* handler thread to work on this I/O and that
+-		* we want a device reset.
+-		*/
++		 * handler thread to work on this I/O and that
++		 * we want a device reset.
++		 */
+ 		spin_lock_irqsave(&task->task_state_lock, flags);
+ 		task->task_state_flags |= SAS_TASK_NEED_DEV_RESET;
+ 		spin_unlock_irqrestore(&task->task_state_lock, flags);
+ 
+ 		/* Cause this task to be scheduled in the SCSI error
+-		* handler thread.
+-		*/
++		 * handler thread.
++		 */
+ 		isci_execpath_callback(ihost, task,
+ 				       sas_task_abort);
+ 
+ 		/* Change the status, since we are holding
+-		* the I/O until it is managed by the SCSI
+-		* error handler.
+-		*/
++		 * the I/O until it is managed by the SCSI
++		 * error handler.
++		 */
+ 		status = SCI_SUCCESS;
+ 	}
+ 
+diff --git a/drivers/scsi/isci/request.h b/drivers/scsi/isci/request.h
+index 9130f22..8c77c4c 100644
+--- a/drivers/scsi/isci/request.h
++++ b/drivers/scsi/isci/request.h
+@@ -136,7 +136,7 @@ struct scic_sds_stp_request {
+ 			u8 ending_error;
+ 
+ 			struct scic_sds_request_pio_sgl {
+-				struct scu_sgl_element_pair *sgl_pair;
++				int sgl_index;
+ 				u8 sgl_set;
+ 				u32 sgl_offset;
+ 			} request_current;
+@@ -172,12 +172,6 @@ struct scic_sds_request {
+ 	struct scic_sds_remote_device *target_device;
+ 
+ 	/*
+-	 * This field is utilized to determine if the SCI user is managing
+-	 * the IO tag for this request or if the core is managing it.
+-	 */
+-	bool was_tag_assigned_by_user;
+-
+-	/*
+ 	 * This field indicates the IO tag for this request.  The IO tag is
+ 	 * comprised of the task_index and a sequence count. The sequence count
+ 	 * is utilized to help identify tasks from one life to another.
+@@ -209,8 +203,7 @@ struct scic_sds_request {
+ 	 */
+ 	u32 post_context;
+ 
+-	struct scu_task_context *task_context_buffer;
+-	struct scu_task_context tc ____cacheline_aligned;
++	struct scu_task_context *tc;
+ 
+ 	/* could be larger with sg chaining */
+ 	#define SCU_SGL_SIZE ((SCI_MAX_SCATTER_GATHER_ELEMENTS + 1) / 2)
+@@ -465,35 +458,6 @@ enum sci_base_request_states {
+ 		(request)->sci_status = (sci_status_code); \
+ 	}
+ 
+-/**
+- * SCU_SGL_ZERO() -
+- *
+- * This macro zeros the hardware SGL element data
+- */
+-#define SCU_SGL_ZERO(scu_sge) \
+-	{ \
+-		(scu_sge).length = 0; \
+-		(scu_sge).address_lower = 0; \
+-		(scu_sge).address_upper = 0; \
+-		(scu_sge).address_modifier = 0;	\
+-	}
+-
+-/**
+- * SCU_SGL_COPY() -
+- *
+- * This macro copys the SGL Element data from the host os to the hardware SGL
+- * elment data
+- */
+-#define SCU_SGL_COPY(scu_sge, os_sge) \
+-	{ \
+-		(scu_sge).length = sg_dma_len(sg); \
+-		(scu_sge).address_upper = \
+-			upper_32_bits(sg_dma_address(sg)); \
+-		(scu_sge).address_lower = \
+-			lower_32_bits(sg_dma_address(sg)); \
+-		(scu_sge).address_modifier = 0;	\
+-	}
+-
+ enum sci_status scic_sds_request_start(struct scic_sds_request *sci_req);
+ enum sci_status scic_sds_io_request_terminate(struct scic_sds_request *sci_req);
+ enum sci_status
+@@ -510,22 +474,6 @@ extern enum sci_status
+ scic_sds_io_request_tc_completion(struct scic_sds_request *sci_req, u32 code);
+ 
+ /* XXX open code in caller */
+-static inline void *scic_request_get_virt_addr(struct scic_sds_request *sci_req,
+-					       dma_addr_t phys_addr)
+-{
+-	struct isci_request *ireq = sci_req_to_ireq(sci_req);
+-	dma_addr_t offset;
+-
+-	BUG_ON(phys_addr < ireq->request_daddr);
+-
+-	offset = phys_addr - ireq->request_daddr;
+-
+-	BUG_ON(offset >= sizeof(*ireq));
+-
+-	return (char *)ireq + offset;
+-}
+-
+-/* XXX open code in caller */
+ static inline dma_addr_t
+ scic_io_request_get_dma_addr(struct scic_sds_request *sci_req, void *virt_addr)
+ {
+@@ -672,7 +620,7 @@ struct isci_request *isci_request_alloc_tmf(struct isci_host *ihost,
+ 					    struct isci_tmf *isci_tmf,
+ 					    gfp_t gfp_flags);
+ int isci_request_execute(struct isci_host *ihost, struct isci_remote_device *idev,
+-			 struct sas_task *task, gfp_t gfp_flags);
++			 struct sas_task *task, u16 tag, gfp_t gfp_flags);
+ void isci_terminate_pending_requests(struct isci_host *ihost,
+ 				     struct isci_remote_device *idev);
+ enum sci_status
+diff --git a/drivers/scsi/isci/task.c b/drivers/scsi/isci/task.c
+index 157e997..22f6fe1 100644
+--- a/drivers/scsi/isci/task.c
++++ b/drivers/scsi/isci/task.c
+@@ -63,6 +63,7 @@
+ #include "request.h"
+ #include "sata.h"
+ #include "task.h"
++#include "host.h"
+ 
+ /**
+ * isci_task_refuse() - complete the request to the upper layer driver in
+@@ -156,25 +157,19 @@ int isci_task_execute_task(struct sas_task *task, int num, gfp_t gfp_flags)
+ {
+ 	struct isci_host *ihost = dev_to_ihost(task->dev);
+ 	struct isci_remote_device *idev;
+-	enum sci_status status;
+ 	unsigned long flags;
+ 	bool io_ready;
+-	int ret;
++	u16 tag;
+ 
+ 	dev_dbg(&ihost->pdev->dev, "%s: num=%d\n", __func__, num);
+ 
+-	/* Check if we have room for more tasks */
+-	ret = isci_host_can_queue(ihost, num);
+-
+-	if (ret) {
+-		dev_warn(&ihost->pdev->dev, "%s: queue full\n", __func__);
+-		return ret;
+-	}
+-
+ 	for_each_sas_task(num, task) {
++		enum sci_status status = SCI_FAILURE;
++
+ 		spin_lock_irqsave(&ihost->scic_lock, flags);
+ 		idev = isci_lookup_device(task->dev);
+ 		io_ready = isci_device_io_ready(idev, task);
++		tag = isci_alloc_tag(ihost);
+ 		spin_unlock_irqrestore(&ihost->scic_lock, flags);
+ 
+ 		dev_dbg(&ihost->pdev->dev,
+@@ -185,15 +180,12 @@ int isci_task_execute_task(struct sas_task *task, int num, gfp_t gfp_flags)
+ 		if (!idev) {
+ 			isci_task_refuse(ihost, task, SAS_TASK_UNDELIVERED,
+ 					 SAS_DEVICE_UNKNOWN);
+-			isci_host_can_dequeue(ihost, 1);
+-		} else if (!io_ready) {
+-
++		} else if (!io_ready || tag == SCI_CONTROLLER_INVALID_IO_TAG) {
+ 			/* Indicate QUEUE_FULL so that the scsi midlayer
+ 			 * retries.
+ 			  */
+ 			isci_task_refuse(ihost, task, SAS_TASK_COMPLETE,
+ 					 SAS_QUEUE_FULL);
+-			isci_host_can_dequeue(ihost, 1);
+ 		} else {
+ 			/* There is a device and it's ready for I/O. */
+ 			spin_lock_irqsave(&task->task_state_lock, flags);
+@@ -206,13 +198,12 @@ int isci_task_execute_task(struct sas_task *task, int num, gfp_t gfp_flags)
+ 				isci_task_refuse(ihost, task,
+ 						 SAS_TASK_UNDELIVERED,
+ 						 SAM_STAT_TASK_ABORTED);
+-				isci_host_can_dequeue(ihost, 1);
+ 			} else {
+ 				task->task_state_flags |= SAS_TASK_AT_INITIATOR;
+ 				spin_unlock_irqrestore(&task->task_state_lock, flags);
+ 
+ 				/* build and send the request. */
+-				status = isci_request_execute(ihost, idev, task, gfp_flags);
++				status = isci_request_execute(ihost, idev, task, tag, gfp_flags);
+ 
+ 				if (status != SCI_SUCCESS) {
+ 
+@@ -231,10 +222,17 @@ int isci_task_execute_task(struct sas_task *task, int num, gfp_t gfp_flags)
+ 					isci_task_refuse(ihost, task,
+ 							 SAS_TASK_COMPLETE,
+ 							 SAS_QUEUE_FULL);
+-					isci_host_can_dequeue(ihost, 1);
+ 				}
+ 			}
+ 		}
++		if (status != SCI_SUCCESS && tag != SCI_CONTROLLER_INVALID_IO_TAG) {
++			spin_lock_irqsave(&ihost->scic_lock, flags);
++			/* command never hit the device, so just free
++			 * the tci and skip the sequence increment
++			 */
++			isci_tci_free(ihost, ISCI_TAG_TCI(tag));
++			spin_unlock_irqrestore(&ihost->scic_lock, flags);
++		}
+ 		isci_put_device(idev);
+ 	}
+ 	return 0;
+@@ -242,7 +240,7 @@ int isci_task_execute_task(struct sas_task *task, int num, gfp_t gfp_flags)
+ 
+ static struct isci_request *isci_task_request_build(struct isci_host *ihost,
+ 						    struct isci_remote_device *idev,
+-						    struct isci_tmf *isci_tmf)
++						    u16 tag, struct isci_tmf *isci_tmf)
+ {
+ 	enum sci_status status = SCI_FAILURE;
+ 	struct isci_request *ireq = NULL;
+@@ -259,8 +257,7 @@ static struct isci_request *isci_task_request_build(struct isci_host *ihost,
+ 		return NULL;
+ 
+ 	/* let the core do it's construct. */
+-	status = scic_task_request_construct(&ihost->sci, &idev->sci,
+-					     SCI_CONTROLLER_INVALID_IO_TAG,
++	status = scic_task_request_construct(&ihost->sci, &idev->sci, tag,
+ 					     &ireq->sci);
+ 
+ 	if (status != SCI_SUCCESS) {
+@@ -290,8 +287,7 @@ static struct isci_request *isci_task_request_build(struct isci_host *ihost,
+ 	return ireq;
+  errout:
+ 	isci_request_free(ihost, ireq);
+-	ireq = NULL;
+-	return ireq;
++	return NULL;
+ }
+ 
+ int isci_task_execute_tmf(struct isci_host *ihost,
+@@ -305,6 +301,14 @@ int isci_task_execute_tmf(struct isci_host *ihost,
+ 	int ret = TMF_RESP_FUNC_FAILED;
+ 	unsigned long flags;
+ 	unsigned long timeleft;
++	u16 tag;
++
++	spin_lock_irqsave(&ihost->scic_lock, flags);
++	tag = isci_alloc_tag(ihost);
++	spin_unlock_irqrestore(&ihost->scic_lock, flags);
++
++	if (tag == SCI_CONTROLLER_INVALID_IO_TAG)
++		return ret;
+ 
+ 	/* sanity check, return TMF_RESP_FUNC_FAILED
+ 	 * if the device is not there and ready.
+@@ -316,7 +320,7 @@ int isci_task_execute_tmf(struct isci_host *ihost,
+ 			"%s: isci_device = %p not ready (%#lx)\n",
+ 			__func__,
+ 			isci_device, isci_device ? isci_device->flags : 0);
+-		return TMF_RESP_FUNC_FAILED;
++		goto err_tci;
+ 	} else
+ 		dev_dbg(&ihost->pdev->dev,
+ 			"%s: isci_device = %p\n",
+@@ -327,22 +331,16 @@ int isci_task_execute_tmf(struct isci_host *ihost,
+ 	/* Assign the pointer to the TMF's completion kernel wait structure. */
+ 	tmf->complete = &completion;
+ 
+-	ireq = isci_task_request_build(ihost, isci_device, tmf);
+-	if (!ireq) {
+-		dev_warn(&ihost->pdev->dev,
+-			"%s: isci_task_request_build failed\n",
+-			__func__);
+-		return TMF_RESP_FUNC_FAILED;
+-	}
++	ireq = isci_task_request_build(ihost, isci_device, tag, tmf);
++	if (!ireq)
++		goto err_tci;
+ 
+ 	spin_lock_irqsave(&ihost->scic_lock, flags);
+ 
+ 	/* start the TMF io. */
+-	status = scic_controller_start_task(
+-		&ihost->sci,
+-		sci_device,
+-		&ireq->sci,
+-		SCI_CONTROLLER_INVALID_IO_TAG);
++	status = scic_controller_start_task(&ihost->sci,
++					    sci_device,
++					    &ireq->sci);
+ 
+ 	if (status != SCI_TASK_SUCCESS) {
+ 		dev_warn(&ihost->pdev->dev,
+@@ -351,8 +349,7 @@ int isci_task_execute_tmf(struct isci_host *ihost,
+ 			 status,
+ 			 ireq);
+ 		spin_unlock_irqrestore(&ihost->scic_lock, flags);
+-		isci_request_free(ihost, ireq);
+-		return ret;
++		goto err_ireq;
+ 	}
+ 
+ 	if (tmf->cb_state_func != NULL)
+@@ -403,6 +400,15 @@ int isci_task_execute_tmf(struct isci_host *ihost,
+ 		ireq);
+ 
+ 	return ret;
++
++ err_ireq:
++	isci_request_free(ihost, ireq);
++ err_tci:
++	spin_lock_irqsave(&ihost->scic_lock, flags);
++	isci_tci_free(ihost, ISCI_TAG_TCI(tag));
++	spin_unlock_irqrestore(&ihost->scic_lock, flags);
++
++	return ret;
+ }
+ 
+ void isci_task_build_tmf(
+-- 
+1.6.0.2
+
