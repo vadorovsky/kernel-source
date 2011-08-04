@@ -1,0 +1,147 @@
+From 4161f9728604a189ce1ea1789039edc234796375 Mon Sep 17 00:00:00 2001
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Wed, 17 Nov 2010 12:28:30 +0000
+Patch-mainline: 2.6.38
+References: fate#310916
+Git-commit: 95762c2b34069bf4adb7929969f1f5f5fc8a38df
+Subject: [PATCH 1749/2588] drm/ttm: Improved fencing of buffer object lists
+
+Drastically reduce the number of spin lock / unlock operations by performing
+unreserving and fencing under global locks.
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Jerome Glisse <j.glisse@redhat.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit 95762c2b34069bf4adb7929969f1f5f5fc8a38df)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/ttm/ttm_bo.c           |   11 +++++++--
+ drivers/gpu/drm/ttm/ttm_execbuf_util.c |   36 ++++++++++++++++++++++---------
+ include/drm/ttm/ttm_bo_driver.h        |   10 ++++++++
+ include/drm/ttm/ttm_execbuf_util.h     |    2 +
+ 4 files changed, 45 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index 2faf65b..78fa926 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -299,14 +299,19 @@ int ttm_bo_reserve(struct ttm_buffer_object *bo,
+ 	return ret;
+ }
+ 
++void ttm_bo_unreserve_locked(struct ttm_buffer_object *bo)
++{
++	ttm_bo_add_to_lru(bo);
++	atomic_set(&bo->reserved, 0);
++	wake_up_all(&bo->event_queue);
++}
++
+ void ttm_bo_unreserve(struct ttm_buffer_object *bo)
+ {
+ 	struct ttm_bo_global *glob = bo->glob;
+ 
+ 	spin_lock(&glob->lru_lock);
+-	ttm_bo_add_to_lru(bo);
+-	atomic_set(&bo->reserved, 0);
+-	wake_up_all(&bo->event_queue);
++	ttm_bo_unreserve_locked(bo);
+ 	spin_unlock(&glob->lru_lock);
+ }
+ EXPORT_SYMBOL(ttm_bo_unreserve);
+diff --git a/drivers/gpu/drm/ttm/ttm_execbuf_util.c b/drivers/gpu/drm/ttm/ttm_execbuf_util.c
+index c3a2100..b6da65c 100644
+--- a/drivers/gpu/drm/ttm/ttm_execbuf_util.c
++++ b/drivers/gpu/drm/ttm/ttm_execbuf_util.c
+@@ -200,22 +200,36 @@ EXPORT_SYMBOL(ttm_eu_reserve_buffers);
+ void ttm_eu_fence_buffer_objects(struct list_head *list, void *sync_obj)
+ {
+ 	struct ttm_validate_buffer *entry;
++	struct ttm_buffer_object *bo;
++	struct ttm_bo_global *glob;
++	struct ttm_bo_device *bdev;
++	struct ttm_bo_driver *driver;
+ 
+-	list_for_each_entry(entry, list, head) {
+-		struct ttm_buffer_object *bo = entry->bo;
+-		struct ttm_bo_device *bdev = bo->bdev;
+-		struct ttm_bo_driver *driver = bdev->driver;
+-		void *old_sync_obj;
++	if (list_empty(list))
++		return;
++
++	bo = list_first_entry(list, struct ttm_validate_buffer, head)->bo;
++	bdev = bo->bdev;
++	driver = bdev->driver;
++	glob = bo->glob;
+ 
+-		spin_lock(&bdev->fence_lock);
+-		old_sync_obj = bo->sync_obj;
++	spin_lock(&bdev->fence_lock);
++	spin_lock(&glob->lru_lock);
++
++	list_for_each_entry(entry, list, head) {
++		bo = entry->bo;
++		entry->old_sync_obj = bo->sync_obj;
+ 		bo->sync_obj = driver->sync_obj_ref(sync_obj);
+ 		bo->sync_obj_arg = entry->new_sync_obj_arg;
+-		spin_unlock(&bdev->fence_lock);
+-		ttm_bo_unreserve(bo);
++		ttm_bo_unreserve_locked(bo);
+ 		entry->reserved = false;
+-		if (old_sync_obj)
+-			driver->sync_obj_unref(&old_sync_obj);
++	}
++	spin_unlock(&glob->lru_lock);
++	spin_unlock(&bdev->fence_lock);
++
++	list_for_each_entry(entry, list, head) {
++		if (entry->old_sync_obj)
++			driver->sync_obj_unref(&entry->old_sync_obj);
+ 	}
+ }
+ EXPORT_SYMBOL(ttm_eu_fence_buffer_objects);
+diff --git a/include/drm/ttm/ttm_bo_driver.h b/include/drm/ttm/ttm_bo_driver.h
+index ca8131e..cfb9ca4 100644
+--- a/include/drm/ttm/ttm_bo_driver.h
++++ b/include/drm/ttm/ttm_bo_driver.h
+@@ -910,6 +910,16 @@ extern int ttm_bo_reserve_locked(struct ttm_buffer_object *bo,
+ extern void ttm_bo_unreserve(struct ttm_buffer_object *bo);
+ 
+ /**
++ * ttm_bo_unreserve_locked
++ *
++ * @bo: A pointer to a struct ttm_buffer_object.
++ *
++ * Unreserve a previous reservation of @bo.
++ * Needs to be called with struct ttm_bo_global::lru_lock held.
++ */
++extern void ttm_bo_unreserve_locked(struct ttm_buffer_object *bo);
++
++/**
+  * ttm_bo_wait_unreserved
+  *
+  * @bo: A pointer to a struct ttm_buffer_object.
+diff --git a/include/drm/ttm/ttm_execbuf_util.h b/include/drm/ttm/ttm_execbuf_util.h
+index fd09b84..535ab00 100644
+--- a/include/drm/ttm/ttm_execbuf_util.h
++++ b/include/drm/ttm/ttm_execbuf_util.h
+@@ -44,6 +44,7 @@
+  * @reserved:       Indicates whether @bo has been reserved for validation.
+  * @removed:        Indicates whether @bo has been removed from lru lists.
+  * @put_count:      Number of outstanding references on bo::list_kref.
++ * @old_sync_obj:   Pointer to a sync object about to be unreferenced
+  */
+ 
+ struct ttm_validate_buffer {
+@@ -53,6 +54,7 @@ struct ttm_validate_buffer {
+ 	bool reserved;
+ 	bool removed;
+ 	int put_count;
++	void *old_sync_obj;
+ };
+ 
+ /**
+-- 
+1.7.6
+

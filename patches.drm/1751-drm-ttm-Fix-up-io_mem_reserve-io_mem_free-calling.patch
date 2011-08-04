@@ -1,0 +1,648 @@
+From 5391573e21afd88ddc35e664a3631681882746f2 Mon Sep 17 00:00:00 2001
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Thu, 11 Nov 2010 09:41:57 +0100
+Patch-mainline: 2.6.38
+References: fate#310916
+Git-commit: eba67093f535322cb4f1c4b737319c0907a0c81d
+Subject: [PATCH 1751/2588] drm/ttm: Fix up io_mem_reserve / io_mem_free
+ calling
+
+This patch attempts to fix up shortcomings with the current calling
+sequences.
+
+1) There's a fastpath where no locking occurs and only io_mem_reserved is
+   called to obtain needed info for mapping. The fastpath is set per
+   memory type manager.
+2) If the fastpath is disabled, io_mem_reserve and io_mem_free will be exactly
+   balanced and not called recursively for the same struct ttm_mem_reg.
+3) Optionally the driver can choose to enable a per memory type manager LRU
+   eviction mechanism that, when io_mem_reserve returns -EAGAIN will attempt
+   to kill user-space mappings of memory in that manager to free up needed
+   resources
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Ben Skeggs <bskeggs@redhat.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit eba67093f535322cb4f1c4b737319c0907a0c81d)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/ttm/ttm_bo.c      |   44 ++++++++++--
+ drivers/gpu/drm/ttm/ttm_bo_util.c |  129 +++++++++++++++++++++++++++++++++----
+ drivers/gpu/drm/ttm/ttm_bo_vm.c   |   23 ++++--
+ include/drm/ttm/ttm_bo_api.h      |    6 ++-
+ include/drm/ttm/ttm_bo_driver.h   |  104 ++++++++++++++++--------------
+ 5 files changed, 226 insertions(+), 80 deletions(-)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index 5838ef5..3c7f269 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -378,8 +378,13 @@ static int ttm_bo_handle_move_mem(struct ttm_buffer_object *bo,
+ 	int ret = 0;
+ 
+ 	if (old_is_pci || new_is_pci ||
+-	    ((mem->placement & bo->mem.placement & TTM_PL_MASK_CACHING) == 0))
+-		ttm_bo_unmap_virtual(bo);
++	    ((mem->placement & bo->mem.placement & TTM_PL_MASK_CACHING) == 0)) {
++		ret = ttm_mem_io_lock(old_man, true);
++		if (unlikely(ret != 0))
++			goto out_err;
++		ttm_bo_unmap_virtual_locked(bo);
++		ttm_mem_io_unlock(old_man);
++	}
+ 
+ 	/*
+ 	 * Create and bind a ttm if required.
+@@ -466,7 +471,6 @@ static void ttm_bo_cleanup_memtype_use(struct ttm_buffer_object *bo)
+ 		ttm_tt_destroy(bo->ttm);
+ 		bo->ttm = NULL;
+ 	}
+-
+ 	ttm_bo_mem_put(bo, &bo->mem);
+ 
+ 	atomic_set(&bo->reserved, 0);
+@@ -665,6 +669,7 @@ static void ttm_bo_release(struct kref *kref)
+ 	struct ttm_buffer_object *bo =
+ 	    container_of(kref, struct ttm_buffer_object, kref);
+ 	struct ttm_bo_device *bdev = bo->bdev;
++	struct ttm_mem_type_manager *man = &bdev->man[bo->mem.mem_type];
+ 
+ 	if (likely(bo->vm_node != NULL)) {
+ 		rb_erase(&bo->vm_rb, &bdev->addr_space_rb);
+@@ -672,6 +677,9 @@ static void ttm_bo_release(struct kref *kref)
+ 		bo->vm_node = NULL;
+ 	}
+ 	write_unlock(&bdev->vm_lock);
++	ttm_mem_io_lock(man, false);
++	ttm_mem_io_free_vm(bo);
++	ttm_mem_io_unlock(man);
+ 	ttm_bo_cleanup_refs_or_queue(bo);
+ 	kref_put(&bo->list_kref, ttm_bo_release_list);
+ 	write_lock(&bdev->vm_lock);
+@@ -728,7 +736,8 @@ static int ttm_bo_evict(struct ttm_buffer_object *bo, bool interruptible,
+ 
+ 	evict_mem = bo->mem;
+ 	evict_mem.mm_node = NULL;
+-	evict_mem.bus.io_reserved = false;
++	evict_mem.bus.io_reserved_vm = false;
++	evict_mem.bus.io_reserved_count = 0;
+ 
+ 	placement.fpfn = 0;
+ 	placement.lpfn = 0;
+@@ -1065,7 +1074,8 @@ int ttm_bo_move_buffer(struct ttm_buffer_object *bo,
+ 	mem.num_pages = bo->num_pages;
+ 	mem.size = mem.num_pages << PAGE_SHIFT;
+ 	mem.page_alignment = bo->mem.page_alignment;
+-	mem.bus.io_reserved = false;
++	mem.bus.io_reserved_vm = false;
++	mem.bus.io_reserved_count = 0;
+ 	/*
+ 	 * Determine where to move the buffer.
+ 	 */
+@@ -1184,6 +1194,7 @@ int ttm_bo_init(struct ttm_bo_device *bdev,
+ 	INIT_LIST_HEAD(&bo->lru);
+ 	INIT_LIST_HEAD(&bo->ddestroy);
+ 	INIT_LIST_HEAD(&bo->swap);
++	INIT_LIST_HEAD(&bo->io_reserve_lru);
+ 	bo->bdev = bdev;
+ 	bo->glob = bdev->glob;
+ 	bo->type = type;
+@@ -1193,7 +1204,8 @@ int ttm_bo_init(struct ttm_bo_device *bdev,
+ 	bo->mem.num_pages = bo->num_pages;
+ 	bo->mem.mm_node = NULL;
+ 	bo->mem.page_alignment = page_alignment;
+-	bo->mem.bus.io_reserved = false;
++	bo->mem.bus.io_reserved_vm = false;
++	bo->mem.bus.io_reserved_count = 0;
+ 	bo->buffer_start = buffer_start & PAGE_MASK;
+ 	bo->priv_flags = 0;
+ 	bo->mem.placement = (TTM_PL_FLAG_SYSTEM | TTM_PL_FLAG_CACHED);
+@@ -1367,6 +1379,10 @@ int ttm_bo_init_mm(struct ttm_bo_device *bdev, unsigned type,
+ 	BUG_ON(type >= TTM_NUM_MEM_TYPES);
+ 	man = &bdev->man[type];
+ 	BUG_ON(man->has_type);
++	man->io_reserve_fastpath = true;
++	man->use_io_reserve_lru = false;
++	mutex_init(&man->io_reserve_mutex);
++	INIT_LIST_HEAD(&man->io_reserve_lru);
+ 
+ 	ret = bdev->driver->init_mem_type(bdev, type, man);
+ 	if (ret)
+@@ -1573,7 +1589,7 @@ bool ttm_mem_reg_is_pci(struct ttm_bo_device *bdev, struct ttm_mem_reg *mem)
+ 	return true;
+ }
+ 
+-void ttm_bo_unmap_virtual(struct ttm_buffer_object *bo)
++void ttm_bo_unmap_virtual_locked(struct ttm_buffer_object *bo)
+ {
+ 	struct ttm_bo_device *bdev = bo->bdev;
+ 	loff_t offset = (loff_t) bo->addr_space_offset;
+@@ -1582,8 +1598,20 @@ void ttm_bo_unmap_virtual(struct ttm_buffer_object *bo)
+ 	if (!bdev->dev_mapping)
+ 		return;
+ 	unmap_mapping_range(bdev->dev_mapping, offset, holelen, 1);
+-	ttm_mem_io_free(bdev, &bo->mem);
++	ttm_mem_io_free_vm(bo);
+ }
++
++void ttm_bo_unmap_virtual(struct ttm_buffer_object *bo)
++{
++	struct ttm_bo_device *bdev = bo->bdev;
++	struct ttm_mem_type_manager *man = &bdev->man[bo->mem.mem_type];
++
++	ttm_mem_io_lock(man, false);
++	ttm_bo_unmap_virtual_locked(bo);
++	ttm_mem_io_unlock(man);
++}
++
++
+ EXPORT_SYMBOL(ttm_bo_unmap_virtual);
+ 
+ static void ttm_bo_vm_insert_rb(struct ttm_buffer_object *bo)
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_util.c b/drivers/gpu/drm/ttm/ttm_bo_util.c
+index 6bf5d0b..47b4914 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_util.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_util.c
+@@ -75,37 +75,123 @@ int ttm_bo_move_ttm(struct ttm_buffer_object *bo,
+ }
+ EXPORT_SYMBOL(ttm_bo_move_ttm);
+ 
+-int ttm_mem_io_reserve(struct ttm_bo_device *bdev, struct ttm_mem_reg *mem)
++int ttm_mem_io_lock(struct ttm_mem_type_manager *man, bool interruptible)
+ {
+-	int ret;
++	if (likely(man->io_reserve_fastpath))
++		return 0;
++
++	if (interruptible)
++		return mutex_lock_interruptible(&man->io_reserve_mutex);
++
++	mutex_lock(&man->io_reserve_mutex);
++	return 0;
++}
+ 
+-	if (!mem->bus.io_reserved) {
+-		mem->bus.io_reserved = true;
++void ttm_mem_io_unlock(struct ttm_mem_type_manager *man)
++{
++	if (likely(man->io_reserve_fastpath))
++		return;
++
++	mutex_unlock(&man->io_reserve_mutex);
++}
++
++static int ttm_mem_io_evict(struct ttm_mem_type_manager *man)
++{
++	struct ttm_buffer_object *bo;
++
++	if (!man->use_io_reserve_lru || list_empty(&man->io_reserve_lru))
++		return -EAGAIN;
++
++	bo = list_first_entry(&man->io_reserve_lru,
++			      struct ttm_buffer_object,
++			      io_reserve_lru);
++	list_del_init(&bo->io_reserve_lru);
++	ttm_bo_unmap_virtual_locked(bo);
++
++	return 0;
++}
++
++static int ttm_mem_io_reserve(struct ttm_bo_device *bdev,
++			      struct ttm_mem_reg *mem)
++{
++	struct ttm_mem_type_manager *man = &bdev->man[mem->mem_type];
++	int ret = 0;
++
++	if (!bdev->driver->io_mem_reserve)
++		return 0;
++	if (likely(man->io_reserve_fastpath))
++		return bdev->driver->io_mem_reserve(bdev, mem);
++
++	if (bdev->driver->io_mem_reserve &&
++	    mem->bus.io_reserved_count++ == 0) {
++retry:
+ 		ret = bdev->driver->io_mem_reserve(bdev, mem);
++		if (ret == -EAGAIN) {
++			ret = ttm_mem_io_evict(man);
++			if (ret == 0)
++				goto retry;
++		}
++	}
++	return ret;
++}
++
++static void ttm_mem_io_free(struct ttm_bo_device *bdev,
++			    struct ttm_mem_reg *mem)
++{
++	struct ttm_mem_type_manager *man = &bdev->man[mem->mem_type];
++
++	if (likely(man->io_reserve_fastpath))
++		return;
++
++	if (bdev->driver->io_mem_reserve &&
++	    --mem->bus.io_reserved_count == 0 &&
++	    bdev->driver->io_mem_free)
++		bdev->driver->io_mem_free(bdev, mem);
++
++}
++
++int ttm_mem_io_reserve_vm(struct ttm_buffer_object *bo)
++{
++	struct ttm_mem_reg *mem = &bo->mem;
++	int ret;
++
++	if (!mem->bus.io_reserved_vm) {
++		struct ttm_mem_type_manager *man =
++			&bo->bdev->man[mem->mem_type];
++
++		ret = ttm_mem_io_reserve(bo->bdev, mem);
+ 		if (unlikely(ret != 0))
+ 			return ret;
++		mem->bus.io_reserved_vm = true;
++		if (man->use_io_reserve_lru)
++			list_add_tail(&bo->io_reserve_lru,
++				      &man->io_reserve_lru);
+ 	}
+ 	return 0;
+ }
+ 
+-void ttm_mem_io_free(struct ttm_bo_device *bdev, struct ttm_mem_reg *mem)
++void ttm_mem_io_free_vm(struct ttm_buffer_object *bo)
+ {
+-	if (bdev->driver->io_mem_reserve) {
+-		if (mem->bus.io_reserved) {
+-			mem->bus.io_reserved = false;
+-			bdev->driver->io_mem_free(bdev, mem);
+-		}
++	struct ttm_mem_reg *mem = &bo->mem;
++
++	if (mem->bus.io_reserved_vm) {
++		mem->bus.io_reserved_vm = false;
++		list_del_init(&bo->io_reserve_lru);
++		ttm_mem_io_free(bo->bdev, mem);
+ 	}
+ }
+ 
+ int ttm_mem_reg_ioremap(struct ttm_bo_device *bdev, struct ttm_mem_reg *mem,
+ 			void **virtual)
+ {
++	struct ttm_mem_type_manager *man = &bdev->man[mem->mem_type];
+ 	int ret;
+ 	void *addr;
+ 
+ 	*virtual = NULL;
++	(void) ttm_mem_io_lock(man, false);
+ 	ret = ttm_mem_io_reserve(bdev, mem);
++	ttm_mem_io_unlock(man);
+ 	if (ret || !mem->bus.is_iomem)
+ 		return ret;
+ 
+@@ -117,7 +203,9 @@ int ttm_mem_reg_ioremap(struct ttm_bo_device *bdev, struct ttm_mem_reg *mem,
+ 		else
+ 			addr = ioremap_nocache(mem->bus.base + mem->bus.offset, mem->bus.size);
+ 		if (!addr) {
++			(void) ttm_mem_io_lock(man, false);
+ 			ttm_mem_io_free(bdev, mem);
++			ttm_mem_io_unlock(man);
+ 			return -ENOMEM;
+ 		}
+ 	}
+@@ -134,7 +222,9 @@ void ttm_mem_reg_iounmap(struct ttm_bo_device *bdev, struct ttm_mem_reg *mem,
+ 
+ 	if (virtual && mem->bus.addr == NULL)
+ 		iounmap(virtual);
++	(void) ttm_mem_io_lock(man, false);
+ 	ttm_mem_io_free(bdev, mem);
++	ttm_mem_io_unlock(man);
+ }
+ 
+ static int ttm_copy_io_page(void *dst, void *src, unsigned long page)
+@@ -231,7 +321,7 @@ int ttm_bo_move_memcpy(struct ttm_buffer_object *bo,
+ 	struct ttm_mem_type_manager *man = &bdev->man[new_mem->mem_type];
+ 	struct ttm_tt *ttm = bo->ttm;
+ 	struct ttm_mem_reg *old_mem = &bo->mem;
+-	struct ttm_mem_reg old_copy = *old_mem;
++	struct ttm_mem_reg old_copy;
+ 	void *old_iomap;
+ 	void *new_iomap;
+ 	int ret;
+@@ -281,7 +371,7 @@ int ttm_bo_move_memcpy(struct ttm_buffer_object *bo,
+ 	mb();
+ out2:
+ 	ttm_bo_free_old_node(bo);
+-
++	old_copy = *old_mem;
+ 	*old_mem = *new_mem;
+ 	new_mem->mm_node = NULL;
+ 
+@@ -292,7 +382,7 @@ out2:
+ 	}
+ 
+ out1:
+-	ttm_mem_reg_iounmap(bdev, new_mem, new_iomap);
++	ttm_mem_reg_iounmap(bdev, old_mem, new_iomap);
+ out:
+ 	ttm_mem_reg_iounmap(bdev, &old_copy, old_iomap);
+ 	return ret;
+@@ -341,6 +431,7 @@ static int ttm_buffer_object_transfer(struct ttm_buffer_object *bo,
+ 	INIT_LIST_HEAD(&fbo->ddestroy);
+ 	INIT_LIST_HEAD(&fbo->lru);
+ 	INIT_LIST_HEAD(&fbo->swap);
++	INIT_LIST_HEAD(&fbo->io_reserve_lru);
+ 	fbo->vm_node = NULL;
+ 	atomic_set(&fbo->cpu_writers, 0);
+ 
+@@ -452,6 +543,8 @@ int ttm_bo_kmap(struct ttm_buffer_object *bo,
+ 		unsigned long start_page, unsigned long num_pages,
+ 		struct ttm_bo_kmap_obj *map)
+ {
++	struct ttm_mem_type_manager *man =
++		&bo->bdev->man[bo->mem.mem_type];
+ 	unsigned long offset, size;
+ 	int ret;
+ 
+@@ -466,7 +559,9 @@ int ttm_bo_kmap(struct ttm_buffer_object *bo,
+ 	if (num_pages > 1 && !DRM_SUSER(DRM_CURPROC))
+ 		return -EPERM;
+ #endif
++	(void) ttm_mem_io_lock(man, false);
+ 	ret = ttm_mem_io_reserve(bo->bdev, &bo->mem);
++	ttm_mem_io_unlock(man);
+ 	if (ret)
+ 		return ret;
+ 	if (!bo->mem.bus.is_iomem) {
+@@ -481,12 +576,15 @@ EXPORT_SYMBOL(ttm_bo_kmap);
+ 
+ void ttm_bo_kunmap(struct ttm_bo_kmap_obj *map)
+ {
++	struct ttm_buffer_object *bo = map->bo;
++	struct ttm_mem_type_manager *man =
++		&bo->bdev->man[bo->mem.mem_type];
++
+ 	if (!map->virtual)
+ 		return;
+ 	switch (map->bo_kmap_type) {
+ 	case ttm_bo_map_iomap:
+ 		iounmap(map->virtual);
+-		ttm_mem_io_free(map->bo->bdev, &map->bo->mem);
+ 		break;
+ 	case ttm_bo_map_vmap:
+ 		vunmap(map->virtual);
+@@ -499,6 +597,9 @@ void ttm_bo_kunmap(struct ttm_bo_kmap_obj *map)
+ 	default:
+ 		BUG();
+ 	}
++	(void) ttm_mem_io_lock(man, false);
++	ttm_mem_io_free(map->bo->bdev, &map->bo->mem);
++	ttm_mem_io_unlock(man);
+ 	map->virtual = NULL;
+ 	map->page = NULL;
+ }
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_vm.c b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+index 8dd446c..221b924 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+@@ -83,6 +83,8 @@ static int ttm_bo_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 	int i;
+ 	unsigned long address = (unsigned long)vmf->virtual_address;
+ 	int retval = VM_FAULT_NOPAGE;
++	struct ttm_mem_type_manager *man =
++		&bdev->man[bo->mem.mem_type];
+ 
+ 	/*
+ 	 * Work around locking order reversal in fault / nopfn
+@@ -130,12 +132,16 @@ static int ttm_bo_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 	} else
+ 		spin_unlock(&bdev->fence_lock);
+ 
+-
+-	ret = ttm_mem_io_reserve(bdev, &bo->mem);
+-	if (ret) {
+-		retval = VM_FAULT_SIGBUS;
++	ret = ttm_mem_io_lock(man, true);
++	if (unlikely(ret != 0)) {
++		retval = VM_FAULT_NOPAGE;
+ 		goto out_unlock;
+ 	}
++	ret = ttm_mem_io_reserve_vm(bo);
++	if (unlikely(ret != 0)) {
++		retval = VM_FAULT_SIGBUS;
++		goto out_io_unlock;
++	}
+ 
+ 	page_offset = ((address - vma->vm_start) >> PAGE_SHIFT) +
+ 	    bo->vm_node->start - vma->vm_pgoff;
+@@ -144,7 +150,7 @@ static int ttm_bo_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 
+ 	if (unlikely(page_offset >= bo->num_pages)) {
+ 		retval = VM_FAULT_SIGBUS;
+-		goto out_unlock;
++		goto out_io_unlock;
+ 	}
+ 
+ 	/*
+@@ -182,7 +188,7 @@ static int ttm_bo_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 			page = ttm_tt_get_page(ttm, page_offset);
+ 			if (unlikely(!page && i == 0)) {
+ 				retval = VM_FAULT_OOM;
+-				goto out_unlock;
++				goto out_io_unlock;
+ 			} else if (unlikely(!page)) {
+ 				break;
+ 			}
+@@ -200,14 +206,15 @@ static int ttm_bo_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 		else if (unlikely(ret != 0)) {
+ 			retval =
+ 			    (ret == -ENOMEM) ? VM_FAULT_OOM : VM_FAULT_SIGBUS;
+-			goto out_unlock;
++			goto out_io_unlock;
+ 		}
+ 
+ 		address += PAGE_SIZE;
+ 		if (unlikely(++page_offset >= page_last))
+ 			break;
+ 	}
+-
++out_io_unlock:
++	ttm_mem_io_unlock(man);
+ out_unlock:
+ 	ttm_bo_unreserve(bo);
+ 	return retval;
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index edacd48..50852aa 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -74,6 +74,8 @@ struct ttm_placement {
+  * @is_iomem:		is this io memory ?
+  * @size:		size in byte
+  * @offset:		offset from the base address
++ * @io_reserved_vm:     The VM system has a refcount in @io_reserved_count
++ * @io_reserved_count:  Refcounting the numbers of callers to ttm_mem_io_reserve
+  *
+  * Structure indicating the bus placement of an object.
+  */
+@@ -83,7 +85,8 @@ struct ttm_bus_placement {
+ 	unsigned long	size;
+ 	unsigned long	offset;
+ 	bool		is_iomem;
+-	bool		io_reserved;
++	bool		io_reserved_vm;
++	uint64_t        io_reserved_count;
+ };
+ 
+ 
+@@ -235,6 +238,7 @@ struct ttm_buffer_object {
+ 	struct list_head lru;
+ 	struct list_head ddestroy;
+ 	struct list_head swap;
++	struct list_head io_reserve_lru;
+ 	uint32_t val_seq;
+ 	bool seq_valid;
+ 
+diff --git a/include/drm/ttm/ttm_bo_driver.h b/include/drm/ttm/ttm_bo_driver.h
+index e3b2e24..1da8af6 100644
+--- a/include/drm/ttm/ttm_bo_driver.h
++++ b/include/drm/ttm/ttm_bo_driver.h
+@@ -179,30 +179,6 @@ struct ttm_tt {
+ #define TTM_MEMTYPE_FLAG_MAPPABLE      (1 << 1)	/* Memory mappable */
+ #define TTM_MEMTYPE_FLAG_CMA           (1 << 3)	/* Can't map aperture */
+ 
+-/**
+- * struct ttm_mem_type_manager
+- *
+- * @has_type: The memory type has been initialized.
+- * @use_type: The memory type is enabled.
+- * @flags: TTM_MEMTYPE_XX flags identifying the traits of the memory
+- * managed by this memory type.
+- * @gpu_offset: If used, the GPU offset of the first managed page of
+- * fixed memory or the first managed location in an aperture.
+- * @size: Size of the managed region.
+- * @available_caching: A mask of available caching types, TTM_PL_FLAG_XX,
+- * as defined in ttm_placement_common.h
+- * @default_caching: The default caching policy used for a buffer object
+- * placed in this memory type if the user doesn't provide one.
+- * @manager: The range manager used for this memory type. FIXME: If the aperture
+- * has a page size different from the underlying system, the granularity
+- * of this manager should take care of this. But the range allocating code
+- * in ttm_bo.c needs to be modified for this.
+- * @lru: The lru list for this memory type.
+- *
+- * This structure is used to identify and manage memory types for a device.
+- * It's set up by the ttm_bo_driver::init_mem_type method.
+- */
+-
+ struct ttm_mem_type_manager;
+ 
+ struct ttm_mem_type_manager_func {
+@@ -287,6 +263,36 @@ struct ttm_mem_type_manager_func {
+ 	void (*debug)(struct ttm_mem_type_manager *man, const char *prefix);
+ };
+ 
++/**
++ * struct ttm_mem_type_manager
++ *
++ * @has_type: The memory type has been initialized.
++ * @use_type: The memory type is enabled.
++ * @flags: TTM_MEMTYPE_XX flags identifying the traits of the memory
++ * managed by this memory type.
++ * @gpu_offset: If used, the GPU offset of the first managed page of
++ * fixed memory or the first managed location in an aperture.
++ * @size: Size of the managed region.
++ * @available_caching: A mask of available caching types, TTM_PL_FLAG_XX,
++ * as defined in ttm_placement_common.h
++ * @default_caching: The default caching policy used for a buffer object
++ * placed in this memory type if the user doesn't provide one.
++ * @func: structure pointer implementing the range manager. See above
++ * @priv: Driver private closure for @func.
++ * @io_reserve_mutex: Mutex optionally protecting shared io_reserve structures
++ * @use_io_reserve_lru: Use an lru list to try to unreserve io_mem_regions
++ * reserved by the TTM vm system.
++ * @io_reserve_lru: Optional lru list for unreserving io mem regions.
++ * @io_reserve_fastpath: Only use bdev::driver::io_mem_reserve to obtain
++ * static information. bdev::driver::io_mem_free is never used.
++ * @lru: The lru list for this memory type.
++ *
++ * This structure is used to identify and manage memory types for a device.
++ * It's set up by the ttm_bo_driver::init_mem_type method.
++ */
++
++
++
+ struct ttm_mem_type_manager {
+ 	struct ttm_bo_device *bdev;
+ 
+@@ -303,6 +309,15 @@ struct ttm_mem_type_manager {
+ 	uint32_t default_caching;
+ 	const struct ttm_mem_type_manager_func *func;
+ 	void *priv;
++	struct mutex io_reserve_mutex;
++	bool use_io_reserve_lru;
++	bool io_reserve_fastpath;
++
++	/*
++	 * Protected by @io_reserve_mutex:
++	 */
++
++	struct list_head io_reserve_lru;
+ 
+ 	/*
+ 	 * Protected by the global->lru_lock.
+@@ -758,31 +773,6 @@ extern void ttm_bo_mem_put_locked(struct ttm_buffer_object *bo,
+ 
+ extern int ttm_bo_wait_cpu(struct ttm_buffer_object *bo, bool no_wait);
+ 
+-/**
+- * ttm_bo_pci_offset - Get the PCI offset for the buffer object memory.
+- *
+- * @bo Pointer to a struct ttm_buffer_object.
+- * @bus_base On return the base of the PCI region
+- * @bus_offset On return the byte offset into the PCI region
+- * @bus_size On return the byte size of the buffer object or zero if
+- * the buffer object memory is not accessible through a PCI region.
+- *
+- * Returns:
+- * -EINVAL if the buffer object is currently not mappable.
+- * 0 otherwise.
+- */
+-
+-extern int ttm_bo_pci_offset(struct ttm_bo_device *bdev,
+-			     struct ttm_mem_reg *mem,
+-			     unsigned long *bus_base,
+-			     unsigned long *bus_offset,
+-			     unsigned long *bus_size);
+-
+-extern int ttm_mem_io_reserve(struct ttm_bo_device *bdev,
+-				struct ttm_mem_reg *mem);
+-extern void ttm_mem_io_free(struct ttm_bo_device *bdev,
+-				struct ttm_mem_reg *mem);
+-
+ extern void ttm_bo_global_release(struct drm_global_reference *ref);
+ extern int ttm_bo_global_init(struct drm_global_reference *ref);
+ 
+@@ -815,6 +805,22 @@ extern int ttm_bo_device_init(struct ttm_bo_device *bdev,
+ extern void ttm_bo_unmap_virtual(struct ttm_buffer_object *bo);
+ 
+ /**
++ * ttm_bo_unmap_virtual
++ *
++ * @bo: tear down the virtual mappings for this BO
++ *
++ * The caller must take ttm_mem_io_lock before calling this function.
++ */
++extern void ttm_bo_unmap_virtual_locked(struct ttm_buffer_object *bo);
++
++extern int ttm_mem_io_reserve_vm(struct ttm_buffer_object *bo);
++extern void ttm_mem_io_free_vm(struct ttm_buffer_object *bo);
++extern int ttm_mem_io_lock(struct ttm_mem_type_manager *man,
++			   bool interruptible);
++extern void ttm_mem_io_unlock(struct ttm_mem_type_manager *man);
++
++
++/**
+  * ttm_bo_reserve:
+  *
+  * @bo: A pointer to a struct ttm_buffer_object.
+-- 
+1.7.6
+

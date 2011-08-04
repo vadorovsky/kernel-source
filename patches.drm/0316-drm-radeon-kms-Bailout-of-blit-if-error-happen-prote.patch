@@ -1,0 +1,225 @@
+From 6a87ababd3ab1b6aaff427a6764dd27a674c762d Mon Sep 17 00:00:00 2001
+From: Jerome Glisse <jglisse@redhat.com>
+Date: Fri, 22 Jan 2010 15:19:00 +0100
+Patch-mainline: 2.6.33
+References: fate#310916
+Git-commit: ff82f052d2a187dd0fa0e431ba70eb457c71a40e
+Subject: [PATCH 0316/2588] drm/radeon/kms: Bailout of blit if error happen &
+ protect with mutex V3
+
+If an error happen in r600_blit_prepare_copy report it rather
+than WARNING and keeping execution. For instance if ib allocation
+failed we did just warn about but then latter tried to access
+NULL ib ptr causing oops. This patch also protect r600_copy_blit
+with a mutex as otherwise one process might overwrite blit temporary
+data with new one possibly leading to GPU lockup.
+
+Should partialy or totaly fix:
+https://bugzilla.redhat.com/show_bug.cgi?id=553279
+
+V2 failing blit initialization is not fatal, fallback to memcpy when
+this happen
+V3 init blit before startup as we pin in startup, remove duplicate
+code (this one was actualy tested unlike V2)
+
+Signed-off-by: Jerome Glisse <jglisse@redhat.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit ff82f052d2a187dd0fa0e431ba70eb457c71a40e)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/radeon/r600.c          |   54 ++++++++++++++++----------------
+ drivers/gpu/drm/radeon/r600_blit_kms.c |    7 +++-
+ drivers/gpu/drm/radeon/radeon.h        |    1 +
+ drivers/gpu/drm/radeon/rv770.c         |   31 +++++++++---------
+ 4 files changed, 48 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/r600.c b/drivers/gpu/drm/radeon/r600.c
+index da9aa3c..1b6d000 100644
+--- a/drivers/gpu/drm/radeon/r600.c
++++ b/drivers/gpu/drm/radeon/r600.c
+@@ -1788,23 +1788,24 @@ void r600_fence_ring_emit(struct radeon_device *rdev,
+ 	radeon_ring_write(rdev, RB_INT_STAT);
+ }
+ 
+-int r600_copy_dma(struct radeon_device *rdev,
+-		  uint64_t src_offset,
+-		  uint64_t dst_offset,
+-		  unsigned num_pages,
+-		  struct radeon_fence *fence)
+-{
+-	/* FIXME: implement */
+-	return 0;
+-}
+-
+ int r600_copy_blit(struct radeon_device *rdev,
+ 		   uint64_t src_offset, uint64_t dst_offset,
+ 		   unsigned num_pages, struct radeon_fence *fence)
+ {
+-	r600_blit_prepare_copy(rdev, num_pages * RADEON_GPU_PAGE_SIZE);
++	int r;
++
++	mutex_lock(&rdev->r600_blit.mutex);
++	rdev->r600_blit.vb_ib = NULL;
++	r = r600_blit_prepare_copy(rdev, num_pages * RADEON_GPU_PAGE_SIZE);
++	if (r) {
++		if (rdev->r600_blit.vb_ib)
++			radeon_ib_free(rdev, &rdev->r600_blit.vb_ib);
++		mutex_unlock(&rdev->r600_blit.mutex);
++		return r;
++	}
+ 	r600_kms_blit_copy(rdev, src_offset, dst_offset, num_pages * RADEON_GPU_PAGE_SIZE);
+ 	r600_blit_done_copy(rdev, fence);
++	mutex_unlock(&rdev->r600_blit.mutex);
+ 	return 0;
+ }
+ 
+@@ -1860,26 +1861,19 @@ int r600_startup(struct radeon_device *rdev)
+ 			return r;
+ 	}
+ 	r600_gpu_init(rdev);
+-
+-	if (!rdev->r600_blit.shader_obj) {
+-		r = r600_blit_init(rdev);
++	/* pin copy shader into vram */
++	if (rdev->r600_blit.shader_obj) {
++		r = radeon_bo_reserve(rdev->r600_blit.shader_obj, false);
++		if (unlikely(r != 0))
++			return r;
++		r = radeon_bo_pin(rdev->r600_blit.shader_obj, RADEON_GEM_DOMAIN_VRAM,
++				&rdev->r600_blit.shader_gpu_addr);
++		radeon_bo_unreserve(rdev->r600_blit.shader_obj);
+ 		if (r) {
+-			DRM_ERROR("radeon: failed blitter (%d).\n", r);
++			dev_err(rdev->dev, "(%d) pin blit object failed\n", r);
+ 			return r;
+ 		}
+ 	}
+-
+-	r = radeon_bo_reserve(rdev->r600_blit.shader_obj, false);
+-	if (unlikely(r != 0))
+-		return r;
+-	r = radeon_bo_pin(rdev->r600_blit.shader_obj, RADEON_GEM_DOMAIN_VRAM,
+-			&rdev->r600_blit.shader_gpu_addr);
+-	radeon_bo_unreserve(rdev->r600_blit.shader_obj);
+-	if (r) {
+-		dev_err(rdev->dev, "(%d) pin blit object failed\n", r);
+-		return r;
+-	}
+-
+ 	/* Enable IRQ */
+ 	r = r600_irq_init(rdev);
+ 	if (r) {
+@@ -2051,6 +2045,12 @@ int r600_init(struct radeon_device *rdev)
+ 	r = r600_pcie_gart_init(rdev);
+ 	if (r)
+ 		return r;
++	r = r600_blit_init(rdev);
++	if (r) {
++		r600_blit_fini(rdev);
++		rdev->asic->copy = NULL;
++		dev_warn(rdev->dev, "failed blitter (%d) falling back to memcpy\n", r);
++	}
+ 
+ 	rdev->accel_working = true;
+ 	r = r600_startup(rdev);
+diff --git a/drivers/gpu/drm/radeon/r600_blit_kms.c b/drivers/gpu/drm/radeon/r600_blit_kms.c
+index 2bedce4..af1c3ca 100644
+--- a/drivers/gpu/drm/radeon/r600_blit_kms.c
++++ b/drivers/gpu/drm/radeon/r600_blit_kms.c
+@@ -449,6 +449,7 @@ int r600_blit_init(struct radeon_device *rdev)
+ 	u32 packet2s[16];
+ 	int num_packet2s = 0;
+ 
++	mutex_init(&rdev->r600_blit.mutex);
+ 	rdev->r600_blit.state_offset = 0;
+ 
+ 	if (rdev->family >= CHIP_RV770)
+@@ -557,7 +558,8 @@ int r600_blit_prepare_copy(struct radeon_device *rdev, int size_bytes)
+ 	int dwords_per_loop = 76, num_loops;
+ 
+ 	r = r600_vb_ib_get(rdev);
+-	WARN_ON(r);
++	if (r)
++		return r;
+ 
+ 	/* set_render_target emits 2 extra dwords on rv6xx */
+ 	if (rdev->family > CHIP_R600 && rdev->family < CHIP_RV770)
+@@ -583,7 +585,8 @@ int r600_blit_prepare_copy(struct radeon_device *rdev, int size_bytes)
+ 	ring_size += 5; /* done copy */
+ 	ring_size += 7; /* fence emit for done copy */
+ 	r = radeon_ring_lock(rdev, ring_size);
+-	WARN_ON(r);
++	if (r)
++		return r;
+ 
+ 	set_default_state(rdev); /* 14 */
+ 	set_shaders(rdev); /* 26 */
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index f7df1a7..2d5f2bf 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -416,6 +416,7 @@ struct r600_ih {
+ };
+ 
+ struct r600_blit {
++	struct mutex		mutex;
+ 	struct radeon_bo	*shader_obj;
+ 	u64 shader_gpu_addr;
+ 	u32 vs_offset, ps_offset;
+diff --git a/drivers/gpu/drm/radeon/rv770.c b/drivers/gpu/drm/radeon/rv770.c
+index 55f6ffc..afd9e82 100644
+--- a/drivers/gpu/drm/radeon/rv770.c
++++ b/drivers/gpu/drm/radeon/rv770.c
+@@ -887,26 +887,19 @@ static int rv770_startup(struct radeon_device *rdev)
+ 			return r;
+ 	}
+ 	rv770_gpu_init(rdev);
+-
+-	if (!rdev->r600_blit.shader_obj) {
+-		r = r600_blit_init(rdev);
++	/* pin copy shader into vram */
++	if (rdev->r600_blit.shader_obj) {
++		r = radeon_bo_reserve(rdev->r600_blit.shader_obj, false);
++		if (unlikely(r != 0))
++			return r;
++		r = radeon_bo_pin(rdev->r600_blit.shader_obj, RADEON_GEM_DOMAIN_VRAM,
++				&rdev->r600_blit.shader_gpu_addr);
++		radeon_bo_unreserve(rdev->r600_blit.shader_obj);
+ 		if (r) {
+-			DRM_ERROR("radeon: failed blitter (%d).\n", r);
++			DRM_ERROR("failed to pin blit object %d\n", r);
+ 			return r;
+ 		}
+ 	}
+-
+-	r = radeon_bo_reserve(rdev->r600_blit.shader_obj, false);
+-	if (unlikely(r != 0))
+-		return r;
+-	r = radeon_bo_pin(rdev->r600_blit.shader_obj, RADEON_GEM_DOMAIN_VRAM,
+-			&rdev->r600_blit.shader_gpu_addr);
+-	radeon_bo_unreserve(rdev->r600_blit.shader_obj);
+-	if (r) {
+-		DRM_ERROR("failed to pin blit object %d\n", r);
+-		return r;
+-	}
+-
+ 	/* Enable IRQ */
+ 	r = r600_irq_init(rdev);
+ 	if (r) {
+@@ -1062,6 +1055,12 @@ int rv770_init(struct radeon_device *rdev)
+ 	r = r600_pcie_gart_init(rdev);
+ 	if (r)
+ 		return r;
++	r = r600_blit_init(rdev);
++	if (r) {
++		r600_blit_fini(rdev);
++		rdev->asic->copy = NULL;
++		dev_warn(rdev->dev, "failed blitter (%d) falling back to memcpy\n", r);
++	}
+ 
+ 	rdev->accel_working = true;
+ 	r = rv770_startup(rdev);
+-- 
+1.7.6
+

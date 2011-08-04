@@ -1,0 +1,428 @@
+From 3ffe5bbcedb6f8fa2bc24a3d1fa804ba0c111cf6 Mon Sep 17 00:00:00 2001
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Wed, 17 Nov 2010 12:28:29 +0000
+Patch-mainline: 2.6.38
+References: fate#310916
+Git-commit: 702adba22433c175e8429a47760f35ca16caf1cd
+Subject: [PATCH 1748/2588] drm/ttm/radeon/nouveau: Kill the bo lock in favour
+ of a bo device fence_lock
+
+The bo lock used only to protect the bo sync object members, and since it
+is a per bo lock, fencing a buffer list will see a lot of locks and unlocks.
+Replace it with a per-device lock that protects the sync object members on
+*all* bos. Reading and setting these members will always be very quick, so
+the risc of heavy lock contention is microscopic. Note that waiting for
+sync objects will always take place outside of this lock.
+
+The bo device fence lock will eventually be replaced with a seqlock /
+rcu mechanism so we can determine that a bo is idle under a
+rcu / read seqlock.
+
+However this change will allow us to batch fencing and unreserving of
+buffers with a minimal amount of locking.
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Jerome Glisse <j.glisse@gmail.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit 702adba22433c175e8429a47760f35ca16caf1cd)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/radeon/radeon_object.c |    4 +-
+ drivers/gpu/drm/radeon/radeon_object.h |    4 +-
+ drivers/gpu/drm/ttm/ttm_bo.c           |   55 ++++++++++++++++---------------
+ drivers/gpu/drm/ttm/ttm_bo_util.c      |    7 ++--
+ drivers/gpu/drm/ttm/ttm_bo_vm.c        |    6 ++--
+ drivers/gpu/drm/ttm/ttm_execbuf_util.c |    7 ++--
+ include/drm/ttm/ttm_bo_api.h           |    6 +--
+ include/drm/ttm/ttm_bo_driver.h        |    3 ++
+ 8 files changed, 47 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/radeon_object.c b/drivers/gpu/drm/radeon/radeon_object.c
+index a598d00..ef1fa5c 100644
+--- a/drivers/gpu/drm/radeon/radeon_object.c
++++ b/drivers/gpu/drm/radeon/radeon_object.c
+@@ -378,11 +378,11 @@ void radeon_bo_list_fence(struct list_head *head, void *fence)
+ 
+ 	list_for_each_entry(lobj, head, list) {
+ 		bo = lobj->bo;
+-		spin_lock(&bo->tbo.lock);
++		spin_lock(&bo->tbo.bdev->fence_lock);
+ 		old_fence = (struct radeon_fence *)bo->tbo.sync_obj;
+ 		bo->tbo.sync_obj = radeon_fence_ref(fence);
+ 		bo->tbo.sync_obj_arg = NULL;
+-		spin_unlock(&bo->tbo.lock);
++		spin_unlock(&bo->tbo.bdev->fence_lock);
+ 		if (old_fence) {
+ 			radeon_fence_unref(&old_fence);
+ 		}
+diff --git a/drivers/gpu/drm/radeon/radeon_object.h b/drivers/gpu/drm/radeon/radeon_object.h
+index d143702..fd53675 100644
+--- a/drivers/gpu/drm/radeon/radeon_object.h
++++ b/drivers/gpu/drm/radeon/radeon_object.h
+@@ -126,12 +126,12 @@ static inline int radeon_bo_wait(struct radeon_bo *bo, u32 *mem_type,
+ 	r = ttm_bo_reserve(&bo->tbo, true, no_wait, false, 0);
+ 	if (unlikely(r != 0))
+ 		return r;
+-	spin_lock(&bo->tbo.lock);
++	spin_lock(&bo->tbo.bdev->fence_lock);
+ 	if (mem_type)
+ 		*mem_type = bo->tbo.mem.mem_type;
+ 	if (bo->tbo.sync_obj)
+ 		r = ttm_bo_wait(&bo->tbo, true, true, no_wait);
+-	spin_unlock(&bo->tbo.lock);
++	spin_unlock(&bo->tbo.bdev->fence_lock);
+ 	ttm_bo_unreserve(&bo->tbo);
+ 	return r;
+ }
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index f50f587..2faf65b 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -427,11 +427,9 @@ moved:
+ 	}
+ 
+ 	if (bo->mem.mm_node) {
+-		spin_lock(&bo->lock);
+ 		bo->offset = (bo->mem.start << PAGE_SHIFT) +
+ 		    bdev->man[bo->mem.mem_type].gpu_offset;
+ 		bo->cur_placement = bo->mem.placement;
+-		spin_unlock(&bo->lock);
+ 	} else
+ 		bo->offset = 0;
+ 
+@@ -485,14 +483,14 @@ static void ttm_bo_cleanup_refs_or_queue(struct ttm_buffer_object *bo)
+ 	int put_count;
+ 	int ret;
+ 
+-	spin_lock(&bo->lock);
++	spin_lock(&bdev->fence_lock);
+ 	(void) ttm_bo_wait(bo, false, false, true);
+ 	if (!bo->sync_obj) {
+ 
+ 		spin_lock(&glob->lru_lock);
+ 
+ 		/**
+-		 * Lock inversion between bo::reserve and bo::lock here,
++		 * Lock inversion between bo:reserve and bdev::fence_lock here,
+ 		 * but that's OK, since we're only trylocking.
+ 		 */
+ 
+@@ -501,7 +499,7 @@ static void ttm_bo_cleanup_refs_or_queue(struct ttm_buffer_object *bo)
+ 		if (unlikely(ret == -EBUSY))
+ 			goto queue;
+ 
+-		spin_unlock(&bo->lock);
++		spin_unlock(&bdev->fence_lock);
+ 		put_count = ttm_bo_del_from_lru(bo);
+ 
+ 		spin_unlock(&glob->lru_lock);
+@@ -522,7 +520,7 @@ queue:
+ 	kref_get(&bo->list_kref);
+ 	list_add_tail(&bo->ddestroy, &bdev->ddestroy);
+ 	spin_unlock(&glob->lru_lock);
+-	spin_unlock(&bo->lock);
++	spin_unlock(&bdev->fence_lock);
+ 
+ 	if (sync_obj) {
+ 		driver->sync_obj_flush(sync_obj, sync_obj_arg);
+@@ -547,14 +545,15 @@ static int ttm_bo_cleanup_refs(struct ttm_buffer_object *bo,
+ 			       bool no_wait_reserve,
+ 			       bool no_wait_gpu)
+ {
++	struct ttm_bo_device *bdev = bo->bdev;
+ 	struct ttm_bo_global *glob = bo->glob;
+ 	int put_count;
+ 	int ret = 0;
+ 
+ retry:
+-	spin_lock(&bo->lock);
++	spin_lock(&bdev->fence_lock);
+ 	ret = ttm_bo_wait(bo, false, interruptible, no_wait_gpu);
+-	spin_unlock(&bo->lock);
++	spin_unlock(&bdev->fence_lock);
+ 
+ 	if (unlikely(ret != 0))
+ 		return ret;
+@@ -707,9 +706,9 @@ static int ttm_bo_evict(struct ttm_buffer_object *bo, bool interruptible,
+ 	struct ttm_placement placement;
+ 	int ret = 0;
+ 
+-	spin_lock(&bo->lock);
++	spin_lock(&bdev->fence_lock);
+ 	ret = ttm_bo_wait(bo, false, interruptible, no_wait_gpu);
+-	spin_unlock(&bo->lock);
++	spin_unlock(&bdev->fence_lock);
+ 
+ 	if (unlikely(ret != 0)) {
+ 		if (ret != -ERESTARTSYS) {
+@@ -1044,6 +1043,7 @@ int ttm_bo_move_buffer(struct ttm_buffer_object *bo,
+ {
+ 	int ret = 0;
+ 	struct ttm_mem_reg mem;
++	struct ttm_bo_device *bdev = bo->bdev;
+ 
+ 	BUG_ON(!atomic_read(&bo->reserved));
+ 
+@@ -1052,9 +1052,9 @@ int ttm_bo_move_buffer(struct ttm_buffer_object *bo,
+ 	 * Have the driver move function wait for idle when necessary,
+ 	 * instead of doing it here.
+ 	 */
+-	spin_lock(&bo->lock);
++	spin_lock(&bdev->fence_lock);
+ 	ret = ttm_bo_wait(bo, false, interruptible, no_wait_gpu);
+-	spin_unlock(&bo->lock);
++	spin_unlock(&bdev->fence_lock);
+ 	if (ret)
+ 		return ret;
+ 	mem.num_pages = bo->num_pages;
+@@ -1171,7 +1171,6 @@ int ttm_bo_init(struct ttm_bo_device *bdev,
+ 	}
+ 	bo->destroy = destroy;
+ 
+-	spin_lock_init(&bo->lock);
+ 	kref_init(&bo->kref);
+ 	kref_init(&bo->list_kref);
+ 	atomic_set(&bo->cpu_writers, 0);
+@@ -1534,7 +1533,7 @@ int ttm_bo_device_init(struct ttm_bo_device *bdev,
+ 	bdev->dev_mapping = NULL;
+ 	bdev->glob = glob;
+ 	bdev->need_dma32 = need_dma32;
+-
++	spin_lock_init(&bdev->fence_lock);
+ 	mutex_lock(&glob->device_list_mutex);
+ 	list_add_tail(&bdev->device_list, &glob->device_list);
+ 	mutex_unlock(&glob->device_list_mutex);
+@@ -1658,6 +1657,7 @@ int ttm_bo_wait(struct ttm_buffer_object *bo,
+ 		bool lazy, bool interruptible, bool no_wait)
+ {
+ 	struct ttm_bo_driver *driver = bo->bdev->driver;
++	struct ttm_bo_device *bdev = bo->bdev;
+ 	void *sync_obj;
+ 	void *sync_obj_arg;
+ 	int ret = 0;
+@@ -1671,9 +1671,9 @@ int ttm_bo_wait(struct ttm_buffer_object *bo,
+ 			void *tmp_obj = bo->sync_obj;
+ 			bo->sync_obj = NULL;
+ 			clear_bit(TTM_BO_PRIV_FLAG_MOVING, &bo->priv_flags);
+-			spin_unlock(&bo->lock);
++			spin_unlock(&bdev->fence_lock);
+ 			driver->sync_obj_unref(&tmp_obj);
+-			spin_lock(&bo->lock);
++			spin_lock(&bdev->fence_lock);
+ 			continue;
+ 		}
+ 
+@@ -1682,29 +1682,29 @@ int ttm_bo_wait(struct ttm_buffer_object *bo,
+ 
+ 		sync_obj = driver->sync_obj_ref(bo->sync_obj);
+ 		sync_obj_arg = bo->sync_obj_arg;
+-		spin_unlock(&bo->lock);
++		spin_unlock(&bdev->fence_lock);
+ 		ret = driver->sync_obj_wait(sync_obj, sync_obj_arg,
+ 					    lazy, interruptible);
+ 		if (unlikely(ret != 0)) {
+ 			driver->sync_obj_unref(&sync_obj);
+-			spin_lock(&bo->lock);
++			spin_lock(&bdev->fence_lock);
+ 			return ret;
+ 		}
+-		spin_lock(&bo->lock);
++		spin_lock(&bdev->fence_lock);
+ 		if (likely(bo->sync_obj == sync_obj &&
+ 			   bo->sync_obj_arg == sync_obj_arg)) {
+ 			void *tmp_obj = bo->sync_obj;
+ 			bo->sync_obj = NULL;
+ 			clear_bit(TTM_BO_PRIV_FLAG_MOVING,
+ 				  &bo->priv_flags);
+-			spin_unlock(&bo->lock);
++			spin_unlock(&bdev->fence_lock);
+ 			driver->sync_obj_unref(&sync_obj);
+ 			driver->sync_obj_unref(&tmp_obj);
+-			spin_lock(&bo->lock);
++			spin_lock(&bdev->fence_lock);
+ 		} else {
+-			spin_unlock(&bo->lock);
++			spin_unlock(&bdev->fence_lock);
+ 			driver->sync_obj_unref(&sync_obj);
+-			spin_lock(&bo->lock);
++			spin_lock(&bdev->fence_lock);
+ 		}
+ 	}
+ 	return 0;
+@@ -1713,6 +1713,7 @@ EXPORT_SYMBOL(ttm_bo_wait);
+ 
+ int ttm_bo_synccpu_write_grab(struct ttm_buffer_object *bo, bool no_wait)
+ {
++	struct ttm_bo_device *bdev = bo->bdev;
+ 	int ret = 0;
+ 
+ 	/*
+@@ -1722,9 +1723,9 @@ int ttm_bo_synccpu_write_grab(struct ttm_buffer_object *bo, bool no_wait)
+ 	ret = ttm_bo_reserve(bo, true, no_wait, false, 0);
+ 	if (unlikely(ret != 0))
+ 		return ret;
+-	spin_lock(&bo->lock);
++	spin_lock(&bdev->fence_lock);
+ 	ret = ttm_bo_wait(bo, false, true, no_wait);
+-	spin_unlock(&bo->lock);
++	spin_unlock(&bdev->fence_lock);
+ 	if (likely(ret == 0))
+ 		atomic_inc(&bo->cpu_writers);
+ 	ttm_bo_unreserve(bo);
+@@ -1796,9 +1797,9 @@ static int ttm_bo_swapout(struct ttm_mem_shrink *shrink)
+ 	 * Wait for GPU, then move to system cached.
+ 	 */
+ 
+-	spin_lock(&bo->lock);
++	spin_lock(&bo->bdev->fence_lock);
+ 	ret = ttm_bo_wait(bo, false, false, false);
+-	spin_unlock(&bo->lock);
++	spin_unlock(&bo->bdev->fence_lock);
+ 
+ 	if (unlikely(ret != 0))
+ 		goto out;
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_util.c b/drivers/gpu/drm/ttm/ttm_bo_util.c
+index ff358ad..6bf5d0b 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_util.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_util.c
+@@ -337,7 +337,6 @@ static int ttm_buffer_object_transfer(struct ttm_buffer_object *bo,
+ 	 * TODO: Explicit member copy would probably be better here.
+ 	 */
+ 
+-	spin_lock_init(&fbo->lock);
+ 	init_waitqueue_head(&fbo->event_queue);
+ 	INIT_LIST_HEAD(&fbo->ddestroy);
+ 	INIT_LIST_HEAD(&fbo->lru);
+@@ -520,7 +519,7 @@ int ttm_bo_move_accel_cleanup(struct ttm_buffer_object *bo,
+ 	struct ttm_buffer_object *ghost_obj;
+ 	void *tmp_obj = NULL;
+ 
+-	spin_lock(&bo->lock);
++	spin_lock(&bdev->fence_lock);
+ 	if (bo->sync_obj) {
+ 		tmp_obj = bo->sync_obj;
+ 		bo->sync_obj = NULL;
+@@ -529,7 +528,7 @@ int ttm_bo_move_accel_cleanup(struct ttm_buffer_object *bo,
+ 	bo->sync_obj_arg = sync_obj_arg;
+ 	if (evict) {
+ 		ret = ttm_bo_wait(bo, false, false, false);
+-		spin_unlock(&bo->lock);
++		spin_unlock(&bdev->fence_lock);
+ 		if (tmp_obj)
+ 			driver->sync_obj_unref(&tmp_obj);
+ 		if (ret)
+@@ -552,7 +551,7 @@ int ttm_bo_move_accel_cleanup(struct ttm_buffer_object *bo,
+ 		 */
+ 
+ 		set_bit(TTM_BO_PRIV_FLAG_MOVING, &bo->priv_flags);
+-		spin_unlock(&bo->lock);
++		spin_unlock(&bdev->fence_lock);
+ 		if (tmp_obj)
+ 			driver->sync_obj_unref(&tmp_obj);
+ 
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_vm.c b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+index fe6cb77..8dd446c 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+@@ -118,17 +118,17 @@ static int ttm_bo_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 	 * move.
+ 	 */
+ 
+-	spin_lock(&bo->lock);
++	spin_lock(&bdev->fence_lock);
+ 	if (test_bit(TTM_BO_PRIV_FLAG_MOVING, &bo->priv_flags)) {
+ 		ret = ttm_bo_wait(bo, false, true, false);
+-		spin_unlock(&bo->lock);
++		spin_unlock(&bdev->fence_lock);
+ 		if (unlikely(ret != 0)) {
+ 			retval = (ret != -ERESTARTSYS) ?
+ 			    VM_FAULT_SIGBUS : VM_FAULT_NOPAGE;
+ 			goto out_unlock;
+ 		}
+ 	} else
+-		spin_unlock(&bo->lock);
++		spin_unlock(&bdev->fence_lock);
+ 
+ 
+ 	ret = ttm_mem_io_reserve(bdev, &bo->mem);
+diff --git a/drivers/gpu/drm/ttm/ttm_execbuf_util.c b/drivers/gpu/drm/ttm/ttm_execbuf_util.c
+index 7dcc647..c3a2100 100644
+--- a/drivers/gpu/drm/ttm/ttm_execbuf_util.c
++++ b/drivers/gpu/drm/ttm/ttm_execbuf_util.c
+@@ -203,14 +203,15 @@ void ttm_eu_fence_buffer_objects(struct list_head *list, void *sync_obj)
+ 
+ 	list_for_each_entry(entry, list, head) {
+ 		struct ttm_buffer_object *bo = entry->bo;
+-		struct ttm_bo_driver *driver = bo->bdev->driver;
++		struct ttm_bo_device *bdev = bo->bdev;
++		struct ttm_bo_driver *driver = bdev->driver;
+ 		void *old_sync_obj;
+ 
+-		spin_lock(&bo->lock);
++		spin_lock(&bdev->fence_lock);
+ 		old_sync_obj = bo->sync_obj;
+ 		bo->sync_obj = driver->sync_obj_ref(sync_obj);
+ 		bo->sync_obj_arg = entry->new_sync_obj_arg;
+-		spin_unlock(&bo->lock);
++		spin_unlock(&bdev->fence_lock);
+ 		ttm_bo_unreserve(bo);
+ 		entry->reserved = false;
+ 		if (old_sync_obj)
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index b0fc9c1..edacd48 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -154,7 +154,6 @@ struct ttm_tt;
+  * keeps one refcount. When this refcount reaches zero,
+  * the object is destroyed.
+  * @event_queue: Queue for processes waiting on buffer object status change.
+- * @lock: spinlock protecting mostly synchronization members.
+  * @mem: structure describing current placement.
+  * @persistant_swap_storage: Usually the swap storage is deleted for buffers
+  * pinned in physical memory. If this behaviour is not desired, this member
+@@ -213,7 +212,6 @@ struct ttm_buffer_object {
+ 	struct kref kref;
+ 	struct kref list_kref;
+ 	wait_queue_head_t event_queue;
+-	spinlock_t lock;
+ 
+ 	/**
+ 	 * Members protected by the bo::reserved lock.
+@@ -248,10 +246,10 @@ struct ttm_buffer_object {
+ 	atomic_t reserved;
+ 
+ 	/**
+-	 * Members protected by the bo::lock
++	 * Members protected by struct buffer_object_device::fence_lock
+ 	 * In addition, setting sync_obj to anything else
+ 	 * than NULL requires bo::reserved to be held. This allows for
+-	 * checking NULL while reserved but not holding bo::lock.
++	 * checking NULL while reserved but not holding the mentioned lock.
+ 	 */
+ 
+ 	void *sync_obj_arg;
+diff --git a/include/drm/ttm/ttm_bo_driver.h b/include/drm/ttm/ttm_bo_driver.h
+index 1e25a40..ca8131e 100644
+--- a/include/drm/ttm/ttm_bo_driver.h
++++ b/include/drm/ttm/ttm_bo_driver.h
+@@ -510,6 +510,8 @@ struct ttm_bo_global {
+  *
+  * @driver: Pointer to a struct ttm_bo_driver struct setup by the driver.
+  * @man: An array of mem_type_managers.
++ * @fence_lock: Protects the synchronizing members on *all* bos belonging
++ * to this device.
+  * @addr_space_mm: Range manager for the device address space.
+  * lru_lock: Spinlock that protects the buffer+device lru lists and
+  * ddestroy lists.
+@@ -531,6 +533,7 @@ struct ttm_bo_device {
+ 	struct ttm_bo_driver *driver;
+ 	rwlock_t vm_lock;
+ 	struct ttm_mem_type_manager man[TTM_NUM_MEM_TYPES];
++	spinlock_t fence_lock;
+ 	/*
+ 	 * Protected by the vm lock.
+ 	 */
+-- 
+1.7.6
+

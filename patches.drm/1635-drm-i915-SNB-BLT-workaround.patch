@@ -1,0 +1,191 @@
+From aa41b45d017ed7335116f3fe7a3f7048a6c3dabe Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 2 Nov 2010 10:38:58 +0000
+Patch-mainline: 2.6.37-rc3
+References: fate#310916
+Git-commit: 5588978882b5f4b81169bd7f9bc941e3a12ee8ba
+Subject: [PATCH 1635/2588] drm/i915: SNB BLT workaround
+
+On some stepping of SNB cpu, the first command to be parsed in BLT
+command streamer should be MI_BATCHBUFFER_START otherwise the GPU
+may hang.
+
+Signed-off-by: Zou Nan hai <nanhai.zou@intel.com>
+Cc: stable@kernel.org
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit 5588978882b5f4b81169bd7f9bc941e3a12ee8ba)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/i915/intel_ringbuffer.c |  116 ++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    3 +
+ 2 files changed, 116 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 09f2dc3..7c1f3ff 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -654,6 +654,10 @@ void intel_cleanup_ring_buffer(struct drm_device *dev,
+ 	i915_gem_object_unpin(ring->gem_object);
+ 	drm_gem_object_unreference(ring->gem_object);
+ 	ring->gem_object = NULL;
++
++	if (ring->cleanup)
++		ring->cleanup(ring);
++
+ 	cleanup_status_page(dev, ring);
+ }
+ 
+@@ -854,19 +858,125 @@ blt_ring_put_user_irq(struct drm_device *dev,
+ 	/* do nothing */
+ }
+ 
++
++/* Workaround for some stepping of SNB,
++ * each time when BLT engine ring tail moved,
++ * the first command in the ring to be parsed
++ * should be MI_BATCH_BUFFER_START
++ */
++#define NEED_BLT_WORKAROUND(dev) \
++	(IS_GEN6(dev) && (dev->pdev->revision < 8))
++
++static inline struct drm_i915_gem_object *
++to_blt_workaround(struct intel_ring_buffer *ring)
++{
++	return ring->private;
++}
++
++static int blt_ring_init(struct drm_device *dev,
++			 struct intel_ring_buffer *ring)
++{
++	if (NEED_BLT_WORKAROUND(dev)) {
++		struct drm_i915_gem_object *obj;
++		u32 __iomem *ptr;
++		int ret;
++
++		obj = to_intel_bo(i915_gem_alloc_object(dev, 4096));
++		if (obj == NULL)
++			return -ENOMEM;
++
++		ret = i915_gem_object_pin(&obj->base, 4096);
++		if (ret) {
++			drm_gem_object_unreference(&obj->base);
++			return ret;
++		}
++
++		ptr = kmap(obj->pages[0]);
++		iowrite32(MI_BATCH_BUFFER_END, ptr);
++		iowrite32(MI_NOOP, ptr+1);
++		kunmap(obj->pages[0]);
++
++		ret = i915_gem_object_set_to_gtt_domain(&obj->base, false);
++		if (ret) {
++			i915_gem_object_unpin(&obj->base);
++			drm_gem_object_unreference(&obj->base);
++			return ret;
++		}
++
++		ring->private = obj;
++	}
++
++	return init_ring_common(dev, ring);
++}
++
++static void blt_ring_begin(struct drm_device *dev,
++			   struct intel_ring_buffer *ring,
++			  int num_dwords)
++{
++	if (ring->private) {
++		intel_ring_begin(dev, ring, num_dwords+2);
++		intel_ring_emit(dev, ring, MI_BATCH_BUFFER_START);
++		intel_ring_emit(dev, ring, to_blt_workaround(ring)->gtt_offset);
++	} else
++		intel_ring_begin(dev, ring, 4);
++}
++
++static void blt_ring_flush(struct drm_device *dev,
++			   struct intel_ring_buffer *ring,
++			   u32 invalidate_domains,
++			   u32 flush_domains)
++{
++	blt_ring_begin(dev, ring, 4);
++	intel_ring_emit(dev, ring, MI_FLUSH_DW);
++	intel_ring_emit(dev, ring, 0);
++	intel_ring_emit(dev, ring, 0);
++	intel_ring_emit(dev, ring, 0);
++	intel_ring_advance(dev, ring);
++}
++
++static u32
++blt_ring_add_request(struct drm_device *dev,
++		     struct intel_ring_buffer *ring,
++		     u32 flush_domains)
++{
++	u32 seqno = i915_gem_get_seqno(dev);
++
++	blt_ring_begin(dev, ring, 4);
++	intel_ring_emit(dev, ring, MI_STORE_DWORD_INDEX);
++	intel_ring_emit(dev, ring,
++			I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
++	intel_ring_emit(dev, ring, seqno);
++	intel_ring_emit(dev, ring, MI_USER_INTERRUPT);
++	intel_ring_advance(dev, ring);
++
++	DRM_DEBUG_DRIVER("%s %d\n", ring->name, seqno);
++	return seqno;
++}
++
++static void blt_ring_cleanup(struct intel_ring_buffer *ring)
++{
++	if (!ring->private)
++		return;
++
++	i915_gem_object_unpin(ring->private);
++	drm_gem_object_unreference(ring->private);
++	ring->private = NULL;
++}
++
+ static const struct intel_ring_buffer gen6_blt_ring = {
+        .name			= "blt ring",
+        .id			= RING_BLT,
+        .mmio_base		= BLT_RING_BASE,
+        .size			= 32 * PAGE_SIZE,
+-       .init			= init_ring_common,
++       .init			= blt_ring_init,
+        .write_tail		= ring_write_tail,
+-       .flush			= gen6_ring_flush,
+-       .add_request		= ring_add_request,
++       .flush			= blt_ring_flush,
++       .add_request		= blt_ring_add_request,
+        .get_seqno		= ring_status_page_get_seqno,
+        .user_irq_get		= blt_ring_get_user_irq,
+        .user_irq_put		= blt_ring_put_user_irq,
+        .dispatch_gem_execbuffer	= gen6_ring_dispatch_gem_execbuffer,
++       .cleanup			= blt_ring_cleanup,
+ };
+ 
+ int intel_init_render_ring_buffer(struct drm_device *dev)
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index a05aff0..3126c26 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -63,6 +63,7 @@ struct  intel_ring_buffer {
+ 			struct drm_i915_gem_execbuffer2 *exec,
+ 			struct drm_clip_rect *cliprects,
+ 			uint64_t exec_offset);
++	void		(*cleanup)(struct intel_ring_buffer *ring);
+ 
+ 	/**
+ 	 * List of objects currently involved in rendering from the
+@@ -98,6 +99,8 @@ struct  intel_ring_buffer {
+ 
+ 	wait_queue_head_t irq_queue;
+ 	drm_local_map_t map;
++
++	void *private;
+ };
+ 
+ static inline u32
+-- 
+1.7.6
+

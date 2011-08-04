@@ -1,0 +1,858 @@
+From 9f4ea95bde03d5d7cbaa36f930ba928b576bfb6d Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 27 Oct 2010 12:45:26 +0100
+Patch-mainline: 2.6.38
+References: fate#310916
+Git-commit: e1f99ce6cac3b6a95551642be5ddb5d9c46bea76
+Subject: [PATCH 1793/2588] drm/i915: Propagate errors from writing to
+ ringbuffer
+
+Preparing the ringbuffer for adding new commands can fail (a timeout
+whilst waiting for the GPU to catch up and free some space). So check
+for any potential error before overwriting HEAD with new commands, and
+propagate that error back to the user where possible.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit e1f99ce6cac3b6a95551642be5ddb5d9c46bea76)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/i915/i915_dma.c         |  119 ++++++++++----------
+ drivers/gpu/drm/i915/i915_drv.h         |   28 +----
+ drivers/gpu/drm/i915/i915_gem.c         |    5 +-
+ drivers/gpu/drm/i915/i915_irq.c         |   13 +-
+ drivers/gpu/drm/i915/intel_display.c    |   51 +++++----
+ drivers/gpu/drm/i915/intel_overlay.c    |   30 ++++-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |  189 ++++++++++++++++++-------------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    4 +-
+ 8 files changed, 244 insertions(+), 195 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index faa3850..562da2b 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -263,7 +263,7 @@ static int i915_dma_init(struct drm_device *dev, void *data,
+  * instruction detected will be given a size of zero, which is a
+  * signal to abort the rest of the buffer.
+  */
+-static int do_validate_cmd(int cmd)
++static int validate_cmd(int cmd)
+ {
+ 	switch (((cmd >> 29) & 0x7)) {
+ 	case 0x0:
+@@ -321,40 +321,27 @@ static int do_validate_cmd(int cmd)
+ 	return 0;
+ }
+ 
+-static int validate_cmd(int cmd)
+-{
+-	int ret = do_validate_cmd(cmd);
+-
+-/*	printk("validate_cmd( %x ): %d\n", cmd, ret); */
+-
+-	return ret;
+-}
+-
+ static int i915_emit_cmds(struct drm_device * dev, int *buffer, int dwords)
+ {
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+-	int i;
++	int i, ret;
+ 
+ 	if ((dwords+1) * sizeof(int) >= dev_priv->render_ring.size - 8)
+ 		return -EINVAL;
+ 
+-	BEGIN_LP_RING((dwords+1)&~1);
+-
+ 	for (i = 0; i < dwords;) {
+-		int cmd, sz;
+-
+-		cmd = buffer[i];
+-
+-		if ((sz = validate_cmd(cmd)) == 0 || i + sz > dwords)
++		int sz = validate_cmd(buffer[i]);
++		if (sz == 0 || i + sz > dwords)
+ 			return -EINVAL;
+-
+-		OUT_RING(cmd);
+-
+-		while (++i, --sz) {
+-			OUT_RING(buffer[i]);
+-		}
++		i += sz;
+ 	}
+ 
++	ret = BEGIN_LP_RING((dwords+1)&~1);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < dwords; i++)
++		OUT_RING(buffer[i]);
+ 	if (dwords & 1)
+ 		OUT_RING(0);
+ 
+@@ -368,7 +355,9 @@ i915_emit_box(struct drm_device *dev,
+ 	      struct drm_clip_rect *boxes,
+ 	      int i, int DR1, int DR4)
+ {
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_clip_rect box = boxes[i];
++	int ret;
+ 
+ 	if (box.y2 <= box.y1 || box.x2 <= box.x1 || box.y2 <= 0 || box.x2 <= 0) {
+ 		DRM_ERROR("Bad box %d,%d..%d,%d\n",
+@@ -377,22 +366,27 @@ i915_emit_box(struct drm_device *dev,
+ 	}
+ 
+ 	if (INTEL_INFO(dev)->gen >= 4) {
+-		BEGIN_LP_RING(4);
++		ret = BEGIN_LP_RING(4);
++		if (ret)
++			return ret;
++
+ 		OUT_RING(GFX_OP_DRAWRECT_INFO_I965);
+ 		OUT_RING((box.x1 & 0xffff) | (box.y1 << 16));
+ 		OUT_RING(((box.x2 - 1) & 0xffff) | ((box.y2 - 1) << 16));
+ 		OUT_RING(DR4);
+-		ADVANCE_LP_RING();
+ 	} else {
+-		BEGIN_LP_RING(6);
++		ret = BEGIN_LP_RING(6);
++		if (ret)
++			return ret;
++
+ 		OUT_RING(GFX_OP_DRAWRECT_INFO);
+ 		OUT_RING(DR1);
+ 		OUT_RING((box.x1 & 0xffff) | (box.y1 << 16));
+ 		OUT_RING(((box.x2 - 1) & 0xffff) | ((box.y2 - 1) << 16));
+ 		OUT_RING(DR4);
+ 		OUT_RING(0);
+-		ADVANCE_LP_RING();
+ 	}
++	ADVANCE_LP_RING();
+ 
+ 	return 0;
+ }
+@@ -412,12 +406,13 @@ static void i915_emit_breadcrumb(struct drm_device *dev)
+ 	if (master_priv->sarea_priv)
+ 		master_priv->sarea_priv->last_enqueue = dev_priv->counter;
+ 
+-	BEGIN_LP_RING(4);
+-	OUT_RING(MI_STORE_DWORD_INDEX);
+-	OUT_RING(I915_BREADCRUMB_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
+-	OUT_RING(dev_priv->counter);
+-	OUT_RING(0);
+-	ADVANCE_LP_RING();
++	if (BEGIN_LP_RING(4) == 0) {
++		OUT_RING(MI_STORE_DWORD_INDEX);
++		OUT_RING(I915_BREADCRUMB_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
++		OUT_RING(dev_priv->counter);
++		OUT_RING(0);
++		ADVANCE_LP_RING();
++	}
+ }
+ 
+ static int i915_dispatch_cmdbuffer(struct drm_device * dev,
+@@ -458,8 +453,9 @@ static int i915_dispatch_batchbuffer(struct drm_device * dev,
+ 				     drm_i915_batchbuffer_t * batch,
+ 				     struct drm_clip_rect *cliprects)
+ {
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	int nbox = batch->num_cliprects;
+-	int i = 0, count;
++	int i, count, ret;
+ 
+ 	if ((batch->start | batch->used) & 0x7) {
+ 		DRM_ERROR("alignment");
+@@ -469,17 +465,19 @@ static int i915_dispatch_batchbuffer(struct drm_device * dev,
+ 	i915_kernel_lost_context(dev);
+ 
+ 	count = nbox ? nbox : 1;
+-
+ 	for (i = 0; i < count; i++) {
+ 		if (i < nbox) {
+-			int ret = i915_emit_box(dev, cliprects, i,
+-						batch->DR1, batch->DR4);
++			ret = i915_emit_box(dev, cliprects, i,
++					    batch->DR1, batch->DR4);
+ 			if (ret)
+ 				return ret;
+ 		}
+ 
+ 		if (!IS_I830(dev) && !IS_845G(dev)) {
+-			BEGIN_LP_RING(2);
++			ret = BEGIN_LP_RING(2);
++			if (ret)
++				return ret;
++
+ 			if (INTEL_INFO(dev)->gen >= 4) {
+ 				OUT_RING(MI_BATCH_BUFFER_START | (2 << 6) | MI_BATCH_NON_SECURE_I965);
+ 				OUT_RING(batch->start);
+@@ -487,26 +485,29 @@ static int i915_dispatch_batchbuffer(struct drm_device * dev,
+ 				OUT_RING(MI_BATCH_BUFFER_START | (2 << 6));
+ 				OUT_RING(batch->start | MI_BATCH_NON_SECURE);
+ 			}
+-			ADVANCE_LP_RING();
+ 		} else {
+-			BEGIN_LP_RING(4);
++			ret = BEGIN_LP_RING(4);
++			if (ret)
++				return ret;
++
+ 			OUT_RING(MI_BATCH_BUFFER);
+ 			OUT_RING(batch->start | MI_BATCH_NON_SECURE);
+ 			OUT_RING(batch->start + batch->used - 4);
+ 			OUT_RING(0);
+-			ADVANCE_LP_RING();
+ 		}
++		ADVANCE_LP_RING();
+ 	}
+ 
+ 
+ 	if (IS_G4X(dev) || IS_GEN5(dev)) {
+-		BEGIN_LP_RING(2);
+-		OUT_RING(MI_FLUSH | MI_NO_WRITE_FLUSH | MI_INVALIDATE_ISP);
+-		OUT_RING(MI_NOOP);
+-		ADVANCE_LP_RING();
++		if (BEGIN_LP_RING(2) == 0) {
++			OUT_RING(MI_FLUSH | MI_NO_WRITE_FLUSH | MI_INVALIDATE_ISP);
++			OUT_RING(MI_NOOP);
++			ADVANCE_LP_RING();
++		}
+ 	}
+-	i915_emit_breadcrumb(dev);
+ 
++	i915_emit_breadcrumb(dev);
+ 	return 0;
+ }
+ 
+@@ -515,6 +516,7 @@ static int i915_dispatch_flip(struct drm_device * dev)
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+ 	struct drm_i915_master_private *master_priv =
+ 		dev->primary->master->driver_priv;
++	int ret;
+ 
+ 	if (!master_priv->sarea_priv)
+ 		return -EINVAL;
+@@ -526,12 +528,13 @@ static int i915_dispatch_flip(struct drm_device * dev)
+ 
+ 	i915_kernel_lost_context(dev);
+ 
+-	BEGIN_LP_RING(2);
++	ret = BEGIN_LP_RING(10);
++	if (ret)
++		return ret;
++
+ 	OUT_RING(MI_FLUSH | MI_READ_FLUSH);
+ 	OUT_RING(0);
+-	ADVANCE_LP_RING();
+ 
+-	BEGIN_LP_RING(6);
+ 	OUT_RING(CMD_OP_DISPLAYBUFFER_INFO | ASYNC_FLIP);
+ 	OUT_RING(0);
+ 	if (dev_priv->current_page == 0) {
+@@ -542,21 +545,21 @@ static int i915_dispatch_flip(struct drm_device * dev)
+ 		dev_priv->current_page = 0;
+ 	}
+ 	OUT_RING(0);
+-	ADVANCE_LP_RING();
+ 
+-	BEGIN_LP_RING(2);
+ 	OUT_RING(MI_WAIT_FOR_EVENT | MI_WAIT_FOR_PLANE_A_FLIP);
+ 	OUT_RING(0);
++
+ 	ADVANCE_LP_RING();
+ 
+ 	master_priv->sarea_priv->last_enqueue = dev_priv->counter++;
+ 
+-	BEGIN_LP_RING(4);
+-	OUT_RING(MI_STORE_DWORD_INDEX);
+-	OUT_RING(I915_BREADCRUMB_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
+-	OUT_RING(dev_priv->counter);
+-	OUT_RING(0);
+-	ADVANCE_LP_RING();
++	if (BEGIN_LP_RING(4) == 0) {
++		OUT_RING(MI_STORE_DWORD_INDEX);
++		OUT_RING(I915_BREADCRUMB_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
++		OUT_RING(dev_priv->counter);
++		OUT_RING(0);
++		ADVANCE_LP_RING();
++	}
+ 
+ 	master_priv->sarea_priv->pf_current_page = dev_priv->current_page;
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index fbbb061..eb067c1 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1218,30 +1218,14 @@ static inline void i915_write(struct drm_i915_private *dev_priv, u32 reg,
+ #define I915_DEBUG_DISABLE_IO() (dev_priv->debug_flags &= ~(I915_DEBUG_READ | \
+ 							    I915_DEBUG_WRITE))
+ 
+-#define I915_VERBOSE 0
++#define BEGIN_LP_RING(n) \
++	intel_ring_begin(&dev_priv->render_ring, (n))
+ 
+-#define BEGIN_LP_RING(n)  do { \
+-	drm_i915_private_t *dev_priv__ = dev->dev_private;		\
+-	if (I915_VERBOSE)						\
+-		DRM_DEBUG("   BEGIN_LP_RING %x\n", (int)(n));		\
+-	intel_ring_begin(&dev_priv__->render_ring, (n));		\
+-} while (0)
+-
+-
+-#define OUT_RING(x) do {						\
+-	drm_i915_private_t *dev_priv__ = dev->dev_private;		\
+-	if (I915_VERBOSE)						\
+-		DRM_DEBUG("   OUT_RING %x\n", (int)(x));		\
+-	intel_ring_emit(&dev_priv__->render_ring, x);			\
+-} while (0)
++#define OUT_RING(x) \
++	intel_ring_emit(&dev_priv->render_ring, x)
+ 
+-#define ADVANCE_LP_RING() do {						\
+-	drm_i915_private_t *dev_priv__ = dev->dev_private;                \
+-	if (I915_VERBOSE)						\
+-		DRM_DEBUG("ADVANCE_LP_RING %x\n",			\
+-				dev_priv__->render_ring.tail);		\
+-	intel_ring_advance(&dev_priv__->render_ring);			\
+-} while(0)
++#define ADVANCE_LP_RING() \
++	intel_ring_advance(&dev_priv->render_ring)
+ 
+ /**
+  * Reads a dword out of the status page, which is written to from the command
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 349664f..da39dff 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3977,7 +3977,10 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 			else
+ 				flip_mask = MI_WAIT_FOR_PLANE_A_FLIP;
+ 
+-			intel_ring_begin(ring, 2);
++			ret = intel_ring_begin(ring, 2);
++			if (ret)
++				goto err;
++
+ 			intel_ring_emit(ring, MI_WAIT_FOR_EVENT | flip_mask);
+ 			intel_ring_emit(ring, MI_NOOP);
+ 			intel_ring_advance(ring);
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index db2e944..282273f 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1102,12 +1102,13 @@ static int i915_emit_irq(struct drm_device * dev)
+ 	if (master_priv->sarea_priv)
+ 		master_priv->sarea_priv->last_enqueue = dev_priv->counter;
+ 
+-	BEGIN_LP_RING(4);
+-	OUT_RING(MI_STORE_DWORD_INDEX);
+-	OUT_RING(I915_BREADCRUMB_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
+-	OUT_RING(dev_priv->counter);
+-	OUT_RING(MI_USER_INTERRUPT);
+-	ADVANCE_LP_RING();
++	if (BEGIN_LP_RING(4) == 0) {
++		OUT_RING(MI_STORE_DWORD_INDEX);
++		OUT_RING(I915_BREADCRUMB_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
++		OUT_RING(dev_priv->counter);
++		OUT_RING(MI_USER_INTERRUPT);
++		ADVANCE_LP_RING();
++	}
+ 
+ 	return dev_priv->counter;
+ }
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index fca5232..44fe56c 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5112,22 +5112,16 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 	if (ret)
+ 		goto cleanup_objs;
+ 
+-	/* Block clients from rendering to the new back buffer until
+-	 * the flip occurs and the object is no longer visible.
+-	 */
+-	atomic_add(1 << intel_crtc->plane,
+-		   &to_intel_bo(work->old_fb_obj)->pending_flip);
+-
+-	work->pending_flip_obj = obj;
+-	obj_priv = to_intel_bo(obj);
+-
+ 	if (IS_GEN3(dev) || IS_GEN2(dev)) {
+ 		u32 flip_mask;
+ 
+ 		/* Can't queue multiple flips, so wait for the previous
+ 		 * one to finish before executing the next.
+ 		 */
+-		BEGIN_LP_RING(2);
++		ret = BEGIN_LP_RING(2);
++		if (ret)
++			goto cleanup_objs;
++
+ 		if (intel_crtc->plane)
+ 			flip_mask = MI_WAIT_FOR_PLANE_B_FLIP;
+ 		else
+@@ -5137,13 +5131,25 @@ static int intel_crtc_page_flip(struct drm_crtc *crtc,
+ 		ADVANCE_LP_RING();
+ 	}
+ 
++	work->pending_flip_obj = obj;
++	obj_priv = to_intel_bo(obj);
++
+ 	work->enable_stall_check = true;
+ 
+ 	/* Offset into the new buffer for cases of shared fbs between CRTCs */
+ 	offset = crtc->y * fb->pitch + crtc->x * fb->bits_per_pixel/8;
+ 
+-	BEGIN_LP_RING(4);
+-	switch(INTEL_INFO(dev)->gen) {
++	ret = BEGIN_LP_RING(4);
++	if (ret)
++		goto cleanup_objs;
++
++	/* Block clients from rendering to the new back buffer until
++	 * the flip occurs and the object is no longer visible.
++	 */
++	atomic_add(1 << intel_crtc->plane,
++		   &to_intel_bo(work->old_fb_obj)->pending_flip);
++
++	switch (INTEL_INFO(dev)->gen) {
+ 	case 2:
+ 		OUT_RING(MI_DISPLAY_FLIP |
+ 			 MI_DISPLAY_FLIP_PLANE(intel_crtc->plane));
+@@ -5946,16 +5952,17 @@ void intel_init_clock_gating(struct drm_device *dev)
+ 			struct drm_i915_gem_object *obj_priv;
+ 			obj_priv = to_intel_bo(dev_priv->renderctx);
+ 			if (obj_priv) {
+-				BEGIN_LP_RING(4);
+-				OUT_RING(MI_SET_CONTEXT);
+-				OUT_RING(obj_priv->gtt_offset |
+-						MI_MM_SPACE_GTT |
+-						MI_SAVE_EXT_STATE_EN |
+-						MI_RESTORE_EXT_STATE_EN |
+-						MI_RESTORE_INHIBIT);
+-				OUT_RING(MI_NOOP);
+-				OUT_RING(MI_FLUSH);
+-				ADVANCE_LP_RING();
++				if (BEGIN_LP_RING(4) == 0) {
++					OUT_RING(MI_SET_CONTEXT);
++					OUT_RING(obj_priv->gtt_offset |
++						 MI_MM_SPACE_GTT |
++						 MI_SAVE_EXT_STATE_EN |
++						 MI_RESTORE_EXT_STATE_EN |
++						 MI_RESTORE_INHIBIT);
++					OUT_RING(MI_NOOP);
++					OUT_RING(MI_FLUSH);
++					ADVANCE_LP_RING();
++				}
+ 			}
+ 		} else
+ 			DRM_DEBUG_KMS("Failed to allocate render context."
+diff --git a/drivers/gpu/drm/i915/intel_overlay.c b/drivers/gpu/drm/i915/intel_overlay.c
+index 9962b0e..81c923a 100644
+--- a/drivers/gpu/drm/i915/intel_overlay.c
++++ b/drivers/gpu/drm/i915/intel_overlay.c
+@@ -289,6 +289,7 @@ i830_deactivate_pipe_a(struct drm_device *dev)
+ static int intel_overlay_on(struct intel_overlay *overlay)
+ {
+ 	struct drm_device *dev = overlay->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_i915_gem_request *request;
+ 	int pipe_a_quirk = 0;
+ 	int ret;
+@@ -308,7 +309,12 @@ static int intel_overlay_on(struct intel_overlay *overlay)
+ 		goto out;
+ 	}
+ 
+-	BEGIN_LP_RING(4);
++	ret = BEGIN_LP_RING(4);
++	if (ret) {
++		kfree(request);
++		goto out;
++	}
++
+ 	OUT_RING(MI_OVERLAY_FLIP | MI_OVERLAY_ON);
+ 	OUT_RING(overlay->flip_addr | OFC_UPDATE);
+ 	OUT_RING(MI_WAIT_FOR_EVENT | MI_WAIT_FOR_OVERLAY_FLIP);
+@@ -332,6 +338,7 @@ static int intel_overlay_continue(struct intel_overlay *overlay,
+ 	struct drm_i915_gem_request *request;
+ 	u32 flip_addr = overlay->flip_addr;
+ 	u32 tmp;
++	int ret;
+ 
+ 	BUG_ON(!overlay->active);
+ 
+@@ -347,7 +354,11 @@ static int intel_overlay_continue(struct intel_overlay *overlay,
+ 	if (tmp & (1 << 17))
+ 		DRM_DEBUG("overlay underrun, DOVSTA: %x\n", tmp);
+ 
+-	BEGIN_LP_RING(2);
++	ret = BEGIN_LP_RING(2);
++	if (ret) {
++		kfree(request);
++		return ret;
++	}
+ 	OUT_RING(MI_OVERLAY_FLIP | MI_OVERLAY_CONTINUE);
+ 	OUT_RING(flip_addr);
+         ADVANCE_LP_RING();
+@@ -389,8 +400,10 @@ static int intel_overlay_off(struct intel_overlay *overlay,
+ 			     bool interruptible)
+ {
+ 	struct drm_device *dev = overlay->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	u32 flip_addr = overlay->flip_addr;
+ 	struct drm_i915_gem_request *request;
++	int ret;
+ 
+ 	BUG_ON(!overlay->active);
+ 
+@@ -404,7 +417,11 @@ static int intel_overlay_off(struct intel_overlay *overlay,
+ 	 * of the hw. Do it in both cases */
+ 	flip_addr |= OFC_UPDATE;
+ 
+-	BEGIN_LP_RING(6);
++	ret = BEGIN_LP_RING(6);
++	if (ret) {
++		kfree(request);
++		return ret;
++	}
+ 	/* wait for overlay to go idle */
+ 	OUT_RING(MI_OVERLAY_FLIP | MI_OVERLAY_CONTINUE);
+ 	OUT_RING(flip_addr);
+@@ -467,7 +484,12 @@ static int intel_overlay_release_old_vid(struct intel_overlay *overlay)
+ 		if (request == NULL)
+ 			return -ENOMEM;
+ 
+-		BEGIN_LP_RING(2);
++		ret = BEGIN_LP_RING(2);
++		if (ret) {
++			kfree(request);
++			return ret;
++		}
++
+ 		OUT_RING(MI_WAIT_FOR_EVENT | MI_WAIT_FOR_OVERLAY_FLIP);
+ 		OUT_RING(MI_NOOP);
+ 		ADVANCE_LP_RING();
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index bc1ab5d..ef8a989 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -112,10 +112,11 @@ render_ring_flush(struct intel_ring_buffer *ring,
+ #if WATCH_EXEC
+ 		DRM_INFO("%s: queue flush %08x to ring\n", __func__, cmd);
+ #endif
+-		intel_ring_begin(ring, 2);
+-		intel_ring_emit(ring, cmd);
+-		intel_ring_emit(ring, MI_NOOP);
+-		intel_ring_advance(ring);
++		if (intel_ring_begin(ring, 2) == 0) {
++			intel_ring_emit(ring, cmd);
++			intel_ring_emit(ring, MI_NOOP);
++			intel_ring_advance(ring);
++		}
+ 	}
+ }
+ 
+@@ -246,16 +247,17 @@ render_ring_add_request(struct intel_ring_buffer *ring,
+ 	seqno = i915_gem_get_seqno(dev);
+ 
+ 	if (IS_GEN6(dev)) {
+-		intel_ring_begin(ring, 6);
+-		intel_ring_emit(ring, GFX_OP_PIPE_CONTROL | 3);
+-		intel_ring_emit(ring, PIPE_CONTROL_QW_WRITE |
+-			 PIPE_CONTROL_WC_FLUSH | PIPE_CONTROL_IS_FLUSH |
+-			 PIPE_CONTROL_NOTIFY);
+-		intel_ring_emit(ring, dev_priv->seqno_gfx_addr | PIPE_CONTROL_GLOBAL_GTT);
+-		intel_ring_emit(ring, seqno);
+-		intel_ring_emit(ring, 0);
+-		intel_ring_emit(ring, 0);
+-		intel_ring_advance(ring);
++		if (intel_ring_begin(ring, 6) == 0) {
++			intel_ring_emit(ring, GFX_OP_PIPE_CONTROL | 3);
++			intel_ring_emit(ring, PIPE_CONTROL_QW_WRITE |
++					PIPE_CONTROL_WC_FLUSH | PIPE_CONTROL_IS_FLUSH |
++					PIPE_CONTROL_NOTIFY);
++			intel_ring_emit(ring, dev_priv->seqno_gfx_addr | PIPE_CONTROL_GLOBAL_GTT);
++			intel_ring_emit(ring, seqno);
++			intel_ring_emit(ring, 0);
++			intel_ring_emit(ring, 0);
++			intel_ring_advance(ring);
++		}
+ 	} else if (HAS_PIPE_CONTROL(dev)) {
+ 		u32 scratch_addr = dev_priv->seqno_gfx_addr + 128;
+ 
+@@ -264,38 +266,40 @@ render_ring_add_request(struct intel_ring_buffer *ring,
+ 		 * PIPE_NOTIFY buffers out to memory before requesting
+ 		 * an interrupt.
+ 		 */
+-		intel_ring_begin(ring, 32);
+-		intel_ring_emit(ring, GFX_OP_PIPE_CONTROL | PIPE_CONTROL_QW_WRITE |
+-			 PIPE_CONTROL_WC_FLUSH | PIPE_CONTROL_TC_FLUSH);
+-		intel_ring_emit(ring, dev_priv->seqno_gfx_addr | PIPE_CONTROL_GLOBAL_GTT);
+-		intel_ring_emit(ring, seqno);
+-		intel_ring_emit(ring, 0);
+-		PIPE_CONTROL_FLUSH(ring, scratch_addr);
+-		scratch_addr += 128; /* write to separate cachelines */
+-		PIPE_CONTROL_FLUSH(ring, scratch_addr);
+-		scratch_addr += 128;
+-		PIPE_CONTROL_FLUSH(ring, scratch_addr);
+-		scratch_addr += 128;
+-		PIPE_CONTROL_FLUSH(ring, scratch_addr);
+-		scratch_addr += 128;
+-		PIPE_CONTROL_FLUSH(ring, scratch_addr);
+-		scratch_addr += 128;
+-		PIPE_CONTROL_FLUSH(ring, scratch_addr);
+-		intel_ring_emit(ring, GFX_OP_PIPE_CONTROL | PIPE_CONTROL_QW_WRITE |
+-			 PIPE_CONTROL_WC_FLUSH | PIPE_CONTROL_TC_FLUSH |
+-			 PIPE_CONTROL_NOTIFY);
+-		intel_ring_emit(ring, dev_priv->seqno_gfx_addr | PIPE_CONTROL_GLOBAL_GTT);
+-		intel_ring_emit(ring, seqno);
+-		intel_ring_emit(ring, 0);
+-		intel_ring_advance(ring);
++		if (intel_ring_begin(ring, 32) == 0) {
++			intel_ring_emit(ring, GFX_OP_PIPE_CONTROL | PIPE_CONTROL_QW_WRITE |
++					PIPE_CONTROL_WC_FLUSH | PIPE_CONTROL_TC_FLUSH);
++			intel_ring_emit(ring, dev_priv->seqno_gfx_addr | PIPE_CONTROL_GLOBAL_GTT);
++			intel_ring_emit(ring, seqno);
++			intel_ring_emit(ring, 0);
++			PIPE_CONTROL_FLUSH(ring, scratch_addr);
++			scratch_addr += 128; /* write to separate cachelines */
++			PIPE_CONTROL_FLUSH(ring, scratch_addr);
++			scratch_addr += 128;
++			PIPE_CONTROL_FLUSH(ring, scratch_addr);
++			scratch_addr += 128;
++			PIPE_CONTROL_FLUSH(ring, scratch_addr);
++			scratch_addr += 128;
++			PIPE_CONTROL_FLUSH(ring, scratch_addr);
++			scratch_addr += 128;
++			PIPE_CONTROL_FLUSH(ring, scratch_addr);
++			intel_ring_emit(ring, GFX_OP_PIPE_CONTROL | PIPE_CONTROL_QW_WRITE |
++					PIPE_CONTROL_WC_FLUSH | PIPE_CONTROL_TC_FLUSH |
++					PIPE_CONTROL_NOTIFY);
++			intel_ring_emit(ring, dev_priv->seqno_gfx_addr | PIPE_CONTROL_GLOBAL_GTT);
++			intel_ring_emit(ring, seqno);
++			intel_ring_emit(ring, 0);
++			intel_ring_advance(ring);
++		}
+ 	} else {
+-		intel_ring_begin(ring, 4);
+-		intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
+-		intel_ring_emit(ring, I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
+-		intel_ring_emit(ring, seqno);
++		if (intel_ring_begin(ring, 4) == 0) {
++			intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
++			intel_ring_emit(ring, I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
++			intel_ring_emit(ring, seqno);
+ 
+-		intel_ring_emit(ring, MI_USER_INTERRUPT);
+-		intel_ring_advance(ring);
++			intel_ring_emit(ring, MI_USER_INTERRUPT);
++			intel_ring_advance(ring);
++		}
+ 	}
+ 	return seqno;
+ }
+@@ -361,10 +365,11 @@ bsd_ring_flush(struct intel_ring_buffer *ring,
+ 	       u32     invalidate_domains,
+ 	       u32     flush_domains)
+ {
+-	intel_ring_begin(ring, 2);
+-	intel_ring_emit(ring, MI_FLUSH);
+-	intel_ring_emit(ring, MI_NOOP);
+-	intel_ring_advance(ring);
++	if (intel_ring_begin(ring, 2) == 0) {
++		intel_ring_emit(ring, MI_FLUSH);
++		intel_ring_emit(ring, MI_NOOP);
++		intel_ring_advance(ring);
++	}
+ }
+ 
+ static u32
+@@ -375,12 +380,13 @@ ring_add_request(struct intel_ring_buffer *ring,
+ 
+ 	seqno = i915_gem_get_seqno(ring->dev);
+ 
+-	intel_ring_begin(ring, 4);
+-	intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
+-	intel_ring_emit(ring, I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
+-	intel_ring_emit(ring, seqno);
+-	intel_ring_emit(ring, MI_USER_INTERRUPT);
+-	intel_ring_advance(ring);
++	if (intel_ring_begin(ring, 4) == 0) {
++		intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
++		intel_ring_emit(ring, I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
++		intel_ring_emit(ring, seqno);
++		intel_ring_emit(ring, MI_USER_INTERRUPT);
++		intel_ring_advance(ring);
++	}
+ 
+ 	DRM_DEBUG_DRIVER("%s %d\n", ring->name, seqno);
+ 
+@@ -411,10 +417,14 @@ ring_dispatch_execbuffer(struct intel_ring_buffer *ring,
+ 			 uint64_t exec_offset)
+ {
+ 	uint32_t exec_start;
++	int ret;
+ 
+ 	exec_start = (uint32_t) exec_offset + exec->batch_start_offset;
+ 
+-	intel_ring_begin(ring, 2);
++	ret = intel_ring_begin(ring, 2);
++	if (ret)
++		return ret;
++
+ 	intel_ring_emit(ring,
+ 			MI_BATCH_BUFFER_START |
+ 			(2 << 6) |
+@@ -434,8 +444,8 @@ render_ring_dispatch_execbuffer(struct intel_ring_buffer *ring,
+ 	struct drm_device *dev = ring->dev;
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+ 	int nbox = exec->num_cliprects;
+-	int i = 0, count;
+ 	uint32_t exec_start, exec_len;
++	int i, count, ret;
+ 
+ 	exec_start = (uint32_t) exec_offset + exec->batch_start_offset;
+ 	exec_len = (uint32_t) exec->batch_len;
+@@ -443,23 +453,28 @@ render_ring_dispatch_execbuffer(struct intel_ring_buffer *ring,
+ 	trace_i915_gem_request_submit(dev, dev_priv->next_seqno + 1);
+ 
+ 	count = nbox ? nbox : 1;
+-
+ 	for (i = 0; i < count; i++) {
+ 		if (i < nbox) {
+-			int ret = i915_emit_box(dev, cliprects, i,
+-						exec->DR1, exec->DR4);
++			ret = i915_emit_box(dev, cliprects, i,
++					    exec->DR1, exec->DR4);
+ 			if (ret)
+ 				return ret;
+ 		}
+ 
+ 		if (IS_I830(dev) || IS_845G(dev)) {
+-			intel_ring_begin(ring, 4);
++			ret = intel_ring_begin(ring, 4);
++			if (ret)
++				return ret;
++
+ 			intel_ring_emit(ring, MI_BATCH_BUFFER);
+ 			intel_ring_emit(ring, exec_start | MI_BATCH_NON_SECURE);
+ 			intel_ring_emit(ring, exec_start + exec_len - 4);
+ 			intel_ring_emit(ring, 0);
+ 		} else {
+-			intel_ring_begin(ring, 2);
++			ret = intel_ring_begin(ring, 2);
++			if (ret)
++				return ret;
++
+ 			if (INTEL_INFO(dev)->gen >= 4) {
+ 				intel_ring_emit(ring,
+ 						MI_BATCH_BUFFER_START | (2 << 6)
+@@ -476,12 +491,13 @@ render_ring_dispatch_execbuffer(struct intel_ring_buffer *ring,
+ 	}
+ 
+ 	if (IS_G4X(dev) || IS_GEN5(dev)) {
+-		intel_ring_begin(ring, 2);
+-		intel_ring_emit(ring, MI_FLUSH |
+-				MI_NO_WRITE_FLUSH |
+-				MI_INVALIDATE_ISP );
+-		intel_ring_emit(ring, MI_NOOP);
+-		intel_ring_advance(ring);
++		if (intel_ring_begin(ring, 2) == 0) {
++			intel_ring_emit(ring, MI_FLUSH |
++					MI_NO_WRITE_FLUSH |
++					MI_INVALIDATE_ISP );
++			intel_ring_emit(ring, MI_NOOP);
++			intel_ring_advance(ring);
++		}
+ 	}
+ 	/* XXX breadcrumb */
+ 
+@@ -706,18 +722,26 @@ int intel_wait_ring_buffer(struct intel_ring_buffer *ring, int n)
+ 	return -EBUSY;
+ }
+ 
+-void intel_ring_begin(struct intel_ring_buffer *ring,
+-		      int num_dwords)
++int intel_ring_begin(struct intel_ring_buffer *ring,
++		     int num_dwords)
+ {
+ 	int n = 4*num_dwords;
++	int ret;
+ 
+-	if (unlikely(ring->tail + n > ring->size))
+-		intel_wrap_ring_buffer(ring);
++	if (unlikely(ring->tail + n > ring->size)) {
++		ret = intel_wrap_ring_buffer(ring);
++		if (unlikely(ret))
++			return ret;
++	}
+ 
+-	if (unlikely(ring->space < n))
+-		intel_wait_ring_buffer(ring, n);
++	if (unlikely(ring->space < n)) {
++		ret = intel_wait_ring_buffer(ring, n);
++		if (unlikely(ret))
++			return ret;
++	}
+ 
+ 	ring->space -= n;
++	return 0;
+ }
+ 
+ void intel_ring_advance(struct intel_ring_buffer *ring)
+@@ -785,12 +809,13 @@ static void gen6_ring_flush(struct intel_ring_buffer *ring,
+ 			    u32 invalidate_domains,
+ 			    u32 flush_domains)
+ {
+-       intel_ring_begin(ring, 4);
+-       intel_ring_emit(ring, MI_FLUSH_DW);
+-       intel_ring_emit(ring, 0);
+-       intel_ring_emit(ring, 0);
+-       intel_ring_emit(ring, 0);
+-       intel_ring_advance(ring);
++	if (intel_ring_begin(ring, 4) == 0) {
++		intel_ring_emit(ring, MI_FLUSH_DW);
++		intel_ring_emit(ring, 0);
++		intel_ring_emit(ring, 0);
++		intel_ring_emit(ring, 0);
++		intel_ring_advance(ring);
++	}
+ }
+ 
+ static int
+@@ -800,10 +825,14 @@ gen6_ring_dispatch_execbuffer(struct intel_ring_buffer *ring,
+ 			      uint64_t exec_offset)
+ {
+        uint32_t exec_start;
++       int ret;
+ 
+        exec_start = (uint32_t) exec_offset + exec->batch_start_offset;
+ 
+-       intel_ring_begin(ring, 2);
++       ret = intel_ring_begin(ring, 2);
++       if (ret)
++	       return ret;
++
+        intel_ring_emit(ring, MI_BATCH_BUFFER_START | MI_BATCH_NON_SECURE_I965);
+        /* bit0-7 is the length on GEN6+ */
+        intel_ring_emit(ring, exec_start);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 2a9f9c0..0909807 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -104,8 +104,8 @@ intel_read_status_page(struct intel_ring_buffer *ring,
+ }
+ 
+ void intel_cleanup_ring_buffer(struct intel_ring_buffer *ring);
+-int intel_wait_ring_buffer(struct intel_ring_buffer *ring, int n);
+-void intel_ring_begin(struct intel_ring_buffer *ring, int n);
++int __must_check intel_wait_ring_buffer(struct intel_ring_buffer *ring, int n);
++int __must_check intel_ring_begin(struct intel_ring_buffer *ring, int n);
+ 
+ static inline void intel_ring_emit(struct intel_ring_buffer *ring,
+ 				   u32 data)
+-- 
+1.7.6
+

@@ -1,0 +1,754 @@
+From a1205c9eb85dbf26ae4e15853928d07c122f0ba8 Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Tue, 8 Dec 2009 07:07:28 +1000
+Patch-mainline: 2.6.33
+References: fate#310916
+Git-commit: 746c1aa4d100f7441423050f34be79f401fbf7d4
+Subject: [PATCH 0124/2588] drm/radeon/kms: initial radeon displayport porting
+
+This is enough to retrieve EDID and DPCP.
+
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit 746c1aa4d100f7441423050f34be79f401fbf7d4)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/radeon/Makefile            |    2 +-
+ drivers/gpu/drm/radeon/atombios_dp.c       |  275 ++++++++++++++++++++++++++++
+ drivers/gpu/drm/radeon/radeon_atombios.c   |   17 +-
+ drivers/gpu/drm/radeon/radeon_connectors.c |   57 ++++++-
+ drivers/gpu/drm/radeon/radeon_display.c    |    7 +
+ drivers/gpu/drm/radeon/radeon_encoders.c   |   93 ++++++++++
+ drivers/gpu/drm/radeon/radeon_i2c.c        |   50 ++++-
+ drivers/gpu/drm/radeon/radeon_mode.h       |   21 ++-
+ include/drm/drm_dp_helper.h                |    2 +
+ 9 files changed, 500 insertions(+), 24 deletions(-)
+ create mode 100644 drivers/gpu/drm/radeon/atombios_dp.c
+
+diff --git a/drivers/gpu/drm/radeon/Makefile b/drivers/gpu/drm/radeon/Makefile
+index b5713ee..feb52ee 100644
+--- a/drivers/gpu/drm/radeon/Makefile
++++ b/drivers/gpu/drm/radeon/Makefile
+@@ -49,7 +49,7 @@ radeon-y += radeon_device.o radeon_kms.o \
+ 	radeon_cs.o radeon_bios.o radeon_benchmark.o r100.o r300.o r420.o \
+ 	rs400.o rs600.o rs690.o rv515.o r520.o r600.o rv770.o radeon_test.o \
+ 	r200.o radeon_legacy_tv.o r600_cs.o r600_blit.o r600_blit_shaders.o \
+-	r600_blit_kms.o radeon_pm.o
++	r600_blit_kms.o radeon_pm.o atombios_dp.o
+ 
+ radeon-$(CONFIG_COMPAT) += radeon_ioc32.o
+ 
+diff --git a/drivers/gpu/drm/radeon/atombios_dp.c b/drivers/gpu/drm/radeon/atombios_dp.c
+new file mode 100644
+index 0000000..a4bc801
+--- /dev/null
++++ b/drivers/gpu/drm/radeon/atombios_dp.c
+@@ -0,0 +1,275 @@
++/*
++ * Copyright 2007-8 Advanced Micro Devices, Inc.
++ * Copyright 2008 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: Dave Airlie
++ *          Alex Deucher
++ */
++#include "drmP.h"
++#include "radeon_drm.h"
++#include "radeon.h"
++
++#include "atom.h"
++#include "atom-bits.h"
++#include "drm_dp_helper.h"
++
++#define DP_LINK_STATUS_SIZE	6
++
++bool radeon_process_aux_ch(struct radeon_i2c_chan *chan, u8 *req_bytes,
++			   int num_bytes, u8 *read_byte, 
++			   u8 read_buf_len, u8 delay)
++{
++	struct drm_device *dev = chan->dev;
++	struct radeon_device *rdev = dev->dev_private;
++	PROCESS_AUX_CHANNEL_TRANSACTION_PS_ALLOCATION args;
++	int index = GetIndexIntoMasterTable(COMMAND, ProcessAuxChannelTransaction);
++	unsigned char *base;
++	
++	memset(&args, 0, sizeof(args));
++	
++	base = (unsigned char *)rdev->mode_info.atom_context->scratch;
++
++	memcpy(base, req_bytes, num_bytes);
++
++	args.lpAuxRequest = 0;
++	args.lpDataOut = 16;
++	args.ucDataOutLen = 0;
++	args.ucChannelID = chan->i2c_id;
++	args.ucDelay = delay;
++
++	atom_execute_table(rdev->mode_info.atom_context, index, (uint32_t *)&args);
++
++	if (args.ucReplyStatus) {
++		DRM_ERROR("failed to get auxch %02x%02x %02x %02x 0x%02x %02x\n",
++			  req_bytes[1], req_bytes[0], req_bytes[2], req_bytes[3],
++			  chan->i2c_id, args.ucReplyStatus);
++		return false;
++	}
++
++	if (args.ucDataOutLen && read_byte && read_buf_len) {
++		if (read_buf_len < args.ucDataOutLen) {
++			DRM_ERROR("Buffer to small for return answer %d %d\n",
++				  read_buf_len, args.ucDataOutLen);
++			return false;
++		}
++		{
++			int len = min(read_buf_len, args.ucDataOutLen);
++			memcpy(read_byte, base + 16, len);
++		}
++	}
++	return true;
++}
++
++int radeon_dp_encoder_service(struct radeon_device *rdev, int action, int dp_clock,
++			      uint8_t ucconfig, uint8_t lane_num)
++{
++	DP_ENCODER_SERVICE_PARAMETERS args;
++	int index = GetIndexIntoMasterTable(COMMAND, DPEncoderService);
++
++	memset(&args, 0, sizeof(args));
++	args.ucLinkClock = dp_clock / 10;
++	args.ucConfig = ucconfig;
++	args.ucAction = action;
++	args.ucLaneNum = lane_num;
++	args.ucStatus = 0;
++
++	atom_execute_table(rdev->mode_info.atom_context, index, (uint32_t *)&args);
++	return args.ucStatus;
++}
++
++int radeon_dp_getsinktype(struct radeon_connector *radeon_connector)
++{
++	struct radeon_connector_atom_dig *radeon_dig_connector = radeon_connector->con_priv;
++	struct drm_device *dev = radeon_connector->base.dev;
++	struct radeon_device *rdev = dev->dev_private;
++
++	return radeon_dp_encoder_service(rdev, ATOM_DP_ACTION_GET_SINK_TYPE, 0,
++					 radeon_dig_connector->uc_i2c_id, 0);
++}
++
++union dig_transmitter_control {
++	DIG_TRANSMITTER_CONTROL_PS_ALLOCATION v1;
++	DIG_TRANSMITTER_CONTROL_PARAMETERS_V2 v2;
++};
++
++bool radeon_dp_aux_native_write(struct radeon_connector *radeon_connector, uint16_t address,
++				uint8_t send_bytes, uint8_t *send)
++{
++	struct radeon_connector_atom_dig *radeon_dig_connector = radeon_connector->con_priv;
++	struct drm_device *dev = radeon_connector->base.dev;
++	struct radeon_device *rdev = dev->dev_private;
++	u8 msg[20];
++	u8 msg_len, dp_msg_len;
++	bool ret;
++
++	dp_msg_len = 4;
++	msg[0] = address;
++	msg[1] = address >> 8;
++	msg[2] = AUX_NATIVE_WRITE << 4;
++	dp_msg_len += send_bytes;
++	msg[3] = (dp_msg_len << 4) | (send_bytes - 1);
++
++	if (send_bytes > 16)
++		return false;
++
++	memcpy(&msg[4], send, send_bytes);
++	msg_len = 4 + send_bytes;
++	ret = radeon_process_aux_ch(radeon_dig_connector->dp_i2c_bus, msg, msg_len, NULL, 0, 0);
++	return ret;
++}
++
++bool radeon_dp_aux_native_read(struct radeon_connector *radeon_connector, uint16_t address,
++			       uint8_t delay, uint8_t expected_bytes,
++			       uint8_t *read_p)
++{
++	struct radeon_connector_atom_dig *radeon_dig_connector = radeon_connector->con_priv;
++	struct drm_device *dev = radeon_connector->base.dev;
++	struct radeon_device *rdev = dev->dev_private;
++	u8 msg[20];
++	u8 msg_len, dp_msg_len;
++	bool ret = false;
++	msg_len = 4;
++	dp_msg_len = 4;
++	msg[0] = address;
++	msg[1] = address >> 8;
++	msg[2] = AUX_NATIVE_READ << 4;
++	msg[3] = (dp_msg_len) << 4;
++	msg[3] |= expected_bytes - 1;
++
++	ret = radeon_process_aux_ch(radeon_dig_connector->dp_i2c_bus, msg, msg_len, read_p, expected_bytes, delay);
++	return ret;
++}
++
++void radeon_dp_getdpcp(struct radeon_connector *radeon_connector)
++{
++	struct radeon_connector_atom_dig *radeon_dig_connector = radeon_connector->con_priv;
++	u8 msg[25];
++	int ret;
++
++	ret = radeon_dp_aux_native_read(radeon_connector, DP_DPCP_REV, 0, 8, msg);
++	if (ret) {
++		memcpy(radeon_dig_connector->dpcp, msg, 8);
++		{ 
++			int i;
++			printk("DPCP: ");
++			for (i = 0; i < 8; i++)
++				printk("%02x ", msg[i]);
++			printk("\n");
++		}
++	}
++	radeon_dig_connector->dpcp[0] = 0;
++	return;
++}
++
++static bool atom_dp_get_link_status(struct radeon_connector *radeon_connector,
++				    u8 link_status[DP_LINK_STATUS_SIZE])
++{
++	int ret;
++	ret = radeon_dp_aux_native_read(radeon_connector, DP_LANE0_1_STATUS, 100,
++					DP_LINK_STATUS_SIZE, link_status);
++	if (!ret) {
++		DRM_ERROR("displayport link status failed\n");
++		return false;
++	}
++
++	DRM_INFO("link status %02x %02x %02x %02x %02x %02x\n",
++		 link_status[0], link_status[1], link_status[2],
++		 link_status[3], link_status[4], link_status[5]);
++	return true;
++}
++
++static void dp_set_power(struct radeon_connector *radeon_connector, u8 power_state)
++{
++	struct radeon_connector_atom_dig *radeon_dig_connector = radeon_connector->con_priv;
++	if (radeon_dig_connector->dpcp[0] >= 0x11) {
++		radeon_dp_aux_native_write(radeon_connector, 0x600, 1,
++					   &power_state);
++	}
++}
++
++static void dp_update_dpvs_emph(struct radeon_connector *radeon_connector,
++				u8 train_set[4])
++{
++	struct radeon_connector_atom_dig *radeon_dig_connector = radeon_connector->con_priv;
++
++//	radeon_dp_digtransmitter_setup_vsemph();
++	radeon_dp_aux_native_write(radeon_connector, DP_TRAINING_LANE0_SET,
++				   0/* lc */, train_set);
++}
++
++static void dp_set_training(struct radeon_connector *radeon_connector,
++			    u8 training)
++{
++	radeon_dp_aux_native_write(radeon_connector, DP_TRAINING_PATTERN_SET,
++				   1, &training);
++}
++
++int radeon_dp_i2c_aux_ch(struct i2c_adapter *adapter, int mode,
++			 uint8_t write_byte, uint8_t *read_byte)
++{
++	struct i2c_algo_dp_aux_data *algo_data = adapter->algo_data;
++	struct radeon_i2c_chan *auxch = (struct radeon_i2c_chan *)adapter;
++	int ret = 0;
++	uint16_t address = algo_data->address;
++	uint8_t msg[5];
++	uint8_t reply[2];
++	int msg_len, dp_msg_len;
++	int reply_bytes;
++
++	/* Set up the command byte */
++	if (mode & MODE_I2C_READ)
++		msg[2] = AUX_I2C_READ << 4;
++	else
++		msg[2] = AUX_I2C_WRITE << 4;
++
++	if (!(mode & MODE_I2C_STOP))
++		msg[2] |= AUX_I2C_MOT << 4;
++
++	msg[0] = address;
++	msg[1] = address >> 8;
++
++	reply_bytes = 1;
++
++	msg_len = 4;
++	dp_msg_len = 3;
++	switch (mode) {
++	case MODE_I2C_WRITE:
++		msg[4] = write_byte;
++		msg_len++;
++		dp_msg_len += 2;
++		break;
++	case MODE_I2C_READ:
++		dp_msg_len += 1;
++		break;
++	default:
++		break;
++	}
++
++	msg[3] = (dp_msg_len) << 4;
++	ret = radeon_process_aux_ch(auxch, msg, msg_len, reply, reply_bytes, 0);
++
++	if (ret) {
++		if (read_byte)
++			*read_byte = reply[0];
++		return reply_bytes;
++	}
++	return -EREMOTEIO;
++}
+diff --git a/drivers/gpu/drm/radeon/radeon_atombios.c b/drivers/gpu/drm/radeon/radeon_atombios.c
+index c333ffa..ad13534 100644
+--- a/drivers/gpu/drm/radeon/radeon_atombios.c
++++ b/drivers/gpu/drm/radeon/radeon_atombios.c
+@@ -47,7 +47,7 @@ radeon_add_atom_connector(struct drm_device *dev,
+ 			  int connector_type,
+ 			  struct radeon_i2c_bus_rec *i2c_bus,
+ 			  bool linkb, uint32_t igp_lane_info,
+-			  uint16_t connector_object_id);
++			  uint16_t connector_object_id, uint8_t uc_i2c_id);
+ 
+ /* from radeon_legacy_encoder.c */
+ extern void
+@@ -60,8 +60,8 @@ union atom_supported_devices {
+ 	struct _ATOM_SUPPORTED_DEVICES_INFO_2d1 info_2d1;
+ };
+ 
+-static inline struct radeon_i2c_bus_rec radeon_lookup_gpio(struct drm_device
+-							   *dev, uint8_t id)
++static inline struct radeon_i2c_bus_rec radeon_lookup_gpio(struct drm_device *dev,
++							   uint8_t id)
+ {
+ 	struct radeon_device *rdev = dev->dev_private;
+ 	struct atom_context *ctx = rdev->mode_info.atom_context;
+@@ -292,7 +292,7 @@ bool radeon_get_atom_connector_info_from_object_table(struct drm_device *dev)
+ 	uint16_t igp_lane_info, conn_id, connector_object_id;
+ 	bool linkb;
+ 	struct radeon_i2c_bus_rec ddc_bus;
+-
++	ATOM_I2C_ID_CONFIG_ACCESS i2c_id;
+ 	atom_parse_data_header(ctx, index, &size, &frev, &crev, &data_offset);
+ 
+ 	if (data_offset == 0)
+@@ -318,7 +318,7 @@ bool radeon_get_atom_connector_info_from_object_table(struct drm_device *dev)
+ 		path = (ATOM_DISPLAY_OBJECT_PATH *) addr;
+ 		path_size += le16_to_cpu(path->usSize);
+ 		linkb = false;
+-
++		i2c_id.ucAccess = 0;
+ 		if (device_support & le16_to_cpu(path->usDeviceTag)) {
+ 			uint8_t con_obj_id, con_obj_num, con_obj_type;
+ 
+@@ -436,7 +436,7 @@ bool radeon_get_atom_connector_info_from_object_table(struct drm_device *dev)
+ 								 asObjects[j].
+ 								 usRecordOffset));
+ 						ATOM_I2C_RECORD *i2c_record;
+-
++						
+ 						while (record->ucRecordType > 0
+ 						       && record->
+ 						       ucRecordType <=
+@@ -447,6 +447,7 @@ bool radeon_get_atom_connector_info_from_object_table(struct drm_device *dev)
+ 								i2c_record =
+ 								    (ATOM_I2C_RECORD
+ 								     *) record;
++								i2c_id.sbfAccess = i2c_record->sucI2cId;
+ 								line_mux =
+ 								    i2c_record->
+ 								    sucI2cId.
+@@ -489,7 +490,7 @@ bool radeon_get_atom_connector_info_from_object_table(struct drm_device *dev)
+ 							      usDeviceTag),
+ 						  connector_type, &ddc_bus,
+ 						  linkb, igp_lane_info,
+-						  connector_object_id);
++						  connector_object_id, i2c_id.ucAccess);
+ 
+ 		}
+ 	}
+@@ -708,7 +709,7 @@ bool radeon_get_atom_connector_info_from_supported_devices_table(struct
+ 						  connector_type,
+ 						  &bios_connectors[i].ddc_bus,
+ 						  false, 0,
+-						  connector_object_id);
++						  connector_object_id, 0);
+ 		}
+ 	}
+ 
+diff --git a/drivers/gpu/drm/radeon/radeon_connectors.c b/drivers/gpu/drm/radeon/radeon_connectors.c
+index 791c5e0..b10a4ee 100644
+--- a/drivers/gpu/drm/radeon/radeon_connectors.c
++++ b/drivers/gpu/drm/radeon/radeon_connectors.c
+@@ -901,6 +901,54 @@ struct drm_connector_funcs radeon_dvi_connector_funcs = {
+ 	.force = radeon_dvi_force,
+ };
+ 
++static int radeon_dp_get_modes(struct drm_connector *connector)
++{
++	struct radeon_connector *radeon_connector = to_radeon_connector(connector);
++	int ret;
++
++	ret = radeon_ddc_get_modes(radeon_connector);
++	return ret;
++}
++
++static enum drm_connector_status radeon_dp_detect(struct drm_connector *connector)
++{
++	struct radeon_connector *radeon_connector = to_radeon_connector(connector);
++	struct drm_encoder *encoder = NULL;
++	struct drm_encoder_helper_funcs *encoder_funcs;
++	struct drm_mode_object *obj;
++	int i;
++	enum drm_connector_status ret = connector_status_disconnected;
++	int sink_type;
++	bool dret;
++
++	if (radeon_connector->edid) {
++		kfree(radeon_connector->edid);
++		radeon_connector->edid = NULL;
++	}
++
++	sink_type = radeon_dp_getsinktype(radeon_connector);
++	if (sink_type == CONNECTOR_OBJECT_ID_DISPLAYPORT) {
++		radeon_dp_getdpcp(radeon_connector);
++		ret = connector_status_connected;
++	}
++	return ret;
++}
++
++struct drm_connector_helper_funcs radeon_dp_connector_helper_funcs = {
++	.get_modes = radeon_dp_get_modes,
++	.mode_valid = radeon_dvi_mode_valid,
++	.best_encoder = radeon_dvi_encoder,
++};
++
++struct drm_connector_funcs radeon_dp_connector_funcs = {
++	.dpms = drm_helper_connector_dpms,
++	.detect = radeon_dp_detect,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.set_property = radeon_connector_set_property,
++	.destroy = radeon_connector_destroy,
++	.force = radeon_dvi_force,
++};
++
+ void
+ radeon_add_atom_connector(struct drm_device *dev,
+ 			  uint32_t connector_id,
+@@ -909,7 +957,7 @@ radeon_add_atom_connector(struct drm_device *dev,
+ 			  struct radeon_i2c_bus_rec *i2c_bus,
+ 			  bool linkb,
+ 			  uint32_t igp_lane_info,
+-			  uint16_t connector_object_id)
++			  uint16_t connector_object_id, uint8_t uc_i2c_id)
+ {
+ 	struct radeon_device *rdev = dev->dev_private;
+ 	struct drm_connector *connector;
+@@ -1035,10 +1083,13 @@ radeon_add_atom_connector(struct drm_device *dev,
+ 		radeon_dig_connector->linkb = linkb;
+ 		radeon_dig_connector->igp_lane_info = igp_lane_info;
+ 		radeon_connector->con_priv = radeon_dig_connector;
+-		drm_connector_init(dev, &radeon_connector->base, &radeon_dvi_connector_funcs, connector_type);
+-		ret = drm_connector_helper_add(&radeon_connector->base, &radeon_dvi_connector_helper_funcs);
++		drm_connector_init(dev, &radeon_connector->base, &radeon_dp_connector_funcs, connector_type);
++		ret = drm_connector_helper_add(&radeon_connector->base, &radeon_dp_connector_helper_funcs);
+ 		if (ret)
+ 			goto failed;
++		/* add DP i2c bus */
++		radeon_dig_connector->uc_i2c_id = uc_i2c_id;
++		radeon_dig_connector->dp_i2c_bus = radeon_i2c_create_dp(dev, "DP-auxch", true, uc_i2c_id);
+ 		if (i2c_bus->valid) {
+ 			radeon_connector->ddc_bus = radeon_i2c_create(dev, i2c_bus, "DP");
+ 			if (!radeon_connector->ddc_bus)
+diff --git a/drivers/gpu/drm/radeon/radeon_display.c b/drivers/gpu/drm/radeon/radeon_display.c
+index f7bbac4..752b03f 100644
+--- a/drivers/gpu/drm/radeon/radeon_display.c
++++ b/drivers/gpu/drm/radeon/radeon_display.c
+@@ -337,6 +337,13 @@ int radeon_ddc_get_modes(struct radeon_connector *radeon_connector)
+ {
+ 	int ret = 0;
+ 
++	if (radeon_connector->base.connector_type == DRM_MODE_CONNECTOR_DisplayPort) {
++		struct radeon_connector_atom_dig *dig = radeon_connector->con_priv;
++		if (dig->dp_i2c_bus) {
++			radeon_connector->edid = drm_get_edid(&radeon_connector->base, &dig->dp_i2c_bus->adapter);	
++			DRM_INFO("got edid %p from DP\n", radeon_connector->edid);
++		}
++	}
+ 	if (!radeon_connector->ddc_bus)
+ 		return -1;
+ 	if (!radeon_connector->edid) {
+diff --git a/drivers/gpu/drm/radeon/radeon_encoders.c b/drivers/gpu/drm/radeon/radeon_encoders.c
+index 5ef7f86..e19823d 100644
+--- a/drivers/gpu/drm/radeon/radeon_encoders.c
++++ b/drivers/gpu/drm/radeon/radeon_encoders.c
+@@ -851,6 +851,99 @@ atombios_dig_transmitter_setup(struct drm_encoder *encoder, int action)
+ }
+ 
+ static void
++atombios_dig_transmitter_setup_vsemph(struct drm_encoder *encoder, u8 lane_num,
++				      u8 lane_set)
++{
++	struct drm_device *dev = encoder->dev;
++	struct radeon_device *rdev = dev->dev_private;
++	struct radeon_encoder *radeon_encoder = to_radeon_encoder(encoder);
++	union dig_transmitter_control args;
++	int index = 0, num = 0;
++	uint8_t frev, crev;
++	struct radeon_encoder_atom_dig *dig;
++	struct drm_connector *connector;
++	struct radeon_connector *radeon_connector;
++	struct radeon_connector_atom_dig *dig_connector;
++
++	connector = radeon_get_connector_for_encoder(encoder);
++	if (!connector)
++		return;
++
++	radeon_connector = to_radeon_connector(connector);
++
++	if (!radeon_encoder->enc_priv)
++		return;
++
++	dig = radeon_encoder->enc_priv;
++
++	if (!radeon_connector->con_priv)
++		return;
++
++	dig_connector = radeon_connector->con_priv;
++
++	memset(&args, 0, sizeof(args));
++
++	if (ASIC_IS_DCE32(rdev))
++		index = GetIndexIntoMasterTable(COMMAND, UNIPHYTransmitterControl);
++	else {
++		switch (radeon_encoder->encoder_id) {
++		case ENCODER_OBJECT_ID_INTERNAL_UNIPHY:
++			index = GetIndexIntoMasterTable(COMMAND, DIG1TransmitterControl);
++			break;
++		case ENCODER_OBJECT_ID_INTERNAL_KLDSCP_LVTMA:
++			index = GetIndexIntoMasterTable(COMMAND, DIG2TransmitterControl);
++			break;
++		}
++	}
++
++	atom_parse_cmd_header(rdev->mode_info.atom_context, index, &frev, &crev);
++
++	args.v1.ucAction = ATOM_TRANSMITTER_ACTION_SETUP_VSEMPH;
++	args.v1.asMode.ucLaneSel = lane_num;
++	args.v1.asMode.ucLaneSet = lane_set;
++
++	if (ASIC_IS_DCE32(rdev)) {
++		args.v2.acConfig.fDPConnector = 1;
++
++		if (dig->dig_block)
++			args.v2.acConfig.ucEncoderSel = 1;
++
++		switch (radeon_encoder->encoder_id) {
++		case ENCODER_OBJECT_ID_INTERNAL_UNIPHY:
++			args.v2.acConfig.ucTransmitterSel = 0;
++			num = 0;
++			break;
++		case ENCODER_OBJECT_ID_INTERNAL_UNIPHY1:
++			args.v2.acConfig.ucTransmitterSel = 1;
++			num = 1;
++			break;
++		case ENCODER_OBJECT_ID_INTERNAL_UNIPHY2:
++			args.v2.acConfig.ucTransmitterSel = 2;
++			num = 2;
++			break;
++		}
++	} else {
++		args.v1.ucConfig = ATOM_TRANSMITTER_CONFIG_CLKSRC_PPLL;
++
++		switch (radeon_encoder->encoder_id) {
++		case ENCODER_OBJECT_ID_INTERNAL_UNIPHY:
++			args.v1.ucConfig |= ATOM_TRANSMITTER_CONFIG_DIG1_ENCODER;
++			if (dig_connector->linkb)
++				args.v1.ucConfig |= ATOM_TRANSMITTER_CONFIG_LINKB | ATOM_TRANSMITTER_CONFIG_LANE_0_3;
++			else
++				args.v1.ucConfig |= ATOM_TRANSMITTER_CONFIG_LINKA | ATOM_TRANSMITTER_CONFIG_LANE_0_3;
++		}
++	}
++
++	atom_execute_table(rdev->mode_info.atom_context, index, (uint32_t *)&args);
++
++	if (ASIC_IS_DCE32(rdev))
++		DRM_INFO("Output UNIPHY%d transmitter VSEMPH setup success\n", num);
++	else
++		DRM_INFO("Output DIG%d transmitter VSEMPH setup success\n", num);
++}
++
++static void
+ atombios_yuv_setup(struct drm_encoder *encoder, bool enable)
+ {
+ 	struct drm_device *dev = encoder->dev;
+diff --git a/drivers/gpu/drm/radeon/radeon_i2c.c b/drivers/gpu/drm/radeon/radeon_i2c.c
+index 6c645fb..f200312 100644
+--- a/drivers/gpu/drm/radeon/radeon_i2c.c
++++ b/drivers/gpu/drm/radeon/radeon_i2c.c
+@@ -172,20 +172,19 @@ struct radeon_i2c_chan *radeon_i2c_create(struct drm_device *dev,
+ 		return NULL;
+ 
+ 	i2c->adapter.owner = THIS_MODULE;
+-	i2c->adapter.algo_data = &i2c->algo;
+ 	i2c->dev = dev;
+-	i2c->algo.setsda = set_data;
+-	i2c->algo.setscl = set_clock;
+-	i2c->algo.getsda = get_data;
+-	i2c->algo.getscl = get_clock;
+-	i2c->algo.udelay = 20;
++	i2c_set_adapdata(&i2c->adapter, i2c);
++	i2c->adapter.algo_data = &i2c->algo.bit;
++	i2c->algo.bit.setsda = set_data;
++	i2c->algo.bit.setscl = set_clock;
++	i2c->algo.bit.getsda = get_data;
++	i2c->algo.bit.getscl = get_clock;
++	i2c->algo.bit.udelay = 20;
+ 	/* vesa says 2.2 ms is enough, 1 jiffy doesn't seem to always
+ 	 * make this, 2 jiffies is a lot more reliable */
+-	i2c->algo.timeout = 2;
+-	i2c->algo.data = i2c;
++	i2c->algo.bit.timeout = 2;
++	i2c->algo.bit.data = i2c;
+ 	i2c->rec = *rec;
+-	i2c_set_adapdata(&i2c->adapter, i2c);
+-
+ 	ret = i2c_bit_add_bus(&i2c->adapter);
+ 	if (ret) {
+ 		DRM_INFO("Failed to register i2c %s\n", name);
+@@ -199,6 +198,37 @@ out_free:
+ 
+ }
+ 
++struct radeon_i2c_chan *radeon_i2c_create_dp(struct drm_device *dev,
++					     const char *name, bool dp, u8 i2c_id)
++{
++	struct radeon_i2c_chan *i2c;
++	int ret;
++
++	i2c = kzalloc(sizeof(struct radeon_i2c_chan), GFP_KERNEL);
++	if (i2c == NULL)
++		return NULL;
++
++	i2c->i2c_id = i2c_id;
++	i2c->adapter.owner = THIS_MODULE;
++	i2c->dev = dev;
++	i2c_set_adapdata(&i2c->adapter, i2c);
++	i2c->adapter.algo_data = &i2c->algo.dp;
++	i2c->algo.dp.aux_ch = radeon_dp_i2c_aux_ch;
++	i2c->algo.dp.address = 0;
++	ret = i2c_dp_aux_add_bus(&i2c->adapter);
++	if (ret) {
++		DRM_INFO("Failed to register i2c %s\n", name);
++		goto out_free;
++	}
++
++	return i2c;
++out_free:
++	kfree(i2c);
++	return NULL;
++
++}
++
++
+ void radeon_i2c_destroy(struct radeon_i2c_chan *i2c)
+ {
+ 	if (!i2c)
+diff --git a/drivers/gpu/drm/radeon/radeon_mode.h b/drivers/gpu/drm/radeon/radeon_mode.h
+index 135693d..ce1cdc7 100644
+--- a/drivers/gpu/drm/radeon/radeon_mode.h
++++ b/drivers/gpu/drm/radeon/radeon_mode.h
+@@ -33,6 +33,7 @@
+ #include <drm_crtc.h>
+ #include <drm_mode.h>
+ #include <drm_edid.h>
++#include <drm_dp_helper.h>
+ #include <linux/i2c.h>
+ #include <linux/i2c-id.h>
+ #include <linux/i2c-algo-bit.h>
+@@ -164,10 +165,14 @@ struct radeon_pll {
+ };
+ 
+ struct radeon_i2c_chan {
+-	struct drm_device *dev;
+ 	struct i2c_adapter adapter;
+-	struct i2c_algo_bit_data algo;
++	struct drm_device *dev;
++	union {
++		struct i2c_algo_dp_aux_data dp;
++		struct i2c_algo_bit_data bit;
++	} algo;
+ 	struct radeon_i2c_bus_rec rec;
++	uint8_t i2c_id;
+ };
+ 
+ /* mostly for macs, but really any system without connector tables */
+@@ -328,6 +333,9 @@ struct radeon_encoder {
+ struct radeon_connector_atom_dig {
+ 	uint32_t igp_lane_info;
+ 	bool linkb;
++	uint16_t uc_i2c_id;
++	struct radeon_i2c_chan *dp_i2c_bus;
++	u8 dpcp[8];
+ };
+ 
+ struct radeon_connector {
+@@ -344,6 +352,8 @@ struct radeon_connector {
+ 	void *con_priv;
+ 	bool dac_load_detect;
+ 	uint16_t connector_object_id;
++	/* need to keep this for display port */
++//	
+ };
+ 
+ struct radeon_framebuffer {
+@@ -351,6 +361,13 @@ struct radeon_framebuffer {
+ 	struct drm_gem_object *obj;
+ };
+ 
++extern int radeon_dp_getsinktype(struct radeon_connector *radeon_connector);
++extern void radeon_dp_getdpcp(struct radeon_connector *connector);
++extern int radeon_dp_i2c_aux_ch(struct i2c_adapter *adapter, int mode,
++				uint8_t write_byte, uint8_t *read_byte);
++
++extern struct radeon_i2c_chan *radeon_i2c_create_dp(struct drm_device *dev,
++						    const char *name, bool dp, u8 i2c_id);
+ extern struct radeon_i2c_chan *radeon_i2c_create(struct drm_device *dev,
+ 						 struct radeon_i2c_bus_rec *rec,
+ 						 const char *name);
+diff --git a/include/drm/drm_dp_helper.h b/include/drm/drm_dp_helper.h
+index e49879c..376155f 100644
+--- a/include/drm/drm_dp_helper.h
++++ b/include/drm/drm_dp_helper.h
+@@ -43,6 +43,8 @@
+ #define AUX_I2C_REPLY_MASK	(0x3 << 6)
+ 
+ /* AUX CH addresses */
++#define DP_DPCP_REV 0x0
++
+ #define	DP_LINK_BW_SET		0x100
+ # define DP_LINK_BW_1_62		    0x06
+ # define DP_LINK_BW_2_7			    0x0a
+-- 
+1.7.6
+

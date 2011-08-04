@@ -1,0 +1,399 @@
+From cce1949c699b738099ffeb06d660ebe7fd86656d Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexdeucher@gmail.com>
+Date: Tue, 23 Feb 2010 03:24:38 -0500
+Patch-mainline: 2.6.34
+References: fate#310916
+Git-commit: 383be5d1789d9a7a2e77dca1cb0aca89507d069e
+Subject: [PATCH 0447/2588] drm/radeon/kms: update new pll algo
+
+- add support for pre-avivo chips
+- add support for fixed post/ref dividers
+- add support for non-fractional fb dividers
+
+By default avivo chips use the new algo and
+pre-avivo chips use the old algo. Use the "new_pll"
+module option to toggle between them.
+
+Signed-off-by: Alex Deucher <alexdeucher@gmail.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit 383be5d1789d9a7a2e77dca1cb0aca89507d069e)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/radeon/atombios_crtc.c      |   12 +-
+ drivers/gpu/drm/radeon/radeon_atombios.c    |   12 +-
+ drivers/gpu/drm/radeon/radeon_display.c     |  228 ++++++++++++++++++---------
+ drivers/gpu/drm/radeon/radeon_drv.c         |    4 +-
+ drivers/gpu/drm/radeon/radeon_legacy_crtc.c |    5 +-
+ drivers/gpu/drm/radeon/radeon_mode.h        |    2 +-
+ 6 files changed, 176 insertions(+), 87 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/atombios_crtc.c b/drivers/gpu/drm/radeon/atombios_crtc.c
+index 0ec6934..dd9fdf5 100644
+--- a/drivers/gpu/drm/radeon/atombios_crtc.c
++++ b/drivers/gpu/drm/radeon/atombios_crtc.c
+@@ -438,12 +438,16 @@ static u32 atombios_adjust_pll(struct drm_crtc *crtc,
+ 
+ 	/* select the PLL algo */
+ 	if (ASIC_IS_AVIVO(rdev)) {
+-		if (radeon_new_pll)
+-			pll->algo = PLL_ALGO_AVIVO;
++		if (radeon_new_pll == 0)
++			pll->algo = PLL_ALGO_LEGACY;
++		else
++			pll->algo = PLL_ALGO_NEW;
++	} else {
++		if (radeon_new_pll == 1)
++			pll->algo = PLL_ALGO_NEW;
+ 		else
+ 			pll->algo = PLL_ALGO_LEGACY;
+-	} else
+-		pll->algo = PLL_ALGO_LEGACY;
++	}
+ 
+ 	if (ASIC_IS_AVIVO(rdev)) {
+ 		if ((rdev->family == CHIP_RS600) ||
+diff --git a/drivers/gpu/drm/radeon/radeon_atombios.c b/drivers/gpu/drm/radeon/radeon_atombios.c
+index 8f79482..73602fd 100644
+--- a/drivers/gpu/drm/radeon/radeon_atombios.c
++++ b/drivers/gpu/drm/radeon/radeon_atombios.c
+@@ -1225,12 +1225,16 @@ struct radeon_encoder_atom_dig *radeon_atombios_get_lvds_info(struct
+ 		lvds->ss = radeon_atombios_get_ss_info(encoder, lvds_info->info.ucSS_Id);
+ 
+ 		if (ASIC_IS_AVIVO(rdev)) {
+-			if (radeon_new_pll)
+-				lvds->pll_algo = PLL_ALGO_AVIVO;
++			if (radeon_new_pll == 0)
++				lvds->pll_algo = PLL_ALGO_LEGACY;
++			else
++				lvds->pll_algo = PLL_ALGO_NEW;
++		} else {
++			if (radeon_new_pll == 1)
++				lvds->pll_algo = PLL_ALGO_NEW;
+ 			else
+ 				lvds->pll_algo = PLL_ALGO_LEGACY;
+-		} else
+-			lvds->pll_algo = PLL_ALGO_LEGACY;
++		}
+ 
+ 		/* LVDS quirks */
+ 		radeon_atom_apply_lvds_quirks(dev, lvds);
+diff --git a/drivers/gpu/drm/radeon/radeon_display.c b/drivers/gpu/drm/radeon/radeon_display.c
+index 314ea7f..ab4d9f4 100644
+--- a/drivers/gpu/drm/radeon/radeon_display.c
++++ b/drivers/gpu/drm/radeon/radeon_display.c
+@@ -616,95 +616,173 @@ static void radeon_compute_pll_legacy(struct radeon_pll *pll,
+ 
+ }
+ 
+-static void radeon_compute_pll_avivo(struct radeon_pll *pll,
+-				     uint64_t freq,
+-				     uint32_t *dot_clock_p,
+-				     uint32_t *fb_div_p,
+-				     uint32_t *frac_fb_div_p,
+-				     uint32_t *ref_div_p,
+-				     uint32_t *post_div_p)
++static bool
++calc_fb_div(struct radeon_pll *pll,
++	    uint32_t freq,
++            uint32_t post_div,
++            uint32_t ref_div,
++            uint32_t *fb_div,
++            uint32_t *fb_div_frac)
+ {
+-	fixed20_12 m, n, frac_n, p, f_vco, f_pclk, best_freq;
+-	fixed20_12 pll_out_max, pll_out_min;
+-	fixed20_12 pll_in_max, pll_in_min;
+-	fixed20_12 reference_freq;
+-	fixed20_12 error, ffreq, a, b;
+-
+-	pll_out_max.full = rfixed_const(pll->pll_out_max);
+-	pll_out_min.full = rfixed_const(pll->pll_out_min);
+-	pll_in_max.full = rfixed_const(pll->pll_in_max);
+-	pll_in_min.full = rfixed_const(pll->pll_in_min);
+-	reference_freq.full = rfixed_const(pll->reference_freq);
+-	do_div(freq, 10);
++	fixed20_12 feedback_divider, a, b;
++	u32 vco_freq;
++
++	vco_freq = freq * post_div;
++	/* feedback_divider = vco_freq * ref_div / pll->reference_freq; */
++	a.full = rfixed_const(pll->reference_freq);
++	feedback_divider.full = rfixed_const(vco_freq);
++	feedback_divider.full = rfixed_div(feedback_divider, a);
++	a.full = rfixed_const(ref_div);
++	feedback_divider.full = rfixed_mul(feedback_divider, a);
++
++	if (pll->flags & RADEON_PLL_USE_FRAC_FB_DIV) {
++		/* feedback_divider = floor((feedback_divider * 10.0) + 0.5) * 0.1; */
++		a.full = rfixed_const(10);
++		feedback_divider.full = rfixed_mul(feedback_divider, a);
++		feedback_divider.full += rfixed_const_half(0);
++		feedback_divider.full = rfixed_floor(feedback_divider);
++		feedback_divider.full = rfixed_div(feedback_divider, a);
++
++		/* *fb_div = floor(feedback_divider); */
++		a.full = rfixed_floor(feedback_divider);
++		*fb_div = rfixed_trunc(a);
++		/* *fb_div_frac = fmod(feedback_divider, 1.0) * 10.0; */
++		a.full = rfixed_const(10);
++		b.full = rfixed_mul(feedback_divider, a);
++
++		feedback_divider.full = rfixed_floor(feedback_divider);
++		feedback_divider.full = rfixed_mul(feedback_divider, a);
++		feedback_divider.full = b.full - feedback_divider.full;
++		*fb_div_frac = rfixed_trunc(feedback_divider);
++	} else {
++		/* *fb_div = floor(feedback_divider + 0.5); */
++		feedback_divider.full += rfixed_const_half(0);
++		feedback_divider.full = rfixed_floor(feedback_divider);
++
++		*fb_div = rfixed_trunc(feedback_divider);
++		*fb_div_frac = 0;
++	}
++
++	if (((*fb_div) < pll->min_feedback_div) || ((*fb_div) > pll->max_feedback_div))
++		return false;
++	else
++		return true;
++}
++
++static bool
++calc_fb_ref_div(struct radeon_pll *pll,
++		uint32_t freq,
++		uint32_t post_div,
++		uint32_t *fb_div,
++                uint32_t *fb_div_frac,
++                uint32_t *ref_div)
++{
++	fixed20_12 ffreq, max_error, error, pll_out, a;
++	u32 vco;
++
+ 	ffreq.full = rfixed_const(freq);
+-	error.full = rfixed_const(100 * 100);
++	/* max_error = ffreq * 0.0025; */
++	a.full = rfixed_const(400);
++	max_error.full = rfixed_div(ffreq, a);
++
++	for ((*ref_div) = pll->min_ref_div; (*ref_div) < pll->max_ref_div; ++(*ref_div)) {
++		if (calc_fb_div(pll, freq, post_div, (*ref_div), fb_div, fb_div_frac)) {
++			vco = pll->reference_freq * (((*fb_div) * 10) + (*fb_div_frac));
++			vco = vco / ((*ref_div) * 10);
++
++			if ((vco < pll->pll_out_min) || (vco > pll->pll_out_max))
++				continue;
+ 
+-	/* max p */
+-	p.full = rfixed_div(pll_out_max, ffreq);
+-	p.full = rfixed_floor(p);
++			/* pll_out = vco / post_div; */
++			a.full = rfixed_const(post_div);
++			pll_out.full = rfixed_const(vco);
++			pll_out.full = rfixed_div(pll_out, a);
+ 
+-	/* min m */
+-	m.full = rfixed_div(reference_freq, pll_in_max);
+-	m.full = rfixed_ceil(m);
++			if (pll_out.full >= ffreq.full) {
++				error.full = pll_out.full - ffreq.full;
++				if (error.full <= max_error.full)
++					return true;
++			}
++		}
++	}
++	return false;
++}
+ 
+-	while (1) {
+-		n.full = rfixed_div(ffreq, reference_freq);
+-		n.full = rfixed_mul(n, m);
+-		n.full = rfixed_mul(n, p);
++static void radeon_compute_pll_new(struct radeon_pll *pll,
++				   uint64_t freq,
++				   uint32_t *dot_clock_p,
++				   uint32_t *fb_div_p,
++				   uint32_t *frac_fb_div_p,
++				   uint32_t *ref_div_p,
++				   uint32_t *post_div_p)
++{
++	u32 fb_div = 0, fb_div_frac = 0, post_div = 0, ref_div = 0;
++	u32 best_freq = 0, vco_frequency;
+ 
+-		f_vco.full = rfixed_div(n, m);
+-		f_vco.full = rfixed_mul(f_vco, reference_freq);
++	/* freq = freq / 10; */
++	do_div(freq, 10);
+ 
+-		f_pclk.full = rfixed_div(f_vco, p);
++	if (pll->flags & RADEON_PLL_USE_POST_DIV) {
++		post_div = pll->post_div;
++		if ((post_div < pll->min_post_div) || (post_div > pll->max_post_div))
++			goto done;
++
++		vco_frequency = freq * post_div;
++		if ((vco_frequency < pll->pll_out_min) || (vco_frequency > pll->pll_out_max))
++			goto done;
++
++		if (pll->flags & RADEON_PLL_USE_REF_DIV) {
++			ref_div = pll->reference_div;
++			if ((ref_div < pll->min_ref_div) || (ref_div > pll->max_ref_div))
++				goto done;
++			if (!calc_fb_div(pll, freq, post_div, ref_div, &fb_div, &fb_div_frac))
++				goto done;
++		}
++	} else {
++		for (post_div = pll->max_post_div; post_div >= pll->min_post_div; --post_div) {
++			if (pll->flags & RADEON_PLL_LEGACY) {
++				if ((post_div == 5) ||
++				    (post_div == 7) ||
++				    (post_div == 9) ||
++				    (post_div == 10) ||
++				    (post_div == 11))
++					continue;
++			}
+ 
+-		if (f_pclk.full > ffreq.full)
+-			error.full = f_pclk.full - ffreq.full;
+-		else
+-			error.full = ffreq.full - f_pclk.full;
+-		error.full = rfixed_div(error, f_pclk);
+-		a.full = rfixed_const(100 * 100);
+-		error.full = rfixed_mul(error, a);
+-
+-		a.full = rfixed_mul(m, p);
+-		a.full = rfixed_div(n, a);
+-		best_freq.full = rfixed_mul(reference_freq, a);
+-
+-		if (rfixed_trunc(error) < 25)
+-			break;
+-
+-		a.full = rfixed_const(1);
+-		m.full = m.full + a.full;
+-		a.full = rfixed_div(reference_freq, m);
+-		if (a.full >= pll_in_min.full)
+-			continue;
++			if ((pll->flags & RADEON_PLL_NO_ODD_POST_DIV) && (post_div & 1))
++				continue;
+ 
+-		m.full = rfixed_div(reference_freq, pll_in_max);
+-		m.full = rfixed_ceil(m);
+-		a.full= rfixed_const(1);
+-		p.full = p.full - a.full;
+-		a.full = rfixed_mul(p, ffreq);
+-		if (a.full >= pll_out_min.full)
+-			continue;
+-		else {
+-			DRM_ERROR("Unable to find pll dividers\n");
+-			break;
++			vco_frequency = freq * post_div;
++			if ((vco_frequency < pll->pll_out_min) || (vco_frequency > pll->pll_out_max))
++				continue;
++			if (pll->flags & RADEON_PLL_USE_REF_DIV) {
++				ref_div = pll->reference_div;
++				if ((ref_div < pll->min_ref_div) || (ref_div > pll->max_ref_div))
++					goto done;
++				if (calc_fb_div(pll, freq, post_div, ref_div, &fb_div, &fb_div_frac))
++					break;
++			} else {
++				if (calc_fb_ref_div(pll, freq, post_div, &fb_div, &fb_div_frac, &ref_div))
++					break;
++			}
+ 		}
+ 	}
+ 
+-	a.full = rfixed_const(10);
+-	b.full = rfixed_mul(n, a);
++	best_freq = pll->reference_freq * 10 * fb_div;
++	best_freq += pll->reference_freq * fb_div_frac;
++	best_freq = best_freq / (ref_div * post_div);
+ 
+-	frac_n.full = rfixed_floor(n);
+-	frac_n.full = rfixed_mul(frac_n, a);
+-	frac_n.full = b.full - frac_n.full;
++done:
++	if (best_freq == 0)
++		DRM_ERROR("Couldn't find valid PLL dividers\n");
+ 
+-	*dot_clock_p = rfixed_trunc(best_freq);
+-	*fb_div_p = rfixed_trunc(n);
+-	*frac_fb_div_p = rfixed_trunc(frac_n);
+-	*ref_div_p = rfixed_trunc(m);
+-	*post_div_p = rfixed_trunc(p);
++	*dot_clock_p = best_freq / 10;
++	*fb_div_p = fb_div;
++	*frac_fb_div_p = fb_div_frac;
++	*ref_div_p = ref_div;
++	*post_div_p = post_div;
+ 
+-	DRM_DEBUG("%u %d.%d, %d, %d\n", *dot_clock_p * 10, *fb_div_p, *frac_fb_div_p, *ref_div_p, *post_div_p);
++	DRM_DEBUG("%u %d.%d, %d, %d\n", *dot_clock_p, *fb_div_p, *frac_fb_div_p, *ref_div_p, *post_div_p);
+ }
+ 
+ void radeon_compute_pll(struct radeon_pll *pll,
+@@ -716,9 +794,9 @@ void radeon_compute_pll(struct radeon_pll *pll,
+ 			uint32_t *post_div_p)
+ {
+ 	switch (pll->algo) {
+-	case PLL_ALGO_AVIVO:
+-		radeon_compute_pll_avivo(pll, freq, dot_clock_p, fb_div_p,
+-					 frac_fb_div_p, ref_div_p, post_div_p);
++	case PLL_ALGO_NEW:
++		radeon_compute_pll_new(pll, freq, dot_clock_p, fb_div_p,
++				       frac_fb_div_p, ref_div_p, post_div_p);
+ 		break;
+ 	case PLL_ALGO_LEGACY:
+ 	default:
+diff --git a/drivers/gpu/drm/radeon/radeon_drv.c b/drivers/gpu/drm/radeon/radeon_drv.c
+index a9572e6..be99d4e 100644
+--- a/drivers/gpu/drm/radeon/radeon_drv.c
++++ b/drivers/gpu/drm/radeon/radeon_drv.c
+@@ -86,7 +86,7 @@ int radeon_benchmarking = 0;
+ int radeon_testing = 0;
+ int radeon_connector_table = 0;
+ int radeon_tv = 1;
+-int radeon_new_pll = 1;
++int radeon_new_pll = -1;
+ int radeon_dynpm = -1;
+ int radeon_audio = 1;
+ 
+@@ -123,7 +123,7 @@ module_param_named(connector_table, radeon_connector_table, int, 0444);
+ MODULE_PARM_DESC(tv, "TV enable (0 = disable)");
+ module_param_named(tv, radeon_tv, int, 0444);
+ 
+-MODULE_PARM_DESC(new_pll, "Select new PLL code for AVIVO chips");
++MODULE_PARM_DESC(new_pll, "Select new PLL code");
+ module_param_named(new_pll, radeon_new_pll, int, 0444);
+ 
+ MODULE_PARM_DESC(dynpm, "Disable/Enable dynamic power management (1 = enable)");
+diff --git a/drivers/gpu/drm/radeon/radeon_legacy_crtc.c b/drivers/gpu/drm/radeon/radeon_legacy_crtc.c
+index dd58b13..10f1cfc 100644
+--- a/drivers/gpu/drm/radeon/radeon_legacy_crtc.c
++++ b/drivers/gpu/drm/radeon/radeon_legacy_crtc.c
+@@ -703,7 +703,10 @@ static void radeon_set_pll(struct drm_crtc *crtc, struct drm_display_mode *mode)
+ 		pll = &rdev->clock.p1pll;
+ 
+ 	pll->flags = RADEON_PLL_LEGACY;
+-	pll->algo = PLL_ALGO_LEGACY;
++	if (radeon_new_pll == 1)
++		pll->algo = PLL_ALGO_NEW;
++	else
++		pll->algo = PLL_ALGO_LEGACY;
+ 
+ 	if (mode->clock > 200000) /* range limits??? */
+ 		pll->flags |= RADEON_PLL_PREFER_HIGH_FB_DIV;
+diff --git a/drivers/gpu/drm/radeon/radeon_mode.h b/drivers/gpu/drm/radeon/radeon_mode.h
+index 8912f2e..1702b82 100644
+--- a/drivers/gpu/drm/radeon/radeon_mode.h
++++ b/drivers/gpu/drm/radeon/radeon_mode.h
+@@ -133,7 +133,7 @@ struct radeon_tmds_pll {
+ /* pll algo */
+ enum radeon_pll_algo {
+ 	PLL_ALGO_LEGACY,
+-	PLL_ALGO_AVIVO
++	PLL_ALGO_NEW
+ };
+ 
+ struct radeon_pll {
+-- 
+1.7.6
+

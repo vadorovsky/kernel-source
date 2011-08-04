@@ -1,0 +1,595 @@
+From 29eea1a15ae648720a5abb307e299370743c0bfa Mon Sep 17 00:00:00 2001
+From: Zou Nan hai <nanhai.zou@intel.com>
+Date: Fri, 21 May 2010 09:08:57 +0800
+Patch-mainline: 2.6.35
+References: fate#310916
+Git-commit: d1b851fc0d105caa6b6e3e7c92d2987dfb52cbe0
+Subject: [PATCH 0796/2588] drm/i915: implement BSD ring buffer V2
+
+The BSD (bit stream decoder) ring is used for accessing the BSD engine
+which decodes video bitstream for H.264 and VC1 on G45+.  It is
+asynchronous with the render ring and has access to separate parts of
+the GPU from it, though the render cache is coherent between the two.
+
+Signed-off-by: Zou Nan hai <nanhai.zou@intel.com>
+Signed-off-by: Xiang Hai hao <haihao.xiang@intel.com>
+Signed-off-by: Eric Anholt <eric@anholt.net>
+(cherry picked from commit d1b851fc0d105caa6b6e3e7c92d2987dfb52cbe0)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/i915/i915_dma.c         |    2 +
+ drivers/gpu/drm/i915/i915_drv.h         |    2 +
+ drivers/gpu/drm/i915/i915_gem.c         |  107 +++++++++++++++++++---
+ drivers/gpu/drm/i915/i915_irq.c         |   13 ++-
+ drivers/gpu/drm/i915/i915_reg.h         |   14 +++
+ drivers/gpu/drm/i915/intel_ringbuffer.c |  153 +++++++++++++++++++++++++++++++
+ 6 files changed, 276 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 65ef1f8..64140cb 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -130,6 +130,8 @@ static int i915_dma_cleanup(struct drm_device * dev)
+ 		drm_irq_uninstall(dev);
+ 
+ 	intel_cleanup_ring_buffer(dev, &dev_priv->render_ring);
++	if (HAS_BSD(dev))
++		intel_cleanup_ring_buffer(dev, &dev_priv->bsd_ring);
+ 
+ 	/* Clear the HWS virtual address at teardown */
+ 	if (I915_NEED_GFX_HWS(dev))
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 3f35989..6bc0fc0 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -235,6 +235,7 @@ typedef struct drm_i915_private {
+ 
+ 	struct pci_dev *bridge_dev;
+ 	struct intel_ring_buffer render_ring;
++	struct intel_ring_buffer bsd_ring;
+ 
+ 	drm_dma_handle_t *status_page_dmah;
+ 	void *hw_status_page;
+@@ -1121,6 +1122,7 @@ extern int intel_trans_dp_port_sel (struct drm_crtc *crtc);
+ 			 (dev)->pci_device == 0x2A42 ||		\
+ 			 (dev)->pci_device == 0x2E42)
+ 
++#define HAS_BSD(dev)            (IS_IRONLAKE(dev) || IS_G4X(dev))
+ #define I915_NEED_GFX_HWS(dev)	(INTEL_INFO(dev)->need_gfx_hws)
+ 
+ /* With the 945 and later, Y tiling got adjusted so that it was 32 128-byte
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 827c17e..a538ef0 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1730,7 +1730,7 @@ i915_seqno_passed(uint32_t seq1, uint32_t seq2)
+ 
+ uint32_t
+ i915_get_gem_seqno(struct drm_device *dev,
+-		struct intel_ring_buffer *ring)
++		   struct intel_ring_buffer *ring)
+ {
+ 	return ring->get_gem_seqno(dev, ring);
+ }
+@@ -1792,8 +1792,13 @@ i915_gem_retire_work_handler(struct work_struct *work)
+ 	mutex_lock(&dev->struct_mutex);
+ 	i915_gem_retire_requests(dev, &dev_priv->render_ring);
+ 
++	if (HAS_BSD(dev))
++		i915_gem_retire_requests(dev, &dev_priv->bsd_ring);
++
+ 	if (!dev_priv->mm.suspended &&
+-			(!list_empty(&dev_priv->render_ring.request_list)))
++		(!list_empty(&dev_priv->render_ring.request_list) ||
++			(HAS_BSD(dev) &&
++			 !list_empty(&dev_priv->bsd_ring.request_list))))
+ 		queue_delayed_work(dev_priv->wq, &dev_priv->mm.retire_work, HZ);
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+@@ -1883,6 +1888,11 @@ i915_gem_flush(struct drm_device *dev,
+ 	dev_priv->render_ring.flush(dev, &dev_priv->render_ring,
+ 			invalidate_domains,
+ 			flush_domains);
++
++	if (HAS_BSD(dev))
++		dev_priv->bsd_ring.flush(dev, &dev_priv->bsd_ring,
++				invalidate_domains,
++				flush_domains);
+ }
+ 
+ static void
+@@ -2039,12 +2049,14 @@ i915_gpu_idle(struct drm_device *dev)
+ {
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+ 	bool lists_empty;
+-	uint32_t seqno;
++	uint32_t seqno1, seqno2;
+ 	int ret;
+ 
+ 	spin_lock(&dev_priv->mm.active_list_lock);
+-	lists_empty = list_empty(&dev_priv->mm.flushing_list) &&
+-		      list_empty(&dev_priv->render_ring.active_list);
++	lists_empty = (list_empty(&dev_priv->mm.flushing_list) &&
++		       list_empty(&dev_priv->render_ring.active_list) &&
++		       (!HAS_BSD(dev) ||
++			list_empty(&dev_priv->bsd_ring.active_list)));
+ 	spin_unlock(&dev_priv->mm.active_list_lock);
+ 
+ 	if (lists_empty)
+@@ -2052,11 +2064,23 @@ i915_gpu_idle(struct drm_device *dev)
+ 
+ 	/* Flush everything onto the inactive list. */
+ 	i915_gem_flush(dev, I915_GEM_GPU_DOMAINS, I915_GEM_GPU_DOMAINS);
+-	seqno = i915_add_request(dev, NULL, I915_GEM_GPU_DOMAINS,
++	seqno1 = i915_add_request(dev, NULL, I915_GEM_GPU_DOMAINS,
+ 			&dev_priv->render_ring);
+-	if (seqno == 0)
++	if (seqno1 == 0)
+ 		return -ENOMEM;
+-	ret = i915_wait_request(dev, seqno, &dev_priv->render_ring);
++	ret = i915_wait_request(dev, seqno1, &dev_priv->render_ring);
++
++	if (HAS_BSD(dev)) {
++		seqno2 = i915_add_request(dev, NULL, I915_GEM_GPU_DOMAINS,
++				&dev_priv->bsd_ring);
++		if (seqno2 == 0)
++			return -ENOMEM;
++
++		ret = i915_wait_request(dev, seqno2, &dev_priv->bsd_ring);
++		if (ret)
++			return ret;
++	}
++
+ 
+ 	return ret;
+ }
+@@ -2071,7 +2095,9 @@ i915_gem_evict_everything(struct drm_device *dev)
+ 	spin_lock(&dev_priv->mm.active_list_lock);
+ 	lists_empty = (list_empty(&dev_priv->mm.inactive_list) &&
+ 		       list_empty(&dev_priv->mm.flushing_list) &&
+-		       list_empty(&dev_priv->render_ring.active_list));
++		       list_empty(&dev_priv->render_ring.active_list) &&
++		       (!HAS_BSD(dev)
++			|| list_empty(&dev_priv->bsd_ring.active_list)));
+ 	spin_unlock(&dev_priv->mm.active_list_lock);
+ 
+ 	if (lists_empty)
+@@ -2091,7 +2117,9 @@ i915_gem_evict_everything(struct drm_device *dev)
+ 	spin_lock(&dev_priv->mm.active_list_lock);
+ 	lists_empty = (list_empty(&dev_priv->mm.inactive_list) &&
+ 		       list_empty(&dev_priv->mm.flushing_list) &&
+-		       list_empty(&dev_priv->render_ring.active_list));
++		       list_empty(&dev_priv->render_ring.active_list) &&
++		       (!HAS_BSD(dev)
++			|| list_empty(&dev_priv->bsd_ring.active_list)));
+ 	spin_unlock(&dev_priv->mm.active_list_lock);
+ 	BUG_ON(!lists_empty);
+ 
+@@ -2106,9 +2134,13 @@ i915_gem_evict_something(struct drm_device *dev, int min_size)
+ 	int ret;
+ 
+ 	struct intel_ring_buffer *render_ring = &dev_priv->render_ring;
++	struct intel_ring_buffer *bsd_ring = &dev_priv->bsd_ring;
+ 	for (;;) {
+ 		i915_gem_retire_requests(dev, render_ring);
+ 
++		if (HAS_BSD(dev))
++			i915_gem_retire_requests(dev, bsd_ring);
++
+ 		/* If there's an inactive buffer available now, grab it
+ 		 * and be done.
+ 		 */
+@@ -2146,6 +2178,21 @@ i915_gem_evict_something(struct drm_device *dev, int min_size)
+ 			continue;
+ 		}
+ 
++		if (HAS_BSD(dev) && !list_empty(&bsd_ring->request_list)) {
++			struct drm_i915_gem_request *request;
++
++			request = list_first_entry(&bsd_ring->request_list,
++						   struct drm_i915_gem_request,
++						   list);
++
++			ret = i915_wait_request(dev,
++					request->seqno, request->ring);
++			if (ret)
++				return ret;
++
++			continue;
++		}
++
+ 		/* If we didn't have anything on the request list but there
+ 		 * are buffers awaiting a flush, emit one and try again.
+ 		 * When we wait on it, those buffers waiting for that flush
+@@ -3649,6 +3696,16 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	DRM_INFO("buffers_ptr %d buffer_count %d len %08x\n",
+ 		  (int) args->buffers_ptr, args->buffer_count, args->batch_len);
+ #endif
++	if (args->flags & I915_EXEC_BSD) {
++		if (!HAS_BSD(dev)) {
++			DRM_ERROR("execbuf with wrong flag\n");
++			return -EINVAL;
++		}
++		ring = &dev_priv->bsd_ring;
++	} else {
++		ring = &dev_priv->render_ring;
++	}
++
+ 
+ 	if (args->buffer_count < 1) {
+ 		DRM_ERROR("execbuf with %d buffers\n", args->buffer_count);
+@@ -3703,8 +3760,6 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 		goto pre_mutex_err;
+ 	}
+ 
+-	ring = &dev_priv->render_ring;
+-
+ 	/* Look up object handles */
+ 	flips = 0;
+ 	for (i = 0; i < args->buffer_count; i++) {
+@@ -3843,6 +3898,10 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 					dev->flush_domains,
+ 					&dev_priv->render_ring);
+ 
++			if (HAS_BSD(dev))
++				(void)i915_add_request(dev, file_priv,
++						dev->flush_domains,
++						&dev_priv->bsd_ring);
+ 		}
+ 	}
+ 
+@@ -4287,6 +4346,9 @@ i915_gem_busy_ioctl(struct drm_device *dev, void *data,
+ 	 */
+ 	i915_gem_retire_requests(dev, &dev_priv->render_ring);
+ 
++	if (HAS_BSD(dev))
++		i915_gem_retire_requests(dev, &dev_priv->bsd_ring);
++
+ 	obj_priv = to_intel_bo(obj);
+ 	/* Don't count being on the flushing list against the object being
+ 	 * done.  Otherwise, a buffer left on the flushing list but not getting
+@@ -4453,7 +4515,9 @@ i915_gem_idle(struct drm_device *dev)
+ 	mutex_lock(&dev->struct_mutex);
+ 
+ 	if (dev_priv->mm.suspended ||
+-			dev_priv->render_ring.gem_object == NULL) {
++			(dev_priv->render_ring.gem_object == NULL) ||
++			(HAS_BSD(dev) &&
++			 dev_priv->bsd_ring.gem_object == NULL)) {
+ 		mutex_unlock(&dev->struct_mutex);
+ 		return 0;
+ 	}
+@@ -4570,6 +4634,10 @@ i915_gem_init_ringbuffer(struct drm_device *dev)
+ 			return ret;
+ 	}
+ 	ret = intel_init_ring_buffer(dev, &dev_priv->render_ring);
++	if (!ret && HAS_BSD(dev)) {
++		dev_priv->bsd_ring = bsd_ring;
++		ret = intel_init_ring_buffer(dev, &dev_priv->bsd_ring);
++	}
+ 	return ret;
+ }
+ 
+@@ -4579,6 +4647,8 @@ i915_gem_cleanup_ringbuffer(struct drm_device *dev)
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+ 
+ 	intel_cleanup_ring_buffer(dev, &dev_priv->render_ring);
++	if (HAS_BSD(dev))
++		intel_cleanup_ring_buffer(dev, &dev_priv->bsd_ring);
+ 	if (HAS_PIPE_CONTROL(dev))
+ 		i915_gem_cleanup_pipe_control(dev);
+ }
+@@ -4609,11 +4679,13 @@ i915_gem_entervt_ioctl(struct drm_device *dev, void *data,
+ 
+ 	spin_lock(&dev_priv->mm.active_list_lock);
+ 	BUG_ON(!list_empty(&dev_priv->render_ring.active_list));
++	BUG_ON(HAS_BSD(dev) && !list_empty(&dev_priv->bsd_ring.active_list));
+ 	spin_unlock(&dev_priv->mm.active_list_lock);
+ 
+ 	BUG_ON(!list_empty(&dev_priv->mm.flushing_list));
+ 	BUG_ON(!list_empty(&dev_priv->mm.inactive_list));
+ 	BUG_ON(!list_empty(&dev_priv->render_ring.request_list));
++	BUG_ON(HAS_BSD(dev) && !list_empty(&dev_priv->bsd_ring.request_list));
+ 	mutex_unlock(&dev->struct_mutex);
+ 
+ 	drm_irq_install(dev);
+@@ -4658,6 +4730,10 @@ i915_gem_load(struct drm_device *dev)
+ 	INIT_LIST_HEAD(&dev_priv->mm.fence_list);
+ 	INIT_LIST_HEAD(&dev_priv->render_ring.active_list);
+ 	INIT_LIST_HEAD(&dev_priv->render_ring.request_list);
++	if (HAS_BSD(dev)) {
++		INIT_LIST_HEAD(&dev_priv->bsd_ring.active_list);
++		INIT_LIST_HEAD(&dev_priv->bsd_ring.request_list);
++	}
+ 	for (i = 0; i < 16; i++)
+ 		INIT_LIST_HEAD(&dev_priv->fence_regs[i].lru_list);
+ 	INIT_DELAYED_WORK(&dev_priv->mm.retire_work,
+@@ -4904,6 +4980,8 @@ i915_gpu_is_active(struct drm_device *dev)
+ 	spin_lock(&dev_priv->mm.active_list_lock);
+ 	lists_empty = list_empty(&dev_priv->mm.flushing_list) &&
+ 		      list_empty(&dev_priv->render_ring.active_list);
++	if (HAS_BSD(dev))
++		lists_empty &= list_empty(&dev_priv->bsd_ring.active_list);
+ 	spin_unlock(&dev_priv->mm.active_list_lock);
+ 
+ 	return !lists_empty;
+@@ -4950,6 +5028,9 @@ rescan:
+ 		spin_unlock(&shrink_list_lock);
+ 		i915_gem_retire_requests(dev, &dev_priv->render_ring);
+ 
++		if (HAS_BSD(dev))
++			i915_gem_retire_requests(dev, &dev_priv->bsd_ring);
++
+ 		list_for_each_entry_safe(obj_priv, next_obj,
+ 					 &dev_priv->mm.inactive_list,
+ 					 list) {
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 8a667f1..0a3a580 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -53,7 +53,7 @@
+ 	 I915_RENDER_COMMAND_PARSER_ERROR_INTERRUPT)
+ 
+ /** Interrupts that we mask and unmask at runtime. */
+-#define I915_INTERRUPT_ENABLE_VAR (I915_USER_INTERRUPT)
++#define I915_INTERRUPT_ENABLE_VAR (I915_USER_INTERRUPT | I915_BSD_USER_INTERRUPT)
+ 
+ #define I915_PIPE_VBLANK_STATUS	(PIPE_START_VBLANK_INTERRUPT_STATUS |\
+ 				 PIPE_VBLANK_INTERRUPT_STATUS)
+@@ -362,6 +362,9 @@ irqreturn_t ironlake_irq_handler(struct drm_device *dev)
+ 		dev_priv->hangcheck_count = 0;
+ 		mod_timer(&dev_priv->hangcheck_timer, jiffies + DRM_I915_HANGCHECK_PERIOD);
+ 	}
++	if (gt_iir & GT_BSD_USER_INTERRUPT)
++		DRM_WAKEUP(&dev_priv->bsd_ring.irq_queue);
++
+ 
+ 	if (de_iir & DE_GSE)
+ 		ironlake_opregion_gse_intr(dev);
+@@ -944,6 +947,9 @@ irqreturn_t i915_driver_irq_handler(DRM_IRQ_ARGS)
+ 			mod_timer(&dev_priv->hangcheck_timer, jiffies + DRM_I915_HANGCHECK_PERIOD);
+ 		}
+ 
++		if (HAS_BSD(dev) && (iir & I915_BSD_USER_INTERRUPT))
++			DRM_WAKEUP(&dev_priv->bsd_ring.irq_queue);
++
+ 		if (iir & I915_DISPLAY_PLANE_A_FLIP_PENDING_INTERRUPT)
+ 			intel_prepare_page_flip(dev, 0);
+ 
+@@ -1297,7 +1303,7 @@ static int ironlake_irq_postinstall(struct drm_device *dev)
+ 	/* enable kind of interrupts always enabled */
+ 	u32 display_mask = DE_MASTER_IRQ_CONTROL | DE_GSE | DE_PCH_EVENT |
+ 			   DE_PLANEA_FLIP_DONE | DE_PLANEB_FLIP_DONE;
+-	u32 render_mask = GT_PIPE_NOTIFY;
++	u32 render_mask = GT_PIPE_NOTIFY | GT_BSD_USER_INTERRUPT;
+ 	u32 hotplug_mask = SDE_CRT_HOTPLUG | SDE_PORTB_HOTPLUG |
+ 			   SDE_PORTC_HOTPLUG | SDE_PORTD_HOTPLUG;
+ 
+@@ -1376,6 +1382,9 @@ int i915_driver_irq_postinstall(struct drm_device *dev)
+ 
+ 	DRM_INIT_WAITQUEUE(&dev_priv->render_ring.irq_queue);
+ 
++	if (HAS_BSD(dev))
++		DRM_INIT_WAITQUEUE(&dev_priv->bsd_ring.irq_queue);
++
+ 	dev_priv->vblank_pipe = DRM_I915_VBLANK_PIPE_A | DRM_I915_VBLANK_PIPE_B;
+ 
+ 	if (HAS_PCH_SPLIT(dev))
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index d621e64..71a86fb4 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -334,6 +334,7 @@
+ #define   I915_DEBUG_INTERRUPT				(1<<2)
+ #define   I915_USER_INTERRUPT				(1<<1)
+ #define   I915_ASLE_INTERRUPT				(1<<0)
++#define   I915_BSD_USER_INTERRUPT                      (1<<25)
+ #define EIR		0x020b0
+ #define EMR		0x020b4
+ #define ESR		0x020b8
+@@ -432,6 +433,17 @@
+ #define BB_ADDR		0x02140 /* 8 bytes */
+ #define GFX_FLSH_CNTL	0x02170 /* 915+ only */
+ 
++/*
++ * BSD (bit stream decoder instruction and interrupt control register defines
++ * (G4X and Ironlake only)
++ */
++
++#define BSD_RING_TAIL          0x04030
++#define BSD_RING_HEAD          0x04034
++#define BSD_RING_START         0x04038
++#define BSD_RING_CTL           0x0403c
++#define BSD_RING_ACTHD         0x04074
++#define BSD_HWS_PGA            0x04080
+ 
+ /*
+  * Framebuffer compression (915+ only)
+@@ -2419,6 +2431,8 @@
+ #define GT_PIPE_NOTIFY		(1 << 4)
+ #define GT_SYNC_STATUS          (1 << 2)
+ #define GT_USER_INTERRUPT       (1 << 0)
++#define GT_BSD_USER_INTERRUPT   (1 << 5)
++
+ 
+ #define GTISR   0x44010
+ #define GTIMR   0x44014
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 5715c4d8..f6b84fe 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -340,6 +340,119 @@ static void render_setup_status_page(struct drm_device *dev,
+ 
+ }
+ 
++void
++bsd_ring_flush(struct drm_device *dev,
++		struct intel_ring_buffer *ring,
++		u32     invalidate_domains,
++		u32     flush_domains)
++{
++	intel_ring_begin(dev, ring, 8);
++	intel_ring_emit(dev, ring, MI_FLUSH);
++	intel_ring_emit(dev, ring, MI_NOOP);
++	intel_ring_advance(dev, ring);
++}
++
++static inline unsigned int bsd_ring_get_head(struct drm_device *dev,
++		struct intel_ring_buffer *ring)
++{
++	drm_i915_private_t *dev_priv = dev->dev_private;
++	return I915_READ(BSD_RING_HEAD) & HEAD_ADDR;
++}
++
++static inline unsigned int bsd_ring_get_tail(struct drm_device *dev,
++		struct intel_ring_buffer *ring)
++{
++	drm_i915_private_t *dev_priv = dev->dev_private;
++	return I915_READ(BSD_RING_TAIL) & TAIL_ADDR;
++}
++
++static inline unsigned int bsd_ring_get_active_head(struct drm_device *dev,
++		struct intel_ring_buffer *ring)
++{
++	drm_i915_private_t *dev_priv = dev->dev_private;
++	return I915_READ(BSD_RING_ACTHD);
++}
++
++static inline void bsd_ring_advance_ring(struct drm_device *dev,
++		struct intel_ring_buffer *ring)
++{
++	drm_i915_private_t *dev_priv = dev->dev_private;
++	I915_WRITE(BSD_RING_TAIL, ring->tail);
++}
++
++static int init_bsd_ring(struct drm_device *dev,
++		struct intel_ring_buffer *ring)
++{
++	return init_ring_common(dev, ring);
++}
++
++static u32
++bsd_ring_add_request(struct drm_device *dev,
++		struct intel_ring_buffer *ring,
++		struct drm_file *file_priv,
++		u32 flush_domains)
++{
++	u32 seqno;
++	seqno = intel_ring_get_seqno(dev, ring);
++	intel_ring_begin(dev, ring, 4);
++	intel_ring_emit(dev, ring, MI_STORE_DWORD_INDEX);
++	intel_ring_emit(dev, ring,
++			I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
++	intel_ring_emit(dev, ring, seqno);
++	intel_ring_emit(dev, ring, MI_USER_INTERRUPT);
++	intel_ring_advance(dev, ring);
++
++	DRM_DEBUG_DRIVER("%s %d\n", ring->name, seqno);
++
++	return seqno;
++}
++
++static void bsd_setup_status_page(struct drm_device *dev,
++		struct  intel_ring_buffer *ring)
++{
++	drm_i915_private_t *dev_priv = dev->dev_private;
++	I915_WRITE(BSD_HWS_PGA, ring->status_page.gfx_addr);
++	I915_READ(BSD_HWS_PGA);
++}
++
++static void
++bsd_ring_get_user_irq(struct drm_device *dev,
++		struct intel_ring_buffer *ring)
++{
++	/* do nothing */
++}
++static void
++bsd_ring_put_user_irq(struct drm_device *dev,
++		struct intel_ring_buffer *ring)
++{
++	/* do nothing */
++}
++
++static u32
++bsd_ring_get_gem_seqno(struct drm_device *dev,
++		struct intel_ring_buffer *ring)
++{
++	return intel_read_status_page(ring, I915_GEM_HWS_INDEX);
++}
++
++static int
++bsd_ring_dispatch_gem_execbuffer(struct drm_device *dev,
++		struct intel_ring_buffer *ring,
++		struct drm_i915_gem_execbuffer2 *exec,
++		struct drm_clip_rect *cliprects,
++		uint64_t exec_offset)
++{
++	uint32_t exec_start;
++	exec_start = (uint32_t) exec_offset + exec->batch_start_offset;
++	intel_ring_begin(dev, ring, 2);
++	intel_ring_emit(dev, ring, MI_BATCH_BUFFER_START |
++			(2 << 6) | MI_BATCH_NON_SECURE_I965);
++	intel_ring_emit(dev, ring, exec_start);
++	intel_ring_advance(dev, ring);
++	return 0;
++}
++
++
+ static int
+ render_ring_dispatch_gem_execbuffer(struct drm_device *dev,
+ 		struct intel_ring_buffer *ring,
+@@ -588,6 +701,7 @@ int intel_wait_ring_buffer(struct drm_device *dev,
+ 			if (master_priv->sarea_priv)
+ 				master_priv->sarea_priv->perf_boxes |= I915_BOX_WAIT;
+ 		}
++
+ 		yield();
+ 	} while (!time_after(jiffies, end));
+ 	trace_i915_ring_wait_end (dev);
+@@ -682,3 +796,42 @@ struct intel_ring_buffer render_ring = {
+ 	.status_page		= {NULL, 0, NULL},
+ 	.map			= {0,}
+ };
++
++/* ring buffer for bit-stream decoder */
++
++struct intel_ring_buffer bsd_ring = {
++	.name                   = "bsd ring",
++	.regs			= {
++		.ctl = BSD_RING_CTL,
++		.head = BSD_RING_HEAD,
++		.tail = BSD_RING_TAIL,
++		.start = BSD_RING_START
++	},
++	.ring_flag		= I915_EXEC_BSD,
++	.size			= 32 * PAGE_SIZE,
++	.alignment		= PAGE_SIZE,
++	.virtual_start		= NULL,
++	.dev			= NULL,
++	.gem_object		= NULL,
++	.head			= 0,
++	.tail			= 0,
++	.space			= 0,
++	.next_seqno		= 1,
++	.user_irq_refcount	= 0,
++	.irq_gem_seqno		= 0,
++	.waiting_gem_seqno	= 0,
++	.setup_status_page	= bsd_setup_status_page,
++	.init			= init_bsd_ring,
++	.get_head		= bsd_ring_get_head,
++	.get_tail		= bsd_ring_get_tail,
++	.get_active_head	= bsd_ring_get_active_head,
++	.advance_ring		= bsd_ring_advance_ring,
++	.flush			= bsd_ring_flush,
++	.add_request		= bsd_ring_add_request,
++	.get_gem_seqno		= bsd_ring_get_gem_seqno,
++	.user_irq_get		= bsd_ring_get_user_irq,
++	.user_irq_put		= bsd_ring_put_user_irq,
++	.dispatch_gem_execbuffer = bsd_ring_dispatch_gem_execbuffer,
++	.status_page		= {NULL, 0, NULL},
++	.map			= {0,}
++};
+-- 
+1.7.6
+

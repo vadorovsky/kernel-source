@@ -1,0 +1,168 @@
+From 266dfad6447bb416b621c9172a02dd883387cb06 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Sun, 6 Mar 2011 13:51:29 +0000
+Patch-mainline: 2.6.39
+References: fate#310916
+Git-commit: c59a333f73868ca6fbcecea99b3542e2c62a3a5c
+Subject: [PATCH 2260/2588] drm/i915: Only wait on a pending flip if we intend
+ to write to the buffer
+
+... as if we are only reading from it, we can do that concurrently with
+the queue flip.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit c59a333f73868ca6fbcecea99b3542e2c62a3a5c)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   92 +++++++++++++--------------
+ 1 files changed, 44 insertions(+), 48 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index d461ad5..8513c04 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -37,6 +37,7 @@ struct change_domains {
+ 	uint32_t invalidate_domains;
+ 	uint32_t flush_domains;
+ 	uint32_t flush_rings;
++	uint32_t flips;
+ };
+ 
+ /*
+@@ -190,6 +191,9 @@ i915_gem_object_set_to_gpu_domain(struct drm_i915_gem_object *obj,
+ 	if ((flush_domains | invalidate_domains) & I915_GEM_DOMAIN_GTT)
+ 		i915_gem_release_mmap(obj);
+ 
++	if (obj->base.pending_write_domain)
++		cd->flips |= atomic_read(&obj->pending_flip);
++
+ 	/* The actual obj->write_domain will be updated with
+ 	 * pending_write_domain after we emit the accumulated flush for all
+ 	 * of our domain changes in execbuffers (which clears objects'
+@@ -774,6 +778,39 @@ i915_gem_execbuffer_sync_rings(struct drm_i915_gem_object *obj,
+ }
+ 
+ static int
++i915_gem_execbuffer_wait_for_flips(struct intel_ring_buffer *ring, u32 flips)
++{
++	u32 plane, flip_mask;
++	int ret;
++
++	/* Check for any pending flips. As we only maintain a flip queue depth
++	 * of 1, we can simply insert a WAIT for the next display flip prior
++	 * to executing the batch and avoid stalling the CPU.
++	 */
++
++	for (plane = 0; flips >> plane; plane++) {
++		if (((flips >> plane) & 1) == 0)
++			continue;
++
++		if (plane)
++			flip_mask = MI_WAIT_FOR_PLANE_B_FLIP;
++		else
++			flip_mask = MI_WAIT_FOR_PLANE_A_FLIP;
++
++		ret = intel_ring_begin(ring, 2);
++		if (ret)
++			return ret;
++
++		intel_ring_emit(ring, MI_WAIT_FOR_EVENT | flip_mask);
++		intel_ring_emit(ring, MI_NOOP);
++		intel_ring_advance(ring);
++	}
++
++	return 0;
++}
++
++
++static int
+ i915_gem_execbuffer_move_to_gpu(struct intel_ring_buffer *ring,
+ 				struct list_head *objects)
+ {
+@@ -781,9 +818,7 @@ i915_gem_execbuffer_move_to_gpu(struct intel_ring_buffer *ring,
+ 	struct change_domains cd;
+ 	int ret;
+ 
+-	cd.invalidate_domains = 0;
+-	cd.flush_domains = 0;
+-	cd.flush_rings = 0;
++	memset(&cd, 0, sizeof(cd));
+ 	list_for_each_entry(obj, objects, exec_list)
+ 		i915_gem_object_set_to_gpu_domain(obj, ring, &cd);
+ 
+@@ -796,6 +831,12 @@ i915_gem_execbuffer_move_to_gpu(struct intel_ring_buffer *ring,
+ 			return ret;
+ 	}
+ 
++	if (cd.flips) {
++		ret = i915_gem_execbuffer_wait_for_flips(ring, cd.flips);
++		if (ret)
++			return ret;
++	}
++
+ 	list_for_each_entry(obj, objects, exec_list) {
+ 		ret = i915_gem_execbuffer_sync_rings(obj, ring);
+ 		if (ret)
+@@ -842,47 +883,6 @@ validate_exec_list(struct drm_i915_gem_exec_object2 *exec,
+ 	return 0;
+ }
+ 
+-static int
+-i915_gem_execbuffer_wait_for_flips(struct intel_ring_buffer *ring,
+-				   struct list_head *objects)
+-{
+-	struct drm_i915_gem_object *obj;
+-	int flips;
+-
+-	/* Check for any pending flips. As we only maintain a flip queue depth
+-	 * of 1, we can simply insert a WAIT for the next display flip prior
+-	 * to executing the batch and avoid stalling the CPU.
+-	 */
+-	flips = 0;
+-	list_for_each_entry(obj, objects, exec_list) {
+-		if (obj->base.write_domain)
+-			flips |= atomic_read(&obj->pending_flip);
+-	}
+-	if (flips) {
+-		int plane, flip_mask, ret;
+-
+-		for (plane = 0; flips >> plane; plane++) {
+-			if (((flips >> plane) & 1) == 0)
+-				continue;
+-
+-			if (plane)
+-				flip_mask = MI_WAIT_FOR_PLANE_B_FLIP;
+-			else
+-				flip_mask = MI_WAIT_FOR_PLANE_A_FLIP;
+-
+-			ret = intel_ring_begin(ring, 2);
+-			if (ret)
+-				return ret;
+-
+-			intel_ring_emit(ring, MI_WAIT_FOR_EVENT | flip_mask);
+-			intel_ring_emit(ring, MI_NOOP);
+-			intel_ring_advance(ring);
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+ static void
+ i915_gem_execbuffer_move_to_active(struct list_head *objects,
+ 				   struct intel_ring_buffer *ring,
+@@ -1133,10 +1133,6 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto err;
+ 
+-	ret = i915_gem_execbuffer_wait_for_flips(ring, &objects);
+-	if (ret)
+-		goto err;
+-
+ 	seqno = i915_gem_next_request_seqno(ring);
+ 	for (i = 0; i < ARRAY_SIZE(ring->sync_seqno); i++) {
+ 		if (seqno < ring->sync_seqno[i]) {
+-- 
+1.7.6
+

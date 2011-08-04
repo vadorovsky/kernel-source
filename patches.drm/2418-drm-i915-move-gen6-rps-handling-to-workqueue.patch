@@ -1,0 +1,210 @@
+From f5e9d263fa3ead4e5fd6e1167776216a45618431 Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <ben@bwidawsk.net>
+Date: Mon, 25 Apr 2011 11:25:20 -0700
+Patch-mainline: 3.0-rc3
+References: fate#310916
+Git-commit: 4912d04193733a825216b926ffd290fada88ab07
+Subject: [PATCH 2418/2588] drm/i915: move gen6 rps handling to workqueue
+
+The render P-state handling code requires reading from a GT register.
+This means that FORCEWAKE must be written to, a resource which is shared
+and should be protected by struct_mutex. Hence we can not manipulate
+that register from within the interrupt handling and so must delegate
+the task to a workqueue.
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Keith Packard <keithp@keithp.com>
+(cherry picked from commit 4912d04193733a825216b926ffd290fada88ab07)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/i915/i915_dma.c      |    1 +
+ drivers/gpu/drm/i915/i915_drv.h      |    4 +++
+ drivers/gpu/drm/i915/i915_irq.c      |   49 ++++++++++++++++++++++++++++-----
+ drivers/gpu/drm/i915/i915_reg.h      |    5 +++-
+ drivers/gpu/drm/i915/intel_display.c |    8 +++++
+ 5 files changed, 58 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 983a3f1..0ba67e9 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -2017,6 +2017,7 @@ int i915_driver_load(struct drm_device *dev, unsigned long flags)
+ 
+ 	spin_lock_init(&dev_priv->irq_lock);
+ 	spin_lock_init(&dev_priv->error_lock);
++	spin_lock_init(&dev_priv->rps_lock);
+ 
+ 	if (IS_MOBILE(dev) || !IS_GEN2(dev))
+ 		dev_priv->num_pipe = 2;
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index bafb387..e9d8243 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -682,6 +682,10 @@ typedef struct drm_i915_private {
+ 
+ 	bool mchbar_need_disable;
+ 
++	struct work_struct rps_work;
++	spinlock_t rps_lock;
++	u32 pm_iir;
++
+ 	u8 cur_delay;
+ 	u8 min_delay;
+ 	u8 max_delay;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index cc712a9..4bcfe82 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -367,22 +367,30 @@ static void notify_ring(struct drm_device *dev,
+ 		  jiffies + msecs_to_jiffies(DRM_I915_HANGCHECK_PERIOD));
+ }
+ 
+-static void gen6_pm_irq_handler(struct drm_device *dev)
++static void gen6_pm_rps_work(struct work_struct *work)
+ {
+-	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
++	drm_i915_private_t *dev_priv = container_of(work, drm_i915_private_t,
++						    rps_work);
+ 	u8 new_delay = dev_priv->cur_delay;
+-	u32 pm_iir;
++	u32 pm_iir, pm_imr;
++
++	spin_lock_irq(&dev_priv->rps_lock);
++	pm_iir = dev_priv->pm_iir;
++	dev_priv->pm_iir = 0;
++	pm_imr = I915_READ(GEN6_PMIMR);
++	spin_unlock_irq(&dev_priv->rps_lock);
+ 
+-	pm_iir = I915_READ(GEN6_PMIIR);
+ 	if (!pm_iir)
+ 		return;
+ 
++	mutex_lock(&dev_priv->dev->struct_mutex);
+ 	if (pm_iir & GEN6_PM_RP_UP_THRESHOLD) {
+ 		if (dev_priv->cur_delay != dev_priv->max_delay)
+ 			new_delay = dev_priv->cur_delay + 1;
+ 		if (new_delay > dev_priv->max_delay)
+ 			new_delay = dev_priv->max_delay;
+ 	} else if (pm_iir & (GEN6_PM_RP_DOWN_THRESHOLD | GEN6_PM_RP_DOWN_TIMEOUT)) {
++		gen6_gt_force_wake_get(dev_priv);
+ 		if (dev_priv->cur_delay != dev_priv->min_delay)
+ 			new_delay = dev_priv->cur_delay - 1;
+ 		if (new_delay < dev_priv->min_delay) {
+@@ -396,12 +404,19 @@ static void gen6_pm_irq_handler(struct drm_device *dev)
+ 			I915_WRITE(GEN6_RP_INTERRUPT_LIMITS,
+ 				   I915_READ(GEN6_RP_INTERRUPT_LIMITS) & ~0x3f0000);
+ 		}
++		gen6_gt_force_wake_put(dev_priv);
+ 	}
+ 
+-	gen6_set_rps(dev, new_delay);
++	gen6_set_rps(dev_priv->dev, new_delay);
+ 	dev_priv->cur_delay = new_delay;
+ 
+-	I915_WRITE(GEN6_PMIIR, pm_iir);
++	/*
++	 * rps_lock not held here because clearing is non-destructive. There is
++	 * an *extremely* unlikely race with gen6_rps_enable() that is prevented
++	 * by holding struct_mutex for the duration of the write.
++	 */
++	I915_WRITE(GEN6_PMIMR, pm_imr & ~pm_iir);
++	mutex_unlock(&dev_priv->dev->struct_mutex);
+ }
+ 
+ static void pch_irq_handler(struct drm_device *dev)
+@@ -525,13 +540,30 @@ static irqreturn_t ironlake_irq_handler(struct drm_device *dev)
+ 		i915_handle_rps_change(dev);
+ 	}
+ 
+-	if (IS_GEN6(dev))
+-		gen6_pm_irq_handler(dev);
++	if (IS_GEN6(dev) && pm_iir & GEN6_PM_DEFERRED_EVENTS) {
++		/*
++		 * IIR bits should never already be set because IMR should
++		 * prevent an interrupt from being shown in IIR. The warning
++		 * displays a case where we've unsafely cleared
++		 * dev_priv->pm_iir. Although missing an interrupt of the same
++		 * type is not a problem, it displays a problem in the logic.
++		 *
++		 * The mask bit in IMR is cleared by rps_work.
++		 */
++		unsigned long flags;
++		spin_lock_irqsave(&dev_priv->rps_lock, flags);
++		WARN(dev_priv->pm_iir & pm_iir, "Missed a PM interrupt\n");
++		I915_WRITE(GEN6_PMIMR, pm_iir);
++		dev_priv->pm_iir |= pm_iir;
++		spin_unlock_irqrestore(&dev_priv->rps_lock, flags);
++		queue_work(dev_priv->wq, &dev_priv->rps_work);
++	}
+ 
+ 	/* should clear PCH hotplug event before clear CPU irq */
+ 	I915_WRITE(SDEIIR, pch_iir);
+ 	I915_WRITE(GTIIR, gt_iir);
+ 	I915_WRITE(DEIIR, de_iir);
++	I915_WRITE(GEN6_PMIIR, pm_iir);
+ 
+ done:
+ 	I915_WRITE(DEIER, de_ier);
+@@ -1659,6 +1691,7 @@ void i915_driver_irq_preinstall(struct drm_device * dev)
+ 
+ 	INIT_WORK(&dev_priv->hotplug_work, i915_hotplug_work_func);
+ 	INIT_WORK(&dev_priv->error_work, i915_error_work_func);
++	INIT_WORK(&dev_priv->rps_work, gen6_pm_rps_work);
+ 
+ 	if (HAS_PCH_SPLIT(dev)) {
+ 		ironlake_irq_preinstall(dev);
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index f39ac3a..289adaa 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -3386,7 +3386,7 @@
+ #define GEN6_PMINTRMSK				0xA168
+ 
+ #define GEN6_PMISR				0x44020
+-#define GEN6_PMIMR				0x44024
++#define GEN6_PMIMR				0x44024 /* rps_lock */
+ #define GEN6_PMIIR				0x44028
+ #define GEN6_PMIER				0x4402C
+ #define  GEN6_PM_MBOX_EVENT			(1<<25)
+@@ -3396,6 +3396,9 @@
+ #define  GEN6_PM_RP_DOWN_THRESHOLD		(1<<4)
+ #define  GEN6_PM_RP_UP_EI_EXPIRED		(1<<2)
+ #define  GEN6_PM_RP_DOWN_EI_EXPIRED		(1<<1)
++#define  GEN6_PM_DEFERRED_EVENTS		(GEN6_PM_RP_UP_THRESHOLD | \
++						 GEN6_PM_RP_DOWN_THRESHOLD | \
++						 GEN6_PM_RP_DOWN_TIMEOUT)
+ 
+ #define GEN6_PCODE_MAILBOX			0x138124
+ #define   GEN6_PCODE_READY			(1<<31)
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index f838e13..ef17be7 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -6878,6 +6878,11 @@ void gen6_disable_rps(struct drm_device *dev)
+ 	I915_WRITE(GEN6_RPNSWREQ, 1 << 31);
+ 	I915_WRITE(GEN6_PMINTRMSK, 0xffffffff);
+ 	I915_WRITE(GEN6_PMIER, 0);
++
++	spin_lock_irq(&dev_priv->rps_lock);
++	dev_priv->pm_iir = 0;
++	spin_unlock_irq(&dev_priv->rps_lock);
++
+ 	I915_WRITE(GEN6_PMIIR, I915_READ(GEN6_PMIIR));
+ }
+ 
+@@ -7080,7 +7085,10 @@ void gen6_enable_rps(struct drm_i915_private *dev_priv)
+ 		   GEN6_PM_RP_DOWN_THRESHOLD |
+ 		   GEN6_PM_RP_UP_EI_EXPIRED |
+ 		   GEN6_PM_RP_DOWN_EI_EXPIRED);
++	spin_lock_irq(&dev_priv->rps_lock);
++	WARN_ON(dev_priv->pm_iir != 0);
+ 	I915_WRITE(GEN6_PMIMR, 0);
++	spin_unlock_irq(&dev_priv->rps_lock);
+ 	/* enable all PM interrupts */
+ 	I915_WRITE(GEN6_PMINTRMSK, 0);
+ 
+-- 
+1.7.6
+

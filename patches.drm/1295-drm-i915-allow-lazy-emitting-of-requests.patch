@@ -1,0 +1,217 @@
+From 0d9c0f00b0d22cb62f1d47d0f87448b0e74cbf38 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Thu, 11 Feb 2010 22:13:59 +0100
+Patch-mainline: 2.6.37
+References: fate#310916
+Git-commit: e35a41de3926ec81e3ed2ed31d1f30cecb3513f9
+Subject: [PATCH 1295/2588] drm/i915: allow lazy emitting of requests
+
+Sometimes (like when flushing in preparation of batchbuffer execution)
+we know that we'll emit a request but haven't yet done so. Allow this
+case by simply taking the next seqno by default. Ensure that a request
+is eventually emitted before waiting for an request by issuing it
+in i915_wait_request iff this is not yet done.
+
+Also replace one open-coded version of i915_gem_object_wait_rendering,
+to prevent future code-diversion.
+
+Chris Wilson asked me to explain and clarify what this patch does and why.
+Here it goes:
+
+Old way of moving objects onto the active list and associating them with a
+reques:
+
+1. i915_add_request + store the returned seqno somewhere
+2. i915_gem_object_move_to_active (with the stored seqno as parameter)
+
+For the current users, this is all fine. But I'd like to associate objects
+(and fence regs) with the batchbuffer request deep down in the execbuf
+call-chain. I thought about three ways of implementing this.
+
+a) Don't care, just emit request when we need a new seqno. When heavily
+pipelining fence reg changes, this would have caused tons of superflous
+request (and corresponding irqs).
+
+b) Thread all changed fences, objects, whatever through the execbuf-maze,
+so that when we emit a request, we can store the new seqno at all the right
+places.
+
+c) Kill that seqno-threading-around business by simply storing the next
+seqno, i.e. allow 2. to be done before 1. in the above sequence.
+
+I've decided to implement c) (in this patch). The following patches are
+just fall-out that resulted from this small conceptual change.
+
+* We can handle the flushing list processing where we actually emit a flush
+  (i915_gem_flush and i915_retire_commands) instead of in i915_add_request.
+  The code makes IMHO more sense this way (and i915_add_request looses the
+  flush_domains parameter, obviously).
+
+* We can avoid emitting unnecessary requests. IMHO there's no point in
+  emitting more than one request per batchbuffer (with or without an
+  corresponding irq).
+
+* By enforcing 2. before 1. ordering in the above sequence the seqno
+  argument of i915_gem_object_move_to_active is redundant and can be
+  dropped.
+
+v2: Now i915_wait_request issues request if it is not yet emitted.
+Also introduce i915_gem_next_request_seqno(dev) just in case we ever
+need to do some prep work before using a new seqno.
+
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+[ickle: Keep i915_gem_object_set_to_display_plane() uninterruptible.]
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+(cherry picked from commit e35a41de3926ec81e3ed2ed31d1f30cecb3513f9)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/i915/i915_gem.c |   55 ++++++++++++++++++++++++---------------
+ 1 files changed, 34 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 6c8d111..d82b51a 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -46,7 +46,8 @@ static int i915_gem_object_set_cpu_read_domain_range(struct drm_gem_object *obj,
+ 						     uint64_t offset,
+ 						     uint64_t size);
+ static void i915_gem_object_set_to_full_cpu_read_domain(struct drm_gem_object *obj);
+-static int i915_gem_object_wait_rendering(struct drm_gem_object *obj);
++static int i915_gem_object_wait_rendering(struct drm_gem_object *obj,
++					  bool interruptible);
+ static int i915_gem_object_bind_to_gtt(struct drm_gem_object *obj,
+ 					   unsigned alignment);
+ static void i915_gem_clear_fence_reg(struct drm_gem_object *obj);
+@@ -1470,6 +1471,14 @@ i915_gem_object_put_pages(struct drm_gem_object *obj)
+ 	obj_priv->pages = NULL;
+ }
+ 
++static uint32_t
++i915_gem_next_request_seqno(struct drm_device *dev)
++{
++	drm_i915_private_t *dev_priv = dev->dev_private;
++
++	return dev_priv->next_seqno;
++}
++
+ static void
+ i915_gem_object_move_to_active(struct drm_gem_object *obj, uint32_t seqno,
+ 			       struct intel_ring_buffer *ring)
+@@ -1485,6 +1494,11 @@ i915_gem_object_move_to_active(struct drm_gem_object *obj, uint32_t seqno,
+ 		drm_gem_object_reference(obj);
+ 		obj_priv->active = 1;
+ 	}
++
++	/* Take the seqno of the next request if none is given */
++	if (seqno == 0)
++		seqno = i915_gem_next_request_seqno(dev);
++
+ 	/* Move from whatever list we were on to the tail of execution. */
+ 	spin_lock(&dev_priv->mm.active_list_lock);
+ 	list_move_tail(&obj_priv->list, &ring->active_list);
+@@ -1830,6 +1844,12 @@ i915_do_wait_request(struct drm_device *dev, uint32_t seqno,
+ 
+ 	BUG_ON(seqno == 0);
+ 
++	if (seqno == dev_priv->next_seqno) {
++		seqno = i915_add_request(dev, NULL, 0, ring);
++		if (seqno == 0)
++			return -ENOMEM;
++	}
++
+ 	if (atomic_read(&dev_priv->mm.wedged))
+ 		return -EIO;
+ 
+@@ -1917,7 +1937,8 @@ i915_gem_flush(struct drm_device *dev,
+  * safe to unbind from the GTT or access from the CPU.
+  */
+ static int
+-i915_gem_object_wait_rendering(struct drm_gem_object *obj)
++i915_gem_object_wait_rendering(struct drm_gem_object *obj,
++			       bool interruptible)
+ {
+ 	struct drm_device *dev = obj->dev;
+ 	struct drm_i915_gem_object *obj_priv = to_intel_bo(obj);
+@@ -1936,8 +1957,10 @@ i915_gem_object_wait_rendering(struct drm_gem_object *obj)
+ 		DRM_INFO("%s: object %p wait for seqno %08x\n",
+ 			  __func__, obj, obj_priv->last_rendering_seqno);
+ #endif
+-		ret = i915_wait_request(dev,
+-				obj_priv->last_rendering_seqno, obj_priv->ring);
++		ret = i915_do_wait_request(dev,
++					   obj_priv->last_rendering_seqno,
++					   interruptible,
++					   obj_priv->ring);
+ 		if (ret != 0)
+ 			return ret;
+ 	}
+@@ -2450,7 +2473,7 @@ i915_gem_object_put_fence_reg(struct drm_gem_object *obj)
+ 		if (ret != 0)
+ 			return ret;
+ 
+-		ret = i915_gem_object_wait_rendering(obj);
++		ret = i915_gem_object_wait_rendering(obj, true);
+ 		if (ret != 0)
+ 			return ret;
+ 	}
+@@ -2706,7 +2729,7 @@ i915_gem_object_set_to_gtt_domain(struct drm_gem_object *obj, int write)
+ 		return ret;
+ 
+ 	/* Wait on any GPU rendering and flushing to occur. */
+-	ret = i915_gem_object_wait_rendering(obj);
++	ret = i915_gem_object_wait_rendering(obj, true);
+ 	if (ret != 0)
+ 		return ret;
+ 
+@@ -2745,7 +2768,6 @@ i915_gem_object_set_to_gtt_domain(struct drm_gem_object *obj, int write)
+ int
+ i915_gem_object_set_to_display_plane(struct drm_gem_object *obj)
+ {
+-	struct drm_device *dev = obj->dev;
+ 	struct drm_i915_gem_object *obj_priv = to_intel_bo(obj);
+ 	uint32_t old_write_domain, old_read_domains;
+ 	int ret;
+@@ -2759,18 +2781,9 @@ i915_gem_object_set_to_display_plane(struct drm_gem_object *obj)
+ 		return ret;
+ 
+ 	/* Wait on any GPU rendering and flushing to occur. */
+-	if (obj_priv->active) {
+-#if WATCH_BUF
+-		DRM_INFO("%s: object %p wait for seqno %08x\n",
+-			  __func__, obj, obj_priv->last_rendering_seqno);
+-#endif
+-		ret = i915_do_wait_request(dev,
+-				obj_priv->last_rendering_seqno,
+-				0,
+-				obj_priv->ring);
+-		if (ret != 0)
+-			return ret;
+-	}
++	ret = i915_gem_object_wait_rendering(obj, false);
++	if (ret != 0)
++		return ret;
+ 
+ 	i915_gem_object_flush_cpu_write_domain(obj);
+ 
+@@ -2809,7 +2822,7 @@ i915_gem_object_set_to_cpu_domain(struct drm_gem_object *obj, int write)
+ 		return ret;
+ 
+ 	/* Wait on any GPU rendering and flushing to occur. */
+-	ret = i915_gem_object_wait_rendering(obj);
++	ret = i915_gem_object_wait_rendering(obj, true);
+ 	if (ret != 0)
+ 		return ret;
+ 
+@@ -3110,7 +3123,7 @@ i915_gem_object_set_cpu_read_domain_range(struct drm_gem_object *obj,
+ 		return ret;
+ 
+ 	/* Wait on any GPU rendering and flushing to occur. */
+-	ret = i915_gem_object_wait_rendering(obj);
++	ret = i915_gem_object_wait_rendering(obj, true);
+ 	if (ret != 0)
+ 		return ret;
+ 	i915_gem_object_flush_gtt_write_domain(obj);
+-- 
+1.7.6
+

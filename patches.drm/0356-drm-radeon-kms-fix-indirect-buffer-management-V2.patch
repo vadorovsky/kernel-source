@@ -1,0 +1,276 @@
+From d3a37e1d1be74fb53926db8e6f9e7558e864b20f Mon Sep 17 00:00:00 2001
+From: Jerome Glisse <jglisse@redhat.com>
+Date: Mon, 15 Feb 2010 21:36:13 +0100
+Patch-mainline: 2.6.33
+References: fate#310916
+Git-commit: 91cb91becf372b5308cdd7d2e15b2e3ef66bae7e
+Subject: [PATCH 0356/2588] drm/radeon/kms: fix indirect buffer management V2
+
+There is 3 different distinct states for an indirect buffer (IB) :
+  1- free with no fence
+  2- free with a fence
+  3- non free (fence doesn't matter)
+Previous code mixed case 2 & 3 in a single one leading to possible
+catastrophique failure. This patch rework the handling and properly
+separate each case. So when you get ib we set the ib as non free and
+fence status doesn't matter. Fence become active (ie has a meaning
+for the ib code) once the ib is scheduled or free. This patch also
+get rid of the alloc bitmap as it was overkill, we know go through
+IB pool list like in a ring buffer as the oldest IB is the first
+one the will be free.
+
+Fix :
+https://bugs.freedesktop.org/show_bug.cgi?id=26438
+and likely other bugs.
+
+V2 remove the scheduled list, it's useless now, fix free ib scanning
+
+Signed-off-by: Jerome Glisse <jglisse@redhat.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+(cherry picked from commit 91cb91becf372b5308cdd7d2e15b2e3ef66bae7e)
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+---
+ drivers/gpu/drm/radeon/r600_blit_kms.c |    3 -
+ drivers/gpu/drm/radeon/radeon.h        |    9 ++-
+ drivers/gpu/drm/radeon/radeon_ring.c   |  105 ++++++++++++--------------------
+ 3 files changed, 45 insertions(+), 72 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/r600_blit_kms.c b/drivers/gpu/drm/radeon/r600_blit_kms.c
+index af1c3ca..446b765 100644
+--- a/drivers/gpu/drm/radeon/r600_blit_kms.c
++++ b/drivers/gpu/drm/radeon/r600_blit_kms.c
+@@ -543,9 +543,6 @@ int r600_vb_ib_get(struct radeon_device *rdev)
+ void r600_vb_ib_put(struct radeon_device *rdev)
+ {
+ 	radeon_fence_emit(rdev, rdev->r600_blit.vb_ib->fence);
+-	mutex_lock(&rdev->ib_pool.mutex);
+-	list_add_tail(&rdev->r600_blit.vb_ib->list, &rdev->ib_pool.scheduled_ibs);
+-	mutex_unlock(&rdev->ib_pool.mutex);
+ 	radeon_ib_free(rdev, &rdev->r600_blit.vb_ib);
+ }
+ 
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index f57480b..c0356bb 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -96,6 +96,7 @@ extern int radeon_audio;
+  * symbol;
+  */
+ #define RADEON_MAX_USEC_TIMEOUT		100000	/* 100 ms */
++/* RADEON_IB_POOL_SIZE must be a power of 2 */
+ #define RADEON_IB_POOL_SIZE		16
+ #define RADEON_DEBUGFS_MAX_NUM_FILES	32
+ #define RADEONFB_CONN_LIMIT		4
+@@ -363,11 +364,12 @@ void radeon_irq_kms_sw_irq_put(struct radeon_device *rdev);
+  */
+ struct radeon_ib {
+ 	struct list_head	list;
+-	unsigned long		idx;
++	unsigned		idx;
+ 	uint64_t		gpu_addr;
+ 	struct radeon_fence	*fence;
+-	uint32_t	*ptr;
++	uint32_t		*ptr;
+ 	uint32_t		length_dw;
++	bool			free;
+ };
+ 
+ /*
+@@ -377,10 +379,9 @@ struct radeon_ib {
+ struct radeon_ib_pool {
+ 	struct mutex		mutex;
+ 	struct radeon_bo	*robj;
+-	struct list_head	scheduled_ibs;
+ 	struct radeon_ib	ibs[RADEON_IB_POOL_SIZE];
+ 	bool			ready;
+-	DECLARE_BITMAP(alloc_bm, RADEON_IB_POOL_SIZE);
++	unsigned		head_id;
+ };
+ 
+ struct radeon_cp {
+diff --git a/drivers/gpu/drm/radeon/radeon_ring.c b/drivers/gpu/drm/radeon/radeon_ring.c
+index 4d12b2d..694799f 100644
+--- a/drivers/gpu/drm/radeon/radeon_ring.c
++++ b/drivers/gpu/drm/radeon/radeon_ring.c
+@@ -41,68 +41,55 @@ int radeon_ib_get(struct radeon_device *rdev, struct radeon_ib **ib)
+ {
+ 	struct radeon_fence *fence;
+ 	struct radeon_ib *nib;
+-	unsigned long i;
+-	int r = 0;
++	int r = 0, i, c;
+ 
+ 	*ib = NULL;
+ 	r = radeon_fence_create(rdev, &fence);
+ 	if (r) {
+-		DRM_ERROR("failed to create fence for new IB\n");
++		dev_err(rdev->dev, "failed to create fence for new IB\n");
+ 		return r;
+ 	}
+ 	mutex_lock(&rdev->ib_pool.mutex);
+-	i = find_first_zero_bit(rdev->ib_pool.alloc_bm, RADEON_IB_POOL_SIZE);
+-	if (i < RADEON_IB_POOL_SIZE) {
+-		set_bit(i, rdev->ib_pool.alloc_bm);
+-		rdev->ib_pool.ibs[i].length_dw = 0;
+-		*ib = &rdev->ib_pool.ibs[i];
+-		mutex_unlock(&rdev->ib_pool.mutex);
+-		goto out;
++	for (i = rdev->ib_pool.head_id, c = 0, nib = NULL; c < RADEON_IB_POOL_SIZE; c++, i++) {
++		i &= (RADEON_IB_POOL_SIZE - 1);
++		if (rdev->ib_pool.ibs[i].free) {
++			nib = &rdev->ib_pool.ibs[i];
++			break;
++		}
+ 	}
+-	if (list_empty(&rdev->ib_pool.scheduled_ibs)) {
+-		/* we go do nothings here */
++	if (nib == NULL) {
++		/* This should never happen, it means we allocated all
++		 * IB and haven't scheduled one yet, return EBUSY to
++		 * userspace hoping that on ioctl recall we get better
++		 * luck
++		 */
++		dev_err(rdev->dev, "no free indirect buffer !\n");
+ 		mutex_unlock(&rdev->ib_pool.mutex);
+-		DRM_ERROR("all IB allocated none scheduled.\n");
+-		r = -EINVAL;
+-		goto out;
++		radeon_fence_unref(&fence);
++		return -EBUSY;
+ 	}
+-	/* get the first ib on the scheduled list */
+-	nib = list_entry(rdev->ib_pool.scheduled_ibs.next,
+-			 struct radeon_ib, list);
+-	if (nib->fence == NULL) {
+-		/* we go do nothings here */
++	rdev->ib_pool.head_id = (nib->idx + 1) & (RADEON_IB_POOL_SIZE - 1);
++	nib->free = false;
++	if (nib->fence) {
+ 		mutex_unlock(&rdev->ib_pool.mutex);
+-		DRM_ERROR("IB %lu scheduled without a fence.\n", nib->idx);
+-		r = -EINVAL;
+-		goto out;
+-	}
+-	mutex_unlock(&rdev->ib_pool.mutex);
+-
+-	r = radeon_fence_wait(nib->fence, false);
+-	if (r) {
+-		DRM_ERROR("radeon: IB(%lu:0x%016lX:%u)\n", nib->idx,
+-			  (unsigned long)nib->gpu_addr, nib->length_dw);
+-		DRM_ERROR("radeon: GPU lockup detected, fail to get a IB\n");
+-		goto out;
++		r = radeon_fence_wait(nib->fence, false);
++		if (r) {
++			dev_err(rdev->dev, "error waiting fence of IB(%u:0x%016lX:%u)\n",
++				nib->idx, (unsigned long)nib->gpu_addr, nib->length_dw);
++			mutex_lock(&rdev->ib_pool.mutex);
++			nib->free = true;
++			mutex_unlock(&rdev->ib_pool.mutex);
++			radeon_fence_unref(&fence);
++			return r;
++		}
++		mutex_lock(&rdev->ib_pool.mutex);
+ 	}
+ 	radeon_fence_unref(&nib->fence);
+-
++	nib->fence = fence;
+ 	nib->length_dw = 0;
+-
+-	/* scheduled list is accessed here */
+-	mutex_lock(&rdev->ib_pool.mutex);
+-	list_del(&nib->list);
+-	INIT_LIST_HEAD(&nib->list);
+ 	mutex_unlock(&rdev->ib_pool.mutex);
+-
+ 	*ib = nib;
+-out:
+-	if (r) {
+-		radeon_fence_unref(&fence);
+-	} else {
+-		(*ib)->fence = fence;
+-	}
+-	return r;
++	return 0;
+ }
+ 
+ void radeon_ib_free(struct radeon_device *rdev, struct radeon_ib **ib)
+@@ -114,18 +101,7 @@ void radeon_ib_free(struct radeon_device *rdev, struct radeon_ib **ib)
+ 		return;
+ 	}
+ 	mutex_lock(&rdev->ib_pool.mutex);
+-	if (!list_empty(&tmp->list) && !radeon_fence_signaled(tmp->fence)) {
+-		/* IB is scheduled & not signaled don't do anythings */
+-		mutex_unlock(&rdev->ib_pool.mutex);
+-		return;
+-	}
+-	list_del(&tmp->list);
+-	INIT_LIST_HEAD(&tmp->list);
+-	if (tmp->fence)
+-		radeon_fence_unref(&tmp->fence);
+-
+-	tmp->length_dw = 0;
+-	clear_bit(tmp->idx, rdev->ib_pool.alloc_bm);
++	tmp->free = true;
+ 	mutex_unlock(&rdev->ib_pool.mutex);
+ }
+ 
+@@ -135,7 +111,7 @@ int radeon_ib_schedule(struct radeon_device *rdev, struct radeon_ib *ib)
+ 
+ 	if (!ib->length_dw || !rdev->cp.ready) {
+ 		/* TODO: Nothings in the ib we should report. */
+-		DRM_ERROR("radeon: couldn't schedule IB(%lu).\n", ib->idx);
++		DRM_ERROR("radeon: couldn't schedule IB(%u).\n", ib->idx);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -148,7 +124,8 @@ int radeon_ib_schedule(struct radeon_device *rdev, struct radeon_ib *ib)
+ 	radeon_ring_ib_execute(rdev, ib);
+ 	radeon_fence_emit(rdev, ib->fence);
+ 	mutex_lock(&rdev->ib_pool.mutex);
+-	list_add_tail(&ib->list, &rdev->ib_pool.scheduled_ibs);
++	/* once scheduled IB is considered free and protected by the fence */
++	ib->free = true;
+ 	mutex_unlock(&rdev->ib_pool.mutex);
+ 	radeon_ring_unlock_commit(rdev);
+ 	return 0;
+@@ -164,7 +141,6 @@ int radeon_ib_pool_init(struct radeon_device *rdev)
+ 	if (rdev->ib_pool.robj)
+ 		return 0;
+ 	/* Allocate 1M object buffer */
+-	INIT_LIST_HEAD(&rdev->ib_pool.scheduled_ibs);
+ 	r = radeon_bo_create(rdev, NULL,  RADEON_IB_POOL_SIZE*64*1024,
+ 				true, RADEON_GEM_DOMAIN_GTT,
+ 				&rdev->ib_pool.robj);
+@@ -195,9 +171,9 @@ int radeon_ib_pool_init(struct radeon_device *rdev)
+ 		rdev->ib_pool.ibs[i].ptr = ptr + offset;
+ 		rdev->ib_pool.ibs[i].idx = i;
+ 		rdev->ib_pool.ibs[i].length_dw = 0;
+-		INIT_LIST_HEAD(&rdev->ib_pool.ibs[i].list);
++		rdev->ib_pool.ibs[i].free = true;
+ 	}
+-	bitmap_zero(rdev->ib_pool.alloc_bm, RADEON_IB_POOL_SIZE);
++	rdev->ib_pool.head_id = 0;
+ 	rdev->ib_pool.ready = true;
+ 	DRM_INFO("radeon: ib pool ready.\n");
+ 	if (radeon_debugfs_ib_init(rdev)) {
+@@ -214,7 +190,6 @@ void radeon_ib_pool_fini(struct radeon_device *rdev)
+ 		return;
+ 	}
+ 	mutex_lock(&rdev->ib_pool.mutex);
+-	bitmap_zero(rdev->ib_pool.alloc_bm, RADEON_IB_POOL_SIZE);
+ 	if (rdev->ib_pool.robj) {
+ 		r = radeon_bo_reserve(rdev->ib_pool.robj, false);
+ 		if (likely(r == 0)) {
+@@ -363,7 +338,7 @@ static int radeon_debugfs_ib_info(struct seq_file *m, void *data)
+ 	if (ib == NULL) {
+ 		return 0;
+ 	}
+-	seq_printf(m, "IB %04lu\n", ib->idx);
++	seq_printf(m, "IB %04u\n", ib->idx);
+ 	seq_printf(m, "IB fence %p\n", ib->fence);
+ 	seq_printf(m, "IB size %05u dwords\n", ib->length_dw);
+ 	for (i = 0; i < ib->length_dw; i++) {
+-- 
+1.7.6
+
