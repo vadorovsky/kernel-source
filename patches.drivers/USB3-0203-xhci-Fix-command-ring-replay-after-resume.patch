@@ -1,0 +1,157 @@
+From 898213200cbadc570ef4248a6d90430c4a9c2908 Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Fri, 12 Nov 2010 11:59:31 -0800
+Subject: xhci: Fix command ring replay after resume.
+Patch-mainline: v2.6.37
+Git-commit: 898213200cbadc570ef4248a6d90430c4a9c2908
+
+Andiry's xHCI bus suspend patch introduced the possibly of a host
+controller replaying old commands on the command ring, if the host
+successfully restores the registers after a resume.
+
+After a resume from suspend, the xHCI driver must restore the registers,
+including the command ring pointer.  I had suggested that Andiry set the
+command ring pointer to the current command ring dequeue pointer, so that
+the driver wouldn't have to zero the command ring.
+
+Unfortunately, setting the command ring pointer to the current dequeue
+pointer won't work because the register assumes the pointer is 64-byte
+aligned, and TRBs on the command ring are 16-byte aligned.  The lower
+seven bits will always be masked off, leading to the written pointer being
+up to 3 TRBs behind the intended pointer.
+
+Here's a log excerpt.  On init, the xHCI driver places a vendor-specific
+command on the command ring:
+
+[  215.750958] xhci_hcd 0000:01:00.0: Vendor specific event TRB type = 48
+[  215.750960] xhci_hcd 0000:01:00.0: NEC firmware version 30.25
+[  215.750962] xhci_hcd 0000:01:00.0: Command ring deq = 0x3781e010 (DMA)
+
+When we resume, the command ring dequeue pointer to be written should have
+been 0x3781e010.  Instead, it's 0x3781e000:
+
+[  235.557846] xhci_hcd 0000:01:00.0: // Setting command ring address to 0x3781e001
+[  235.557848] xhci_hcd 0000:01:00.0: `MEM_WRITE_DWORD(3'b000, 64'hffffc900100bc038, 64'h3781e001, 4'hf);
+[  235.557850] xhci_hcd 0000:01:00.0: `MEM_WRITE_DWORD(3'b000, 32'hffffc900100bc020, 32'h204, 4'hf);
+[  235.557866] usb usb9: root hub lost power or was reset
+
+(I can't see the results of this bug because the xHCI restore always fails
+on this box, and the xHCI driver re-allocates everything.)
+
+The fix is to zero the command ring and put the software and hardware
+enqueue and dequeue pointer back to the beginning of the ring.  We do this
+before the system suspends, to be paranoid and prevent the BIOS from
+starting the host without clearing the command ring pointer, which might
+cause the host to muck with stale memory.  (The pointer isn't required to
+be in the suspend power well, but it could be.)  The command ring pointer
+is set again after the host resumes.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Tested-by: Andiry Xu <andiry.xu@amd.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/xhci.c |   71 +++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 61 insertions(+), 10 deletions(-)
+
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -576,6 +576,65 @@ static void xhci_restore_registers(struc
+ 	xhci_write_64(xhci, xhci->s3.erst_base, &xhci->ir_set->erst_base);
+ }
+ 
++static void xhci_set_cmd_ring_deq(struct xhci_hcd *xhci)
++{
++	u64	val_64;
++
++	/* step 2: initialize command ring buffer */
++	val_64 = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
++	val_64 = (val_64 & (u64) CMD_RING_RSVD_BITS) |
++		(xhci_trb_virt_to_dma(xhci->cmd_ring->deq_seg,
++				      xhci->cmd_ring->dequeue) &
++		 (u64) ~CMD_RING_RSVD_BITS) |
++		xhci->cmd_ring->cycle_state;
++	xhci_dbg(xhci, "// Setting command ring address to 0x%llx\n",
++			(long unsigned long) val_64);
++	xhci_write_64(xhci, val_64, &xhci->op_regs->cmd_ring);
++}
++
++/*
++ * The whole command ring must be cleared to zero when we suspend the host.
++ *
++ * The host doesn't save the command ring pointer in the suspend well, so we
++ * need to re-program it on resume.  Unfortunately, the pointer must be 64-byte
++ * aligned, because of the reserved bits in the command ring dequeue pointer
++ * register.  Therefore, we can't just set the dequeue pointer back in the
++ * middle of the ring (TRBs are 16-byte aligned).
++ */
++static void xhci_clear_command_ring(struct xhci_hcd *xhci)
++{
++	struct xhci_ring *ring;
++	struct xhci_segment *seg;
++
++	ring = xhci->cmd_ring;
++	seg = ring->deq_seg;
++	do {
++		memset(seg->trbs, 0, SEGMENT_SIZE);
++		seg = seg->next;
++	} while (seg != ring->deq_seg);
++
++	/* Reset the software enqueue and dequeue pointers */
++	ring->deq_seg = ring->first_seg;
++	ring->dequeue = ring->first_seg->trbs;
++	ring->enq_seg = ring->deq_seg;
++	ring->enqueue = ring->dequeue;
++
++	/*
++	 * Ring is now zeroed, so the HW should look for change of ownership
++	 * when the cycle bit is set to 1.
++	 */
++	ring->cycle_state = 1;
++
++	/*
++	 * Reset the hardware dequeue pointer.
++	 * Yes, this will need to be re-written after resume, but we're paranoid
++	 * and want to make sure the hardware doesn't access bogus memory
++	 * because, say, the BIOS or an SMI started the host without changing
++	 * the command ring pointers.
++	 */
++	xhci_set_cmd_ring_deq(xhci);
++}
++
+ /*
+  * Stop HC (not bus-specific)
+  *
+@@ -603,6 +662,7 @@ int xhci_suspend(struct xhci_hcd *xhci)
+ 		spin_unlock_irq(&xhci->lock);
+ 		return -ETIMEDOUT;
+ 	}
++	xhci_clear_command_ring(xhci);
+ 
+ 	/* step 3: save registers */
+ 	xhci_save_registers(xhci);
+@@ -634,7 +694,6 @@ int xhci_resume(struct xhci_hcd *xhci, b
+ 	u32			command, temp = 0;
+ 	struct usb_hcd		*hcd = xhci_to_hcd(xhci);
+ 	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
+-	u64	val_64;
+ 	int	old_state, retval;
+ 
+ 	old_state = hcd->state;
+@@ -647,15 +706,7 @@ int xhci_resume(struct xhci_hcd *xhci, b
+ 		/* step 1: restore register */
+ 		xhci_restore_registers(xhci);
+ 		/* step 2: initialize command ring buffer */
+-		val_64 = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
+-		val_64 = (val_64 & (u64) CMD_RING_RSVD_BITS) |
+-			 (xhci_trb_virt_to_dma(xhci->cmd_ring->deq_seg,
+-					       xhci->cmd_ring->dequeue) &
+-			 (u64) ~CMD_RING_RSVD_BITS) |
+-			 xhci->cmd_ring->cycle_state;
+-		xhci_dbg(xhci, "// Setting command ring address to 0x%llx\n",
+-				(long unsigned long) val_64);
+-		xhci_write_64(xhci, val_64, &xhci->op_regs->cmd_ring);
++		xhci_set_cmd_ring_deq(xhci);
+ 		/* step 3: restore state and start state*/
+ 		/* step 3: set CRS flag */
+ 		command = xhci_readl(xhci, &xhci->op_regs->command);
