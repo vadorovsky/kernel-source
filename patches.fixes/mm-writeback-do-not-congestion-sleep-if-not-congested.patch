@@ -1,0 +1,325 @@
+From: Mel Gorman <mgorman@suse.de>
+Date: Mon, 8 Aug 2011 14:39:35 +0100
+Subject: [PATCH] writeback: do not sleep on the congestion queue if there are no congested BDIs or if significant congestion is not being encountered in the current zone
+References: IO slowdown (bnc#694011, fate#312305)
+Git-commit: 0e093d99763eb4cea09f8ca4f1d01f34e121d10b
+Patch-mainline: v2.6.37-rc1
+
+If congestion_wait() is called with no BDI congested, the caller will
+sleep for the full timeout and this may be an unnecessary sleep.
+This patch adds a wait_iff_congested() that checks congestion and
+only sleeps if a BDI is congested else, it calls cond_resched() to
+ensure the caller is not hogging the CPU longer than its quota but
+otherwise will not sleep.
+
+This is aimed at reducing some of the major desktop stalls reported
+during IO.  For example, while kswapd is operating, it calls
+congestion_wait() but it could just have been reclaiming clean page
+cache pages with no congestion.  Without this patch, it would sleep
+for a full timeout but after this patch, it'll just call schedule()
+if it has been on the CPU too long.  Similar logic applies to direct
+reclaimers that are not making enough progress.
+
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Minchan Kim <minchan.kim@gmail.com>
+Cc: Wu Fengguang <fengguang.wu@intel.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/backing-dev.h |    2 +-
+ include/linux/mmzone.h      |    8 ++++++
+ mm/backing-dev.c            |   58 +++++++++++++++++++++++++++++++++++++++++-
+ mm/page_alloc.c             |    4 +-
+ mm/vmscan.c                 |   46 +++++++++++++++++++++++++++------
+ 5 files changed, 104 insertions(+), 14 deletions(-)
+
+diff --git a/include/linux/backing-dev.h b/include/linux/backing-dev.h
+index 2110fe7..59cdf77 100644
+--- a/include/linux/backing-dev.h
++++ b/include/linux/backing-dev.h
+@@ -284,7 +284,7 @@ enum {
+ void clear_bdi_congested(struct backing_dev_info *bdi, int sync);
+ void set_bdi_congested(struct backing_dev_info *bdi, int sync);
+ long congestion_wait(int sync, long timeout);
+-
++long wait_iff_congested(struct zone *zone, int sync, long timeout);
+ 
+ static inline bool bdi_cap_writeback_dirty(struct backing_dev_info *bdi)
+ {
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 34fb227..dc75c46 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -431,6 +431,9 @@ struct zone {
+ typedef enum {
+ 	ZONE_RECLAIM_LOCKED,		/* prevents concurrent reclaim */
+ 	ZONE_OOM_LOCKED,		/* zone is in OOM killer zonelist */
++	ZONE_CONGESTED,			/* zone has many dirty pages backed by
++					 * a congested BDI
++					 */
+ } zone_flags_t;
+ 
+ static inline void zone_set_flag(struct zone *zone, zone_flags_t flag)
+@@ -448,6 +451,11 @@ static inline void zone_clear_flag(struct zone *zone, zone_flags_t flag)
+ 	clear_bit(flag, &zone->flags);
+ }
+ 
++static inline int zone_is_reclaim_congested(const struct zone *zone)
++{
++	return test_bit(ZONE_CONGESTED, &zone->flags);
++}
++
+ static inline int zone_is_reclaim_locked(const struct zone *zone)
+ {
+ 	return test_bit(ZONE_RECLAIM_LOCKED, &zone->flags);
+diff --git a/mm/backing-dev.c b/mm/backing-dev.c
+index 87a5ef2..2b3f397 100644
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -719,6 +719,7 @@ static wait_queue_head_t congestion_wqh[2] = {
+ 		__WAIT_QUEUE_HEAD_INITIALIZER(congestion_wqh[0]),
+ 		__WAIT_QUEUE_HEAD_INITIALIZER(congestion_wqh[1])
+ 	};
++static atomic_t nr_bdi_congested[2];
+ 
+ void clear_bdi_congested(struct backing_dev_info *bdi, int sync)
+ {
+@@ -726,7 +727,8 @@ void clear_bdi_congested(struct backing_dev_info *bdi, int sync)
+ 	wait_queue_head_t *wqh = &congestion_wqh[sync];
+ 
+ 	bit = sync ? BDI_sync_congested : BDI_async_congested;
+-	clear_bit(bit, &bdi->state);
++	if (test_and_clear_bit(bit, &bdi->state))
++		atomic_dec(&nr_bdi_congested[sync]);
+ 	smp_mb__after_clear_bit();
+ 	if (waitqueue_active(wqh))
+ 		wake_up(wqh);
+@@ -738,7 +740,8 @@ void set_bdi_congested(struct backing_dev_info *bdi, int sync)
+ 	enum bdi_state bit;
+ 
+ 	bit = sync ? BDI_sync_congested : BDI_async_congested;
+-	set_bit(bit, &bdi->state);
++	if (!test_and_set_bit(bit, &bdi->state))
++		atomic_inc(&nr_bdi_congested[sync]);
+ }
+ EXPORT_SYMBOL(set_bdi_congested);
+ 
+@@ -764,3 +767,54 @@ long congestion_wait(int sync, long timeout)
+ }
+ EXPORT_SYMBOL(congestion_wait);
+ 
++/**
++ * wait_iff_congested - Conditionally wait for a backing_dev to become uncongested or a zone to complete writes
++ * @zone: A zone to check if it is heavily congested
++ * @sync: SYNC or ASYNC IO
++ * @timeout: timeout in jiffies
++ *
++ * In the event of a congested backing_dev (any backing_dev) and the given
++ * @zone has experienced recent congestion, this waits for up to @timeout
++ * jiffies for either a BDI to exit congestion of the given @sync queue
++ * or a write to complete.
++ *
++ * In the absense of zone congestion, cond_resched() is called to yield
++ * the processor if necessary but otherwise does not sleep.
++ *
++ * The return value is 0 if the sleep is for the full timeout. Otherwise,
++ * it is the number of jiffies that were still remaining when the function
++ * returned. return_value == timeout implies the function did not sleep.
++ */
++long wait_iff_congested(struct zone *zone, int sync, long timeout)
++{
++	long ret;
++	unsigned long start = jiffies;
++	DEFINE_WAIT(wait);
++	wait_queue_head_t *wqh = &congestion_wqh[sync];
++
++	/*
++	 * If there is no congestion, or heavy congestion is not being
++	 * encountered in the current zone, yield if necessary instead
++	 * of sleeping on the congestion queue
++	 */
++	if (atomic_read(&nr_bdi_congested[sync]) == 0 ||
++			!zone_is_reclaim_congested(zone)) {
++		cond_resched();
++
++		/* In case we scheduled, work out time remaining */
++		ret = timeout - (jiffies - start);
++		if (ret < 0)
++			ret = 0;
++
++		goto out;
++	}
++
++	/* Sleep until uncongested or a write happens */
++	prepare_to_wait(wqh, &wait, TASK_UNINTERRUPTIBLE);
++	ret = io_schedule_timeout(timeout);
++	finish_wait(wqh, &wait);
++
++out:
++	return ret;
++}
++EXPORT_SYMBOL(wait_iff_congested);
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 1690e1d..e7eeb20 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1862,7 +1862,7 @@ __alloc_pages_high_priority(gfp_t gfp_mask, unsigned int order,
+ 			preferred_zone, migratetype);
+ 
+ 		if (!page && gfp_mask & __GFP_NOFAIL)
+-			congestion_wait(BLK_RW_ASYNC, HZ/50);
++			wait_iff_congested(preferred_zone, BLK_RW_ASYNC, HZ/50);
+ 	} while (!page && (gfp_mask & __GFP_NOFAIL));
+ 
+ 	return page;
+@@ -2063,7 +2063,7 @@ rebalance:
+ 	pages_reclaimed += did_some_progress;
+ 	if (should_alloc_retry(gfp_mask, order, pages_reclaimed)) {
+ 		/* Wait for some write requests to complete then retry */
+-		congestion_wait(BLK_RW_ASYNC, HZ/50);
++		wait_iff_congested(preferred_zone, BLK_RW_ASYNC, HZ/50);
+ 		goto rebalance;
+ 	} else {
+ 		/*
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index bd7e674..e58b534 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -420,10 +420,8 @@ static pageout_t pageout(struct page *page, struct address_space *mapping,
+ 	}
+ 	if (mapping->a_ops->writepage == NULL)
+ 		return PAGE_ACTIVATE;
+-	if (!may_write_to_queue(mapping->backing_dev_info, sc)) {
+-		reset_reclaim_mode(sc);
++	if (!may_write_to_queue(mapping->backing_dev_info, sc))
+ 		return PAGE_KEEP;
+-	}
+ 
+ 	if (clear_page_dirty_for_io(page)) {
+ 		int res;
+@@ -701,11 +699,14 @@ static noinline_for_stack void free_page_list(struct list_head *free_pages)
+  * shrink_page_list() returns the number of reclaimed pages
+  */
+ static unsigned long shrink_page_list(struct list_head *page_list,
++				      struct zone *zone,
+ 				      struct scan_control *sc)
+ {
+ 	LIST_HEAD(ret_pages);
+ 	LIST_HEAD(free_pages);
+ 	int pgactivate = 0;
++	unsigned long nr_dirty = 0;
++	unsigned long nr_congested = 0;
+ 	unsigned long nr_reclaimed = 0;
+ 
+ 	cond_resched();
+@@ -725,6 +726,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 			goto keep;
+ 
+ 		VM_BUG_ON(PageActive(page));
++		VM_BUG_ON(page_zone(page) != zone);
+ 
+ 		sc->nr_scanned++;
+ 
+@@ -802,6 +804,8 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 		}
+ 
+ 		if (PageDirty(page)) {
++			nr_dirty++;
++
+ 			if (references == PAGEREF_RECLAIM_CLEAN)
+ 				goto keep_locked;
+ 			if (!may_enter_fs)
+@@ -812,6 +816,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 			/* Page is dirty, try to write it out here */
+ 			switch (pageout(page, mapping, sc)) {
+ 			case PAGE_KEEP:
++				nr_congested++;
+ 				goto keep_locked;
+ 			case PAGE_ACTIVATE:
+ 				goto activate_locked;
+@@ -922,6 +927,15 @@ keep_lumpy:
+ 		VM_BUG_ON(PageLRU(page) || PageUnevictable(page));
+ 	}
+ 
++	/*
++	 * Tag a zone as congested if all the dirty pages encountered were
++	 * backed by a congested BDI. In this case, reclaimers should just
++	 * back off and wait for congestion to clear because further reclaim
++	 * will encounter the same problem
++	 */
++	if (nr_dirty == nr_congested)
++		zone_set_flag(zone, ZONE_CONGESTED);
++
+ 	free_page_list(&free_pages);
+ 
+ 	list_splice(&ret_pages, page_list);
+@@ -1404,12 +1418,10 @@ shrink_inactive_list(unsigned long nr_to_scan, struct zone *zone,
+ 
+ 	spin_unlock_irq(&zone->lru_lock);
+ 
+-	nr_reclaimed = shrink_page_list(&page_list, sc);
++	nr_reclaimed = shrink_page_list(&page_list, zone, sc);
+ 
+ 	/* Check if we should syncronously wait for writeback */
+ 	if (should_reclaim_stall(nr_taken, nr_reclaimed, priority, sc)) {
+-		congestion_wait(BLK_RW_ASYNC, HZ/10);
+-
+ 		/*
+ 		 * The attempt at page out may have made some
+ 		 * of the pages active, mark them inactive again.
+@@ -1418,7 +1430,7 @@ shrink_inactive_list(unsigned long nr_to_scan, struct zone *zone,
+ 		count_vm_events(PGDEACTIVATE, nr_active);
+ 
+ 		set_reclaim_mode(priority, sc, true);
+-		nr_reclaimed += shrink_page_list(&page_list, sc);
++		nr_reclaimed += shrink_page_list(&page_list, zone, sc);
+ 	}
+ 
+ 	local_irq_disable();
+@@ -2038,8 +2050,13 @@ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
+ 		}
+ 
+ 		/* Take a nap, wait for some writeback to complete */
+-		if (sc->nr_scanned && priority < DEF_PRIORITY - 2)
+-			congestion_wait(BLK_RW_ASYNC, HZ/10);
++		if (sc->nr_scanned && priority < DEF_PRIORITY - 2) {
++			struct zone *preferred_zone;
++
++			first_zones_zonelist(zonelist, gfp_zone(sc->gfp_mask),
++						NULL, &preferred_zone);
++			wait_iff_congested(preferred_zone, BLK_RW_ASYNC, HZ/10);
++		}
+ 	}
+ 
+ out:
+@@ -2247,6 +2264,8 @@ loop_again:
+ 				end_zone = i;
+ 				break;
+ 			}
++
++			zone_clear_flag(zone, ZONE_CONGESTED);
+ 		}
+ 		if (i < 0)
+ 			goto out;
+@@ -2333,6 +2352,15 @@ loop_again:
+ 					       	high_wmark_pages(zone), end_zone, 0)) {
+ 				all_zones_ok = 0;	
+ 			} else {
++				/*
++				 * If a zone reaches its high watermark,
++				 * consider it to be no longer congested. It's
++				 * possible there are dirty pages backed by
++				 * congested BDIs but as pressure is relieved,
++				 * spectulatively avoid congestion waits
++				 */
++				zone_clear_flag(zone, ZONE_CONGESTED);
++
+ 				if (i <= classzone_idx)
+ 					any_zone_ok = 1;
+ 			}
