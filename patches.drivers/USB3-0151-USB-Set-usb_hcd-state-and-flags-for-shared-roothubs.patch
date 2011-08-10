@@ -1,0 +1,139 @@
+From ff9d78b36f76687c91c67b9f4c5c33bc888ed2f9 Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Thu, 2 Dec 2010 19:10:02 -0800
+Subject: USB: Set usb_hcd->state and flags for shared roothubs.
+Patch-mainline: v2.6.39
+Git-commit: ff9d78b36f76687c91c67b9f4c5c33bc888ed2f9
+
+The hcd->flags are in a sorry state.  Some of them are clearly specific to
+the particular roothub (HCD_POLL_RH, HCD_POLL_PENDING, and
+HCD_WAKEUP_PENDING), but some flags are related to PCI device state
+(HCD_HW_ACCESSIBLE and HCD_SAW_IRQ).  This is an issue when one PCI device
+can have two roothubs that share the same IRQ line and hardware.
+
+Make sure to set HCD_FLAG_SAW_IRQ for both roothubs when an interrupt is
+serviced, or an URB is unlinked without an interrupt.  (We can't tell if
+the host actually serviced an interrupt for a particular bus, but we can
+tell it serviced some interrupt.)
+
+HCD_HW_ACCESSIBLE is set once by usb_add_hcd(), which is set for both
+roothubs as they are added, so it doesn't need to be modified.
+HCD_POLL_RH and HCD_POLL_PENDING are only checked by the USB core, and
+they are never set by the xHCI driver, since the roothub never needs to be
+polled.
+
+The usb_hcd's state field is a similar mess.  Sometimes the state applies
+to the underlying hardware: HC_STATE_HALT, HC_STATE_RUNNING, and
+HC_STATE_QUIESCING.  But sometimes the state refers to the roothub state:
+HC_STATE_RESUMING and HC_STATE_SUSPENDED.
+
+Alan Stern recently made the USB core not rely on the hcd->state variable.
+Internally, the xHCI driver still checks for HC_STATE_SUSPENDED, so leave
+that code in.  Remove all references to HC_STATE_HALT, since the xHCI
+driver only sets and doesn't test those variables.  We still have to set
+HC_STATE_RUNNING, since Alan's patch has a bug that means the roothub
+won't get registered if we don't set that.
+
+Alan's patch made the USB core check a different variable when trying to
+determine whether to suspend a roothub.  The xHCI host has a split
+roothub, where two buses are registered for one PCI device.  Each bus in
+the xHCI split roothub can be suspended separately, but both buses must be
+suspended before the PCI device can be suspended.  Therefore, make sure
+that the USB core checks HCD_RH_RUNNING() for both roothubs before
+suspending the PCI host.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/hcd-pci.c   |   20 +++++++++++++++++---
+ drivers/usb/core/hcd.c       |    4 ++++
+ drivers/usb/host/xhci-ring.c |    2 ++
+ 3 files changed, 23 insertions(+), 3 deletions(-)
+
+--- a/drivers/usb/core/hcd-pci.c
++++ b/drivers/usb/core/hcd-pci.c
+@@ -244,6 +244,13 @@ static int check_root_hub_suspended(stru
+ 		dev_warn(dev, "Root hub is not suspended\n");
+ 		return -EBUSY;
+ 	}
++	if (hcd->shared_hcd) {
++		hcd = hcd->shared_hcd;
++		if (HCD_RH_RUNNING(hcd)) {
++			dev_warn(dev, "Secondary root hub is not suspended\n");
++			return -EBUSY;
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -301,8 +308,9 @@ static int hcd_pci_suspend_noirq(struct
+ 
+ 	pci_save_state(pci_dev);
+ 
+-	/* If the root hub is dead rather than suspended,
+-	 * disallow remote wakeup.
++	/* If the root hub is dead rather than suspended, disallow remote
++	 * wakeup.  usb_hc_died() should ensure that both hosts are marked as
++	 * dying, so we only need to check the primary roothub.
+ 	 */
+ 	if (HCD_DEAD(hcd))
+ 		device_set_wakeup_enable(dev, 0);
+@@ -344,7 +352,9 @@ static int resume_common(struct device *
+ 	struct usb_hcd		*hcd = pci_get_drvdata(pci_dev);
+ 	int			retval;
+ 
+-	if (HCD_RH_RUNNING(hcd)) {
++	if (HCD_RH_RUNNING(hcd) ||
++			(hcd->shared_hcd &&
++			 HCD_RH_RUNNING(hcd->shared_hcd))) {
+ 		dev_dbg(dev, "can't resume, not suspended!\n");
+ 		return 0;
+ 	}
+@@ -358,11 +368,15 @@ static int resume_common(struct device *
+ 	pci_set_master(pci_dev);
+ 
+ 	clear_bit(HCD_FLAG_SAW_IRQ, &hcd->flags);
++	if (hcd->shared_hcd)
++		clear_bit(HCD_FLAG_SAW_IRQ, &hcd->shared_hcd->flags);
+ 
+ 	if (hcd->driver->pci_resume && !HCD_DEAD(hcd)) {
+ 		retval = hcd->driver->pci_resume(hcd, hibernated);
+ 		if (retval) {
+ 			dev_err(dev, "PCI post-resume error %d!\n", retval);
++			if (hcd->shared_hcd)
++				usb_hc_died(hcd->shared_hcd);
+ 			usb_hc_died(hcd);
+ 		}
+ 	}
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1153,6 +1153,8 @@ int usb_hcd_check_unlink_urb(struct usb_
+ 		dev_warn(hcd->self.controller, "Unlink after no-IRQ?  "
+ 			"Controller is probably using the wrong IRQ.\n");
+ 		set_bit(HCD_FLAG_SAW_IRQ, &hcd->flags);
++		if (hcd->shared_hcd)
++			set_bit(HCD_FLAG_SAW_IRQ, &hcd->shared_hcd->flags);
+ 	}
+ 
+ 	return 0;
+@@ -2115,6 +2117,8 @@ irqreturn_t usb_hcd_irq (int irq, void *
+ 		rc = IRQ_NONE;
+ 	} else {
+ 		set_bit(HCD_FLAG_SAW_IRQ, &hcd->flags);
++		if (hcd->shared_hcd)
++			set_bit(HCD_FLAG_SAW_IRQ, &hcd->shared_hcd->flags);
+ 
+ 		if (unlikely(hcd->state == HC_STATE_HALT))
+ 			usb_hc_died(hcd);
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -2195,6 +2195,8 @@ irqreturn_t xhci_msi_irq(int irq, struct
+ 	irqreturn_t ret;
+ 
+ 	set_bit(HCD_FLAG_SAW_IRQ, &hcd->flags);
++	if (hcd->shared_hcd)
++		set_bit(HCD_FLAG_SAW_IRQ, &hcd->shared_hcd->flags);
+ 
+ 	ret = xhci_irq(hcd);
+ 
