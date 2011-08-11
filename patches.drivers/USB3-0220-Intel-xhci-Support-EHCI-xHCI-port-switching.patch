@@ -1,0 +1,245 @@
+From 69e848c2090aebba5698a1620604c7dccb448684 Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Tue, 22 Feb 2011 09:57:15 -0800
+Subject: Intel xhci: Support EHCI/xHCI port switching.
+Patch-mainline: v3.0
+Git-commit: 69e848c2090aebba5698a1620604c7dccb448684
+
+The Intel Panther Point chipsets contain an EHCI and xHCI host controller
+that shares some number of skew-dependent ports.  These ports can be
+switched from the EHCI to the xHCI host (and vice versa) by a hardware MUX
+that is controlled by registers in the xHCI PCI configuration space.  The
+USB 3.0 SuperSpeed terminations on the xHCI ports can be controlled
+separately from the USB 2.0 data wires.
+
+This switchover mechanism is there to support users who do a custom
+install of certain non-Linux operating systems that don't have official
+USB 3.0 support.  By default, the ports are under EHCI, SuperSpeed
+terminations are off, and USB 3.0 devices will show up under the EHCI
+controller at reduced speeds.  (This was more palatable for the marketing
+folks than having completely dead USB 3.0 ports if no xHCI drivers are
+available.)  Users should be able to turn on xHCI by default through a
+BIOS option, but users are happiest when they don't have to change random
+BIOS settings.
+
+This patch introduces a driver method to switchover the ports from EHCI to
+xHCI before the EHCI driver finishes PCI enumeration.  We want to switch
+the ports over before the USB core has the chance to enumerate devices
+under EHCI, or boot from USB mass storage will fail if the boot device
+connects under EHCI first, and then gets disconnected when the port
+switches over to xHCI.
+
+Add code to the xHCI PCI quirk to switch the ports from EHCI to xHCI.  The
+PCI quirks code will run before any other PCI probe function is called, so
+this avoids the issue with boot devices.
+
+Another issue is with BIOS behavior during system resume from hibernate.
+If the BIOS doesn't support xHCI, it may switch the devices under EHCI to
+allow use of the USB keyboard, mice, and mass storage devices.  It's
+supposed to remember the value of the port routing registers and switch
+them back when the OS attempts to take control of the xHCI host controller,
+but we all know not to trust BIOS writers.
+
+Make both the xHCI driver and the EHCI driver attempt to switchover the
+ports in their PCI resume functions.  We can't guarantee which PCI device
+will be resumed first, so this avoids any race conditions.  Writing a '1'
+to an already set port switchover bit or a '0' to a cleared port switchover
+bit should have no effect.
+
+The xHCI PCI configuration registers will be documented in the EDS-level
+chipset spec, which is not public yet.  I have permission from legal and
+the Intel chipset group to release this patch early to allow good Linux
+support at product launch.  I've tried to document the registers as much
+as possible, so please let me know if anything is unclear.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/host/ehci-pci.c   |   39 ++++++++++++++++++++++++++
+ drivers/usb/host/pci-quirks.c |   63 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/usb/host/pci-quirks.h |    2 +
+ drivers/usb/host/xhci-pci.c   |   20 +++++++++++++
+ 4 files changed, 124 insertions(+)
+
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -356,11 +356,50 @@ static int ehci_pci_suspend(struct usb_h
+ 	return rc;
+ }
+ 
++static bool usb_is_intel_switchable_ehci(struct pci_dev *pdev)
++{
++	return pdev->class == PCI_CLASS_SERIAL_USB_EHCI &&
++		pdev->vendor == PCI_VENDOR_ID_INTEL &&
++		pdev->device == 0x1E26;
++}
++
++static void ehci_enable_xhci_companion(void)
++{
++	struct pci_dev		*companion = NULL;
++
++	/* The xHCI and EHCI controllers are not on the same PCI slot */
++	for_each_pci_dev(companion) {
++		if (!usb_is_intel_switchable_xhci(companion))
++			continue;
++		usb_enable_xhci_ports(companion);
++		return;
++	}
++}
++
+ static int ehci_pci_resume(struct usb_hcd *hcd, bool hibernated)
+ {
+ 	struct ehci_hcd		*ehci = hcd_to_ehci(hcd);
+ 	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
+ 
++	/* The BIOS on systems with the Intel Panther Point chipset may or may
++	 * not support xHCI natively.  That means that during system resume, it
++	 * may switch the ports back to EHCI so that users can use their
++	 * keyboard to select a kernel from GRUB after resume from hibernate.
++	 *
++	 * The BIOS is supposed to remember whether the OS had xHCI ports
++	 * enabled before resume, and switch the ports back to xHCI when the
++	 * BIOS/OS semaphore is written, but we all know we can't trust BIOS
++	 * writers.
++	 *
++	 * Unconditionally switch the ports back to xHCI after a system resume.
++	 * We can't tell whether the EHCI or xHCI controller will be resumed
++	 * first, so we have to do the port switchover in both drivers.  Writing
++	 * a '1' to the port switchover registers should have no effect if the
++	 * port was already switched over.
++	 */
++	if (usb_is_intel_switchable_ehci(pdev))
++		ehci_enable_xhci_companion();
++
+ 	// maybe restore FLADJ
+ 
+ 	if (time_before(jiffies, ehci->next_statechange))
+--- a/drivers/usb/host/pci-quirks.c
++++ b/drivers/usb/host/pci-quirks.c
+@@ -71,6 +71,9 @@
+ #define	NB_PIF0_PWRDOWN_0	0x01100012
+ #define	NB_PIF0_PWRDOWN_1	0x01100013
+ 
++#define USB_INTEL_XUSB2PR      0xD0
++#define USB_INTEL_USB3_PSSEN   0xD8
++
+ static struct amd_chipset_info {
+ 	struct pci_dev	*nb_dev;
+ 	struct pci_dev	*smbus_dev;
+@@ -701,6 +704,64 @@ static int handshake(void __iomem *ptr,
+ 	return -ETIMEDOUT;
+ }
+ 
++bool usb_is_intel_switchable_xhci(struct pci_dev *pdev)
++{
++	return pdev->class == PCI_CLASS_SERIAL_USB_XHCI &&
++		pdev->vendor == PCI_VENDOR_ID_INTEL &&
++		pdev->device == PCI_DEVICE_ID_INTEL_PANTHERPOINT_XHCI;
++}
++EXPORT_SYMBOL_GPL(usb_is_intel_switchable_xhci);
++
++/*
++ * Intel's Panther Point chipset has two host controllers (EHCI and xHCI) that
++ * share some number of ports.  These ports can be switched between either
++ * controller.  Not all of the ports under the EHCI host controller may be
++ * switchable.
++ *
++ * The ports should be switched over to xHCI before PCI probes for any device
++ * start.  This avoids active devices under EHCI being disconnected during the
++ * port switchover, which could cause loss of data on USB storage devices, or
++ * failed boot when the root file system is on a USB mass storage device and is
++ * enumerated under EHCI first.
++ *
++ * We write into the xHC's PCI configuration space in some Intel-specific
++ * registers to switch the ports over.  The USB 3.0 terminations and the USB
++ * 2.0 data wires are switched separately.  We want to enable the SuperSpeed
++ * terminations before switching the USB 2.0 wires over, so that USB 3.0
++ * devices connect at SuperSpeed, rather than at USB 2.0 speeds.
++ */
++void usb_enable_xhci_ports(struct pci_dev *xhci_pdev)
++{
++	u32		ports_available;
++
++	ports_available = 0xffffffff;
++	/* Write USB3_PSSEN, the USB 3.0 Port SuperSpeed Enable
++	 * Register, to turn on SuperSpeed terminations for all
++	 * available ports.
++	 */
++	pci_write_config_dword(xhci_pdev, USB_INTEL_USB3_PSSEN,
++			cpu_to_le32(ports_available));
++
++	pci_read_config_dword(xhci_pdev, USB_INTEL_USB3_PSSEN,
++			&ports_available);
++	dev_dbg(&xhci_pdev->dev, "USB 3.0 ports that are now enabled "
++			"under xHCI: 0x%x\n", ports_available);
++
++	ports_available = 0xffffffff;
++	/* Write XUSB2PR, the xHC USB 2.0 Port Routing Register, to
++	 * switch the USB 2.0 power and data lines over to the xHCI
++	 * host.
++	 */
++	pci_write_config_dword(xhci_pdev, USB_INTEL_XUSB2PR,
++			cpu_to_le32(ports_available));
++
++	pci_read_config_dword(xhci_pdev, USB_INTEL_XUSB2PR,
++			&ports_available);
++	dev_dbg(&xhci_pdev->dev, "USB 2.0 ports that are now switched over "
++			"to xHCI: 0x%x\n", ports_available);
++}
++EXPORT_SYMBOL_GPL(usb_enable_xhci_ports);
++
+ /**
+  * PCI Quirks for xHCI.
+  *
+@@ -760,6 +821,8 @@ static void __devinit quirk_usb_handoff_
+ 	writel(XHCI_LEGACY_DISABLE_SMI,
+ 			base + ext_cap_offset + XHCI_LEGACY_CONTROL_OFFSET);
+ 
++	if (usb_is_intel_switchable_xhci(pdev))
++		usb_enable_xhci_ports(pdev);
+ hc_init:
+ 	op_reg_base = base + XHCI_HC_LENGTH(readl(base));
+ 
+--- a/drivers/usb/host/pci-quirks.h
++++ b/drivers/usb/host/pci-quirks.h
+@@ -8,6 +8,8 @@ int usb_amd_find_chipset_info(void);
+ void usb_amd_dev_put(void);
+ void usb_amd_quirk_pll_disable(void);
+ void usb_amd_quirk_pll_enable(void);
++bool usb_is_intel_switchable_xhci(struct pci_dev *pdev);
++void usb_enable_xhci_ports(struct pci_dev *xhci_pdev);
+ #else
+ static inline void usb_amd_quirk_pll_disable(void) {}
+ static inline void usb_amd_quirk_pll_enable(void) {}
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -242,8 +242,28 @@ static int xhci_pci_suspend(struct usb_h
+ static int xhci_pci_resume(struct usb_hcd *hcd, bool hibernated)
+ {
+ 	struct xhci_hcd		*xhci = hcd_to_xhci(hcd);
++	struct pci_dev		*pdev = to_pci_dev(hcd->self.controller);
+ 	int			retval = 0;
+ 
++	/* The BIOS on systems with the Intel Panther Point chipset may or may
++	 * not support xHCI natively.  That means that during system resume, it
++	 * may switch the ports back to EHCI so that users can use their
++	 * keyboard to select a kernel from GRUB after resume from hibernate.
++	 *
++	 * The BIOS is supposed to remember whether the OS had xHCI ports
++	 * enabled before resume, and switch the ports back to xHCI when the
++	 * BIOS/OS semaphore is written, but we all know we can't trust BIOS
++	 * writers.
++	 *
++	 * Unconditionally switch the ports back to xHCI after a system resume.
++	 * We can't tell whether the EHCI or xHCI controller will be resumed
++	 * first, so we have to do the port switchover in both drivers.  Writing
++	 * a '1' to the port switchover registers should have no effect if the
++	 * port was already switched over.
++	 */
++	if (usb_is_intel_switchable_xhci(pdev))
++		usb_enable_xhci_ports(pdev);
++
+ 	retval = xhci_resume(xhci, hibernated);
+ 	return retval;
+ }
