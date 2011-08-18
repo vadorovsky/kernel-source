@@ -1,0 +1,902 @@
+From: Chris Mason <chris.mason@oracle.com>
+Date: Tue, 19 Jul 2011 12:04:14 -0400
+Subject: [PATCH] Btrfs: stop using highmem for extent_buffers
+References: bnc#707031
+Patch-mainline: yes
+
+The extent_buffers have a very complex interface where
+we use HIGHMEM for metadata and try to cache a kmap mapping
+to access the memory.
+
+The next commit adds reader/writer locks, and concurrent use
+of this kmap cache would make it even more complex.
+
+This commit drops the ability to use HIGHMEM with extent buffers,
+and rips out all of the related code.
+
+Signed-off-by: Chris Mason <chris.mason@oracle.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/ctree.c        |  189 ------------------------------------------------
+ fs/btrfs/disk-io.c      |    7 -
+ fs/btrfs/extent_io.c    |   67 +++--------------
+ fs/btrfs/extent_io.h    |   11 --
+ fs/btrfs/file-item.c    |   32 --------
+ fs/btrfs/inode.c        |   24 ------
+ fs/btrfs/struct-funcs.c |  100 +++++++------------------
+ 7 files changed, 52 insertions(+), 378 deletions(-)
+
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@ -625,14 +625,6 @@ int btrfs_realloc_node(struct btrfs_tran
+ 	for (i = start_slot; i < end_slot; i++) {
+ 		int close = 1;
+ 
+-		if (!parent->map_token) {
+-			map_extent_buffer(parent,
+-					btrfs_node_key_ptr_offset(i),
+-					sizeof(struct btrfs_key_ptr),
+-					&parent->map_token, &parent->kaddr,
+-					&parent->map_start, &parent->map_len,
+-					KM_USER1);
+-		}
+ 		btrfs_node_key(parent, &disk_key, i);
+ 		if (!progress_passed && comp_keys(&disk_key, progress) < 0)
+ 			continue;
+@@ -655,11 +647,6 @@ int btrfs_realloc_node(struct btrfs_tran
+ 			last_block = blocknr;
+ 			continue;
+ 		}
+-		if (parent->map_token) {
+-			unmap_extent_buffer(parent, parent->map_token,
+-					    KM_USER1);
+-			parent->map_token = NULL;
+-		}
+ 
+ 		cur = btrfs_find_tree_block(root, blocknr, blocksize);
+ 		if (cur)
+@@ -700,11 +687,6 @@ int btrfs_realloc_node(struct btrfs_tran
+ 		btrfs_tree_unlock(cur);
+ 		free_extent_buffer(cur);
+ 	}
+-	if (parent->map_token) {
+-		unmap_extent_buffer(parent, parent->map_token,
+-				    KM_USER1);
+-		parent->map_token = NULL;
+-	}
+ 	return err;
+ }
+ 
+@@ -745,7 +727,6 @@ static noinline int generic_bin_search(s
+ 	struct btrfs_disk_key *tmp = NULL;
+ 	struct btrfs_disk_key unaligned;
+ 	unsigned long offset;
+-	char *map_token = NULL;
+ 	char *kaddr = NULL;
+ 	unsigned long map_start = 0;
+ 	unsigned long map_len = 0;
+@@ -755,18 +736,13 @@ static noinline int generic_bin_search(s
+ 		mid = (low + high) / 2;
+ 		offset = p + mid * item_size;
+ 
+-		if (!map_token || offset < map_start ||
++		if (!kaddr || offset < map_start ||
+ 		    (offset + sizeof(struct btrfs_disk_key)) >
+ 		    map_start + map_len) {
+-			if (map_token) {
+-				unmap_extent_buffer(eb, map_token, KM_USER0);
+-				map_token = NULL;
+-			}
+ 
+ 			err = map_private_extent_buffer(eb, offset,
+ 						sizeof(struct btrfs_disk_key),
+-						&map_token, &kaddr,
+-						&map_start, &map_len, KM_USER0);
++						&kaddr, &map_start, &map_len);
+ 
+ 			if (!err) {
+ 				tmp = (struct btrfs_disk_key *)(kaddr + offset -
+@@ -789,14 +765,10 @@ static noinline int generic_bin_search(s
+ 			high = mid;
+ 		else {
+ 			*slot = mid;
+-			if (map_token)
+-				unmap_extent_buffer(eb, map_token, KM_USER0);
+ 			return 0;
+ 		}
+ 	}
+ 	*slot = low;
+-	if (map_token)
+-		unmap_extent_buffer(eb, map_token, KM_USER0);
+ 	return 1;
+ }
+ 
+@@ -1227,7 +1199,6 @@ static void reada_for_search(struct btrf
+ 	u32 nr;
+ 	u32 blocksize;
+ 	u32 nscan = 0;
+-	bool map = true;
+ 
+ 	if (level != 1)
+ 		return;
+@@ -1249,19 +1220,8 @@ static void reada_for_search(struct btrf
+ 
+ 	nritems = btrfs_header_nritems(node);
+ 	nr = slot;
+-	if (node->map_token || path->skip_locking)
+-		map = false;
+ 
+ 	while (1) {
+-		if (map && !node->map_token) {
+-			unsigned long offset = btrfs_node_key_ptr_offset(nr);
+-			map_private_extent_buffer(node, offset,
+-						  sizeof(struct btrfs_key_ptr),
+-						  &node->map_token,
+-						  &node->kaddr,
+-						  &node->map_start,
+-						  &node->map_len, KM_USER1);
+-		}
+ 		if (direction < 0) {
+ 			if (nr == 0)
+ 				break;
+@@ -1280,11 +1240,6 @@ static void reada_for_search(struct btrf
+ 		if ((search <= target && target - search <= 65536) ||
+ 		    (search > target && search - target <= 65536)) {
+ 			gen = btrfs_node_ptr_generation(node, nr);
+-			if (map && node->map_token) {
+-				unmap_extent_buffer(node, node->map_token,
+-						    KM_USER1);
+-				node->map_token = NULL;
+-			}
+ 			readahead_tree_block(root, search, blocksize, gen);
+ 			nread += blocksize;
+ 		}
+@@ -1292,10 +1247,6 @@ static void reada_for_search(struct btrf
+ 		if ((nread > 65536 || nscan > 32))
+ 			break;
+ 	}
+-	if (map && node->map_token) {
+-		unmap_extent_buffer(node, node->map_token, KM_USER1);
+-		node->map_token = NULL;
+-	}
+ }
+ 
+ /*
+@@ -2252,14 +2203,6 @@ static noinline int __push_leaf_right(st
+ 		if (path->slots[0] == i)
+ 			push_space += data_size;
+ 
+-		if (!left->map_token) {
+-			map_extent_buffer(left, (unsigned long)item,
+-					sizeof(struct btrfs_item),
+-					&left->map_token, &left->kaddr,
+-					&left->map_start, &left->map_len,
+-					KM_USER1);
+-		}
+-
+ 		this_item_size = btrfs_item_size(left, item);
+ 		if (this_item_size + sizeof(*item) + push_space > free_space)
+ 			break;
+@@ -2270,10 +2213,6 @@ static noinline int __push_leaf_right(st
+ 			break;
+ 		i--;
+ 	}
+-	if (left->map_token) {
+-		unmap_extent_buffer(left, left->map_token, KM_USER1);
+-		left->map_token = NULL;
+-	}
+ 
+ 	if (push_items == 0)
+ 		goto out_unlock;
+@@ -2315,21 +2254,10 @@ static noinline int __push_leaf_right(st
+ 	push_space = BTRFS_LEAF_DATA_SIZE(root);
+ 	for (i = 0; i < right_nritems; i++) {
+ 		item = btrfs_item_nr(right, i);
+-		if (!right->map_token) {
+-			map_extent_buffer(right, (unsigned long)item,
+-					sizeof(struct btrfs_item),
+-					&right->map_token, &right->kaddr,
+-					&right->map_start, &right->map_len,
+-					KM_USER1);
+-		}
+ 		push_space -= btrfs_item_size(right, item);
+ 		btrfs_set_item_offset(right, item, push_space);
+ 	}
+ 
+-	if (right->map_token) {
+-		unmap_extent_buffer(right, right->map_token, KM_USER1);
+-		right->map_token = NULL;
+-	}
+ 	left_nritems -= push_items;
+ 	btrfs_set_header_nritems(left, left_nritems);
+ 
+@@ -2466,13 +2394,6 @@ static noinline int __push_leaf_left(str
+ 
+ 	for (i = 0; i < nr; i++) {
+ 		item = btrfs_item_nr(right, i);
+-		if (!right->map_token) {
+-			map_extent_buffer(right, (unsigned long)item,
+-					sizeof(struct btrfs_item),
+-					&right->map_token, &right->kaddr,
+-					&right->map_start, &right->map_len,
+-					KM_USER1);
+-		}
+ 
+ 		if (!empty && push_items > 0) {
+ 			if (path->slots[0] < i)
+@@ -2495,11 +2416,6 @@ static noinline int __push_leaf_left(str
+ 		push_space += this_item_size + sizeof(*item);
+ 	}
+ 
+-	if (right->map_token) {
+-		unmap_extent_buffer(right, right->map_token, KM_USER1);
+-		right->map_token = NULL;
+-	}
+-
+ 	if (push_items == 0) {
+ 		ret = 1;
+ 		goto out;
+@@ -2529,23 +2445,12 @@ static noinline int __push_leaf_left(str
+ 		u32 ioff;
+ 
+ 		item = btrfs_item_nr(left, i);
+-		if (!left->map_token) {
+-			map_extent_buffer(left, (unsigned long)item,
+-					sizeof(struct btrfs_item),
+-					&left->map_token, &left->kaddr,
+-					&left->map_start, &left->map_len,
+-					KM_USER1);
+-		}
+ 
+ 		ioff = btrfs_item_offset(left, item);
+ 		btrfs_set_item_offset(left, item,
+ 		      ioff - (BTRFS_LEAF_DATA_SIZE(root) - old_left_item_size));
+ 	}
+ 	btrfs_set_header_nritems(left, old_left_nritems + push_items);
+-	if (left->map_token) {
+-		unmap_extent_buffer(left, left->map_token, KM_USER1);
+-		left->map_token = NULL;
+-	}
+ 
+ 	/* fixup right node */
+ 	if (push_items > right_nritems) {
+@@ -2573,21 +2478,9 @@ static noinline int __push_leaf_left(str
+ 	for (i = 0; i < right_nritems; i++) {
+ 		item = btrfs_item_nr(right, i);
+ 
+-		if (!right->map_token) {
+-			map_extent_buffer(right, (unsigned long)item,
+-					sizeof(struct btrfs_item),
+-					&right->map_token, &right->kaddr,
+-					&right->map_start, &right->map_len,
+-					KM_USER1);
+-		}
+-
+ 		push_space = push_space - btrfs_item_size(right, item);
+ 		btrfs_set_item_offset(right, item, push_space);
+ 	}
+-	if (right->map_token) {
+-		unmap_extent_buffer(right, right->map_token, KM_USER1);
+-		right->map_token = NULL;
+-	}
+ 
+ 	btrfs_mark_buffer_dirty(left);
+ 	if (right_nritems)
+@@ -2728,23 +2621,10 @@ static noinline int copy_for_split(struc
+ 		struct btrfs_item *item = btrfs_item_nr(right, i);
+ 		u32 ioff;
+ 
+-		if (!right->map_token) {
+-			map_extent_buffer(right, (unsigned long)item,
+-					sizeof(struct btrfs_item),
+-					&right->map_token, &right->kaddr,
+-					&right->map_start, &right->map_len,
+-					KM_USER1);
+-		}
+-
+ 		ioff = btrfs_item_offset(right, item);
+ 		btrfs_set_item_offset(right, item, ioff + rt_data_off);
+ 	}
+ 
+-	if (right->map_token) {
+-		unmap_extent_buffer(right, right->map_token, KM_USER1);
+-		right->map_token = NULL;
+-	}
+-
+ 	btrfs_set_header_nritems(l, mid);
+ 	ret = 0;
+ 	btrfs_item_key(right, &disk_key, 0);
+@@ -3263,23 +3143,10 @@ int btrfs_truncate_item(struct btrfs_tra
+ 		u32 ioff;
+ 		item = btrfs_item_nr(leaf, i);
+ 
+-		if (!leaf->map_token) {
+-			map_extent_buffer(leaf, (unsigned long)item,
+-					sizeof(struct btrfs_item),
+-					&leaf->map_token, &leaf->kaddr,
+-					&leaf->map_start, &leaf->map_len,
+-					KM_USER1);
+-		}
+-
+ 		ioff = btrfs_item_offset(leaf, item);
+ 		btrfs_set_item_offset(leaf, item, ioff + size_diff);
+ 	}
+ 
+-	if (leaf->map_token) {
+-		unmap_extent_buffer(leaf, leaf->map_token, KM_USER1);
+-		leaf->map_token = NULL;
+-	}
+-
+ 	/* shift the data */
+ 	if (from_end) {
+ 		memmove_extent_buffer(leaf, btrfs_leaf_data(leaf) +
+@@ -3376,22 +3243,10 @@ int btrfs_extend_item(struct btrfs_trans
+ 		u32 ioff;
+ 		item = btrfs_item_nr(leaf, i);
+ 
+-		if (!leaf->map_token) {
+-			map_extent_buffer(leaf, (unsigned long)item,
+-					sizeof(struct btrfs_item),
+-					&leaf->map_token, &leaf->kaddr,
+-					&leaf->map_start, &leaf->map_len,
+-					KM_USER1);
+-		}
+ 		ioff = btrfs_item_offset(leaf, item);
+ 		btrfs_set_item_offset(leaf, item, ioff - data_size);
+ 	}
+ 
+-	if (leaf->map_token) {
+-		unmap_extent_buffer(leaf, leaf->map_token, KM_USER1);
+-		leaf->map_token = NULL;
+-	}
+-
+ 	/* shift the data */
+ 	memmove_extent_buffer(leaf, btrfs_leaf_data(leaf) +
+ 		      data_end - data_size, btrfs_leaf_data(leaf) +
+@@ -3493,27 +3348,13 @@ int btrfs_insert_some_items(struct btrfs
+ 		 * item0..itemN ... dataN.offset..dataN.size .. data0.size
+ 		 */
+ 		/* first correct the data pointers */
+-		WARN_ON(leaf->map_token);
+ 		for (i = slot; i < nritems; i++) {
+ 			u32 ioff;
+ 
+ 			item = btrfs_item_nr(leaf, i);
+-			if (!leaf->map_token) {
+-				map_extent_buffer(leaf, (unsigned long)item,
+-					sizeof(struct btrfs_item),
+-					&leaf->map_token, &leaf->kaddr,
+-					&leaf->map_start, &leaf->map_len,
+-					KM_USER1);
+-			}
+-
+ 			ioff = btrfs_item_offset(leaf, item);
+ 			btrfs_set_item_offset(leaf, item, ioff - total_data);
+ 		}
+-		if (leaf->map_token) {
+-			unmap_extent_buffer(leaf, leaf->map_token, KM_USER1);
+-			leaf->map_token = NULL;
+-		}
+-
+ 		/* shift the items */
+ 		memmove_extent_buffer(leaf, btrfs_item_nr_offset(slot + nr),
+ 			      btrfs_item_nr_offset(slot),
+@@ -3607,27 +3448,13 @@ int setup_items_for_insert(struct btrfs_
+ 		 * item0..itemN ... dataN.offset..dataN.size .. data0.size
+ 		 */
+ 		/* first correct the data pointers */
+-		WARN_ON(leaf->map_token);
+ 		for (i = slot; i < nritems; i++) {
+ 			u32 ioff;
+ 
+ 			item = btrfs_item_nr(leaf, i);
+-			if (!leaf->map_token) {
+-				map_extent_buffer(leaf, (unsigned long)item,
+-					sizeof(struct btrfs_item),
+-					&leaf->map_token, &leaf->kaddr,
+-					&leaf->map_start, &leaf->map_len,
+-					KM_USER1);
+-			}
+-
+ 			ioff = btrfs_item_offset(leaf, item);
+ 			btrfs_set_item_offset(leaf, item, ioff - total_data);
+ 		}
+-		if (leaf->map_token) {
+-			unmap_extent_buffer(leaf, leaf->map_token, KM_USER1);
+-			leaf->map_token = NULL;
+-		}
+-
+ 		/* shift the items */
+ 		memmove_extent_buffer(leaf, btrfs_item_nr_offset(slot + nr),
+ 			      btrfs_item_nr_offset(slot),
+@@ -3839,22 +3666,10 @@ int btrfs_del_items(struct btrfs_trans_h
+ 			u32 ioff;
+ 
+ 			item = btrfs_item_nr(leaf, i);
+-			if (!leaf->map_token) {
+-				map_extent_buffer(leaf, (unsigned long)item,
+-					sizeof(struct btrfs_item),
+-					&leaf->map_token, &leaf->kaddr,
+-					&leaf->map_start, &leaf->map_len,
+-					KM_USER1);
+-			}
+ 			ioff = btrfs_item_offset(leaf, item);
+ 			btrfs_set_item_offset(leaf, item, ioff + dsize);
+ 		}
+ 
+-		if (leaf->map_token) {
+-			unmap_extent_buffer(leaf, leaf->map_token, KM_USER1);
+-			leaf->map_token = NULL;
+-		}
+-
+ 		memmove_extent_buffer(leaf, btrfs_item_nr_offset(slot),
+ 			      btrfs_item_nr_offset(slot + nr),
+ 			      sizeof(struct btrfs_item) *
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -218,7 +218,6 @@ static int csum_tree_block(struct btrfs_
+ 	unsigned long len;
+ 	unsigned long cur_len;
+ 	unsigned long offset = BTRFS_CSUM_SIZE;
+-	char *map_token = NULL;
+ 	char *kaddr;
+ 	unsigned long map_start;
+ 	unsigned long map_len;
+@@ -229,8 +228,7 @@ static int csum_tree_block(struct btrfs_
+ 	len = buf->len - offset;
+ 	while (len > 0) {
+ 		err = map_private_extent_buffer(buf, offset, 32,
+-					&map_token, &kaddr,
+-					&map_start, &map_len, KM_USER0);
++					&kaddr, &map_start, &map_len);
+ 		if (err)
+ 			return 1;
+ 		cur_len = min(len, map_len - (offset - map_start));
+@@ -238,7 +236,6 @@ static int csum_tree_block(struct btrfs_
+ 				      crc, cur_len);
+ 		len -= cur_len;
+ 		offset += cur_len;
+-		unmap_extent_buffer(buf, map_token, KM_USER0);
+ 	}
+ 	if (csum_size > sizeof(inline_result)) {
+ 		result = kzalloc(csum_size * sizeof(char), GFP_NOFS);
+@@ -1699,7 +1696,7 @@ struct btrfs_root *open_ctree(struct sup
+ 		goto fail_bdi;
+ 	}
+ 
+-	fs_info->btree_inode->i_mapping->flags &= ~__GFP_FS;
++	mapping_set_gfp_mask(fs_info->btree_inode->i_mapping, GFP_NOFS);
+ 
+ 	INIT_RADIX_TREE(&fs_info->fs_roots_radix, GFP_ATOMIC);
+ 	INIT_LIST_HEAD(&fs_info->trans_list);
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -3114,7 +3114,7 @@ struct extent_buffer *alloc_extent_buffe
+ 		i = 0;
+ 	}
+ 	for (; i < num_pages; i++, index++) {
+-		p = find_or_create_page(mapping, index, GFP_NOFS | __GFP_HIGHMEM);
++		p = find_or_create_page(mapping, index, GFP_NOFS);
+ 		if (!p) {
+ 			WARN_ON(1);
+ 			goto free_eb;
+@@ -3487,9 +3487,8 @@ void read_extent_buffer(struct extent_bu
+ 		page = extent_buffer_page(eb, i);
+ 
+ 		cur = min(len, (PAGE_CACHE_SIZE - offset));
+-		kaddr = kmap_atomic(page, KM_USER1);
++		kaddr = page_address(page);
+ 		memcpy(dst, kaddr + offset, cur);
+-		kunmap_atomic(kaddr, KM_USER1);
+ 
+ 		dst += cur;
+ 		len -= cur;
+@@ -3499,9 +3498,9 @@ void read_extent_buffer(struct extent_bu
+ }
+ 
+ int map_private_extent_buffer(struct extent_buffer *eb, unsigned long start,
+-			       unsigned long min_len, char **token, char **map,
++			       unsigned long min_len, char **map,
+ 			       unsigned long *map_start,
+-			       unsigned long *map_len, int km)
++			       unsigned long *map_len)
+ {
+ 	size_t offset = start & (PAGE_CACHE_SIZE - 1);
+ 	char *kaddr;
+@@ -3531,42 +3530,12 @@ int map_private_extent_buffer(struct ext
+ 	}
+ 
+ 	p = extent_buffer_page(eb, i);
+-	kaddr = kmap_atomic(p, km);
+-	*token = kaddr;
++	kaddr = page_address(p);
+ 	*map = kaddr + offset;
+ 	*map_len = PAGE_CACHE_SIZE - offset;
+ 	return 0;
+ }
+ 
+-int map_extent_buffer(struct extent_buffer *eb, unsigned long start,
+-		      unsigned long min_len,
+-		      char **token, char **map,
+-		      unsigned long *map_start,
+-		      unsigned long *map_len, int km)
+-{
+-	int err;
+-	int save = 0;
+-	if (eb->map_token) {
+-		unmap_extent_buffer(eb, eb->map_token, km);
+-		eb->map_token = NULL;
+-		save = 1;
+-	}
+-	err = map_private_extent_buffer(eb, start, min_len, token, map,
+-				       map_start, map_len, km);
+-	if (!err && save) {
+-		eb->map_token = *token;
+-		eb->kaddr = *map;
+-		eb->map_start = *map_start;
+-		eb->map_len = *map_len;
+-	}
+-	return err;
+-}
+-
+-void unmap_extent_buffer(struct extent_buffer *eb, char *token, int km)
+-{
+-	kunmap_atomic(token, km);
+-}
+-
+ int memcmp_extent_buffer(struct extent_buffer *eb, const void *ptrv,
+ 			  unsigned long start,
+ 			  unsigned long len)
+@@ -3590,9 +3559,8 @@ int memcmp_extent_buffer(struct extent_b
+ 
+ 		cur = min(len, (PAGE_CACHE_SIZE - offset));
+ 
+-		kaddr = kmap_atomic(page, KM_USER0);
++		kaddr = page_address(page);
+ 		ret = memcmp(ptr, kaddr + offset, cur);
+-		kunmap_atomic(kaddr, KM_USER0);
+ 		if (ret)
+ 			break;
+ 
+@@ -3625,9 +3593,8 @@ void write_extent_buffer(struct extent_b
+ 		WARN_ON(!PageUptodate(page));
+ 
+ 		cur = min(len, PAGE_CACHE_SIZE - offset);
+-		kaddr = kmap_atomic(page, KM_USER1);
++		kaddr = page_address(page);
+ 		memcpy(kaddr + offset, src, cur);
+-		kunmap_atomic(kaddr, KM_USER1);
+ 
+ 		src += cur;
+ 		len -= cur;
+@@ -3656,9 +3623,8 @@ void memset_extent_buffer(struct extent_
+ 		WARN_ON(!PageUptodate(page));
+ 
+ 		cur = min(len, PAGE_CACHE_SIZE - offset);
+-		kaddr = kmap_atomic(page, KM_USER0);
++		kaddr = page_address(page);
+ 		memset(kaddr + offset, c, cur);
+-		kunmap_atomic(kaddr, KM_USER0);
+ 
+ 		len -= cur;
+ 		offset = 0;
+@@ -3689,9 +3655,8 @@ void copy_extent_buffer(struct extent_bu
+ 
+ 		cur = min(len, (unsigned long)(PAGE_CACHE_SIZE - offset));
+ 
+-		kaddr = kmap_atomic(page, KM_USER0);
++		kaddr = page_address(page);
+ 		read_extent_buffer(src, kaddr + offset, src_offset, cur);
+-		kunmap_atomic(kaddr, KM_USER0);
+ 
+ 		src_offset += cur;
+ 		len -= cur;
+@@ -3704,20 +3669,17 @@ static void move_pages(struct page *dst_
+ 		       unsigned long dst_off, unsigned long src_off,
+ 		       unsigned long len)
+ {
+-	char *dst_kaddr = kmap_atomic(dst_page, KM_USER0);
++	char *dst_kaddr = page_address(dst_page);
+ 	if (dst_page == src_page) {
+ 		memmove(dst_kaddr + dst_off, dst_kaddr + src_off, len);
+ 	} else {
+-		char *src_kaddr = kmap_atomic(src_page, KM_USER1);
++		char *src_kaddr = page_address(src_page);
+ 		char *p = dst_kaddr + dst_off + len;
+ 		char *s = src_kaddr + src_off + len;
+ 
+ 		while (len--)
+ 			*--p = *--s;
+-
+-		kunmap_atomic(src_kaddr, KM_USER1);
+ 	}
+-	kunmap_atomic(dst_kaddr, KM_USER0);
+ }
+ 
+ static inline bool areas_overlap(unsigned long src, unsigned long dst, unsigned long len)
+@@ -3730,20 +3692,17 @@ static void copy_pages(struct page *dst_
+ 		       unsigned long dst_off, unsigned long src_off,
+ 		       unsigned long len)
+ {
+-	char *dst_kaddr = kmap_atomic(dst_page, KM_USER0);
++	char *dst_kaddr = page_address(dst_page);
+ 	char *src_kaddr;
+ 
+ 	if (dst_page != src_page) {
+-		src_kaddr = kmap_atomic(src_page, KM_USER1);
++		src_kaddr = page_address(src_page);
+ 	} else {
+ 		src_kaddr = dst_kaddr;
+ 		BUG_ON(areas_overlap(src_off, dst_off, len));
+ 	}
+ 
+ 	memcpy(dst_kaddr + dst_off, src_kaddr + src_off, len);
+-	kunmap_atomic(dst_kaddr, KM_USER0);
+-	if (dst_page != src_page)
+-		kunmap_atomic(src_kaddr, KM_USER1);
+ }
+ 
+ void memcpy_extent_buffer(struct extent_buffer *dst, unsigned long dst_offset,
+--- a/fs/btrfs/extent_io.h
++++ b/fs/btrfs/extent_io.h
+@@ -120,8 +120,6 @@ struct extent_state {
+ struct extent_buffer {
+ 	u64 start;
+ 	unsigned long len;
+-	char *map_token;
+-	char *kaddr;
+ 	unsigned long map_start;
+ 	unsigned long map_len;
+ 	struct page *first_page;
+@@ -279,15 +277,10 @@ int clear_extent_buffer_uptodate(struct
+ int extent_buffer_uptodate(struct extent_io_tree *tree,
+ 			   struct extent_buffer *eb,
+ 			   struct extent_state *cached_state);
+-int map_extent_buffer(struct extent_buffer *eb, unsigned long offset,
+-		      unsigned long min_len, char **token, char **map,
+-		      unsigned long *map_start,
+-		      unsigned long *map_len, int km);
+ int map_private_extent_buffer(struct extent_buffer *eb, unsigned long offset,
+-		      unsigned long min_len, char **token, char **map,
++		      unsigned long min_len, char **map,
+ 		      unsigned long *map_start,
+-		      unsigned long *map_len, int km);
+-void unmap_extent_buffer(struct extent_buffer *eb, char *token, int km);
++		      unsigned long *map_len);
+ int extent_range_uptodate(struct extent_io_tree *tree,
+ 			  u64 start, u64 end);
+ int extent_clear_unlock_delalloc(struct inode *inode,
+--- a/fs/btrfs/file-item.c
++++ b/fs/btrfs/file-item.c
+@@ -663,10 +663,6 @@ int btrfs_csum_file_blocks(struct btrfs_
+ 	struct btrfs_sector_sum *sector_sum;
+ 	u32 nritems;
+ 	u32 ins_size;
+-	char *eb_map;
+-	char *eb_token;
+-	unsigned long map_len;
+-	unsigned long map_start;
+ 	u16 csum_size =
+ 		btrfs_super_csum_size(&root->fs_info->super_copy);
+ 
+@@ -813,30 +809,9 @@ found:
+ 	item_end = btrfs_item_ptr(leaf, path->slots[0], struct btrfs_csum_item);
+ 	item_end = (struct btrfs_csum_item *)((unsigned char *)item_end +
+ 				      btrfs_item_size_nr(leaf, path->slots[0]));
+-	eb_token = NULL;
+ next_sector:
+ 
+-	if (!eb_token ||
+-	   (unsigned long)item + csum_size >= map_start + map_len) {
+-		int err;
+-
+-		if (eb_token)
+-			unmap_extent_buffer(leaf, eb_token, KM_USER1);
+-		eb_token = NULL;
+-		err = map_private_extent_buffer(leaf, (unsigned long)item,
+-						csum_size,
+-						&eb_token, &eb_map,
+-						&map_start, &map_len, KM_USER1);
+-		if (err)
+-			eb_token = NULL;
+-	}
+-	if (eb_token) {
+-		memcpy(eb_token + ((unsigned long)item & (PAGE_CACHE_SIZE - 1)),
+-		       &sector_sum->sum, csum_size);
+-	} else {
+-		write_extent_buffer(leaf, &sector_sum->sum,
+-				    (unsigned long)item, csum_size);
+-	}
++	write_extent_buffer(leaf, &sector_sum->sum, (unsigned long)item, csum_size);
+ 
+ 	total_bytes += root->sectorsize;
+ 	sector_sum++;
+@@ -849,10 +824,7 @@ next_sector:
+ 			goto next_sector;
+ 		}
+ 	}
+-	if (eb_token) {
+-		unmap_extent_buffer(leaf, eb_token, KM_USER1);
+-		eb_token = NULL;
+-	}
++
+ 	btrfs_mark_buffer_dirty(path->nodes[0]);
+ 	if (total_bytes < sums->len) {
+ 		btrfs_release_path(path);
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -2517,13 +2517,6 @@ static void btrfs_read_locked_inode(stru
+ 	leaf = path->nodes[0];
+ 	inode_item = btrfs_item_ptr(leaf, path->slots[0],
+ 				    struct btrfs_inode_item);
+-	if (!leaf->map_token)
+-		map_private_extent_buffer(leaf, (unsigned long)inode_item,
+-					  sizeof(struct btrfs_inode_item),
+-					  &leaf->map_token, &leaf->kaddr,
+-					  &leaf->map_start, &leaf->map_len,
+-					  KM_USER1);
+-
+ 	inode->i_mode = btrfs_inode_mode(leaf, inode_item);
+ 	inode->i_nlink = btrfs_inode_nlink(leaf, inode_item);
+ 	inode->i_uid = btrfs_inode_uid(leaf, inode_item);
+@@ -2561,11 +2554,6 @@ static void btrfs_read_locked_inode(stru
+ 	if (!maybe_acls)
+ 		cache_no_acl(inode);
+ 
+-	if (leaf->map_token) {
+-		unmap_extent_buffer(leaf, leaf->map_token, KM_USER1);
+-		leaf->map_token = NULL;
+-	}
+-
+ 	btrfs_free_path(path);
+ 	inode_item = NULL;
+ 
+@@ -2611,13 +2599,6 @@ static void fill_inode_item(struct btrfs
+ 			    struct btrfs_inode_item *item,
+ 			    struct inode *inode)
+ {
+-	if (!leaf->map_token)
+-		map_private_extent_buffer(leaf, (unsigned long)item,
+-					  sizeof(struct btrfs_inode_item),
+-					  &leaf->map_token, &leaf->kaddr,
+-					  &leaf->map_start, &leaf->map_len,
+-					  KM_USER1);
+-
+ 	btrfs_set_inode_uid(leaf, item, inode->i_uid);
+ 	btrfs_set_inode_gid(leaf, item, inode->i_gid);
+ 	btrfs_set_inode_size(leaf, item, BTRFS_I(inode)->disk_i_size);
+@@ -2646,11 +2627,6 @@ static void fill_inode_item(struct btrfs
+ 	btrfs_set_inode_rdev(leaf, item, inode->i_rdev);
+ 	btrfs_set_inode_flags(leaf, item, BTRFS_I(inode)->flags);
+ 	btrfs_set_inode_block_group(leaf, item, 0);
+-
+-	if (leaf->map_token) {
+-		unmap_extent_buffer(leaf, leaf->map_token, KM_USER1);
+-		leaf->map_token = NULL;
+-	}
+ }
+ 
+ /*
+--- a/fs/btrfs/struct-funcs.c
++++ b/fs/btrfs/struct-funcs.c
+@@ -50,36 +50,22 @@ u##bits btrfs_##name(struct extent_buffe
+ 	unsigned long part_offset = (unsigned long)s;			\
+ 	unsigned long offset = part_offset + offsetof(type, member);	\
+ 	type *p;							\
+-	/* ugly, but we want the fast path here */			\
+-	if (eb->map_token && offset >= eb->map_start &&			\
+-	    offset + sizeof(((type *)0)->member) <= eb->map_start +	\
+-	    eb->map_len) {						\
+-		p = (type *)(eb->kaddr + part_offset - eb->map_start);	\
+-		return le##bits##_to_cpu(p->member);			\
+-	}								\
+-	{								\
+-		int err;						\
+-		char *map_token;					\
+-		char *kaddr;						\
+-		int unmap_on_exit = (eb->map_token == NULL);		\
+-		unsigned long map_start;				\
+-		unsigned long map_len;					\
+-		u##bits res;						\
+-		err = map_extent_buffer(eb, offset,			\
+-				sizeof(((type *)0)->member),		\
+-				&map_token, &kaddr,			\
+-				&map_start, &map_len, KM_USER1);	\
+-		if (err) {						\
+-			__le##bits leres;				\
+-			read_eb_member(eb, s, type, member, &leres);	\
+-			return le##bits##_to_cpu(leres);		\
+-		}							\
+-		p = (type *)(kaddr + part_offset - map_start);		\
+-		res = le##bits##_to_cpu(p->member);			\
+-		if (unmap_on_exit)					\
+-			unmap_extent_buffer(eb, map_token, KM_USER1);	\
+-		return res;						\
+-	}								\
++	int err;						\
++	char *kaddr;						\
++	unsigned long map_start;				\
++	unsigned long map_len;					\
++	u##bits res;						\
++	err = map_private_extent_buffer(eb, offset,		\
++			sizeof(((type *)0)->member),		\
++			&kaddr, &map_start, &map_len);		\
++	if (err) {						\
++		__le##bits leres;				\
++		read_eb_member(eb, s, type, member, &leres);	\
++		return le##bits##_to_cpu(leres);		\
++	}							\
++	p = (type *)(kaddr + part_offset - map_start);		\
++	res = le##bits##_to_cpu(p->member);			\
++	return res;						\
+ }									\
+ void btrfs_set_##name(struct extent_buffer *eb,				\
+ 				    type *s, u##bits val)		\
+@@ -87,36 +73,21 @@ void btrfs_set_##name(struct extent_buff
+ 	unsigned long part_offset = (unsigned long)s;			\
+ 	unsigned long offset = part_offset + offsetof(type, member);	\
+ 	type *p;							\
+-	/* ugly, but we want the fast path here */			\
+-	if (eb->map_token && offset >= eb->map_start &&			\
+-	    offset + sizeof(((type *)0)->member) <= eb->map_start +	\
+-	    eb->map_len) {						\
+-		p = (type *)(eb->kaddr + part_offset - eb->map_start);	\
+-		p->member = cpu_to_le##bits(val);			\
+-		return;							\
+-	}								\
+-	{								\
+-		int err;						\
+-		char *map_token;					\
+-		char *kaddr;						\
+-		int unmap_on_exit = (eb->map_token == NULL);		\
+-		unsigned long map_start;				\
+-		unsigned long map_len;					\
+-		err = map_extent_buffer(eb, offset,			\
+-				sizeof(((type *)0)->member),		\
+-				&map_token, &kaddr,			\
+-				&map_start, &map_len, KM_USER1);	\
+-		if (err) {						\
+-			__le##bits val2;				\
+-			val2 = cpu_to_le##bits(val);			\
+-			write_eb_member(eb, s, type, member, &val2);	\
+-			return;						\
+-		}							\
+-		p = (type *)(kaddr + part_offset - map_start);		\
+-		p->member = cpu_to_le##bits(val);			\
+-		if (unmap_on_exit)					\
+-			unmap_extent_buffer(eb, map_token, KM_USER1);	\
+-	}								\
++	int err;						\
++	char *kaddr;						\
++	unsigned long map_start;				\
++	unsigned long map_len;					\
++	err = map_private_extent_buffer(eb, offset,		\
++			sizeof(((type *)0)->member),		\
++			&kaddr, &map_start, &map_len);		\
++	if (err) {						\
++		__le##bits val2;				\
++		val2 = cpu_to_le##bits(val);			\
++		write_eb_member(eb, s, type, member, &val2);	\
++		return;						\
++	}							\
++	p = (type *)(kaddr + part_offset - map_start);		\
++	p->member = cpu_to_le##bits(val);			\
+ }
+ 
+ #include "ctree.h"
+@@ -125,15 +96,6 @@ void btrfs_node_key(struct extent_buffer
+ 		    struct btrfs_disk_key *disk_key, int nr)
+ {
+ 	unsigned long ptr = btrfs_node_key_ptr_offset(nr);
+-	if (eb->map_token && ptr >= eb->map_start &&
+-	    ptr + sizeof(*disk_key) <= eb->map_start + eb->map_len) {
+-		memcpy(disk_key, eb->kaddr + ptr - eb->map_start,
+-			sizeof(*disk_key));
+-		return;
+-	} else if (eb->map_token) {
+-		unmap_extent_buffer(eb, eb->map_token, KM_USER1);
+-		eb->map_token = NULL;
+-	}
+ 	read_eb_member(eb, (struct btrfs_key_ptr *)ptr,
+ 		       struct btrfs_key_ptr, key, disk_key);
+ }
