@@ -20,12 +20,16 @@ fi
 
 
 source $(dirname $0)/config.sh
-set -- $(echo $SRCVERSION | sed -ne 's/\([0-9]\+\).\([0-9]\+\).\([0-9]\+\)\(.*\)/\1 \2 \3 \4/p')
-
-VERSION=$1
-PATCHLEVEL=$2
-SUBLEVEL=$3
-EXTRAVERSION=$4
+parse_srcversion()
+{
+	local IFS=.
+	set -- ${SRCVERSION%%-*}
+	VERSION=$1
+	PATCHLEVEL=${2:-0}
+	SUBLEVEL=${3:-0}
+	EXTRAVERSION=${SRCVERSION#${SRCVERSION%%-*}}
+}
+parse_srcversion
 
 EXTRA_SYMBOLS=$(set -- $([ -e $(dirname $0)/extra-symbols ] && cat $(dirname $0)/extra-symbols) ; echo $*)
 
@@ -49,7 +53,7 @@ while read patch; do
 				warned=true
 			fi
 			tmp_files="$tmp_files $dir"
-			tar xjf "$p/$dir.tar.bz2"
+			tar -xjf "$p/$dir.tar.bz2"
 			echo "$patch"
 			continue 2
 		fi
@@ -69,4 +73,5 @@ eval "$(
     ' \
     | sed -e 's,^+,,' -e 's, *= *\(.*\),="\1",'
 )"
+
 echo "$VERSION.$PATCHLEVEL.$SUBLEVEL$EXTRAVERSION"
