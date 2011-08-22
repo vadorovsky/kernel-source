@@ -1,13 +1,14 @@
+From 1d65f86db14806cf7b1218c7b4ecb8b4db5af27d Mon Sep 17 00:00:00 2001
 From: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
-Date: Thu, 23 Jun 2011 18:50:32 +0900
-Subject: [PATCH] mm: preallocate page before lock_page() at filemap COW.
+Date: Mon, 25 Jul 2011 17:12:27 -0700
+Subject: [PATCH] mm: preallocate page before lock_page() at filemap COW
 Patch-mainline: 1d65f86db14806cf7b1218c7b4ecb8b4db5af27d
-References: bnc#7000995
+References: bnc#700995
 
 Currently we are keeping faulted page locked throughout whole __do_fault
-call (except for page_mkwrite code path) after calling file system's
-fault code. If we do early COW, we allocate a new page which has to be
-charged for a memcg (mem_cgroup_newpage_charge).
+call (except for page_mkwrite code path) after calling file system's fault
+code.  If we do early COW, we allocate a new page which has to be charged
+for a memcg (mem_cgroup_newpage_charge).
 
 This function, however, might block for unbounded amount of time if memcg
 oom killer is disabled or fork-bomb is running because the only way out of
@@ -15,8 +16,8 @@ the OOM situation is either an external event or OOM-situation fix.
 
 In the end we are keeping the faulted page locked and blocking other
 processes from faulting it in which is not good at all because we are
-basically punishing potentially an unrelated process for OOM condition
-in a different group (I have seen stuck system because of ld-2.11.1.so being
+basically punishing potentially an unrelated process for OOM condition in
+a different group (I have seen stuck system because of ld-2.11.1.so being
 locked).
 
 We can do test easily.
@@ -27,31 +28,56 @@ We can do test easily.
  % cd kernel_dir; cgexec -g memory:A make -j
 
 Then, the whole system will live-locked until you kill 'make -j'
-by hands (or push reboot...) This is because some important
-page in a shared library are locked.
+by hands (or push reboot...) This is because some important page in a
+a shared library are locked.
 
 Considering again, the new page is not necessary to be allocated
-with lock_page() held. So....
+with lock_page() held. And usual page allocation may dive into
+long memory reclaim loop with holding lock_page() and can cause
+very long latency.
+
+There are 3 ways.
+  1. do allocation/charge before lock_page()
+     Pros. - simple and can handle page allocation in the same manner.
+             This will reduce holding time of lock_page() in general.
+     Cons. - we do page allocation even if ->fault() returns error.
+
+  2. do charge after unlock_page(). Even if charge fails, it's just OOM.
+     Pros. - no impact to non-memcg path.
+     Cons. - implemenation requires special cares of LRU and we need to modify
+             page_add_new_anon_rmap()...
+
+  3. do unlock->charge->lock again method.
+     Pros. - no impact to non-memcg path.
+     Cons. - This may kill LOCK_PAGE_RETRY optimization. We need to release
+             lock and get it again...
+
 This patch moves "charge" and memory allocation for COW page
 before lock_page(). Then, we can avoid scanning LRU with holding
-a lock on a page.
+a lock on a page and latency under lock_page() will be reduced.
 
 Then, above livelock disappears.
 
+[akpm@linux-foundation.org: fix code layout]
+Signed-off-by: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
 Reported-by: Lutz Vieweg <lvml@5t9.de>
 Original-idea-by: Michal Hocko <mhocko@suse.cz>
-Signed-off-by: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
-Reviewed-by: Michal Hocko <mhocko@suse.cz>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: Ying Han <yinghan@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Daisuke Nishimura <nishimura@mxp.nes.nec.co.jp>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
 Acked-by: Michal Hocko <mhocko@suse.cz>
-
 ---
- mm/memory.c |   62 ++++++++++++++++++++++++++++++++++----------------------------
- 1 file changed, 34 insertions(+), 28 deletions(-)
-Index: linux-2.6.32-SLE11-SP2/mm/memory.c
-===================================================================
---- linux-2.6.32-SLE11-SP2.orig/mm/memory.c
-+++ linux-2.6.32-SLE11-SP2/mm/memory.c
-@@ -2951,14 +2951,34 @@ static int __do_fault(struct mm_struct *
+ mm/memory.c |   56 ++++++++++++++++++++++++++++++++++----------------------
+ 1 files changed, 34 insertions(+), 22 deletions(-)
+
+diff --git a/mm/memory.c b/mm/memory.c
+index a58bbeb..3c9f3aa 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3093,14 +3093,34 @@ static int __do_fault(struct mm_struct *mm, struct vm_area_struct *vma,
  	pte_t *page_table;
  	spinlock_t *ptl;
  	struct page *page;
@@ -71,7 +97,7 @@ Index: linux-2.6.32-SLE11-SP2/mm/memory.c
 +	if ((flags & FAULT_FLAG_WRITE) && !(vma->vm_flags & VM_SHARED)) {
 +
 +		if (unlikely(anon_vma_prepare(vma)))
-+			return  VM_FAULT_OOM;
++			return VM_FAULT_OOM;
 +
 +		cow_page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, address);
 +		if (!cow_page)
@@ -87,10 +113,10 @@ Index: linux-2.6.32-SLE11-SP2/mm/memory.c
  	vmf.virtual_address = (void __user *)(address & PAGE_MASK);
  	vmf.pgoff = pgoff;
  	vmf.flags = flags;
-@@ -2966,12 +2986,13 @@ static int __do_fault(struct mm_struct *
- 
+@@ -3109,12 +3129,13 @@ static int __do_fault(struct mm_struct *mm, struct vm_area_struct *vma,
  	ret = vma->vm_ops->fault(vma, &vmf);
- 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE)))
+ 	if (unlikely(ret & (VM_FAULT_ERROR | VM_FAULT_NOPAGE |
+ 			    VM_FAULT_RETRY)))
 -		return ret;
 +		goto uncharge_out;
  
@@ -103,7 +129,7 @@ Index: linux-2.6.32-SLE11-SP2/mm/memory.c
  	}
  
  	/*
-@@ -2989,29 +3010,8 @@ static int __do_fault(struct mm_struct *
+@@ -3132,23 +3153,8 @@ static int __do_fault(struct mm_struct *mm, struct vm_area_struct *vma,
  	page = vmf.page;
  	if (flags & FAULT_FLAG_WRITE) {
  		if (!(vma->vm_flags & VM_SHARED)) {
@@ -125,18 +151,12 @@ Index: linux-2.6.32-SLE11-SP2/mm/memory.c
 -				goto out;
 -			}
 -			charged = 1;
--			/*
--			 * Don't let another task, with possibly unlocked vma,
--			 * keep the mlocked page.
--			 */
--			if (vma->vm_flags & VM_LOCKED)
--				clear_page_mlock(vmf.page);
  			copy_user_highpage(page, vmf.page, address, vma);
  			__SetPageUptodate(page);
  		} else {
-@@ -3080,8 +3080,8 @@ static int __do_fault(struct mm_struct *
+@@ -3217,8 +3223,8 @@ static int __do_fault(struct mm_struct *mm, struct vm_area_struct *vma,
  		/* no need to invalidate: a not-present page won't be cached */
- 		update_mmu_cache(vma, address, entry);
+ 		update_mmu_cache(vma, address, page_table);
  	} else {
 -		if (charged)
 -			mem_cgroup_uncharge_page(page);
@@ -145,7 +165,7 @@ Index: linux-2.6.32-SLE11-SP2/mm/memory.c
  		if (anon)
  			page_cache_release(page);
  		else
-@@ -3090,7 +3090,6 @@ static int __do_fault(struct mm_struct *
+@@ -3227,7 +3233,6 @@ static int __do_fault(struct mm_struct *mm, struct vm_area_struct *vma,
  
  	pte_unmap_unlock(page_table, ptl);
  
@@ -153,7 +173,7 @@ Index: linux-2.6.32-SLE11-SP2/mm/memory.c
  	if (dirty_page) {
  		struct address_space *mapping = page->mapping;
  
-@@ -3120,6 +3119,13 @@ out:
+@@ -3257,6 +3262,13 @@ out:
  unwritable_page:
  	page_cache_release(page);
  	return ret;
@@ -167,3 +187,6 @@ Index: linux-2.6.32-SLE11-SP2/mm/memory.c
  }
  
  static int do_linear_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+-- 
+1.7.1
+
