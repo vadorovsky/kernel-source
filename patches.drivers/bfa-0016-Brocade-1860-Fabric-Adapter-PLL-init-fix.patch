@@ -1,0 +1,596 @@
+From: Krishna Gudipati <kgudipat@brocade.com>
+Date: Fri, 24 Jun 2011 20:23:38 -0700
+Subject: [PATCH] bfa: Brocade-1860 Fabric Adapter PLL init fixes.
+Git-commit: 10a07379247078448c076690657a076076bf89aa
+References: FATE#311450,bnc#689227
+Patch-Mainline: 3.0.1
+
+- If flash controller is halted unconditionally, this results in
+  illegal write access to flash controller register domain. Since
+  flash controller registers are only accessible once s_clk is started
+  - added logic to check for WGN status and halt flash controller only
+  if it is already running.
+- Added check to wait for flash controller halt to be completed before
+  proceeding with s_clk/l_clk initializations.
+- Removed unnecessary reset logic for PMM 1T memory and moved memory
+  initialization after flash access enable.
+- Disable Brocade-1860 asic MBOX interrupt before PLL initialization.
+- Remove reset enable for S_CLK/L_CLK after both PLL initializations
+  are complete.
+
+Signed-off-by: Krishna Gudipati <kgudipat@brocade.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/bfa/bfa_core.c   |   43 ++++++++--
+ drivers/scsi/bfa/bfa_hw_cb.c  |    2 +-
+ drivers/scsi/bfa/bfa_ioc.c    |   42 +---------
+ drivers/scsi/bfa/bfa_ioc.h    |    3 +-
+ drivers/scsi/bfa/bfa_ioc_ct.c |  180 +++++++++++++++++++++++-----------------
+ drivers/scsi/bfa/bfad.c       |   15 +++-
+ drivers/scsi/bfa/bfi.h        |    2 +-
+ drivers/scsi/bfa/bfi_ms.h     |    3 +-
+ drivers/scsi/bfa/bfi_reg.h    |   11 +++
+ 9 files changed, 169 insertions(+), 132 deletions(-)
+
+diff --git a/drivers/scsi/bfa/bfa_core.c b/drivers/scsi/bfa/bfa_core.c
+index 4befbf9..f949844 100644
+--- a/drivers/scsi/bfa/bfa_core.c
++++ b/drivers/scsi/bfa/bfa_core.c
+@@ -251,7 +251,39 @@ bfa_isr_reqq(struct bfa_s *bfa, int qid)
+ void
+ bfa_msix_all(struct bfa_s *bfa, int vec)
+ {
+-	bfa_intx(bfa);
++	u32	intr, qintr;
++	int	queue;
++
++	intr = readl(bfa->iocfc.bfa_regs.intr_status);
++	if (!intr)
++		return;
++
++	/*
++	 * RME completion queue interrupt
++	 */
++	qintr = intr & __HFN_INT_RME_MASK;
++	if (qintr && bfa->queue_process) {
++		for (queue = 0; queue < BFI_IOC_MAX_CQS; queue++)
++			bfa_isr_rspq(bfa, queue);
++	}
++
++	intr &= ~qintr;
++	if (!intr)
++		return;
++
++	/*
++	 * CPE completion queue interrupt
++	 */
++	qintr = intr & __HFN_INT_CPE_MASK;
++	if (qintr && bfa->queue_process) {
++		for (queue = 0; queue < BFI_IOC_MAX_CQS; queue++)
++			bfa_isr_reqq(bfa, queue);
++	}
++	intr &= ~qintr;
++	if (!intr)
++		return;
++
++	bfa_msix_lpu_err(bfa, intr);
+ }
+ 
+ bfa_boolean_t
+@@ -469,6 +501,9 @@ bfa_iocfc_send_cfg(void *bfa_arg)
+ 	/*
+ 	 * initialize IOC configuration info
+ 	 */
++	cfg_info->single_msix_vec = 0;
++	if (bfa->msix.nvecs == 1)
++		cfg_info->single_msix_vec = 1;
+ 	cfg_info->endian_sig = BFI_IOC_ENDIAN_SIG;
+ 	cfg_info->num_cqs = cfg->fwcfg.num_cqs;
+ 	cfg_info->num_ioim_reqs = cpu_to_be16(cfg->fwcfg.num_ioim_reqs);
+@@ -1080,12 +1115,6 @@ bfa_iocfc_attach(struct bfa_s *bfa, void *bfad, struct bfa_iocfc_cfg_s *cfg,
+ 	ioc->trcmod = bfa->trcmod;
+ 	bfa_ioc_attach(&bfa->ioc, bfa, &bfa_iocfc_cbfn, &bfa->timer_mod);
+ 
+-	/*
+-	 * Set FC mode for BFA_PCI_DEVICE_ID_CT_FC.
+-	 */
+-	if (pcidev->device_id == BFA_PCI_DEVICE_ID_CT_FC)
+-		bfa_ioc_set_fcmode(&bfa->ioc);
+-
+ 	bfa_ioc_pci_init(&bfa->ioc, pcidev, BFI_PCIFN_CLASS_FC);
+ 	bfa_ioc_mbox_register(&bfa->ioc, bfa_mbox_isrs);
+ 
+diff --git a/drivers/scsi/bfa/bfa_hw_cb.c b/drivers/scsi/bfa/bfa_hw_cb.c
+index 15fbb13..694ebf1 100644
+--- a/drivers/scsi/bfa/bfa_hw_cb.c
++++ b/drivers/scsi/bfa/bfa_hw_cb.c
+@@ -114,7 +114,7 @@ bfa_hwcb_msix_ctrl_install(struct bfa_s *bfa)
+ 		return;
+ 
+ 	if (bfa->msix.nvecs == 1) {
+-		for (i = BFI_MSIX_RME_QMAX_CB+1; i < BFI_MSIX_CB_MAX; i++)
++		for (i = BFI_MSIX_CPE_QMIN_CB; i < BFI_MSIX_CB_MAX; i++)
+ 			bfa->msix.handler[i] = bfa_msix_all;
+ 		return;
+ 	}
+diff --git a/drivers/scsi/bfa/bfa_ioc.c b/drivers/scsi/bfa/bfa_ioc.c
+index 7b4a567..bfe3a87 100644
+--- a/drivers/scsi/bfa/bfa_ioc.c
++++ b/drivers/scsi/bfa/bfa_ioc.c
+@@ -2399,12 +2399,6 @@ bfa_ioc_error_isr(struct bfa_ioc_s *ioc)
+ 	bfa_fsm_send_event(ioc, IOC_E_HWERROR);
+ }
+ 
+-void
+-bfa_ioc_set_fcmode(struct bfa_ioc_s *ioc)
+-{
+-	ioc->fcmode  = BFA_TRUE;
+-}
+-
+ /*
+  * return true if IOC is disabled
+  */
+@@ -2592,35 +2586,7 @@ bfa_ioc_get_adapter_model(struct bfa_ioc_s *ioc, char *model)
+ 
+ 	ioc_attr = ioc->attr;
+ 
+-	/*
+-	 * model name
+-	 */
+-	if (ioc->asic_gen == BFI_ASIC_GEN_CT2) {
+-		int np = bfa_ioc_get_nports(ioc);
+-		char c;
+-		switch (ioc_attr->card_type) {
+-		case BFA_MFG_TYPE_PROWLER_F:
+-		case BFA_MFG_TYPE_PROWLER_N:
+-		case BFA_MFG_TYPE_PROWLER_C:
+-			snprintf(model, BFA_ADAPTER_MODEL_NAME_LEN,
+-				"%s-%u-%u",
+-				BFA_MFG_NAME, ioc_attr->card_type, np);
+-			break;
+-		case BFA_MFG_TYPE_PROWLER_D:
+-			if (ioc_attr->ic == BFA_MFG_IC_FC)
+-				c = 'F';
+-			else
+-				c = 'P';
+-
+-			snprintf(model, BFA_ADAPTER_MODEL_NAME_LEN,
+-				"%s-%u-%u%c",
+-				BFA_MFG_NAME, ioc_attr->card_type, np, c);
+-			break;
+-		default:
+-			break;
+-		}
+-	} else
+-		snprintf(model, BFA_ADAPTER_MODEL_NAME_LEN, "%s-%u",
++	snprintf(model, BFA_ADAPTER_MODEL_NAME_LEN, "%s-%u",
+ 			BFA_MFG_NAME, ioc_attr->card_type);
+ }
+ 
+@@ -2711,12 +2677,6 @@ bfa_ioc_get_mfg_mac(struct bfa_ioc_s *ioc)
+ 	return m;
+ }
+ 
+-bfa_boolean_t
+-bfa_ioc_get_fcmode(struct bfa_ioc_s *ioc)
+-{
+-	return ioc->fcmode || bfa_asic_id_cb(ioc->pcidev.device_id);
+-}
+-
+ /*
+  * Retrieve saved firmware trace from a prior IOC failure.
+  */
+diff --git a/drivers/scsi/bfa/bfa_ioc.h b/drivers/scsi/bfa/bfa_ioc.h
+index 78e9606..1055ca9 100644
+--- a/drivers/scsi/bfa/bfa_ioc.h
++++ b/drivers/scsi/bfa/bfa_ioc.h
+@@ -362,6 +362,7 @@ bfa_status_t bfa_ioc_ct2_pll_init(void __iomem *rb, enum bfi_asic_mode mode);
+ } while (0)
+ #define	bfa_ioc_ownership_reset(__ioc)				\
+ 			((__ioc)->ioc_hwif->ioc_ownership_reset(__ioc))
++#define bfa_ioc_get_fcmode(__ioc)	((__ioc)->fcmode)
+ #define bfa_ioc_lpu_read_stat(__ioc) do {			\
+ 	if ((__ioc)->ioc_hwif->ioc_lpu_read_stat)		\
+ 		((__ioc)->ioc_hwif->ioc_lpu_read_stat(__ioc));	\
+@@ -414,8 +415,6 @@ bfa_status_t bfa_ioc_debug_fwtrc(struct bfa_ioc_s *ioc, void *trcdata,
+ 				 int *trclen);
+ bfa_status_t bfa_ioc_debug_fwcore(struct bfa_ioc_s *ioc, void *buf,
+ 	u32 *offset, int *buflen);
+-void bfa_ioc_set_fcmode(struct bfa_ioc_s *ioc);
+-bfa_boolean_t bfa_ioc_get_fcmode(struct bfa_ioc_s *ioc);
+ bfa_boolean_t bfa_ioc_sem_get(void __iomem *sem_reg);
+ void bfa_ioc_fwver_get(struct bfa_ioc_s *ioc,
+ 			struct bfi_ioc_image_hdr_s *fwhdr);
+diff --git a/drivers/scsi/bfa/bfa_ioc_ct.c b/drivers/scsi/bfa/bfa_ioc_ct.c
+index 216016c..77f2b44 100644
+--- a/drivers/scsi/bfa/bfa_ioc_ct.c
++++ b/drivers/scsi/bfa/bfa_ioc_ct.c
+@@ -564,10 +564,12 @@ bfa_ioc_set_ct2_hwif(struct bfa_ioc_s *ioc)
+  * Temporary workaround for MSI-X resource allocation for catapult-2.
+  */
+ #define HOSTFN_MSIX_DEFAULT		16
++#define HOSTFN_MSIX_VT_INDEX_MBOX_ERR	0x30138
+ #define HOSTFN_MSIX_VT_OFST_NUMVT	0x3013c
+ #define __MSIX_VT_NUMVT__MK		0x003ff800
+ #define __MSIX_VT_NUMVT__SH		11
+ #define __MSIX_VT_NUMVT_(_v)		((_v) << __MSIX_VT_NUMVT__SH)
++#define __MSIX_VT_OFST_			0x000007ff
+ void
+ bfa_ioc_ct2_poweron(struct bfa_ioc_s *ioc)
+ {
+@@ -575,12 +577,17 @@ bfa_ioc_ct2_poweron(struct bfa_ioc_s *ioc)
+ 	u32	r32;
+ 
+ 	r32 = readl(rb + HOSTFN_MSIX_VT_OFST_NUMVT);
+-	if (r32 & __MSIX_VT_NUMVT__MK)
++	if (r32 & __MSIX_VT_NUMVT__MK) {
++		writel(r32 & __MSIX_VT_OFST_,
++			rb + HOSTFN_MSIX_VT_INDEX_MBOX_ERR);
+ 		return;
++	}
+ 
+ 	writel(__MSIX_VT_NUMVT_(HOSTFN_MSIX_DEFAULT - 1) |
+ 		HOSTFN_MSIX_DEFAULT * bfa_ioc_pcifn(ioc),
+ 		rb + HOSTFN_MSIX_VT_OFST_NUMVT);
++	writel(HOSTFN_MSIX_DEFAULT * bfa_ioc_pcifn(ioc),
++		rb + HOSTFN_MSIX_VT_INDEX_MBOX_ERR);
+ }
+ 
+ bfa_status_t
+@@ -649,17 +656,8 @@ bfa_ioc_ct_pll_init(void __iomem *rb, enum bfi_asic_mode mode)
+ 	return BFA_STATUS_OK;
+ }
+ 
+-static struct { u32 sclk, speed, half_speed; } ct2_pll[] = {
+-	{0},							/* unused */
+-	{__APP_PLL_SCLK_CLK_DIV2, 0, 0},			/* FC 8G  */
+-	{0, 0, 0},						/* FC 16G */
+-	{__APP_PLL_SCLK_REFCLK_SEL | __APP_PLL_SCLK_CLK_DIV2, 0, /* ETH   */
+-	__APP_LPUCLK_HALFSPEED},
+-	{0, 0, 0},						/* COMBO  */
+-};
+-
+ static void
+-bfa_ioc_ct2_sclk_init(void __iomem *rb, enum bfi_asic_mode mode)
++bfa_ioc_ct2_sclk_init(void __iomem *rb)
+ {
+ 	u32 r32;
+ 
+@@ -673,11 +671,12 @@ bfa_ioc_ct2_sclk_init(void __iomem *rb, enum bfi_asic_mode mode)
+ 	writel(r32, (rb + CT2_APP_PLL_SCLK_CTL_REG));
+ 
+ 	/*
+-	 * select clock speed based on mode
++	 * Ignore mode and program for the max clock (which is FC16)
++	 * Firmware/NFC will do the PLL init appropiately
+ 	 */
+ 	r32 = readl((rb + CT2_APP_PLL_SCLK_CTL_REG));
+ 	r32 &= ~(__APP_PLL_SCLK_REFCLK_SEL | __APP_PLL_SCLK_CLK_DIV2);
+-	writel(r32 | ct2_pll[mode].sclk, (rb + CT2_APP_PLL_SCLK_CTL_REG));
++	writel(r32, (rb + CT2_APP_PLL_SCLK_CTL_REG));
+ 
+ 	/*
+ 	 * while doing PLL init dont clock gate ethernet subsystem
+@@ -700,30 +699,10 @@ bfa_ioc_ct2_sclk_init(void __iomem *rb, enum bfi_asic_mode mode)
+ 	 * poll for s_clk lock or delay 1ms
+ 	 */
+ 	udelay(1000);
+-
+-	/*
+-	 * release soft reset on s_clk & l_clk
+-	 */
+-	r32 = readl((rb + CT2_APP_PLL_SCLK_CTL_REG));
+-	writel(r32 & ~__APP_PLL_SCLK_LOGIC_SOFT_RESET,
+-		(rb + CT2_APP_PLL_SCLK_CTL_REG));
+-
+-	/*
+-	 * clock gating for ethernet subsystem if not in ethernet mode
+-	 */
+-	if (mode != BFI_ASIC_MODE_ETH) {
+-		r32 = readl((rb + CT2_CHIP_MISC_PRG));
+-		writel(r32 & ~__ETH_CLK_ENABLE_PORT0,
+-			(rb + CT2_CHIP_MISC_PRG));
+-
+-		r32 = readl((rb + CT2_PCIE_MISC_REG));
+-		writel(r32 & ~__ETH_CLK_ENABLE_PORT1,
+-			(rb + CT2_PCIE_MISC_REG));
+-	}
+ }
+ 
+ static void
+-bfa_ioc_ct2_lclk_init(void __iomem *rb, enum bfi_asic_mode mode)
++bfa_ioc_ct2_lclk_init(void __iomem *rb)
+ {
+ 	u32 r32;
+ 
+@@ -737,97 +716,144 @@ bfa_ioc_ct2_lclk_init(void __iomem *rb, enum bfi_asic_mode mode)
+ 	writel(r32, (rb + CT2_APP_PLL_LCLK_CTL_REG));
+ 
+ 	/*
+-	 * set LPU speed
++	 * set LPU speed (set for FC16 which will work for other modes)
+ 	 */
+ 	r32 = readl((rb + CT2_CHIP_MISC_PRG));
+-	writel(r32 | ct2_pll[mode].speed,
+-		(rb + CT2_CHIP_MISC_PRG));
++	writel(r32, (rb + CT2_CHIP_MISC_PRG));
+ 
+ 	/*
+-	 * set LPU half speed
++	 * set LPU half speed (set for FC16 which will work for other modes)
+ 	 */
+ 	r32 = readl((rb + CT2_APP_PLL_LCLK_CTL_REG));
+-	writel(r32 | ct2_pll[mode].half_speed,
+-		(rb + CT2_APP_PLL_LCLK_CTL_REG));
++	writel(r32, (rb + CT2_APP_PLL_LCLK_CTL_REG));
+ 
+ 	/*
+-	 * set lclk for mode
++	 * set lclk for mode (set for FC16)
+ 	 */
+ 	r32 = readl((rb + CT2_APP_PLL_LCLK_CTL_REG));
+ 	r32 &= (__P_LCLK_PLL_LOCK | __APP_LPUCLK_HALFSPEED);
+-	 if (mode == BFI_ASIC_MODE_FC || mode == BFI_ASIC_MODE_FC16 ||
+-	     mode == BFI_ASIC_MODE_ETH)
+-		r32 |= 0x20c1731b;
+-	else
+-		r32 |= 0x2081731b;
++	r32 |= 0x20c1731b;
+ 	writel(r32, (rb + CT2_APP_PLL_LCLK_CTL_REG));
+ 
+ 	/*
+ 	 * poll for s_clk lock or delay 1ms
+ 	 */
+ 	udelay(1000);
+-
+-	/*
+-	 * release soft reset on s_clk & l_clk
+-	 */
+-	r32 = readl((rb + CT2_APP_PLL_LCLK_CTL_REG));
+-	writel(r32 & ~__APP_PLL_LCLK_LOGIC_SOFT_RESET,
+-		(rb + CT2_APP_PLL_LCLK_CTL_REG));
+ }
+ 
+ static void
+-bfa_ioc_ct2_mem_init(void __iomem *rb, enum bfi_asic_mode mode)
++bfa_ioc_ct2_mem_init(void __iomem *rb)
+ {
+-	bfa_boolean_t fcmode;
+ 	u32	r32;
+ 
+-	fcmode = (mode == BFI_ASIC_MODE_FC) || (mode == BFI_ASIC_MODE_FC16);
+-	if (!fcmode) {
+-		writel(__PMM_1T_PNDB_P | __PMM_1T_RESET_P,
+-			(rb + CT2_PMM_1T_CONTROL_REG_P0));
+-		writel(__PMM_1T_PNDB_P | __PMM_1T_RESET_P,
+-			(rb + CT2_PMM_1T_CONTROL_REG_P1));
+-	}
+-
+ 	r32 = readl((rb + PSS_CTL_REG));
+ 	r32 &= ~__PSS_LMEM_RESET;
+ 	writel(r32, (rb + PSS_CTL_REG));
+ 	udelay(1000);
+ 
+-	if (!fcmode) {
+-		writel(__PMM_1T_PNDB_P, (rb + CT2_PMM_1T_CONTROL_REG_P0));
+-		writel(__PMM_1T_PNDB_P, (rb + CT2_PMM_1T_CONTROL_REG_P1));
+-	}
+-
+ 	writel(__EDRAM_BISTR_START, (rb + CT2_MBIST_CTL_REG));
+ 	udelay(1000);
+ 	writel(0, (rb + CT2_MBIST_CTL_REG));
+ }
+ 
++void
++bfa_ioc_ct2_mac_reset(void __iomem *rb)
++{
++	u32	r32;
++
++	bfa_ioc_ct2_sclk_init(rb);
++	bfa_ioc_ct2_lclk_init(rb);
++
++	/*
++	 * release soft reset on s_clk & l_clk
++	 */
++	r32 = readl((rb + CT2_APP_PLL_SCLK_CTL_REG));
++	writel(r32 & ~__APP_PLL_SCLK_LOGIC_SOFT_RESET,
++		(rb + CT2_APP_PLL_SCLK_CTL_REG));
++
++	/*
++	 * release soft reset on s_clk & l_clk
++	 */
++	r32 = readl((rb + CT2_APP_PLL_LCLK_CTL_REG));
++	writel(r32 & ~__APP_PLL_LCLK_LOGIC_SOFT_RESET,
++		(rb + CT2_APP_PLL_LCLK_CTL_REG));
++
++	/* put port0, port1 MAC & AHB in reset */
++	writel((__CSI_MAC_RESET | __CSI_MAC_AHB_RESET),
++		rb + CT2_CSI_MAC_CONTROL_REG(0));
++	writel((__CSI_MAC_RESET | __CSI_MAC_AHB_RESET),
++		rb + CT2_CSI_MAC_CONTROL_REG(1));
++}
++
++#define CT2_NFC_MAX_DELAY	1000
+ bfa_status_t
+ bfa_ioc_ct2_pll_init(void __iomem *rb, enum bfi_asic_mode mode)
+ {
+-	u32	r32;
++	u32	wgn, r32;
++	int i;
+ 
+ 	/*
+ 	 * Initialize PLL if not already done by NFC
+ 	 */
+-	r32 = readl((rb + CT2_WGN_STATUS));
++	wgn = readl(rb + CT2_WGN_STATUS);
++	if (!(wgn & __GLBL_PF_VF_CFG_RDY)) {
++		writel(__HALT_NFC_CONTROLLER, rb + CT2_NFC_CSR_SET_REG);
++		for (i = 0; i < CT2_NFC_MAX_DELAY; i++) {
++			r32 = readl(rb + CT2_NFC_CSR_SET_REG);
++			if (r32 & __NFC_CONTROLLER_HALTED)
++				break;
++			udelay(1000);
++		}
++	}
+ 
+-	writel(__HALT_NFC_CONTROLLER, (rb + CT2_NFC_CSR_SET_REG));
++	/*
++	 * Mask the interrupts and clear any
++	 * pending interrupts.
++	 */
++	writel(1, (rb + CT2_LPU0_HOSTFN_MBOX0_MSK));
++	writel(1, (rb + CT2_LPU1_HOSTFN_MBOX0_MSK));
+ 
+-	bfa_ioc_ct2_sclk_init(rb, mode);
+-	bfa_ioc_ct2_lclk_init(rb, mode);
+-	bfa_ioc_ct2_mem_init(rb, mode);
++	r32 = readl((rb + CT2_LPU0_HOSTFN_CMD_STAT));
++	if (r32 == 1) {
++		writel(1, (rb + CT2_LPU0_HOSTFN_CMD_STAT));
++		readl((rb + CT2_LPU0_HOSTFN_CMD_STAT));
++	}
++	r32 = readl((rb + CT2_LPU1_HOSTFN_CMD_STAT));
++	if (r32 == 1) {
++		writel(1, (rb + CT2_LPU1_HOSTFN_CMD_STAT));
++		readl((rb + CT2_LPU1_HOSTFN_CMD_STAT));
++	}
++
++	bfa_ioc_ct2_mac_reset(rb);
++	bfa_ioc_ct2_sclk_init(rb);
++	bfa_ioc_ct2_lclk_init(rb);
++
++	/*
++	 * release soft reset on s_clk & l_clk
++	 */
++	r32 = readl((rb + CT2_APP_PLL_SCLK_CTL_REG));
++	writel(r32 & ~__APP_PLL_SCLK_LOGIC_SOFT_RESET,
++		(rb + CT2_APP_PLL_SCLK_CTL_REG));
++
++	/*
++	 * release soft reset on s_clk & l_clk
++	 */
++	r32 = readl((rb + CT2_APP_PLL_LCLK_CTL_REG));
++	writel(r32 & ~__APP_PLL_LCLK_LOGIC_SOFT_RESET,
++		(rb + CT2_APP_PLL_LCLK_CTL_REG));
+ 
+ 	/*
+ 	 * Announce flash device presence, if flash was corrupted.
+ 	 */
+-	if (r32 == (__WGN_READY | __GLBL_PF_VF_CFG_RDY)) {
+-		writel(0, (rb + PSS_GPIO_OUT_REG));
+-		writel(1, (rb + PSS_GPIO_OE_REG));
++	if (wgn == (__WGN_READY | __GLBL_PF_VF_CFG_RDY)) {
++		r32 = readl((rb + PSS_GPIO_OUT_REG));
++		writel(r32 & ~1, (rb + PSS_GPIO_OUT_REG));
++		r32 = readl((rb + PSS_GPIO_OE_REG));
++		writel(r32 | 1, (rb + PSS_GPIO_OE_REG));
+ 	}
+ 
++	bfa_ioc_ct2_mem_init(rb);
++
+ 	writel(BFI_IOC_UNINIT, (rb + CT2_BFA_IOC0_STATE_REG));
+ 	writel(BFI_IOC_UNINIT, (rb + CT2_BFA_IOC1_STATE_REG));
+ 	return BFA_STATUS_OK;
+diff --git a/drivers/scsi/bfa/bfad.c b/drivers/scsi/bfa/bfad.c
+index 4fa3988..76af7ac 100644
+--- a/drivers/scsi/bfa/bfad.c
++++ b/drivers/scsi/bfa/bfad.c
+@@ -784,11 +784,14 @@ bfad_pci_init(struct pci_dev *pdev, struct bfad_s *bfad)
+ 	pci_set_master(pdev);
+ 
+ 
+-	if (pci_set_dma_mask(pdev, DMA_BIT_MASK(64)) != 0)
+-		if (pci_set_dma_mask(pdev, DMA_BIT_MASK(32)) != 0) {
++	if ((pci_set_dma_mask(pdev, DMA_BIT_MASK(64)) != 0) ||
++	    (pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64)) != 0)) {
++		if ((pci_set_dma_mask(pdev, DMA_BIT_MASK(32)) != 0) ||
++		   (pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32)) != 0)) {
+ 			printk(KERN_ERR "pci_set_dma_mask fail %p\n", pdev);
+ 			goto out_release_region;
+ 		}
++	}
+ 
+ 	bfad->pci_bar0_kva = pci_iomap(pdev, 0, pci_resource_len(pdev, 0));
+ 	bfad->pci_bar2_kva = pci_iomap(pdev, 2, pci_resource_len(pdev, 2));
+@@ -1291,6 +1294,7 @@ bfad_setup_intr(struct bfad_s *bfad)
+ 	u32 mask = 0, i, num_bit = 0, max_bit = 0;
+ 	struct msix_entry msix_entries[MAX_MSIX_ENTRY];
+ 	struct pci_dev *pdev = bfad->pcidev;
++	u16	reg;
+ 
+ 	/* Call BFA to get the msix map for this PCI function.  */
+ 	bfa_msix_getvecs(&bfad->bfa, &mask, &num_bit, &max_bit);
+@@ -1320,6 +1324,13 @@ bfad_setup_intr(struct bfad_s *bfad)
+ 			goto line_based;
+ 		}
+ 
++		/* Disable INTX in MSI-X mode */
++		pci_read_config_word(pdev, PCI_COMMAND, &reg);
++
++		if (!(reg & PCI_COMMAND_INTX_DISABLE))
++			pci_write_config_word(pdev, PCI_COMMAND,
++				reg | PCI_COMMAND_INTX_DISABLE);
++
+ 		/* Save the vectors */
+ 		for (i = 0; i < bfad->nvec; i++) {
+ 			bfa_trc(bfad, msix_entries[i].vector);
+diff --git a/drivers/scsi/bfa/bfi.h b/drivers/scsi/bfa/bfi.h
+index d8f1a71..3fb2e83 100644
+--- a/drivers/scsi/bfa/bfi.h
++++ b/drivers/scsi/bfa/bfi.h
+@@ -253,7 +253,7 @@ struct bfi_ioc_attr_s {
+ 	u32	adapter_prop;	/*  adapter properties     */
+ 	u16	maxfrsize;	/*  max receive frame size */
+ 	char		asic_rev;
+-	u8		ic;	/* initial capability */
++	u8		rsvd_d;
+ 	char		fw_version[BFA_VERSION_LEN];
+ 	char		optrom_version[BFA_VERSION_LEN];
+ 	struct		bfa_mfg_vpd_s	vpd;
+diff --git a/drivers/scsi/bfa/bfi_ms.h b/drivers/scsi/bfa/bfi_ms.h
+index c665a80..8c19734 100644
+--- a/drivers/scsi/bfa/bfi_ms.h
++++ b/drivers/scsi/bfa/bfi_ms.h
+@@ -48,7 +48,8 @@ struct bfi_iocfc_cfg_s {
+ 	u32	endian_sig;	/*  endian signature of host     */
+ 	__be16	num_ioim_reqs;
+ 	__be16	num_fwtio_reqs;
+-	u8	rsvd[4];
++	u8	single_msix_vec;
++	u8	rsvd[3];
+ 
+ 	/*
+ 	 * Request and response circular queue base addresses, size and
+diff --git a/drivers/scsi/bfa/bfi_reg.h b/drivers/scsi/bfa/bfi_reg.h
+index d20d2b3..d892064 100644
+--- a/drivers/scsi/bfa/bfi_reg.h
++++ b/drivers/scsi/bfa/bfi_reg.h
+@@ -277,6 +277,8 @@ enum {
+ #define CT2_LPU1_HOSTFN_CMD_STAT	(CT2_PCI_CPQ_BASE + 0x8c)
+ #define CT2_HOSTFN_LPU0_READ_STAT	(CT2_PCI_CPQ_BASE + 0x90)
+ #define CT2_HOSTFN_LPU1_READ_STAT	(CT2_PCI_CPQ_BASE + 0x94)
++#define CT2_LPU0_HOSTFN_MBOX0_MSK	(CT2_PCI_CPQ_BASE + 0x98)
++#define CT2_LPU1_HOSTFN_MBOX0_MSK	(CT2_PCI_CPQ_BASE + 0x9C)
+ #define CT2_HOST_SEM0_REG		0x000148f0
+ #define CT2_HOST_SEM1_REG		0x000148f4
+ #define CT2_HOST_SEM2_REG		0x000148f8
+@@ -337,6 +339,15 @@ enum {
+ #define __GLBL_PF_VF_CFG_RDY		0x00000200
+ #define CT2_NFC_CSR_SET_REG		0x00027424
+ #define __HALT_NFC_CONTROLLER		0x00000002
++#define __NFC_CONTROLLER_HALTED		0x00001000
++
++#define CT2_CSI_MAC0_CONTROL_REG	0x000270d0
++#define __CSI_MAC_RESET			0x00000010
++#define __CSI_MAC_AHB_RESET		0x00000008
++#define CT2_CSI_MAC1_CONTROL_REG	0x000270d4
++#define CT2_CSI_MAC_CONTROL_REG(__n)	\
++	(CT2_CSI_MAC0_CONTROL_REG +	\
++	(__n) * (CT2_CSI_MAC1_CONTROL_REG - CT2_CSI_MAC0_CONTROL_REG))
+ 
+ /*
+  * Name semaphore registers based on usage
+-- 
+1.6.0.2
+
