@@ -1,0 +1,477 @@
+From: Krishna Gudipati <kgudipat@brocade.com>
+Date: Fri, 24 Jun 2011 20:22:56 -0700
+Subject: [PATCH] bfa: IOC bug fixes.
+Git-commit: 5a0adaedffce91100d03fc1036dde024c8589295
+References: FATE#311450,bnc#689227
+Patch-Mainline: 3.0.1
+
+- Add logic to handle the case where PCI mapping goes away when
+  IOCPF state machine is waiting for semaphore.
+- Added logic to unlock hw semaphore if the previos FW boot was
+  from flash based and the current FW initialization attempt is from OS.
+- Added fix to update hbfails and hb_count stats during hwerror event.
+
+Signed-off-by: Krishna Gudipati <kgudipat@brocade.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/bfa/bfa_defs.h   |    2 +
+ drivers/scsi/bfa/bfa_ioc.c    |  116 +++++++++++++++++++++++++++++++++++++++--
+ drivers/scsi/bfa/bfa_ioc_cb.c |   15 -----
+ drivers/scsi/bfa/bfa_ioc_ct.c |   23 ++++-----
+ drivers/scsi/bfa/bfi.h        |    3 +-
+ 5 files changed, 125 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/scsi/bfa/bfa_defs.h b/drivers/scsi/bfa/bfa_defs.h
+index cced587..c675e65 100644
+--- a/drivers/scsi/bfa/bfa_defs.h
++++ b/drivers/scsi/bfa/bfa_defs.h
+@@ -274,6 +274,7 @@ enum bfa_ioc_state {
+ 	BFA_IOC_DISABLED	= 10,	/*  IOC is disabled */
+ 	BFA_IOC_FWMISMATCH	= 11,	/*  IOC f/w different from drivers */
+ 	BFA_IOC_ENABLING	= 12,	/*  IOC is being enabled */
++	BFA_IOC_HWFAIL		= 13,	/*  PCI mapping doesn't exist */
+ };
+ 
+ /*
+@@ -303,6 +304,7 @@ struct bfa_ioc_drv_stats_s {
+ 	u32	enable_reqs;
+ 	u32	disable_replies;
+ 	u32	enable_replies;
++	u32	rsvd;
+ };
+ 
+ /*
+diff --git a/drivers/scsi/bfa/bfa_ioc.c b/drivers/scsi/bfa/bfa_ioc.c
+index 2c575f5..931bf97 100644
+--- a/drivers/scsi/bfa/bfa_ioc.c
++++ b/drivers/scsi/bfa/bfa_ioc.c
+@@ -112,6 +112,7 @@ enum ioc_event {
+ 	IOC_E_HBFAIL		= 9,	/*  heartbeat failure		*/
+ 	IOC_E_HWERROR		= 10,	/*  hardware error interrupt	*/
+ 	IOC_E_TIMEOUT		= 11,	/*  timeout			*/
++	IOC_E_HWFAILED		= 12,	/*  PCI mapping failure notice	*/
+ };
+ 
+ bfa_fsm_state_decl(bfa_ioc, uninit, struct bfa_ioc_s, enum ioc_event);
+@@ -123,6 +124,7 @@ bfa_fsm_state_decl(bfa_ioc, fail_retry, struct bfa_ioc_s, enum ioc_event);
+ bfa_fsm_state_decl(bfa_ioc, fail, struct bfa_ioc_s, enum ioc_event);
+ bfa_fsm_state_decl(bfa_ioc, disabling, struct bfa_ioc_s, enum ioc_event);
+ bfa_fsm_state_decl(bfa_ioc, disabled, struct bfa_ioc_s, enum ioc_event);
++bfa_fsm_state_decl(bfa_ioc, hwfail, struct bfa_ioc_s, enum ioc_event);
+ 
+ static struct bfa_sm_table_s ioc_sm_table[] = {
+ 	{BFA_SM(bfa_ioc_sm_uninit), BFA_IOC_UNINIT},
+@@ -134,6 +136,7 @@ static struct bfa_sm_table_s ioc_sm_table[] = {
+ 	{BFA_SM(bfa_ioc_sm_fail), BFA_IOC_FAIL},
+ 	{BFA_SM(bfa_ioc_sm_disabling), BFA_IOC_DISABLING},
+ 	{BFA_SM(bfa_ioc_sm_disabled), BFA_IOC_DISABLED},
++	{BFA_SM(bfa_ioc_sm_hwfail), BFA_IOC_HWFAIL},
+ };
+ 
+ /*
+@@ -176,6 +179,7 @@ enum iocpf_event {
+ 	IOCPF_E_GETATTRFAIL	= 9,	/*  init fail notice by ioc sm	*/
+ 	IOCPF_E_SEMLOCKED	= 10,	/*  h/w semaphore is locked	*/
+ 	IOCPF_E_TIMEOUT		= 11,	/*  f/w response timeout	*/
++	IOCPF_E_SEM_ERROR	= 12,	/*  h/w sem mapping error	*/
+ };
+ 
+ /*
+@@ -322,6 +326,11 @@ bfa_ioc_sm_enabling(struct bfa_ioc_s *ioc, enum ioc_event event)
+ 			bfa_fsm_send_event(&ioc->iocpf, IOCPF_E_INITFAIL);
+ 		break;
+ 
++	case IOC_E_HWFAILED:
++		ioc->cbfn->enable_cbfn(ioc->bfa, BFA_STATUS_IOC_FAILURE);
++		bfa_fsm_set_state(ioc, bfa_ioc_sm_hwfail);
++		break;
++
+ 	case IOC_E_DISABLE:
+ 		bfa_fsm_set_state(ioc, bfa_ioc_sm_disabling);
+ 		break;
+@@ -465,6 +474,11 @@ bfa_ioc_sm_disabling(struct bfa_ioc_s *ioc, enum ioc_event event)
+ 		bfa_fsm_send_event(&ioc->iocpf, IOCPF_E_FAIL);
+ 		break;
+ 
++	case IOC_E_HWFAILED:
++		bfa_fsm_set_state(ioc, bfa_ioc_sm_hwfail);
++		bfa_ioc_disable_comp(ioc);
++		break;
++
+ 	default:
+ 		bfa_sm_fault(ioc, event);
+ 	}
+@@ -534,6 +548,11 @@ bfa_ioc_sm_fail_retry(struct bfa_ioc_s *ioc, enum ioc_event event)
+ 			bfa_fsm_send_event(&ioc->iocpf, IOCPF_E_INITFAIL);
+ 		break;
+ 
++	case IOC_E_HWFAILED:
++		ioc->cbfn->enable_cbfn(ioc->bfa, BFA_STATUS_IOC_FAILURE);
++		bfa_fsm_set_state(ioc, bfa_ioc_sm_hwfail);
++		break;
++
+ 	case IOC_E_ENABLE:
+ 		break;
+ 
+@@ -591,6 +610,35 @@ bfa_ioc_sm_fail(struct bfa_ioc_s *ioc, enum ioc_event event)
+ 	}
+ }
+ 
++static void
++bfa_ioc_sm_hwfail_entry(struct bfa_ioc_s *ioc)
++{
++	bfa_trc(ioc, 0);
++}
++
++static void
++bfa_ioc_sm_hwfail(struct bfa_ioc_s *ioc, enum ioc_event event)
++{
++	bfa_trc(ioc, event);
++
++	switch (event) {
++	case IOC_E_ENABLE:
++		ioc->cbfn->enable_cbfn(ioc->bfa, BFA_STATUS_IOC_FAILURE);
++		break;
++
++	case IOC_E_DISABLE:
++		ioc->cbfn->disable_cbfn(ioc->bfa);
++		break;
++
++	case IOC_E_DETACH:
++		bfa_fsm_set_state(ioc, bfa_ioc_sm_uninit);
++		break;
++
++	default:
++		bfa_sm_fault(ioc, event);
++	}
++}
++
+ /*
+  * IOCPF State Machine
+  */
+@@ -634,6 +682,28 @@ bfa_iocpf_sm_reset(struct bfa_iocpf_s *iocpf, enum iocpf_event event)
+ static void
+ bfa_iocpf_sm_fwcheck_entry(struct bfa_iocpf_s *iocpf)
+ {
++	struct bfi_ioc_image_hdr_s	fwhdr;
++	u32	fwstate = readl(iocpf->ioc->ioc_regs.ioc_fwstate);
++
++	/* h/w sem init */
++	if (fwstate == BFI_IOC_UNINIT)
++		goto sem_get;
++
++	bfa_ioc_fwver_get(iocpf->ioc, &fwhdr);
++
++	if (swab32(fwhdr.exec) == BFI_FWBOOT_TYPE_NORMAL)
++		goto sem_get;
++
++	bfa_trc(iocpf->ioc, fwstate);
++	bfa_trc(iocpf->ioc, fwhdr.exec);
++	writel(BFI_IOC_UNINIT, iocpf->ioc->ioc_regs.ioc_fwstate);
++
++	/*
++	 * Try to lock and then unlock the semaphore.
++	 */
++	readl(iocpf->ioc->ioc_regs.ioc_sem_reg);
++	writel(1, iocpf->ioc->ioc_regs.ioc_sem_reg);
++sem_get:
+ 	bfa_ioc_hw_sem_get(iocpf->ioc);
+ }
+ 
+@@ -664,6 +734,11 @@ bfa_iocpf_sm_fwcheck(struct bfa_iocpf_s *iocpf, enum iocpf_event event)
+ 		}
+ 		break;
+ 
++	case IOCPF_E_SEM_ERROR:
++		bfa_fsm_set_state(iocpf, bfa_iocpf_sm_fail);
++		bfa_fsm_send_event(ioc, IOC_E_HWFAILED);
++		break;
++
+ 	case IOCPF_E_DISABLE:
+ 		bfa_sem_timer_stop(ioc);
+ 		bfa_fsm_set_state(iocpf, bfa_iocpf_sm_reset);
+@@ -757,6 +832,11 @@ bfa_iocpf_sm_semwait(struct bfa_iocpf_s *iocpf, enum iocpf_event event)
+ 		}
+ 		break;
+ 
++	case IOCPF_E_SEM_ERROR:
++		bfa_fsm_set_state(iocpf, bfa_iocpf_sm_fail);
++		bfa_fsm_send_event(ioc, IOC_E_HWFAILED);
++		break;
++
+ 	case IOCPF_E_DISABLE:
+ 		bfa_sem_timer_stop(ioc);
+ 		bfa_fsm_set_state(iocpf, bfa_iocpf_sm_disabling_sync);
+@@ -957,6 +1037,11 @@ bfa_iocpf_sm_disabling_sync(struct bfa_iocpf_s *iocpf, enum iocpf_event event)
+ 		bfa_fsm_set_state(iocpf, bfa_iocpf_sm_disabled);
+ 		break;
+ 
++	case IOCPF_E_SEM_ERROR:
++		bfa_fsm_set_state(iocpf, bfa_iocpf_sm_fail);
++		bfa_fsm_send_event(ioc, IOC_E_HWFAILED);
++		break;
++
+ 	case IOCPF_E_FAIL:
+ 		break;
+ 
+@@ -1000,6 +1085,7 @@ bfa_iocpf_sm_disabled(struct bfa_iocpf_s *iocpf, enum iocpf_event event)
+ static void
+ bfa_iocpf_sm_initfail_sync_entry(struct bfa_iocpf_s *iocpf)
+ {
++	bfa_ioc_debug_save_ftrc(iocpf->ioc);
+ 	bfa_ioc_hw_sem_get(iocpf->ioc);
+ }
+ 
+@@ -1022,6 +1108,11 @@ bfa_iocpf_sm_initfail_sync(struct bfa_iocpf_s *iocpf, enum iocpf_event event)
+ 		bfa_fsm_set_state(iocpf, bfa_iocpf_sm_initfail);
+ 		break;
+ 
++	case IOCPF_E_SEM_ERROR:
++		bfa_fsm_set_state(iocpf, bfa_iocpf_sm_fail);
++		bfa_fsm_send_event(ioc, IOC_E_HWFAILED);
++		break;
++
+ 	case IOCPF_E_DISABLE:
+ 		bfa_sem_timer_stop(ioc);
+ 		bfa_fsm_set_state(iocpf, bfa_iocpf_sm_disabling_sync);
+@@ -1044,6 +1135,7 @@ bfa_iocpf_sm_initfail_sync(struct bfa_iocpf_s *iocpf, enum iocpf_event event)
+ static void
+ bfa_iocpf_sm_initfail_entry(struct bfa_iocpf_s *iocpf)
+ {
++	bfa_trc(iocpf->ioc, 0);
+ }
+ 
+ /*
+@@ -1113,6 +1205,11 @@ bfa_iocpf_sm_fail_sync(struct bfa_iocpf_s *iocpf, enum iocpf_event event)
+ 		}
+ 		break;
+ 
++	case IOCPF_E_SEM_ERROR:
++		bfa_fsm_set_state(iocpf, bfa_iocpf_sm_fail);
++		bfa_fsm_send_event(ioc, IOC_E_HWFAILED);
++		break;
++
+ 	case IOCPF_E_DISABLE:
+ 		bfa_sem_timer_stop(ioc);
+ 		bfa_fsm_set_state(iocpf, bfa_iocpf_sm_disabling_sync);
+@@ -1129,6 +1226,7 @@ bfa_iocpf_sm_fail_sync(struct bfa_iocpf_s *iocpf, enum iocpf_event event)
+ static void
+ bfa_iocpf_sm_fail_entry(struct bfa_iocpf_s *iocpf)
+ {
++	bfa_trc(iocpf->ioc, 0);
+ }
+ 
+ /*
+@@ -1195,7 +1293,6 @@ bfa_ioc_sem_get(void __iomem *sem_reg)
+ 	if (!(r32 & 1))
+ 		return BFA_TRUE;
+ 
+-	WARN_ON(cnt >= BFA_SEM_SPINCNT);
+ 	return BFA_FALSE;
+ }
+ 
+@@ -1209,6 +1306,11 @@ bfa_ioc_hw_sem_get(struct bfa_ioc_s *ioc)
+ 	 * will return 1. Semaphore is released by writing 1 to the register
+ 	 */
+ 	r32 = readl(ioc->ioc_regs.ioc_sem_reg);
++	if (r32 == ~0) {
++		WARN_ON(r32 == ~0);
++		bfa_fsm_send_event(&ioc->iocpf, IOCPF_E_SEM_ERROR);
++		return;
++	}
+ 	if (!(r32 & 1)) {
+ 		bfa_fsm_send_event(&ioc->iocpf, IOCPF_E_SEMLOCKED);
+ 		return;
+@@ -1617,6 +1719,7 @@ bfa_ioc_getattr_reply(struct bfa_ioc_s *ioc)
+ 	attr->adapter_prop  = be32_to_cpu(attr->adapter_prop);
+ 	attr->card_type     = be32_to_cpu(attr->card_type);
+ 	attr->maxfrsize	    = be16_to_cpu(attr->maxfrsize);
++	ioc->fcmode	= (attr->port_mode == BFI_PORT_MODE_FC);
+ 
+ 	bfa_fsm_send_event(ioc, IOC_E_FWRSP_GETATTR);
+ }
+@@ -1733,6 +1836,7 @@ bfa_ioc_smem_read(struct bfa_ioc_s *ioc, void *tbuf, u32 soff, u32 sz)
+ 	/*
+ 	 *  release semaphore.
+ 	 */
++	readl(ioc->ioc_regs.ioc_init_sem_reg);
+ 	writel(1, ioc->ioc_regs.ioc_init_sem_reg);
+ 
+ 	bfa_trc(ioc, pgnum);
+@@ -1789,6 +1893,7 @@ bfa_ioc_smem_clr(struct bfa_ioc_s *ioc, u32 soff, u32 sz)
+ 	/*
+ 	 *  release semaphore.
+ 	 */
++	readl(ioc->ioc_regs.ioc_init_sem_reg);
+ 	writel(1, ioc->ioc_regs.ioc_init_sem_reg);
+ 	bfa_trc(ioc, pgnum);
+ 	return BFA_STATUS_OK;
+@@ -1840,6 +1945,7 @@ bfa_ioc_pll_init(struct bfa_ioc_s *ioc)
+ 	/*
+ 	 *  release semaphore.
+ 	 */
++	readl(ioc->ioc_regs.ioc_init_sem_reg);
+ 	writel(1, ioc->ioc_regs.ioc_init_sem_reg);
+ 
+ 	return BFA_STATUS_OK;
+@@ -2232,6 +2338,8 @@ bfa_ioc_mbox_isr(struct bfa_ioc_s *ioc)
+ void
+ bfa_ioc_error_isr(struct bfa_ioc_s *ioc)
+ {
++	bfa_ioc_stats(ioc, ioc_hbfails);
++	ioc->stats.hb_count = ioc->hb_count;
+ 	bfa_fsm_send_event(ioc, IOC_E_HWERROR);
+ }
+ 
+@@ -2354,15 +2462,12 @@ bfa_ioc_get_adapter_attr(struct bfa_ioc_s *ioc,
+ enum bfa_ioc_type_e
+ bfa_ioc_get_type(struct bfa_ioc_s *ioc)
+ {
+-	enum bfi_port_mode mode;
+-
+ 	if (ioc->clscode == BFI_PCIFN_CLASS_ETH)
+ 		return BFA_IOC_TYPE_LL;
+ 
+ 	WARN_ON(ioc->clscode != BFI_PCIFN_CLASS_FC);
+ 
+-	mode = (ioc->port_id == 0) ? ioc->port0_mode : ioc->port1_mode;
+-	return (mode == BFI_PORT_MODE_FC)
++	return (ioc->attr->port_mode == BFI_PORT_MODE_FC)
+ 		? BFA_IOC_TYPE_FC : BFA_IOC_TYPE_FCoE;
+ }
+ 
+@@ -2739,6 +2844,7 @@ static void
+ bfa_ioc_recover(struct bfa_ioc_s *ioc)
+ {
+ 	bfa_ioc_stats(ioc, ioc_hbfails);
++	ioc->stats.hb_count = ioc->hb_count;
+ 	bfa_fsm_send_event(ioc, IOC_E_HBFAIL);
+ }
+ 
+diff --git a/drivers/scsi/bfa/bfa_ioc_cb.c b/drivers/scsi/bfa/bfa_ioc_cb.c
+index e858bc0..30df8a2 100644
+--- a/drivers/scsi/bfa/bfa_ioc_cb.c
++++ b/drivers/scsi/bfa/bfa_ioc_cb.c
+@@ -69,21 +69,6 @@ bfa_ioc_set_cb_hwif(struct bfa_ioc_s *ioc)
+ static bfa_boolean_t
+ bfa_ioc_cb_firmware_lock(struct bfa_ioc_s *ioc)
+ {
+-	struct bfi_ioc_image_hdr_s fwhdr;
+-	uint32_t fwstate = readl(ioc->ioc_regs.ioc_fwstate);
+-
+-	if (fwstate == BFI_IOC_UNINIT)
+-		return BFA_TRUE;
+-
+-	bfa_ioc_fwver_get(ioc, &fwhdr);
+-
+-	if (swab32(fwhdr.exec) == BFI_FWBOOT_TYPE_NORMAL)
+-		return BFA_TRUE;
+-
+-	bfa_trc(ioc, fwstate);
+-	bfa_trc(ioc, fwhdr.exec);
+-	writel(BFI_IOC_UNINIT, ioc->ioc_regs.ioc_fwstate);
+-
+ 	return BFA_TRUE;
+ }
+ 
+diff --git a/drivers/scsi/bfa/bfa_ioc_ct.c b/drivers/scsi/bfa/bfa_ioc_ct.c
+index 5b55794..216016c 100644
+--- a/drivers/scsi/bfa/bfa_ioc_ct.c
++++ b/drivers/scsi/bfa/bfa_ioc_ct.c
+@@ -58,12 +58,6 @@ bfa_ioc_ct_firmware_lock(struct bfa_ioc_s *ioc)
+ 	struct bfi_ioc_image_hdr_s fwhdr;
+ 
+ 	/*
+-	 * Firmware match check is relevant only for CNA.
+-	 */
+-	if (!bfa_ioc_is_cna(ioc))
+-		return BFA_TRUE;
+-
+-	/*
+ 	 * If bios boot (flash based) -- do not increment usage count
+ 	 */
+ 	if (bfa_cb_image_get_size(bfa_ioc_asic_gen(ioc)) <
+@@ -78,6 +72,7 @@ bfa_ioc_ct_firmware_lock(struct bfa_ioc_s *ioc)
+ 	 */
+ 	if (usecnt == 0) {
+ 		writel(1, ioc->ioc_regs.ioc_usage_reg);
++		readl(ioc->ioc_regs.ioc_usage_sem_reg);
+ 		writel(1, ioc->ioc_regs.ioc_usage_sem_reg);
+ 		writel(0, ioc->ioc_regs.ioc_fail_sync);
+ 		bfa_trc(ioc, usecnt);
+@@ -97,6 +92,7 @@ bfa_ioc_ct_firmware_lock(struct bfa_ioc_s *ioc)
+ 	 */
+ 	bfa_ioc_fwver_get(ioc, &fwhdr);
+ 	if (!bfa_ioc_fwver_cmp(ioc, &fwhdr)) {
++		readl(ioc->ioc_regs.ioc_usage_sem_reg);
+ 		writel(1, ioc->ioc_regs.ioc_usage_sem_reg);
+ 		bfa_trc(ioc, usecnt);
+ 		return BFA_FALSE;
+@@ -107,6 +103,7 @@ bfa_ioc_ct_firmware_lock(struct bfa_ioc_s *ioc)
+ 	 */
+ 	usecnt++;
+ 	writel(usecnt, ioc->ioc_regs.ioc_usage_reg);
++	readl(ioc->ioc_regs.ioc_usage_sem_reg);
+ 	writel(1, ioc->ioc_regs.ioc_usage_sem_reg);
+ 	bfa_trc(ioc, usecnt);
+ 	return BFA_TRUE;
+@@ -118,12 +115,6 @@ bfa_ioc_ct_firmware_unlock(struct bfa_ioc_s *ioc)
+ 	u32 usecnt;
+ 
+ 	/*
+-	 * Firmware lock is relevant only for CNA.
+-	 */
+-	if (!bfa_ioc_is_cna(ioc))
+-		return;
+-
+-	/*
+ 	 * If bios boot (flash based) -- do not decrement usage count
+ 	 */
+ 	if (bfa_cb_image_get_size(bfa_ioc_asic_gen(ioc)) <
+@@ -141,6 +132,7 @@ bfa_ioc_ct_firmware_unlock(struct bfa_ioc_s *ioc)
+ 	writel(usecnt, ioc->ioc_regs.ioc_usage_reg);
+ 	bfa_trc(ioc, usecnt);
+ 
++	readl(ioc->ioc_regs.ioc_usage_sem_reg);
+ 	writel(1, ioc->ioc_regs.ioc_usage_sem_reg);
+ }
+ 
+@@ -344,7 +336,11 @@ bfa_ioc_ct_map_port(struct bfa_ioc_s *ioc)
+ static void
+ bfa_ioc_ct2_map_port(struct bfa_ioc_s *ioc)
+ {
+-	ioc->port_id = bfa_ioc_pcifn(ioc) % 2;
++	void __iomem	*rb = ioc->pcidev.pci_bar_kva;
++	u32	r32;
++
++	r32 = readl(rb + CT2_HOSTFN_PERSONALITY0);
++	ioc->port_id = ((r32 & __FC_LL_PORT_MAP__MK) >> __FC_LL_PORT_MAP__SH);
+ 
+ 	bfa_trc(ioc, bfa_ioc_pcifn(ioc));
+ 	bfa_trc(ioc, ioc->port_id);
+@@ -407,6 +403,7 @@ bfa_ioc_ct_ownership_reset(struct bfa_ioc_s *ioc)
+ 	if (bfa_ioc_is_cna(ioc)) {
+ 		bfa_ioc_sem_get(ioc->ioc_regs.ioc_usage_sem_reg);
+ 		writel(0, ioc->ioc_regs.ioc_usage_reg);
++		readl(ioc->ioc_regs.ioc_usage_sem_reg);
+ 		writel(1, ioc->ioc_regs.ioc_usage_sem_reg);
+ 	}
+ 
+diff --git a/drivers/scsi/bfa/bfi.h b/drivers/scsi/bfa/bfi.h
+index d28c7c5..02e4456 100644
+--- a/drivers/scsi/bfa/bfi.h
++++ b/drivers/scsi/bfa/bfi.h
+@@ -236,7 +236,8 @@ struct bfi_ioc_attr_s {
+ 	wwn_t		mfg_pwwn;	/*  Mfg port wwn	   */
+ 	wwn_t		mfg_nwwn;	/*  Mfg node wwn	   */
+ 	mac_t		mfg_mac;	/*  Mfg mac		   */
+-	u16	rsvd_a;
++	u8		port_mode;	/* bfi_port_mode	   */
++	u8		rsvd_a;
+ 	wwn_t		pwwn;
+ 	wwn_t		nwwn;
+ 	mac_t		mac;		/*  PBC or Mfg mac	   */
+-- 
+1.6.0.2
+
