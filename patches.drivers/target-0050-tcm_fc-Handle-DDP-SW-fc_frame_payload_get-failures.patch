@@ -1,0 +1,210 @@
+From: Kiran Patil <kiran.patil@intel.com>
+Date: Wed, 3 Aug 2011 09:20:01 +0000
+Subject: tcm_fc: Handle DDP/SW fc_frame_payload_get failures in ft_recv_write_data
+Git-commit: dcd998ccdbf74a7d8fe0f0a44e85da1ed5975946
+References: bnc#718950
+Patch-Mainline: 3.1-rc1
+
+Problem: HW DDP context was not invalidated in case of ABORTS, etc...
+This leads to the problem where memory pages which are used for DDP
+as user descriptor could get reused for some other purpose (such as to
+satisfy new memory allocation request either by kernel or user mode threads)
+and since HW DDP context was not invalidated, HW continue to write to
+those pages, hence causing memory corruption.
+
+Fix: Either on incoming ABORTS or due to exchange time out, allowed the
+target to cleanup HW DDP context if it was setup for respective ft_cmd.
+Added new function to perform this cleanup, furthur it can be enhanced
+for other cleanup activity.  Fix ft_recv_write_data() to properly handle
+fc_frame_payload_get to return pointer to payload if it exist. If there is
+no payload which is most common case (+ve case in case if DDP is working
+as expected, it will return NULL. Yes, scope of buf is limited to printk.
+Invalidation of HW context (which is done inside ft_invl_hw_context() is
+necessary in SUCCESS and FAILURE case of DDP. Hence invalidation is DONE
+as long as there was DDP setup (whether it worked correctly or not,
+
+NOTE: For some reason, if there is any error w.r.t DDP such as out of
+order packet reception, HW simply post the full packet in rx queue.
+
+Signed-off-by: Kiran Patil <kiran.patil@intel.com>
+Cc: Robert W Love <robert.w.love@intel.com>
+Signed-off-by: Nicholas A. Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/target/tcm_fc/tcm_fc.h  |    5 ++
+ drivers/target/tcm_fc/tfc_cmd.c |    1 +
+ drivers/target/tcm_fc/tfc_io.c  |  121 +++++++++++++++++++++++----------------
+ 3 files changed, 78 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/target/tcm_fc/tcm_fc.h b/drivers/target/tcm_fc/tcm_fc.h
+index f7fff7e..bd4fe21 100644
+--- a/drivers/target/tcm_fc/tcm_fc.h
++++ b/drivers/target/tcm_fc/tcm_fc.h
+@@ -187,4 +187,9 @@ void ft_dump_cmd(struct ft_cmd *, const char *caller);
+ 
+ ssize_t ft_format_wwn(char *, size_t, u64);
+ 
++/*
++ * Underlying HW specific helper function
++ */
++void ft_invl_hw_context(struct ft_cmd *);
++
+ #endif /* __TCM_FC_H__ */
+diff --git a/drivers/target/tcm_fc/tfc_cmd.c b/drivers/target/tcm_fc/tfc_cmd.c
+index 16493a7..e8a6315 100644
+--- a/drivers/target/tcm_fc/tfc_cmd.c
++++ b/drivers/target/tcm_fc/tfc_cmd.c
+@@ -321,6 +321,7 @@ static void ft_recv_seq(struct fc_seq *sp, struct fc_frame *fp, void *arg)
+ 	default:
+ 		pr_debug("%s: unhandled frame r_ctl %x\n",
+ 		       __func__, fh->fh_r_ctl);
++		ft_invl_hw_context(cmd);
+ 		fc_frame_free(fp);
+ 		transport_generic_free_cmd(&cmd->se_cmd, 0, 0);
+ 		break;
+diff --git a/drivers/target/tcm_fc/tfc_io.c b/drivers/target/tcm_fc/tfc_io.c
+index 11e6483..06943ee 100644
+--- a/drivers/target/tcm_fc/tfc_io.c
++++ b/drivers/target/tcm_fc/tfc_io.c
+@@ -214,62 +214,49 @@ void ft_recv_write_data(struct ft_cmd *cmd, struct fc_frame *fp)
+ 	if (!(ntoh24(fh->fh_f_ctl) & FC_FC_REL_OFF))
+ 		goto drop;
+ 
++	f_ctl = ntoh24(fh->fh_f_ctl);
++	ep = fc_seq_exch(seq);
++	lport = ep->lp;
++	if (cmd->was_ddp_setup) {
++		BUG_ON(!ep);
++		BUG_ON(!lport);
++	}
++
+ 	/*
+-	 * Doesn't expect even single byte of payload. Payload
++	 * Doesn't expect payload if DDP is setup. Payload
+ 	 * is expected to be copied directly to user buffers
+-	 * due to DDP (Large Rx offload) feature, hence
+-	 * BUG_ON if BUF is non-NULL
++	 * due to DDP (Large Rx offload),
+ 	 */
+ 	buf = fc_frame_payload_get(fp, 1);
+-	if (cmd->was_ddp_setup && buf) {
+-		pr_debug("%s: When DDP was setup, not expected to"
+-				 "receive frame with payload, Payload shall be"
+-				 "copied directly to buffer instead of coming "
+-				 "via. legacy receive queues\n", __func__);
+-		BUG_ON(buf);
+-	}
++	if (buf)
++		pr_err("%s: xid 0x%x, f_ctl 0x%x, cmd->sg %p, "
++				"cmd->sg_cnt 0x%x. DDP was setup"
++				" hence not expected to receive frame with "
++				"payload, Frame will be dropped if "
++				"'Sequence Initiative' bit in f_ctl is "
++				"not set\n", __func__, ep->xid, f_ctl,
++				cmd->sg, cmd->sg_cnt);
++	/*
++ 	 * Invalidate HW DDP context if it was setup for respective
++ 	 * command. Invalidation of HW DDP context is requited in both
++ 	 * situation (success and error). 
++ 	 */
++	ft_invl_hw_context(cmd);
+ 
+ 	/*
+-	 * If ft_cmd indicated 'ddp_setup', in that case only the last frame
+-	 * should come with 'TSI bit being set'. If 'TSI bit is not set and if
+-	 * data frame appears here, means error condition. In both the cases
+-	 * release the DDP context (ddp_put) and in error case, as well
+-	 * initiate error recovery mechanism.
++	 * If "Sequence Initiative (TSI)" bit set in f_ctl, means last
++	 * write data frame is received successfully where payload is
++	 * posted directly to user buffer and only the last frame's
++	 * header is posted in receive queue.
++	 *
++	 * If "Sequence Initiative (TSI)" bit is not set, means error
++	 * condition w.r.t. DDP, hence drop the packet and let explict
++	 * ABORTS from other end of exchange timer trigger the recovery.
+ 	 */
+-	ep = fc_seq_exch(seq);
+-	if (cmd->was_ddp_setup) {
+-		BUG_ON(!ep);
+-		lport = ep->lp;
+-		BUG_ON(!lport);
+-	}
+-	if (cmd->was_ddp_setup && ep->xid != FC_XID_UNKNOWN) {
+-		f_ctl = ntoh24(fh->fh_f_ctl);
+-		/*
+-		 * If TSI bit set in f_ctl, means last write data frame is
+-		 * received successfully where payload is posted directly
+-		 * to user buffer and only the last frame's header is posted
+-		 * in legacy receive queue
+-		 */
+-		if (f_ctl & FC_FC_SEQ_INIT) { /* TSI bit set in FC frame */
+-			cmd->write_data_len = lport->tt.ddp_done(lport,
+-								ep->xid);
+-			goto last_frame;
+-		} else {
+-			/*
+-			 * Updating the write_data_len may be meaningless at
+-			 * this point, but just in case if required in future
+-			 * for debugging or any other purpose
+-			 */
+-			pr_err("%s: Received frame with TSI bit not"
+-					" being SET, dropping the frame, "
+-					"cmd->sg <%p>, cmd->sg_cnt <0x%x>\n",
+-					__func__, cmd->sg, cmd->sg_cnt);
+-			cmd->write_data_len = lport->tt.ddp_done(lport,
+-							      ep->xid);
+-			lport->tt.seq_exch_abort(cmd->seq, 0);
+-			goto drop;
+-		}
+-	}
++	if (f_ctl & FC_FC_SEQ_INIT)
++		goto last_frame;
++	else
++		goto drop;
+ 
+ 	rel_off = ntohl(fh->fh_parm_offset);
+ 	frame_len = fr_len(fp);
+@@ -332,3 +319,39 @@ last_frame:
+ drop:
+ 	fc_frame_free(fp);
+ }
++
++/*
++ * Handle and cleanup any HW specific resources if
++ * received ABORTS, errors, timeouts.
++ */
++void ft_invl_hw_context(struct ft_cmd *cmd)
++{
++	struct fc_seq *seq = cmd->seq;
++	struct fc_exch *ep = NULL;
++	struct fc_lport *lport = NULL;
++
++	BUG_ON(!cmd);
++
++	/* Cleanup the DDP context in HW if DDP was setup */
++	if (cmd->was_ddp_setup && seq) {
++		ep = fc_seq_exch(seq);
++		if (ep) {
++			lport = ep->lp;
++			if (lport && (ep->xid <= lport->lro_xid))
++				/*
++				 * "ddp_done" trigger invalidation of HW
++				 * specific DDP context
++				 */
++				cmd->write_data_len = lport->tt.ddp_done(lport,
++								      ep->xid);
++
++				/*
++				 * Resetting same variable to indicate HW's
++				 * DDP context has been invalidated to avoid
++				 * re_invalidation of same context (context is
++				 * identified using ep->xid)
++				 */
++				cmd->was_ddp_setup = 0;
++		}
++	}
++}
+-- 
+1.6.0.2
+
