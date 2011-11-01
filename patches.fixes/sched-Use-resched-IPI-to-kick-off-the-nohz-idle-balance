@@ -1,0 +1,168 @@
+Subject: sched: Use resched IPI to kick off the nohz idle balance
+From: Suresh Siddha <suresh.b.siddha@intel.com>
+Date: Mon, 3 Oct 2011 15:09:00 -0700
+Patch-mainline: v3.2-rc1
+Git-commit: ca38062e57e97791c2f62e3dbd06caf3ebb5721c
+References: bnc#726023
+
+Current use of smp call function to kick the nohz idle balance can deadlock
+in this scenario.
+
+1. cpu-A did a generic_exec_single() to cpu-B and after queuing its call single
+data (csd) to the call single queue, cpu-A took a timer interrupt.  Actual IPI
+to cpu-B to process the call single queue is not yet sent.
+
+2. As part of the timer interrupt handler, cpu-A decided to kick cpu-B
+for the idle load balancing (sets cpu-B's rq->nohz_balance_kick to 1)
+and __smp_call_function_single() with nowait will queue the csd to the
+cpu-B's queue. But the generic_exec_single() won't send an IPI to cpu-B
+as the call single queue was not empty.
+
+3. cpu-A is busy with lot of interrupts
+
+4. Meanwhile cpu-B is entering and exiting idle and noticed that it has
+it's rq->nohz_balance_kick set to '1'. So it will go ahead and do the
+idle load balancer and clear its rq->nohz_balance_kick.
+
+5. At this point, csd queued as part of the step-2 above is still locked
+and waiting to be serviced on cpu-B.
+
+6. cpu-A is still busy with interrupt load and now it got another timer
+interrupt and as part of it decided to kick cpu-B for another idle load
+balancing (as it finds cpu-B's rq->nohz_balance_kick cleared in step-4
+above) and does __smp_call_function_single() with the same csd that is
+still locked.
+
+7. And we get a deadlock waiting for the csd_lock() in the
+__smp_call_function_single().
+
+Main issue here is that cpu-B can service the idle load balancer kick
+request from cpu-A even with out receiving the IPI and this lead to
+doing multiple __smp_call_function_single() on the same csd leading to
+deadlock.
+
+To kick a cpu, scheduler already has the reschedule vector reserved. Use
+that mechanism (kick_process()) instead of using the generic smp call function
+mechanism to kick off the nohz idle load balancing and avoid the deadlock.
+
+   [ This issue is present from 2.6.35+ kernels, but marking it -stable
+     only from v3.0+ as the proposed fix depends on the scheduler_ipi()
+     that is introduced recently. ]
+
+Reported-by: Prarit Bhargava <prarit@redhat.com>
+Signed-off-by: Suresh Siddha <suresh.b.siddha@intel.com>
+Cc: stable@kernel.org # v3.0+
+Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/20111003220934.834943260@sbsiddha-desk.sc.intel.com
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Acked-by: Mike Galbraith <mgalbraith@suse.de>
+
+---
+ kernel/sched.c      |   24 +++++++++++++++++++++---
+ kernel/sched_fair.c |   29 +++++++++--------------------
+ 2 files changed, 30 insertions(+), 23 deletions(-)
+
+Index: linux-3.0-SLE11-SP2/kernel/sched.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/kernel/sched.c
++++ linux-3.0-SLE11-SP2/kernel/sched.c
+@@ -1406,6 +1406,18 @@ void wake_up_idle_cpu(int cpu)
+ 		smp_send_reschedule(cpu);
+ }
+ 
++static inline bool got_nohz_idle_kick(void)
++{
++	return idle_cpu(smp_processor_id()) && this_rq()->nohz_balance_kick;
++}
++
++#else /* CONFIG_NO_HZ */
++
++static inline bool got_nohz_idle_kick(void)
++{
++	return false;
++}
++
+ #endif /* CONFIG_NO_HZ */
+ 
+ static u64 sched_avg_period(void)
+@@ -2699,7 +2711,7 @@ void scheduler_ipi(void)
+ 	struct rq *rq = this_rq();
+ 	struct task_struct *list = xchg(&rq->wake_list, NULL);
+ 
+-	if (!list)
++	if (!list && !got_nohz_idle_kick())
+ 		return;
+ 
+ 	/*
+@@ -2716,7 +2728,14 @@ void scheduler_ipi(void)
+ 	 * somewhat pessimize the simple resched case.
+ 	 */
+ 	irq_enter();
+-	sched_ttwu_do_pending(list);
++	if (list)
++		sched_ttwu_do_pending(list);
++
++	/*
++	 * Check if someone kicked us for doing the nohz idle load balance.
++	 */
++	if (unlikely(got_nohz_idle_kick() && !need_resched()))
++		raise_softirq_irqoff(SCHED_SOFTIRQ);
+ 	irq_exit();
+ }
+ 
+@@ -8264,7 +8283,6 @@ void __init sched_init(void)
+ 		rq_attach_root(rq, &def_root_domain);
+ #ifdef CONFIG_NO_HZ
+ 		rq->nohz_balance_kick = 0;
+-		init_sched_softirq_csd(&per_cpu(remote_sched_softirq_cb, i));
+ #endif
+ #endif
+ 		init_rq_hrtick(rq);
+Index: linux-3.0-SLE11-SP2/kernel/sched_fair.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/kernel/sched_fair.c
++++ linux-3.0-SLE11-SP2/kernel/sched_fair.c
+@@ -4300,22 +4300,6 @@ out_unlock:
+ }
+ 
+ #ifdef CONFIG_NO_HZ
+-
+-static DEFINE_PER_CPU(struct call_single_data, remote_sched_softirq_cb);
+-
+-static void trigger_sched_softirq(void *data)
+-{
+-	raise_softirq_irqoff(SCHED_SOFTIRQ);
+-}
+-
+-static inline void init_sched_softirq_csd(struct call_single_data *csd)
+-{
+-	csd->func = trigger_sched_softirq;
+-	csd->info = NULL;
+-	csd->flags = 0;
+-	csd->priv = 0;
+-}
+-
+ /*
+  * idle load balancing details
+  * - One of the idle CPUs nominates itself as idle load_balancer, while
+@@ -4481,11 +4465,16 @@ static void nohz_balancer_kick(int cpu)
+ 	}
+ 
+ 	if (!cpu_rq(ilb_cpu)->nohz_balance_kick) {
+-		struct call_single_data *cp;
+-
+ 		cpu_rq(ilb_cpu)->nohz_balance_kick = 1;
+-		cp = &per_cpu(remote_sched_softirq_cb, cpu);
+-		__smp_call_function_single(ilb_cpu, cp, 0);
++
++		smp_mb();
++		/*
++		 * Use smp_send_reschedule() instead of resched_cpu().
++		 * This way we generate a sched IPI on the target cpu which
++		 * is idle. And the softirq performing nohz idle load balance
++		 * will be run before returning from the IPI.
++		 */
++		smp_send_reschedule(ilb_cpu);
+ 	}
+ 	return;
+ }
