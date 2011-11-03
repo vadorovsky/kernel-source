@@ -1,0 +1,456 @@
+From 2e27980e6eb78114c4ecbaad1ba71836e3887d18 Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Fri, 2 Sep 2011 11:05:50 -0700
+Subject: xhci: Track interval bandwidth tables per port/TT.
+Patch-mainline: HEAD
+Git-commit: 2e27980e6eb78114c4ecbaad1ba71836e3887d18
+
+In order to update the root port or TT's bandwidth interval table, we will
+need to keep track of a list of endpoints, per interval.  That way we can
+easily know the new largest max packet size when we have to remove an
+endpoint.
+
+Add an endpoint list for each root port or TT structure, sorted by
+endpoint max packet size.  Insert new endpoints into the list such that
+the head of the list always has the endpoint with the greatest max packet
+size.  Only insert endpoints and update the interval table with new
+information when those endpoints are periodic.
+
+Make sure to update the number of active TTs when we add or drop periodic
+endpoints.  A TT is only considered active if it has one or more periodic
+endpoints attached (control and bulk are best effort, and counted in the
+20% reserved on the high speed bus).  If the number of active endpoints
+for a TT was zero, and it's now non-zero, increment the number of active
+TTs for the rootport.  If the number of active endpoints was non-zero, and
+it's now zero, decrement the number of active TTs.
+
+We have to be careful when we're checking the bandwidth for a new
+configuration/alt setting.  If we don't have enough bandwidth, we need to
+be able to "roll back" the bandwidth information stored in the endpoint
+and the root port/TT interval bandwidth table.  We can't just create a
+copy of the interval bandwidth table, modify it, and check the bandwidth
+with the copy because we have lists of endpoints and entries can't be on
+more than one list.  Instead, we copy the old endpoint bandwidth
+information, and use it to revert the interval table when the bandwidth
+check fails.
+
+We don't check the bandwidth after endpoints are dropped from the interval
+table when a device is reset or freed after a disconnect, because having
+endpoints use less bandwidth should not push the bandwidth usage over the
+limits.  Besides which, we can't fail a device disconnect.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index 9451d94..1c5c9ba 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -783,6 +783,7 @@ void xhci_free_virt_device(struct xhci_hcd *xhci, int slot_id)
+ {
+ 	struct xhci_virt_device *dev;
+ 	int i;
++	int old_active_eps = 0;
+ 
+ 	/* Slot ID 0 is reserved */
+ 	if (slot_id == 0 || !xhci->devs[slot_id])
+@@ -793,15 +794,29 @@ void xhci_free_virt_device(struct xhci_hcd *xhci, int slot_id)
+ 	if (!dev)
+ 		return;
+ 
++	if (dev->tt_info)
++		old_active_eps = dev->tt_info->active_eps;
++
+ 	for (i = 0; i < 31; ++i) {
+ 		if (dev->eps[i].ring)
+ 			xhci_ring_free(xhci, dev->eps[i].ring);
+ 		if (dev->eps[i].stream_info)
+ 			xhci_free_stream_info(xhci,
+ 					dev->eps[i].stream_info);
++		/* Endpoints on the TT/root port lists should have been removed
++		 * when usb_disable_device() was called for the device.
++		 * We can't drop them anyway, because the udev might have gone
++		 * away by this point, and we can't tell what speed it was.
++		 */
++		if (!list_empty(&dev->eps[i].bw_endpoint_list))
++			xhci_warn(xhci, "Slot %u endpoint %u "
++					"not removed from BW list!\n",
++					slot_id, i);
+ 	}
+ 	/* If this is a hub, free the TT(s) from the TT list */
+ 	xhci_free_tt_info(xhci, dev, slot_id);
++	/* If necessary, update the number of active TTs on this root port */
++	xhci_update_tt_active_eps(xhci, dev, old_active_eps);
+ 
+ 	if (dev->ring_cache) {
+ 		for (i = 0; i < dev->num_rings_cached; i++)
+@@ -855,6 +870,7 @@ int xhci_alloc_virt_device(struct xhci_hcd *xhci, int slot_id,
+ 	for (i = 0; i < 31; i++) {
+ 		xhci_init_endpoint_timer(xhci, &dev->eps[i]);
+ 		INIT_LIST_HEAD(&dev->eps[i].cancelled_td_list);
++		INIT_LIST_HEAD(&dev->eps[i].bw_endpoint_list);
+ 	}
+ 
+ 	/* Allocate endpoint 0 ring */
+@@ -1994,7 +2010,7 @@ static int xhci_setup_port_arrays(struct xhci_hcd *xhci, gfp_t flags)
+ 	__le32 __iomem *addr;
+ 	u32 offset;
+ 	unsigned int num_ports;
+-	int i, port_index;
++	int i, j, port_index;
+ 
+ 	addr = &xhci->cap_regs->hcc_params;
+ 	offset = XHCI_HCC_EXT_CAPS(xhci_readl(xhci, addr));
+@@ -2012,8 +2028,14 @@ static int xhci_setup_port_arrays(struct xhci_hcd *xhci, gfp_t flags)
+ 	xhci->rh_bw = kzalloc(sizeof(*xhci->rh_bw)*num_ports, flags);
+ 	if (!xhci->rh_bw)
+ 		return -ENOMEM;
+-	for (i = 0; i < num_ports; i++)
++	for (i = 0; i < num_ports; i++) {
++		struct xhci_interval_bw_table *bw_table;
++
+ 		INIT_LIST_HEAD(&xhci->rh_bw[i].tts);
++		bw_table = &xhci->rh_bw[i].bw_table;
++		for (j = 0; j < XHCI_MAX_INTERVAL; j++)
++			INIT_LIST_HEAD(&bw_table->interval_bw[j].endpoints);
++	}
+ 
+ 	/*
+ 	 * For whatever reason, the first capability offset is from the
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 8279146..51c4d38 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -1747,6 +1747,241 @@ static void xhci_finish_resource_reservation(struct xhci_hcd *xhci,
+ 				xhci->num_active_eps);
+ }
+ 
++/* Run the algorithm on the bandwidth table.  If this table is part of a
++ * TT, see if we need to update the number of active TTs.
++ */
++static int xhci_check_bw_table(struct xhci_hcd *xhci,
++		struct xhci_virt_device *virt_dev,
++		int old_active_eps)
++{
++	return 0;
++}
++
++static bool xhci_is_async_ep(unsigned int ep_type)
++{
++	return (ep_type != ISOC_OUT_EP && ep_type != INT_OUT_EP &&
++					ep_type != ISOC_IN_EP &&
++					ep_type != INT_IN_EP);
++}
++
++void xhci_drop_ep_from_interval_table(struct xhci_hcd *xhci,
++		struct xhci_bw_info *ep_bw,
++		struct xhci_interval_bw_table *bw_table,
++		struct usb_device *udev,
++		struct xhci_virt_ep *virt_ep,
++		struct xhci_tt_bw_info *tt_info)
++{
++	struct xhci_interval_bw	*interval_bw;
++	int normalized_interval;
++
++	if (xhci_is_async_ep(ep_bw->type) ||
++			list_empty(&virt_ep->bw_endpoint_list))
++		return;
++
++	/* For LS/FS devices, we need to translate the interval expressed in
++	 * microframes to frames.
++	 */
++	if (udev->speed == USB_SPEED_HIGH)
++		normalized_interval = ep_bw->ep_interval;
++	else
++		normalized_interval = ep_bw->ep_interval - 3;
++
++	if (normalized_interval == 0)
++		bw_table->interval0_esit_payload -= ep_bw->max_esit_payload;
++	interval_bw = &bw_table->interval_bw[normalized_interval];
++	interval_bw->num_packets -= ep_bw->num_packets;
++	switch (udev->speed) {
++	case USB_SPEED_LOW:
++		interval_bw->overhead[LS_OVERHEAD_TYPE] -= 1;
++		break;
++	case USB_SPEED_FULL:
++		interval_bw->overhead[FS_OVERHEAD_TYPE] -= 1;
++		break;
++	case USB_SPEED_HIGH:
++		interval_bw->overhead[HS_OVERHEAD_TYPE] -= 1;
++		break;
++	case USB_SPEED_SUPER:
++	case USB_SPEED_UNKNOWN:
++	case USB_SPEED_WIRELESS:
++		/* Should never happen because only LS/FS/HS endpoints will get
++		 * added to the endpoint list.
++		 */
++		return;
++	}
++	if (tt_info)
++		tt_info->active_eps -= 1;
++	list_del_init(&virt_ep->bw_endpoint_list);
++}
++
++static void xhci_add_ep_to_interval_table(struct xhci_hcd *xhci,
++		struct xhci_bw_info *ep_bw,
++		struct xhci_interval_bw_table *bw_table,
++		struct usb_device *udev,
++		struct xhci_virt_ep *virt_ep,
++		struct xhci_tt_bw_info *tt_info)
++{
++	struct xhci_interval_bw	*interval_bw;
++	struct xhci_virt_ep *smaller_ep;
++	int normalized_interval;
++
++	if (xhci_is_async_ep(ep_bw->type))
++		return;
++
++	/* For LS/FS devices, we need to translate the interval expressed in
++	 * microframes to frames.
++	 */
++	if (udev->speed == USB_SPEED_HIGH)
++		normalized_interval = ep_bw->ep_interval;
++	else
++		normalized_interval = ep_bw->ep_interval - 3;
++
++	if (normalized_interval == 0)
++		bw_table->interval0_esit_payload += ep_bw->max_esit_payload;
++	interval_bw = &bw_table->interval_bw[normalized_interval];
++	interval_bw->num_packets += ep_bw->num_packets;
++	switch (udev->speed) {
++	case USB_SPEED_LOW:
++		interval_bw->overhead[LS_OVERHEAD_TYPE] += 1;
++		break;
++	case USB_SPEED_FULL:
++		interval_bw->overhead[FS_OVERHEAD_TYPE] += 1;
++		break;
++	case USB_SPEED_HIGH:
++		interval_bw->overhead[HS_OVERHEAD_TYPE] += 1;
++		break;
++	case USB_SPEED_SUPER:
++	case USB_SPEED_UNKNOWN:
++	case USB_SPEED_WIRELESS:
++		/* Should never happen because only LS/FS/HS endpoints will get
++		 * added to the endpoint list.
++		 */
++		return;
++	}
++
++	if (tt_info)
++		tt_info->active_eps += 1;
++	/* Insert the endpoint into the list, largest max packet size first. */
++	list_for_each_entry(smaller_ep, &interval_bw->endpoints,
++			bw_endpoint_list) {
++		if (ep_bw->max_packet_size >=
++				smaller_ep->bw_info.max_packet_size) {
++			/* Add the new ep before the smaller endpoint */
++			list_add_tail(&virt_ep->bw_endpoint_list,
++					&smaller_ep->bw_endpoint_list);
++			return;
++		}
++	}
++	/* Add the new endpoint at the end of the list. */
++	list_add_tail(&virt_ep->bw_endpoint_list,
++			&interval_bw->endpoints);
++}
++
++void xhci_update_tt_active_eps(struct xhci_hcd *xhci,
++		struct xhci_virt_device *virt_dev,
++		int old_active_eps)
++{
++	struct xhci_root_port_bw_info *rh_bw_info;
++	if (!virt_dev->tt_info)
++		return;
++
++	rh_bw_info = &xhci->rh_bw[virt_dev->real_port - 1];
++	if (old_active_eps == 0 &&
++				virt_dev->tt_info->active_eps != 0) {
++		rh_bw_info->num_active_tts += 1;
++	} else if (old_active_eps != 0 &&
++				virt_dev->tt_info->active_eps == 0) {
++		rh_bw_info->num_active_tts -= 1;
++	}
++}
++
++static int xhci_reserve_bandwidth(struct xhci_hcd *xhci,
++		struct xhci_virt_device *virt_dev,
++		struct xhci_container_ctx *in_ctx)
++{
++	struct xhci_bw_info ep_bw_info[31];
++	int i;
++	struct xhci_input_control_ctx *ctrl_ctx;
++	int old_active_eps = 0;
++
++	if (virt_dev->udev->speed == USB_SPEED_SUPER)
++		return 0;
++
++	if (virt_dev->tt_info)
++		old_active_eps = virt_dev->tt_info->active_eps;
++
++	ctrl_ctx = xhci_get_input_control_ctx(xhci, in_ctx);
++
++	for (i = 0; i < 31; i++) {
++		if (!EP_IS_ADDED(ctrl_ctx, i) && !EP_IS_DROPPED(ctrl_ctx, i))
++			continue;
++
++		/* Make a copy of the BW info in case we need to revert this */
++		memcpy(&ep_bw_info[i], &virt_dev->eps[i].bw_info,
++				sizeof(ep_bw_info[i]));
++		/* Drop the endpoint from the interval table if the endpoint is
++		 * being dropped or changed.
++		 */
++		if (EP_IS_DROPPED(ctrl_ctx, i))
++			xhci_drop_ep_from_interval_table(xhci,
++					&virt_dev->eps[i].bw_info,
++					virt_dev->bw_table,
++					virt_dev->udev,
++					&virt_dev->eps[i],
++					virt_dev->tt_info);
++	}
++	/* Overwrite the information stored in the endpoints' bw_info */
++	xhci_update_bw_info(xhci, virt_dev->in_ctx, ctrl_ctx, virt_dev);
++	for (i = 0; i < 31; i++) {
++		/* Add any changed or added endpoints to the interval table */
++		if (EP_IS_ADDED(ctrl_ctx, i))
++			xhci_add_ep_to_interval_table(xhci,
++					&virt_dev->eps[i].bw_info,
++					virt_dev->bw_table,
++					virt_dev->udev,
++					&virt_dev->eps[i],
++					virt_dev->tt_info);
++	}
++
++	if (!xhci_check_bw_table(xhci, virt_dev, old_active_eps)) {
++		/* Ok, this fits in the bandwidth we have.
++		 * Update the number of active TTs.
++		 */
++		xhci_update_tt_active_eps(xhci, virt_dev, old_active_eps);
++		return 0;
++	}
++
++	/* We don't have enough bandwidth for this, revert the stored info. */
++	for (i = 0; i < 31; i++) {
++		if (!EP_IS_ADDED(ctrl_ctx, i) && !EP_IS_DROPPED(ctrl_ctx, i))
++			continue;
++
++		/* Drop the new copies of any added or changed endpoints from
++		 * the interval table.
++		 */
++		if (EP_IS_ADDED(ctrl_ctx, i)) {
++			xhci_drop_ep_from_interval_table(xhci,
++					&virt_dev->eps[i].bw_info,
++					virt_dev->bw_table,
++					virt_dev->udev,
++					&virt_dev->eps[i],
++					virt_dev->tt_info);
++		}
++		/* Revert the endpoint back to its old information */
++		memcpy(&virt_dev->eps[i].bw_info, &ep_bw_info[i],
++				sizeof(ep_bw_info[i]));
++		/* Add any changed or dropped endpoints back into the table */
++		if (EP_IS_DROPPED(ctrl_ctx, i))
++			xhci_add_ep_to_interval_table(xhci,
++					&virt_dev->eps[i].bw_info,
++					virt_dev->bw_table,
++					virt_dev->udev,
++					&virt_dev->eps[i],
++					virt_dev->tt_info);
++	}
++	return -ENOMEM;
++}
++
++
+ /* Issue a configure endpoint command or evaluate context command
+  * and wait for it to finish.
+  */
+@@ -1779,6 +2014,14 @@ static int xhci_configure_endpoint(struct xhci_hcd *xhci,
+ 				xhci->num_active_eps);
+ 		return -ENOMEM;
+ 	}
++	if ((xhci->quirks & XHCI_SW_BW_CHECKING) &&
++			xhci_reserve_bandwidth(xhci, virt_dev, in_ctx)) {
++		if ((xhci->quirks & XHCI_EP_LIMIT_QUIRK))
++			xhci_free_host_resources(xhci, in_ctx);
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		xhci_warn(xhci, "Not enough bandwidth\n");
++		return -ENOMEM;
++	}
+ 
+ 	if (command) {
+ 		cmd_completion = command->completion;
+@@ -1912,7 +2155,6 @@ int xhci_check_bandwidth(struct usb_hcd *hcd, struct usb_device *udev)
+ 		    !(le32_to_cpu(ctrl_ctx->add_flags) & (1 << (i + 1))))
+ 			xhci_free_or_cache_endpoint_ring(xhci, virt_dev, i);
+ 	}
+-	xhci_update_bw_info(xhci, virt_dev->in_ctx, ctrl_ctx, virt_dev);
+ 	xhci_zero_in_ctx(xhci, virt_dev);
+ 	/*
+ 	 * Install any rings for completely new endpoints or changed endpoints,
+@@ -2528,6 +2770,7 @@ int xhci_discover_or_reset_device(struct usb_hcd *hcd, struct usb_device *udev)
+ 	int timeleft;
+ 	int last_freed_endpoint;
+ 	struct xhci_slot_ctx *slot_ctx;
++	int old_active_eps = 0;
+ 
+ 	ret = xhci_check_args(hcd, udev, NULL, 0, false, __func__);
+ 	if (ret <= 0)
+@@ -2669,8 +2912,18 @@ int xhci_discover_or_reset_device(struct usb_hcd *hcd, struct usb_device *udev)
+ 			xhci_free_or_cache_endpoint_ring(xhci, virt_dev, i);
+ 			last_freed_endpoint = i;
+ 		}
++		if (!list_empty(&virt_dev->eps[i].bw_endpoint_list))
++			xhci_drop_ep_from_interval_table(xhci,
++					&virt_dev->eps[i].bw_info,
++					virt_dev->bw_table,
++					udev,
++					&virt_dev->eps[i],
++					virt_dev->tt_info);
+ 		xhci_clear_endpoint_bw_info(&virt_dev->eps[i].bw_info);
+ 	}
++	/* If necessary, update the number of active TTs on this root port */
++	xhci_update_tt_active_eps(xhci, virt_dev, old_active_eps);
++
+ 	xhci_dbg(xhci, "Output context after successful reset device cmd:\n");
+ 	xhci_dbg_ctx(xhci, virt_dev->out_ctx, last_freed_endpoint);
+ 	ret = 0;
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index af15b90..050f07b 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -797,7 +797,9 @@ struct xhci_virt_ep {
+ 	 * process the missed tds on the endpoint ring.
+ 	 */
+ 	bool			skip;
++	/* Bandwidth checking storage */
+ 	struct xhci_bw_info	bw_info;
++	struct list_head	bw_endpoint_list;
+ };
+ 
+ enum xhci_overhead_type {
+@@ -808,6 +810,10 @@ enum xhci_overhead_type {
+ 
+ struct xhci_interval_bw {
+ 	unsigned int		num_packets;
++	/* Sorted by max packet size.
++	 * Head of the list is the greatest max packet size.
++	 */
++	struct list_head	endpoints;
+ 	/* How many endpoints of each speed are present. */
+ 	unsigned int		overhead[3];
+ };
+@@ -1511,6 +1517,15 @@ unsigned int xhci_get_endpoint_flag(struct usb_endpoint_descriptor *desc);
+ unsigned int xhci_get_endpoint_flag_from_index(unsigned int ep_index);
+ unsigned int xhci_last_valid_endpoint(u32 added_ctxs);
+ void xhci_endpoint_zero(struct xhci_hcd *xhci, struct xhci_virt_device *virt_dev, struct usb_host_endpoint *ep);
++void xhci_drop_ep_from_interval_table(struct xhci_hcd *xhci,
++		struct xhci_bw_info *ep_bw,
++		struct xhci_interval_bw_table *bw_table,
++		struct usb_device *udev,
++		struct xhci_virt_ep *virt_ep,
++		struct xhci_tt_bw_info *tt_info);
++void xhci_update_tt_active_eps(struct xhci_hcd *xhci,
++		struct xhci_virt_device *virt_dev,
++		int old_active_eps);
+ void xhci_clear_endpoint_bw_info(struct xhci_bw_info *bw_info);
+ void xhci_update_bw_info(struct xhci_hcd *xhci,
+ 		struct xhci_container_ctx *in_ctx,

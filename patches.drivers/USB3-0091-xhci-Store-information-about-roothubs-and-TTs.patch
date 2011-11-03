@@ -1,0 +1,323 @@
+From 839c817ce67178ca3c7c7ad534c571bba1e69ebe Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Fri, 2 Sep 2011 11:05:47 -0700
+Subject: xhci: Store information about roothubs and TTs.
+Patch-mainline: HEAD
+Git-commit: 839c817ce67178ca3c7c7ad534c571bba1e69ebe
+
+For upcoming patches, we need to keep information about the bandwidth
+domains under the xHCI host.  Each root port is a separate primary
+bandwidth domain, and each high speed hub's TT (and potentially each port
+on a multi-TT hub) is a secondary bandwidth domain.
+
+If the table were in text form, it would look a bit like this:
+
+EP Interval	Sum of Number	Largest Max	Max Packet
+		of Packets	Packet Size	Overhead
+	0	   N		   mps		  overhead
+...
+	15	   N		   mps		  overhead
+
+Overhead is the maximum packet overhead (for bit stuffing, CRC, protocol
+overhead, etc) for all the endpoints in this interval.  Devices with
+different speeds have different max packet overhead.  For example, if
+there is a low speed and a full speed endpoint that both have an interval
+of 3, we would use the higher overhead (the low speed overhead).  Interval
+0 is a bit special, since we really just want to know the sum of the max
+ESIT payloads instead of the largest max packet size.  That's stored in
+the interval0_esit_payload variable.  For root ports, we also need to keep
+track of the number of active TTs.
+
+For each root port, and each TT under a root port, store some information
+about the bandwidth consumption.  Dynamically allocate an array of root
+port bandwidth information for the number of root ports on the xHCI host.
+Each root port stores a list of TTs under the root port.  A single TT hub
+only has one entry in the list, but a multi-TT hub will have an entry per
+port.
+
+When the USB core says that a USB device is a hub, create one or more
+entries in the root port TT list for the hub.  When a device is deleted,
+and it is a hub, search through the root port TT list and delete all
+TT entries for the hub.  Keep track of which TT entry is associated with a
+device under a TT.
+
+LS/FS devices attached directly to the root port will have usb_device->tt
+set to the roothub.  Ignore that, and treat it like a primary bandwidth
+domain, since there isn't really a high speed bus between the roothub and
+the host.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index 1755c66..5efb0af 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -687,7 +687,98 @@ static void xhci_init_endpoint_timer(struct xhci_hcd *xhci,
+ 	ep->xhci = xhci;
+ }
+ 
+-/* All the xhci_tds in the ring's TD list should be freed at this point */
++static void xhci_free_tt_info(struct xhci_hcd *xhci,
++		struct xhci_virt_device *virt_dev,
++		int slot_id)
++{
++	struct list_head *tt;
++	struct list_head *tt_list_head;
++	struct list_head *tt_next;
++	struct xhci_tt_bw_info *tt_info;
++
++	/* If the device never made it past the Set Address stage,
++	 * it may not have the real_port set correctly.
++	 */
++	if (virt_dev->real_port == 0 ||
++			virt_dev->real_port > HCS_MAX_PORTS(xhci->hcs_params1)) {
++		xhci_dbg(xhci, "Bad real port.\n");
++		return;
++	}
++
++	tt_list_head = &(xhci->rh_bw[virt_dev->real_port - 1].tts);
++	if (list_empty(tt_list_head))
++		return;
++
++	list_for_each(tt, tt_list_head) {
++		tt_info = list_entry(tt, struct xhci_tt_bw_info, tt_list);
++		if (tt_info->slot_id == slot_id)
++			break;
++	}
++	/* Cautionary measure in case the hub was disconnected before we
++	 * stored the TT information.
++	 */
++	if (tt_info->slot_id != slot_id)
++		return;
++
++	tt_next = tt->next;
++	tt_info = list_entry(tt, struct xhci_tt_bw_info,
++			tt_list);
++	/* Multi-TT hubs will have more than one entry */
++	do {
++		list_del(tt);
++		kfree(tt_info);
++		tt = tt_next;
++		if (list_empty(tt_list_head))
++			break;
++		tt_next = tt->next;
++		tt_info = list_entry(tt, struct xhci_tt_bw_info,
++				tt_list);
++	} while (tt_info->slot_id == slot_id);
++}
++
++int xhci_alloc_tt_info(struct xhci_hcd *xhci,
++		struct xhci_virt_device *virt_dev,
++		struct usb_device *hdev,
++		struct usb_tt *tt, gfp_t mem_flags)
++{
++	struct xhci_tt_bw_info		*tt_info;
++	unsigned int			num_ports;
++	int				i, j;
++
++	if (!tt->multi)
++		num_ports = 1;
++	else
++		num_ports = hdev->maxchild;
++
++	for (i = 0; i < num_ports; i++, tt_info++) {
++		struct xhci_interval_bw_table *bw_table;
++
++		tt_info = kzalloc(sizeof(*tt_info), mem_flags);
++		if (!tt_info)
++			goto free_tts;
++		INIT_LIST_HEAD(&tt_info->tt_list);
++		list_add(&tt_info->tt_list,
++				&xhci->rh_bw[virt_dev->real_port - 1].tts);
++		tt_info->slot_id = virt_dev->udev->slot_id;
++		if (tt->multi)
++			tt_info->ttport = i+1;
++		bw_table = &tt_info->bw_table;
++		for (j = 0; j < XHCI_MAX_INTERVAL; j++)
++			INIT_LIST_HEAD(&bw_table->interval_bw[j].endpoints);
++	}
++	return 0;
++
++free_tts:
++	xhci_free_tt_info(xhci, virt_dev, virt_dev->udev->slot_id);
++	return -ENOMEM;
++}
++
++
++/* All the xhci_tds in the ring's TD list should be freed at this point.
++ * Should be called with xhci->lock held if there is any chance the TT lists
++ * will be manipulated by the configure endpoint, allocate device, or update
++ * hub functions while this function is removing the TT entries from the list.
++ */
+ void xhci_free_virt_device(struct xhci_hcd *xhci, int slot_id)
+ {
+ 	struct xhci_virt_device *dev;
+@@ -709,6 +800,8 @@ void xhci_free_virt_device(struct xhci_hcd *xhci, int slot_id)
+ 			xhci_free_stream_info(xhci,
+ 					dev->eps[i].stream_info);
+ 	}
++	/* If this is a hub, free the TT(s) from the TT list */
++	xhci_free_tt_info(xhci, dev, slot_id);
+ 
+ 	if (dev->ring_cache) {
+ 		for (i = 0; i < dev->num_rings_cached; i++)
+@@ -926,6 +1019,36 @@ int xhci_setup_addressable_virt_dev(struct xhci_hcd *xhci, struct usb_device *ud
+ 	xhci_dbg(xhci, "Set root hub portnum to %d\n", port_num);
+ 	xhci_dbg(xhci, "Set fake root hub portnum to %d\n", dev->fake_port);
+ 
++	/* Find the right bandwidth table that this device will be a part of.
++	 * If this is a full speed device attached directly to a root port (or a
++	 * decendent of one), it counts as a primary bandwidth domain, not a
++	 * secondary bandwidth domain under a TT.  An xhci_tt_info structure
++	 * will never be created for the HS root hub.
++	 */
++	if (!udev->tt || !udev->tt->hub->parent) {
++		dev->bw_table = &xhci->rh_bw[port_num - 1].bw_table;
++	} else {
++		struct xhci_root_port_bw_info *rh_bw;
++		struct xhci_tt_bw_info *tt_bw;
++
++		rh_bw = &xhci->rh_bw[port_num - 1];
++		/* Find the right TT. */
++		list_for_each_entry(tt_bw, &rh_bw->tts, tt_list) {
++			if (tt_bw->slot_id != udev->tt->hub->slot_id)
++				continue;
++
++			if (!dev->udev->tt->multi ||
++					(udev->tt->multi &&
++					 tt_bw->ttport == dev->udev->ttport)) {
++				dev->bw_table = &tt_bw->bw_table;
++				dev->tt_info = tt_bw;
++				break;
++			}
++		}
++		if (!dev->tt_info)
++			xhci_warn(xhci, "WARN: Didn't find a matching TT\n");
++	}
++
+ 	/* Is this a LS/FS device under an external HS hub? */
+ 	if (udev->tt && udev->tt->hub->parent) {
+ 		slot_ctx->tt_info = cpu_to_le32(udev->tt->hub->slot_id |
+@@ -1552,6 +1675,7 @@ void xhci_mem_cleanup(struct xhci_hcd *xhci)
+ 	kfree(xhci->usb2_ports);
+ 	kfree(xhci->usb3_ports);
+ 	kfree(xhci->port_array);
++	kfree(xhci->rh_bw);
+ 
+ 	xhci->page_size = 0;
+ 	xhci->page_shift = 0;
+@@ -1822,6 +1946,12 @@ static int xhci_setup_port_arrays(struct xhci_hcd *xhci, gfp_t flags)
+ 	if (!xhci->port_array)
+ 		return -ENOMEM;
+ 
++	xhci->rh_bw = kzalloc(sizeof(*xhci->rh_bw)*num_ports, flags);
++	if (!xhci->rh_bw)
++		return -ENOMEM;
++	for (i = 0; i < num_ports; i++)
++		INIT_LIST_HEAD(&xhci->rh_bw[i].tts);
++
+ 	/*
+ 	 * For whatever reason, the first capability offset is from the
+ 	 * capability register base, not from the HCCPARAMS register.
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 7da3b13..1657041 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -2990,6 +2990,14 @@ int xhci_update_hub_device(struct usb_hcd *hcd, struct usb_device *hdev,
+ 	}
+ 
+ 	spin_lock_irqsave(&xhci->lock, flags);
++	if (hdev->speed == USB_SPEED_HIGH &&
++			xhci_alloc_tt_info(xhci, vdev, hdev, tt, GFP_ATOMIC)) {
++		xhci_dbg(xhci, "Could not allocate xHCI TT structure.\n");
++		xhci_free_command(xhci, config_cmd);
++		spin_unlock_irqrestore(&xhci->lock, flags);
++		return -ENOMEM;
++	}
++
+ 	xhci_slot_copy(xhci, config_cmd->in_ctx, vdev->out_ctx);
+ 	ctrl_ctx = xhci_get_input_control_ctx(xhci, config_cmd->in_ctx);
+ 	ctrl_ctx->add_flags |= cpu_to_le32(SLOT_FLAG);
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index ec48170..eee47c8 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -774,6 +774,26 @@ struct xhci_virt_ep {
+ 	bool			skip;
+ };
+ 
++enum xhci_overhead_type {
++	LS_OVERHEAD_TYPE = 0,
++	FS_OVERHEAD_TYPE,
++	HS_OVERHEAD_TYPE,
++};
++
++struct xhci_interval_bw {
++	unsigned int		num_packets;
++	/* How many endpoints of each speed are present. */
++	unsigned int		overhead[3];
++};
++
++#define	XHCI_MAX_INTERVAL	16
++
++struct xhci_interval_bw_table {
++	unsigned int		interval0_esit_payload;
++	struct xhci_interval_bw	interval_bw[XHCI_MAX_INTERVAL];
++};
++
++
+ struct xhci_virt_device {
+ 	struct usb_device		*udev;
+ 	/*
+@@ -800,6 +820,30 @@ struct xhci_virt_device {
+ 	struct list_head		cmd_list;
+ 	u8				fake_port;
+ 	u8				real_port;
++	struct xhci_interval_bw_table	*bw_table;
++	struct xhci_tt_bw_info		*tt_info;
++};
++
++/*
++ * For each roothub, keep track of the bandwidth information for each periodic
++ * interval.
++ *
++ * If a high speed hub is attached to the roothub, each TT associated with that
++ * hub is a separate bandwidth domain.  The interval information for the
++ * endpoints on the devices under that TT will appear in the TT structure.
++ */
++struct xhci_root_port_bw_info {
++	struct list_head		tts;
++	unsigned int			num_active_tts;
++	struct xhci_interval_bw_table	bw_table;
++};
++
++struct xhci_tt_bw_info {
++	struct list_head		tt_list;
++	int				slot_id;
++	int				ttport;
++	struct xhci_interval_bw_table	bw_table;
++	int				active_eps;
+ };
+ 
+ 
+@@ -1268,6 +1312,8 @@ struct xhci_hcd {
+ 	int slot_id;
+ 	/* Internal mirror of the HW's dcbaa */
+ 	struct xhci_virt_device	*devs[MAX_HC_SLOTS];
++	/* For keeping track of bandwidth domains per roothub. */
++	struct xhci_root_port_bw_info	*rh_bw;
+ 
+ 	/* DMA pools */
+ 	struct dma_pool	*device_pool;
+@@ -1508,6 +1554,10 @@ irqreturn_t xhci_irq(struct usb_hcd *hcd);
+ irqreturn_t xhci_msi_irq(int irq, struct usb_hcd *hcd);
+ int xhci_alloc_dev(struct usb_hcd *hcd, struct usb_device *udev);
+ void xhci_free_dev(struct usb_hcd *hcd, struct usb_device *udev);
++int xhci_alloc_tt_info(struct xhci_hcd *xhci,
++		struct xhci_virt_device *virt_dev,
++		struct usb_device *hdev,
++		struct usb_tt *tt, gfp_t mem_flags);
+ int xhci_alloc_streams(struct usb_hcd *hcd, struct usb_device *udev,
+ 		struct usb_host_endpoint **eps, unsigned int num_eps,
+ 		unsigned int num_streams, gfp_t mem_flags);
