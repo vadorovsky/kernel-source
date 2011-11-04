@@ -1,0 +1,332 @@
+From 9574323c39d1f8359a04843075d89c9f32d8b7e6 Mon Sep 17 00:00:00 2001
+From: Andiry Xu <andiry.xu@amd.com>
+Date: Fri, 23 Sep 2011 14:19:51 -0700
+Subject: xHCI: test USB2 software LPM
+Patch-mainline: v3.2
+Git-commit: 9574323c39d1f8359a04843075d89c9f32d8b7e6
+
+This patch tests USB2 software LPM for a USB2 LPM-capable device.
+
+When a lpm-capable device is addressed, if the host also supports software
+LPM, apply a test by putting the device into L1 state and resume it to see
+if the device can do L1 suspend/resume successfully.
+
+If the device fails to enter L1 or resume from L1 state, it may not
+function normally and usbcore may disconnect and re-enumerate it. In this
+case, store the device's Vid and Pid information, make sure the host will
+not test LPM for it twice.
+
+The test result is per device/host. Some devices claim to be lpm-capable,
+but fail to enter L1 or resume. So the test is necessary.
+
+The xHCI 1.0 errata has modified the USB2.0 LPM implementation. It redefines
+the HIRD field to BESL, and adds another register Port Hardware LPM Control
+(PORTHLPMC). However, this should not affect the LPM behavior on xHC which
+does not implement 1.0 errata.
+
+USB2.0 LPM errata defines a new bit BESL in the device's USB 2.0 extension
+descriptor. If the device reports it uses BESL, driver should use BESL
+instead of HIRD for it.
+
+Signed-off-by: Andiry Xu <andiry.xu@amd.com>
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index 9c7ddf0..3ec2ac9 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -1685,6 +1685,8 @@ void xhci_free_command(struct xhci_hcd *xhci,
+ void xhci_mem_cleanup(struct xhci_hcd *xhci)
+ {
+ 	struct pci_dev	*pdev = to_pci_dev(xhci_to_hcd(xhci)->self.controller);
++	struct dev_info	*dev_info, *next;
++	unsigned long	flags;
+ 	int size;
+ 	int i;
+ 
+@@ -1742,6 +1744,13 @@ void xhci_mem_cleanup(struct xhci_hcd *xhci)
+ 
+ 	scratchpad_free(xhci);
+ 
++	spin_lock_irqsave(&xhci->lock, flags);
++	list_for_each_entry_safe(dev_info, next, &xhci->lpm_failed_devs, list) {
++		list_del(&dev_info->list);
++		kfree(dev_info);
++	}
++	spin_unlock_irqrestore(&xhci->lock, flags);
++
+ 	xhci->num_usb2_ports = 0;
+ 	xhci->num_usb3_ports = 0;
+ 	kfree(xhci->usb2_ports);
+@@ -2328,6 +2337,8 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
+ 	if (xhci_setup_port_arrays(xhci, flags))
+ 		goto fail;
+ 
++	INIT_LIST_HEAD(&xhci->lpm_failed_devs);
++
+ 	return 0;
+ 
+ fail:
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index a111099..213a7d7 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -345,6 +345,10 @@ static const struct hc_driver xhci_pci_hc_driver = {
+ 	.hub_status_data =	xhci_hub_status_data,
+ 	.bus_suspend =		xhci_bus_suspend,
+ 	.bus_resume =		xhci_bus_resume,
++	/*
++	 * call back when device connected and addressed
++	 */
++	.update_device =        xhci_update_device,
+ };
+ 
+ /*-------------------------------------------------------------------------*/
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 54cb762..b0649a4 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -3539,6 +3539,187 @@ int xhci_address_device(struct usb_hcd *hcd, struct usb_device *udev)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_USB_SUSPEND
++
++/* BESL to HIRD Encoding array for USB2 LPM */
++static int xhci_besl_encoding[16] = {125, 150, 200, 300, 400, 500, 1000, 2000,
++	3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000};
++
++/* Calculate HIRD/BESL for USB2 PORTPMSC*/
++static int xhci_calculate_hird_besl(int u2del, bool use_besl)
++{
++	int hird;
++
++	if (use_besl) {
++		for (hird = 0; hird < 16; hird++) {
++			if (xhci_besl_encoding[hird] >= u2del)
++				break;
++		}
++	} else {
++		if (u2del <= 50)
++			hird = 0;
++		else
++			hird = (u2del - 51) / 75 + 1;
++
++		if (hird > 15)
++			hird = 15;
++	}
++
++	return hird;
++}
++
++static int xhci_usb2_software_lpm_test(struct usb_hcd *hcd,
++					struct usb_device *udev)
++{
++	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
++	struct dev_info	*dev_info;
++	__le32 __iomem	**port_array;
++	__le32 __iomem	*addr, *pm_addr;
++	u32		temp, dev_id;
++	unsigned int	port_num;
++	unsigned long	flags;
++	int		u2del, hird;
++	int		ret;
++
++	if (hcd->speed == HCD_USB3 || !xhci->sw_lpm_support ||
++			!udev->lpm_capable)
++		return -EINVAL;
++
++	/* we only support lpm for non-hub device connected to root hub yet */
++	if (!udev->parent || udev->parent->parent ||
++			udev->descriptor.bDeviceClass == USB_CLASS_HUB)
++		return -EINVAL;
++
++	spin_lock_irqsave(&xhci->lock, flags);
++
++	/* Look for devices in lpm_failed_devs list */
++	dev_id = le16_to_cpu(udev->descriptor.idVendor) << 16 |
++			le16_to_cpu(udev->descriptor.idProduct);
++	list_for_each_entry(dev_info, &xhci->lpm_failed_devs, list) {
++		if (dev_info->dev_id == dev_id) {
++			ret = -EINVAL;
++			goto finish;
++		}
++	}
++
++	port_array = xhci->usb2_ports;
++	port_num = udev->portnum - 1;
++
++	if (port_num > HCS_MAX_PORTS(xhci->hcs_params1)) {
++		xhci_dbg(xhci, "invalid port number %d\n", udev->portnum);
++		ret = -EINVAL;
++		goto finish;
++	}
++
++	/*
++	 * Test USB 2.0 software LPM.
++	 * FIXME: some xHCI 1.0 hosts may implement a new register to set up
++	 * hardware-controlled USB 2.0 LPM. See section 5.4.11 and 4.23.5.1.1.1
++	 * in the June 2011 errata release.
++	 */
++	xhci_dbg(xhci, "test port %d software LPM\n", port_num);
++	/*
++	 * Set L1 Device Slot and HIRD/BESL.
++	 * Check device's USB 2.0 extension descriptor to determine whether
++	 * HIRD or BESL shoule be used. See USB2.0 LPM errata.
++	 */
++	pm_addr = port_array[port_num] + 1;
++	u2del = HCS_U2_LATENCY(xhci->hcs_params3);
++	if (le32_to_cpu(udev->bos->ext_cap->bmAttributes) & (1 << 2))
++		hird = xhci_calculate_hird_besl(u2del, 1);
++	else
++		hird = xhci_calculate_hird_besl(u2del, 0);
++
++	temp = PORT_L1DS(udev->slot_id) | PORT_HIRD(hird);
++	xhci_writel(xhci, temp, pm_addr);
++
++	/* Set port link state to U2(L1) */
++	addr = port_array[port_num];
++	xhci_set_link_state(xhci, port_array, port_num, XDEV_U2);
++
++	/* wait for ACK */
++	spin_unlock_irqrestore(&xhci->lock, flags);
++	msleep(10);
++	spin_lock_irqsave(&xhci->lock, flags);
++
++	/* Check L1 Status */
++	ret = handshake(xhci, pm_addr, PORT_L1S_MASK, PORT_L1S_SUCCESS, 125);
++	if (ret != -ETIMEDOUT) {
++		/* enter L1 successfully */
++		temp = xhci_readl(xhci, addr);
++		xhci_dbg(xhci, "port %d entered L1 state, port status 0x%x\n",
++				port_num, temp);
++		ret = 0;
++	} else {
++		temp = xhci_readl(xhci, pm_addr);
++		xhci_dbg(xhci, "port %d software lpm failed, L1 status %d\n",
++				port_num, temp & PORT_L1S_MASK);
++		ret = -EINVAL;
++	}
++
++	/* Resume the port */
++	xhci_set_link_state(xhci, port_array, port_num, XDEV_U0);
++
++	spin_unlock_irqrestore(&xhci->lock, flags);
++	msleep(10);
++	spin_lock_irqsave(&xhci->lock, flags);
++
++	/* Clear PLC */
++	xhci_test_and_clear_bit(xhci, port_array, port_num, PORT_PLC);
++
++	/* Check PORTSC to make sure the device is in the right state */
++	if (!ret) {
++		temp = xhci_readl(xhci, addr);
++		xhci_dbg(xhci, "resumed port %d status 0x%x\n",	port_num, temp);
++		if (!(temp & PORT_CONNECT) || !(temp & PORT_PE) ||
++				(temp & PORT_PLS_MASK) != XDEV_U0) {
++			xhci_dbg(xhci, "port L1 resume fail\n");
++			ret = -EINVAL;
++		}
++	}
++
++	if (ret) {
++		/* Insert dev to lpm_failed_devs list */
++		xhci_warn(xhci, "device LPM test failed, may disconnect and "
++				"re-enumerate\n");
++		dev_info = kzalloc(sizeof(struct dev_info), GFP_ATOMIC);
++		if (!dev_info) {
++			ret = -ENOMEM;
++			goto finish;
++		}
++		dev_info->dev_id = dev_id;
++		INIT_LIST_HEAD(&dev_info->list);
++		list_add(&dev_info->list, &xhci->lpm_failed_devs);
++	} else {
++		xhci_ring_device(xhci, udev->slot_id);
++	}
++
++finish:
++	spin_unlock_irqrestore(&xhci->lock, flags);
++	return ret;
++}
++
++int xhci_update_device(struct usb_hcd *hcd, struct usb_device *udev)
++{
++	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
++	int		ret;
++
++	ret = xhci_usb2_software_lpm_test(hcd, udev);
++	if (!ret)
++		xhci_dbg(xhci, "software LPM test succeed\n");
++
++	return 0;
++}
++
++#else
++
++int xhci_update_device(struct usb_hcd *hcd, struct usb_device *udev)
++{
++	return 0;
++}
++
++#endif /* CONFIG_USB_SUSPEND */
++
+ /* Once a hub descriptor is fetched for a device, we need to update the xHC's
+  * internal data structures for the device.
+  */
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index 8673f98..b24c4fc 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -272,6 +272,7 @@ struct xhci_op_regs {
+  */
+ #define PORT_PLS_MASK	(0xf << 5)
+ #define XDEV_U0		(0x0 << 5)
++#define XDEV_U2		(0x2 << 5)
+ #define XDEV_U3		(0x3 << 5)
+ #define XDEV_RESUME	(0xf << 5)
+ /* true: port has power (see HCC_PPC) */
+@@ -362,7 +363,11 @@ struct xhci_op_regs {
+ /* Bits 24:31 for port testing */
+ 
+ /* USB2 Protocol PORTSPMSC */
+-#define PORT_RWE	(1 << 0x3)
++#define	PORT_L1S_MASK		7
++#define	PORT_L1S_SUCCESS	1
++#define	PORT_RWE		(1 << 3)
++#define	PORT_HIRD(p)		(((p) & 0xf) << 4)
++#define	PORT_L1DS(p)		(((p) & 0xff) << 8)
+ 
+ /**
+  * struct xhci_intr_reg - Interrupt Register Set
+@@ -1324,6 +1329,12 @@ struct s3_save {
+ 	u64	erst_dequeue;
+ };
+ 
++/* Use for lpm */
++struct dev_info {
++	u32			dev_id;
++	struct	list_head	list;
++};
++
+ struct xhci_bus_state {
+ 	unsigned long		bus_suspended;
+ 	unsigned long		next_statechange;
+@@ -1387,6 +1398,8 @@ struct xhci_hcd {
+ 	struct xhci_erst	erst;
+ 	/* Scratchpad */
+ 	struct xhci_scratchpad  *scratchpad;
++	/* Store LPM test failed devices' information */
++	struct list_head	lpm_failed_devs;
+ 
+ 	/* slot enabling and address device helpers */
+ 	struct completion	addr_dev;
+@@ -1663,6 +1676,7 @@ int xhci_free_streams(struct usb_hcd *hcd, struct usb_device *udev,
+ 		struct usb_host_endpoint **eps, unsigned int num_eps,
+ 		gfp_t mem_flags);
+ int xhci_address_device(struct usb_hcd *hcd, struct usb_device *udev);
++int xhci_update_device(struct usb_hcd *hcd, struct usb_device *udev);
+ int xhci_update_hub_device(struct usb_hcd *hcd, struct usb_device *hdev,
+ 			struct usb_tt *tt, gfp_t mem_flags);
+ int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags);

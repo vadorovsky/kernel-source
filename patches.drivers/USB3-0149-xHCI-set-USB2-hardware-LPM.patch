@@ -1,0 +1,287 @@
+From 65580b4321eb36f16ae8b5987bfa1bb948fc5112 Mon Sep 17 00:00:00 2001
+From: Andiry Xu <andiry.xu@amd.com>
+Date: Fri, 23 Sep 2011 14:19:52 -0700
+Subject: xHCI: set USB2 hardware LPM
+Patch-mainline: v3.2
+Git-commit: 65580b4321eb36f16ae8b5987bfa1bb948fc5112
+
+If the device pass the USB2 software LPM and the host supports hardware
+LPM, enable hardware LPM for the device to let the host decide when to
+put the link into lower power state.
+
+If hardware LPM is enabled for a port and driver wants to put it into
+suspend, it must first disable hardware LPM, resume the port into U0,
+and then suspend the port.
+
+Signed-off-by: Andiry Xu <andiry.xu@amd.com>
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@suse.de>
+
+---
+ drivers/usb/core/driver.c   |   14 ++++++++
+ drivers/usb/core/hub.c      |    9 +++++
+ drivers/usb/core/usb.h      |    5 ++
+ drivers/usb/host/xhci-hub.c |    9 +++++
+ drivers/usb/host/xhci-pci.c |    1 
+ drivers/usb/host/xhci.c     |   74 +++++++++++++++++++++++++++++++++++++++++++-
+ drivers/usb/host/xhci.h     |    4 ++
+ include/linux/usb.h         |    4 ++
+ include/linux/usb/hcd.h     |    1 
+ 9 files changed, 120 insertions(+), 1 deletion(-)
+
+--- a/drivers/usb/core/driver.c
++++ b/drivers/usb/core/driver.c
+@@ -1700,6 +1700,20 @@ int usb_runtime_idle(struct device *dev)
+ 	return 0;
+ }
+ 
++int usb_set_usb2_hardware_lpm(struct usb_device *udev, int enable)
++{
++	struct usb_hcd *hcd = bus_to_hcd(udev->bus);
++	int ret = -EPERM;
++
++	if (hcd->driver->set_usb2_hw_lpm) {
++		ret = hcd->driver->set_usb2_hw_lpm(hcd, udev, enable);
++		if (!ret)
++			udev->usb2_hw_lpm_enabled = enable;
++	}
++
++	return ret;
++}
++
+ #endif /* CONFIG_USB_SUSPEND */
+ 
+ struct bus_type usb_bus_type = {
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -2397,6 +2397,10 @@ int usb_port_suspend(struct usb_device *
+ 		}
+ 	}
+ 
++	/* disable USB2 hardware LPM */
++	if (udev->usb2_hw_lpm_enabled == 1)
++		usb_set_usb2_hardware_lpm(udev, 0);
++
+ 	/* see 7.1.7.6 */
+ 	if (hub_is_superspeed(hub->hdev))
+ 		status = set_port_feature(hub->hdev,
+@@ -2608,7 +2612,12 @@ int usb_port_resume(struct usb_device *u
+ 	if (status < 0) {
+ 		dev_dbg(&udev->dev, "can't resume, status %d\n", status);
+ 		hub_port_logical_disconnect(hub, port1);
++	} else  {
++		/* Try to enable USB2 hardware LPM */
++		if (udev->usb2_hw_lpm_capable == 1)
++			usb_set_usb2_hardware_lpm(udev, 1);
+ 	}
++
+ 	return status;
+ }
+ 
+--- a/drivers/usb/core/usb.h
++++ b/drivers/usb/core/usb.h
+@@ -82,6 +82,7 @@ extern int usb_remote_wakeup(struct usb_
+ extern int usb_runtime_suspend(struct device *dev);
+ extern int usb_runtime_resume(struct device *dev);
+ extern int usb_runtime_idle(struct device *dev);
++extern int usb_set_usb2_hardware_lpm(struct usb_device *udev, int enable);
+ 
+ #else
+ 
+@@ -96,6 +97,10 @@ static inline int usb_remote_wakeup(stru
+ 	return 0;
+ }
+ 
++static inline int usb_set_usb2_hardware_lpm(struct usb_device *udev, int enable)
++{
++	return 0;
++}
+ #endif
+ 
+ extern struct bus_type usb_bus_type;
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -574,10 +574,19 @@ int xhci_hub_control(struct usb_hcd *hcd
+ 		switch (wValue) {
+ 		case USB_PORT_FEAT_SUSPEND:
+ 			temp = xhci_readl(xhci, port_array[wIndex]);
++			if ((temp & PORT_PLS_MASK) != XDEV_U0) {
++				/* Resume the port to U0 first */
++				xhci_set_link_state(xhci, port_array, wIndex,
++							XDEV_U0);
++				spin_unlock_irqrestore(&xhci->lock, flags);
++				msleep(10);
++				spin_lock_irqsave(&xhci->lock, flags);
++			}
+ 			/* In spec software should not attempt to suspend
+ 			 * a port unless the port reports that it is in the
+ 			 * enabled (PED = ‘1’,PLS < ‘3’) state.
+ 			 */
++			temp = xhci_readl(xhci, port_array[wIndex]);
+ 			if ((temp & PORT_PE) == 0 || (temp & PORT_RESET)
+ 				|| (temp & PORT_PLS_MASK) >= XDEV_U3) {
+ 				xhci_warn(xhci, "USB core suspending device "
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -352,6 +352,7 @@ static const struct hc_driver xhci_pci_h
+ 	 * call back when device connected and addressed
+ 	 */
+ 	.update_device =        xhci_update_device,
++	.set_usb2_hw_lpm =	xhci_set_usb2_hardware_lpm,
+ };
+ 
+ /*-------------------------------------------------------------------------*/
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -3286,6 +3286,11 @@ void xhci_free_dev(struct usb_hcd *hcd,
+ 		del_timer_sync(&virt_dev->eps[i].stop_cmd_timer);
+ 	}
+ 
++	if (udev->usb2_hw_lpm_enabled) {
++		xhci_set_usb2_hardware_lpm(hcd, udev, 0);
++		udev->usb2_hw_lpm_enabled = 0;
++	}
++
+ 	spin_lock_irqsave(&xhci->lock, flags);
+ 	/* Don't disable the slot if the host controller is dead. */
+ 	state = xhci_readl(xhci, &xhci->op_regs->status);
+@@ -3699,20 +3704,87 @@ finish:
+ 	return ret;
+ }
+ 
++int xhci_set_usb2_hardware_lpm(struct usb_hcd *hcd,
++			struct usb_device *udev, int enable)
++{
++	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
++	__le32 __iomem	**port_array;
++	__le32 __iomem	*pm_addr;
++	u32		temp;
++	unsigned int	port_num;
++	unsigned long	flags;
++	int		u2del, hird;
++
++	if (hcd->speed == HCD_USB3 || !xhci->hw_lpm_support ||
++			!udev->lpm_capable)
++		return -EPERM;
++
++	if (!udev->parent || udev->parent->parent ||
++			udev->descriptor.bDeviceClass == USB_CLASS_HUB)
++		return -EPERM;
++
++	if (udev->usb2_hw_lpm_capable != 1)
++		return -EPERM;
++
++	spin_lock_irqsave(&xhci->lock, flags);
++
++	port_array = xhci->usb2_ports;
++	port_num = udev->portnum - 1;
++	pm_addr = port_array[port_num] + 1;
++	temp = xhci_readl(xhci, pm_addr);
++
++	xhci_dbg(xhci, "%s port %d USB2 hardware LPM\n",
++			enable ? "enable" : "disable", port_num);
++
++	u2del = HCS_U2_LATENCY(xhci->hcs_params3);
++	if (le32_to_cpu(udev->bos->ext_cap->bmAttributes) & (1 << 2))
++		hird = xhci_calculate_hird_besl(u2del, 1);
++	else
++		hird = xhci_calculate_hird_besl(u2del, 0);
++
++	if (enable) {
++		temp &= ~PORT_HIRD_MASK;
++		temp |= PORT_HIRD(hird) | PORT_RWE;
++		xhci_writel(xhci, temp, pm_addr);
++		temp = xhci_readl(xhci, pm_addr);
++		temp |= PORT_HLE;
++		xhci_writel(xhci, temp, pm_addr);
++	} else {
++		temp &= ~(PORT_HLE | PORT_RWE | PORT_HIRD_MASK);
++		xhci_writel(xhci, temp, pm_addr);
++	}
++
++	spin_unlock_irqrestore(&xhci->lock, flags);
++	return 0;
++}
++
+ int xhci_update_device(struct usb_hcd *hcd, struct usb_device *udev)
+ {
+ 	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
+ 	int		ret;
+ 
+ 	ret = xhci_usb2_software_lpm_test(hcd, udev);
+-	if (!ret)
++	if (!ret) {
+ 		xhci_dbg(xhci, "software LPM test succeed\n");
++		if (xhci->hw_lpm_support == 1) {
++			udev->usb2_hw_lpm_capable = 1;
++			ret = xhci_set_usb2_hardware_lpm(hcd, udev, 1);
++			if (!ret)
++				udev->usb2_hw_lpm_enabled = 1;
++		}
++	}
+ 
+ 	return 0;
+ }
+ 
+ #else
+ 
++int xhci_set_usb2_hardware_lpm(struct usb_hcd *hcd,
++				struct usb_device *udev, int enable)
++{
++	return 0;
++}
++
+ int xhci_update_device(struct usb_hcd *hcd, struct usb_device *udev)
+ {
+ 	return 0;
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -367,7 +367,9 @@ struct xhci_op_regs {
+ #define	PORT_L1S_SUCCESS	1
+ #define	PORT_RWE		(1 << 3)
+ #define	PORT_HIRD(p)		(((p) & 0xf) << 4)
++#define	PORT_HIRD_MASK		(0xf << 4)
+ #define	PORT_L1DS(p)		(((p) & 0xff) << 8)
++#define	PORT_HLE		(1 << 16)
+ 
+ /**
+  * struct xhci_intr_reg - Interrupt Register Set
+@@ -1678,6 +1680,8 @@ int xhci_free_streams(struct usb_hcd *hc
+ 		gfp_t mem_flags);
+ int xhci_address_device(struct usb_hcd *hcd, struct usb_device *udev);
+ int xhci_update_device(struct usb_hcd *hcd, struct usb_device *udev);
++int xhci_set_usb2_hardware_lpm(struct usb_hcd *hcd,
++				struct usb_device *udev, int enable);
+ int xhci_update_hub_device(struct usb_hcd *hcd, struct usb_device *hdev,
+ 			struct usb_tt *tt, gfp_t mem_flags);
+ int xhci_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags);
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -411,6 +411,8 @@ struct usb_tt;
+  * @authenticated: Crypto authentication passed
+  * @wusb: device is Wireless USB
+  * @lpm_capable: device supports LPM
++ * @usb2_hw_lpm_capable: device can perform USB2 hardware LPM
++ * @usb2_hw_lpm_enabled: USB2 hardware LPM enabled
+  * @string_langid: language ID for strings
+  * @product: iProduct string, if present (static)
+  * @manufacturer: iManufacturer string, if present (static)
+@@ -474,6 +476,8 @@ struct usb_device {
+ 	unsigned authenticated:1;
+ 	unsigned wusb:1;
+ 	unsigned lpm_capable:1;
++	unsigned usb2_hw_lpm_capable:1;
++	unsigned usb2_hw_lpm_enabled:1;
+ 	int string_langid;
+ 
+ 	/* static strings from the device */
+--- a/include/linux/usb/hcd.h
++++ b/include/linux/usb/hcd.h
+@@ -346,6 +346,7 @@ struct hc_driver {
+ 		 * address is set
+ 		 */
+ 	int	(*update_device)(struct usb_hcd *, struct usb_device *);
++	int	(*set_usb2_hw_lpm)(struct usb_hcd *, struct usb_device *, int);
+ 
+ 	/* To by used for SLE security fixes if we run into a KABI problem */
+ 	void *suse_kabi_padding;
