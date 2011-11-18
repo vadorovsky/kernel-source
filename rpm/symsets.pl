@@ -322,6 +322,10 @@ sub module_exports {
         next if ($l =~ /^[^ ]* .....d/); # debug symbol
         my $sym = $l[$#l];
         my $sec = $l[$#l - 2];
+        # 3.0 and later creates a section for each exported symbol, named
+        # ___ksymtab(_gpl)+<symbol>
+        $sec =~ s/\+.*//;
+        $sec =~ s/^___ksymtab/__ksymtab/;
         if ($sym =~ /^__crc_(.*)/) {
             $crcs{$1} = $l[0];
             $crcs{$1} =~ s/^0{8}//;
