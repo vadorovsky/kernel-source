@@ -1,0 +1,280 @@
+Subject: perf events: Fix slow and broken cgroup context switch code
+From: Stephane Eranian <eranian@google.com>
+Date: Thu, 25 Aug 2011 15:58:03 +0200
+Patch-mainline: a8d757ef076f0f95f13a918808824058de25b3eb
+References:
+
+The current cgroup context switch code was incorrect leading
+to bogus counts. Furthermore, as soon as there was an active
+cgroup event on a CPU, the context switch cost on that CPU
+would increase by a significant amount as demonstrated by a
+simple ping/pong example:
+
+ $ ./pong
+ Both processes pinned to CPU1, running for 10s
+ 10684.51 ctxsw/s
+
+Now start a cgroup perf stat:
+ $ perf stat -e cycles,cycles -A -a -G test  -C 1 -- sleep 100
+
+$ ./pong
+ Both processes pinned to CPU1, running for 10s
+ 6674.61 ctxsw/s
+
+That's a 37% penalty.
+
+Note that pong is not even in the monitored cgroup.
+
+The results shown by perf stat are bogus:
+ $ perf stat -e cycles,cycles -A -a -G test  -C 1 -- sleep 100
+
+ Performance counter stats for 'sleep 100':
+
+ CPU1 <not counted> cycles   test
+ CPU1 16,984,189,138 cycles  #    0.000 GHz
+
+The second 'cycles' event should report a count @ CPU clock
+(here 2.4GHz) as it is counting across all cgroups.
+
+The patch below fixes the bogus accounting and bypasses any
+cgroup switches in case the outgoing and incoming tasks are
+in the same cgroup.
+
+With this patch the same test now yields:
+ $ ./pong
+ Both processes pinned to CPU1, running for 10s
+ 10775.30 ctxsw/s
+
+Start perf stat with cgroup:
+
+ $ perf stat -e cycles,cycles -A -a -G test  -C 1 -- sleep 10
+
+Run pong outside the cgroup:
+ $ /pong
+ Both processes pinned to CPU1, running for 10s
+ 10687.80 ctxsw/s
+
+The penalty is now less than 2%.
+
+And the results for perf stat are correct:
+
+$ perf stat -e cycles,cycles -A -a -G test  -C 1 -- sleep 10
+
+ Performance counter stats for 'sleep 10':
+
+ CPU1 <not counted> cycles test #    0.000 GHz
+ CPU1 23,933,981,448 cycles      #    0.000 GHz
+
+Now perf stat reports the correct counts for
+for the non cgroup event.
+
+If we run pong inside the cgroup, then we also get the
+correct counts:
+
+$ perf stat -e cycles,cycles -A -a -G test  -C 1 -- sleep 10
+
+ Performance counter stats for 'sleep 10':
+
+ CPU1 22,297,726,205 cycles test #    0.000 GHz
+ CPU1 23,933,981,448 cycles      #    0.000 GHz
+
+      10.001457237 seconds time elapsed
+
+Signed-off-by: Stephane Eranian <eranian@google.com>
+Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/20110825135803.GA4697@quad
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Acked-by: Mike Galbraith <mgalbraith@suse.de>
+
+---
+ include/linux/perf_event.h |   24 ++++++++++-------
+ kernel/events/core.c       |   63 +++++++++++++++++++++++++++++++++++++--------
+ kernel/sched.c             |    2 -
+ 3 files changed, 69 insertions(+), 20 deletions(-)
+
+Index: linux-3.0-SLE11-SP2/include/linux/perf_event.h
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/include/linux/perf_event.h
++++ linux-3.0-SLE11-SP2/include/linux/perf_event.h
+@@ -961,8 +961,10 @@ extern void perf_pmu_unregister(struct p
+ 
+ extern int perf_num_counters(void);
+ extern const char *perf_pmu_name(void);
+-extern void __perf_event_task_sched_in(struct task_struct *task);
+-extern void __perf_event_task_sched_out(struct task_struct *task, struct task_struct *next);
++extern void __perf_event_task_sched_in(struct task_struct *prev,
++				       struct task_struct *task);
++extern void __perf_event_task_sched_out(struct task_struct *prev,
++					struct task_struct *next);
+ extern int perf_event_init_task(struct task_struct *child);
+ extern void perf_event_exit_task(struct task_struct *child);
+ extern void perf_event_free_task(struct task_struct *task);
+@@ -1074,17 +1076,20 @@ perf_sw_event(u32 event_id, u64 nr, int
+ 
+ extern struct jump_label_key perf_sched_events;
+ 
+-static inline void perf_event_task_sched_in(struct task_struct *task)
++static inline void perf_event_task_sched_in(struct task_struct *prev,
++					    struct task_struct *task)
+ {
+ 	if (static_branch(&perf_sched_events))
+-		__perf_event_task_sched_in(task);
++		__perf_event_task_sched_in(prev, task);
+ }
+ 
+-static inline void perf_event_task_sched_out(struct task_struct *task, struct task_struct *next)
++static inline void perf_event_task_sched_out(struct task_struct *prev,
++					     struct task_struct *next)
+ {
+ 	perf_sw_event(PERF_COUNT_SW_CONTEXT_SWITCHES, 1, 1, NULL, 0);
+ 
+-	__perf_event_task_sched_out(task, next);
++	if (static_branch(&perf_sched_events))
++		__perf_event_task_sched_out(prev, next);
+ }
+ 
+ extern void perf_event_mmap(struct vm_area_struct *vma);
+@@ -1155,10 +1160,11 @@ extern void perf_event_disable(struct pe
+ extern void perf_event_task_tick(void);
+ #else
+ static inline void
+-perf_event_task_sched_in(struct task_struct *task)			{ }
++perf_event_task_sched_in(struct task_struct *prev,
++			 struct task_struct *task)			{ }
+ static inline void
+-perf_event_task_sched_out(struct task_struct *task,
+-			    struct task_struct *next)			{ }
++perf_event_task_sched_out(struct task_struct *prev,
++			  struct task_struct *next)			{ }
+ static inline int perf_event_init_task(struct task_struct *child)	{ return 0; }
+ static inline void perf_event_exit_task(struct task_struct *child)	{ }
+ static inline void perf_event_free_task(struct task_struct *task)	{ }
+Index: linux-3.0-SLE11-SP2/kernel/events/core.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/kernel/events/core.c
++++ linux-3.0-SLE11-SP2/kernel/events/core.c
+@@ -397,14 +397,54 @@ void perf_cgroup_switch(struct task_stru
+ 	local_irq_restore(flags);
+ }
+ 
+-static inline void perf_cgroup_sched_out(struct task_struct *task)
++static inline void perf_cgroup_sched_out(struct task_struct *task,
++					 struct task_struct *next)
+ {
+-	perf_cgroup_switch(task, PERF_CGROUP_SWOUT);
++	struct perf_cgroup *cgrp1;
++	struct perf_cgroup *cgrp2 = NULL;
++
++	/*
++	 * we come here when we know perf_cgroup_events > 0
++	 */
++	cgrp1 = perf_cgroup_from_task(task);
++
++	/*
++	 * next is NULL when called from perf_event_enable_on_exec()
++	 * that will systematically cause a cgroup_switch()
++	 */
++	if (next)
++		cgrp2 = perf_cgroup_from_task(next);
++
++	/*
++	 * only schedule out current cgroup events if we know
++	 * that we are switching to a different cgroup. Otherwise,
++	 * do no touch the cgroup events.
++	 */
++	if (cgrp1 != cgrp2)
++		perf_cgroup_switch(task, PERF_CGROUP_SWOUT);
+ }
+ 
+-static inline void perf_cgroup_sched_in(struct task_struct *task)
++static inline void perf_cgroup_sched_in(struct task_struct *prev,
++					struct task_struct *task)
+ {
+-	perf_cgroup_switch(task, PERF_CGROUP_SWIN);
++	struct perf_cgroup *cgrp1;
++	struct perf_cgroup *cgrp2 = NULL;
++
++	/*
++	 * we come here when we know perf_cgroup_events > 0
++	 */
++	cgrp1 = perf_cgroup_from_task(task);
++
++	/* prev can never be NULL */
++	cgrp2 = perf_cgroup_from_task(prev);
++
++	/*
++	 * only need to schedule in cgroup events if we are changing
++	 * cgroup during ctxsw. Cgroup events were not scheduled
++	 * out of ctxsw out if that was not the case.
++	 */
++	if (cgrp1 != cgrp2)
++		perf_cgroup_switch(task, PERF_CGROUP_SWIN);
+ }
+ 
+ static inline int perf_cgroup_connect(int fd, struct perf_event *event,
+@@ -516,11 +556,13 @@ static inline void update_cgrp_time_from
+ {
+ }
+ 
+-static inline void perf_cgroup_sched_out(struct task_struct *task)
++static inline void perf_cgroup_sched_out(struct task_struct *task,
++					 struct task_struct *next)
+ {
+ }
+ 
+-static inline void perf_cgroup_sched_in(struct task_struct *task)
++static inline void perf_cgroup_sched_in(struct task_struct *prev,
++					struct task_struct *task)
+ {
+ }
+ 
+@@ -1984,7 +2026,7 @@ void __perf_event_task_sched_out(struct
+ 	 * cgroup event are system-wide mode only
+ 	 */
+ 	if (atomic_read(&__get_cpu_var(perf_cgroup_events)))
+-		perf_cgroup_sched_out(task);
++		perf_cgroup_sched_out(task, next);
+ }
+ 
+ static void task_ctx_sched_out(struct perf_event_context *ctx)
+@@ -2149,7 +2191,8 @@ static void perf_event_context_sched_in(
+  * accessing the event control register. If a NMI hits, then it will
+  * keep the event running.
+  */
+-void __perf_event_task_sched_in(struct task_struct *task)
++void __perf_event_task_sched_in(struct task_struct *prev,
++				struct task_struct *task)
+ {
+ 	struct perf_event_context *ctx;
+ 	int ctxn;
+@@ -2167,7 +2210,7 @@ void __perf_event_task_sched_in(struct t
+ 	 * cgroup event are system-wide mode only
+ 	 */
+ 	if (atomic_read(&__get_cpu_var(perf_cgroup_events)))
+-		perf_cgroup_sched_in(task);
++		perf_cgroup_sched_in(prev, task);
+ }
+ 
+ static u64 perf_calculate_period(struct perf_event *event, u64 nsec, u64 count)
+@@ -2423,7 +2466,7 @@ static void perf_event_enable_on_exec(st
+ 	 * ctxswin cgroup events which are already scheduled
+ 	 * in.
+ 	 */
+-	perf_cgroup_sched_out(current);
++	perf_cgroup_sched_out(current, NULL);
+ 
+ 	raw_spin_lock(&ctx->lock);
+ 	task_ctx_sched_out(ctx);
+Index: linux-3.0-SLE11-SP2/kernel/sched.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/kernel/sched.c
++++ linux-3.0-SLE11-SP2/kernel/sched.c
+@@ -3205,7 +3205,7 @@ static void finish_task_switch(struct rq
+ #ifdef __ARCH_WANT_INTERRUPTS_ON_CTXSW
+ 	local_irq_disable();
+ #endif /* __ARCH_WANT_INTERRUPTS_ON_CTXSW */
+-	perf_event_task_sched_in(current);
++	perf_event_task_sched_in(prev, current);
+ #ifdef __ARCH_WANT_INTERRUPTS_ON_CTXSW
+ 	local_irq_enable();
+ #endif /* __ARCH_WANT_INTERRUPTS_ON_CTXSW */
