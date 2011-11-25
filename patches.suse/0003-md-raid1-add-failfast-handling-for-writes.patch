@@ -1,0 +1,191 @@
+From 9b92e49d27ffd1108cb2753ba2a8c4bc0a1d8511 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.de>
+Date: Thu, 24 Nov 2011 14:19:21 +1100
+Subject: [PATCH 3/5] md/raid1 - add failfast handling for writes.
+References: Fate#311379
+Patch-mainline: 3.3?
+
+When writing to a fastfail device we use REQ_FASTFAIL_DEV unless it is
+the only device being written to.
+For resync/recovery assume there was a working device to read from so
+always use REQ_FASTFAIL_DEV.
+
+If a write for resync/recovery fails we just fail the device - there
+is not much else to do.
+
+If a normal write fail but the device cannot be failed (must be only
+one left) we queue for write error handling.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+---
+ drivers/md/raid1.c |   94 +++++++++++++++++++++++++++++++++++++++++++++++++++--
+ drivers/md/raid1.h |    1 
+ 2 files changed, 92 insertions(+), 3 deletions(-)
+
+--- linux-3.0-SLE11-SP2.orig/drivers/md/raid1.c
++++ linux-3.0-SLE11-SP2/drivers/md/raid1.c
+@@ -308,6 +308,10 @@ static void r1_bio_write_done(r1bio_t *r
+ {
+ 	if (atomic_dec_and_test(&r1_bio->remaining))
+ 	{
++		if (test_bit(R1BIO_WriteError, &r1_bio->state)) {
++			reschedule_retry(r1_bio);
++			return;
++		}
+ 		/* it really is the end of this request */
+ 		if (test_bit(R1BIO_BehindIO, &r1_bio->state)) {
+ 			/* free extra copy of the data pages */
+@@ -334,11 +338,13 @@ static void raid1_end_write_request(stru
+ 	int mirror, behind = test_bit(R1BIO_BehindIO, &r1_bio->state);
+ 	conf_t *conf = r1_bio->mddev->private;
+ 	struct bio *to_put = NULL;
++	mdk_rdev_t *rdev;
+ 
+ 
+ 	for (mirror = 0; mirror < conf->raid_disks; mirror++)
+ 		if (r1_bio->bios[mirror] == bio)
+ 			break;
++	rdev = conf->mirrors[mirror].rdev;
+ 
+ 	/*
+ 	 * 'one mirror IO has finished' event handler:
+@@ -348,7 +354,20 @@ static void raid1_end_write_request(stru
+ 	if (!uptodate) {
+ 		md_error(r1_bio->mddev, conf->mirrors[mirror].rdev);
+ 		/* an I/O failed, we can't clear the bitmap */
+-		set_bit(R1BIO_Degraded, &r1_bio->state);
++
++		if (test_bit(FailFast, &rdev->flags) &&
++		    /* We never try FailFast to WriteMostly devices */
++		    !test_bit(WriteMostly, &rdev->flags) &&
++		    !test_bit(Faulty, &rdev->flags)) {
++			/* This is the only remaining device,
++			 * We need to retry the write without
++			 * FailFast
++			 */
++			set_bit(R1BIO_WriteError, &r1_bio->state);
++			r1_bio->bios[mirror] = to_put;
++			to_put = NULL;
++		} else
++			set_bit(R1BIO_Degraded, &r1_bio->state);
+ 	} else
+ 		/*
+ 		 * Set R1BIO_Uptodate in our master bio, so that we
+@@ -388,7 +407,8 @@ static void raid1_end_write_request(stru
+ 			}
+ 		}
+ 	}
+-	rdev_dec_pending(conf->mirrors[mirror].rdev, conf->mddev);
++	if (r1_bio->bios[mirror] == NULL)
++		rdev_dec_pending(conf->mirrors[mirror].rdev, conf->mddev);
+ 
+ 	/*
+ 	 * Let's see if all mirrored write operations have finished
+@@ -911,6 +931,10 @@ static int make_request(mddev_t *mddev,
+ 		mbio->bi_bdev = conf->mirrors[i].rdev->bdev;
+ 		mbio->bi_end_io	= raid1_end_write_request;
+ 		mbio->bi_rw = WRITE | do_flush_fua | do_sync;
++		if (test_bit(FailFast, &conf->mirrors[i].rdev->flags) &&
++		    !test_bit(WriteMostly, &conf->mirrors[i].rdev->flags) &&
++		    conf->raid_disks - mddev->degraded > 1)
++			mbio->bi_rw |= REQ_FAILFAST_DEV;
+ 		mbio->bi_private = r1_bio;
+ 
+ 		if (r1_bio->behind_pages) {
+@@ -1446,6 +1470,9 @@ static void sync_request_write(mddev_t *
+ 			continue;
+ 
+ 		wbio->bi_rw = WRITE;
++		if (test_bit(FailFast, &conf->mirrors[i].rdev->flags))
++			wbio->bi_rw |= REQ_FAILFAST_DEV;
++
+ 		wbio->bi_end_io = end_sync_write;
+ 		atomic_inc(&r1_bio->remaining);
+ 		md_sync_acct(conf->mirrors[i].rdev->bdev, wbio->bi_size >> 9);
+@@ -1553,6 +1580,65 @@ static void fix_read_error(conf_t *conf,
+ 	}
+ }
+ 
++static void bi_complete(struct bio *bio, int error)
++{
++	complete((struct completion *)bio->bi_private);
++}
++
++static int submit_bio_wait(int rw, struct bio *bio)
++{
++	struct completion event;
++	rw |= REQ_SYNC;
++
++	init_completion(&event);
++	bio->bi_private = &event;
++	bio->bi_end_io = bi_complete;
++	submit_bio(rw, bio);
++	wait_for_completion(&event);
++
++	return test_bit(BIO_UPTODATE, &bio->bi_flags);
++}
++
++static void handle_write_error(conf_t *conf, r1bio_t *r1_bio)
++{
++	int m;
++
++	for (m = 0; m < conf->raid_disks; m++) {
++		struct bio *wbio = r1_bio->bios[m];
++		mdk_rdev_t *rdev;
++		if (!wbio)
++			continue;
++		/* We got a write error on this FailFast
++		 * device.  Need to try again without
++		 * FailFast as it is only device remaining
++		 */
++		wbio->bi_sector = r1_bio->sector;
++		wbio->bi_flags &= ~(BIO_POOL_MASK-1);
++		wbio->bi_flags |= 1 << BIO_UPTODATE;
++		wbio->bi_rw = WRITE;
++		wbio->bi_vcnt = r1_bio->master_bio->bi_vcnt;
++		memcpy(wbio->bi_io_vec,
++		       r1_bio->master_bio->bi_io_vec,
++		       wbio->bi_vcnt *sizeof(struct bio_vec));
++		wbio->bi_idx = r1_bio->master_bio->bi_idx;
++
++		wbio->bi_size = r1_bio->sectors << 9;
++
++		rdev = conf->mirrors[m].rdev;
++		wbio->bi_sector += rdev->data_offset;
++		wbio->bi_bdev = rdev->bdev;
++		if (submit_bio_wait(WRITE, wbio) != 0)
++			set_bit(R1BIO_Uptodate, &r1_bio->state);
++		else
++			set_bit(R1BIO_Degraded, &r1_bio->state);
++		rdev_dec_pending(rdev, conf->mddev);
++	}
++	/* Now we can really finish the request */
++	atomic_inc(&r1_bio->remaining);
++	clear_bit(R1BIO_WriteError, &r1_bio->state);
++	r1_bio_write_done(r1_bio);
++}
++
+ static void raid1d(mddev_t *mddev)
+ {
+ 	r1bio_t *r1_bio;
+@@ -1584,7 +1670,9 @@ static void raid1d(mddev_t *mddev)
+ 
+ 		mddev = r1_bio->mddev;
+ 		conf = mddev->private;
+-		if (test_bit(R1BIO_IsSync, &r1_bio->state))
++		if (test_bit(R1BIO_WriteError, &r1_bio->state))
++			handle_write_error(conf, r1_bio);
++		else if (test_bit(R1BIO_IsSync, &r1_bio->state))
+ 			sync_request_write(mddev, r1_bio);
+ 		else {
+ 			int disk;
+--- linux-3.0-SLE11-SP2.orig/drivers/md/raid1.h
++++ linux-3.0-SLE11-SP2/drivers/md/raid1.h
+@@ -128,6 +128,7 @@ struct r1bio_s {
+ #define	R1BIO_Returned 6
+ /* failfast devices did receive failfast requests. */
+ #define	R1BIO_FailFast 7
++#define	R1BIO_WriteError 8
+ 
+ extern int md_raid1_congested(mddev_t *mddev, int bits);
+ 
