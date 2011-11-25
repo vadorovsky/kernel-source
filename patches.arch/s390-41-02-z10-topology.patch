@@ -1,0 +1,217 @@
+From: Gerald Schaefer <geraldsc@de.ibm.com>
+Subject: kernel: fix z10 CPU topology
+Patch-mainline: yes
+References: bnc#732371,LTC#76623
+
+Description: kernel: fix z10 CPU topology
+Symptom:     Bad performance on some workloads.
+Problem:     Since the book scheduling domain is available, CPUs that belong
+             to a book on a z10 incorrectly were marked as core siblings
+             instead of book siblings. Since the scheduler assumes that core
+             siblings are closer to each other than book siblings tasks
+             will be moved to differerent CPUs more frequently than they
+             should. This in turn will result in higher cross CPU signalling
+             and cache misses which will reduce overall performance.
+Solution:    Change topology code to make sure that CPUs within a book on
+             a z10 machine appear as book siblings. Also verify if the
+             target CPU of a cross CPU signal is scheduled and use the
+             appropriate SIGP order.
+
+Acked-by: John Jolly <jjolly@suse.de>
+---
+
+ arch/s390/include/asm/irq.h |    3 +-
+ arch/s390/kernel/head31.S   |    2 -
+ arch/s390/kernel/head64.S   |    2 -
+ arch/s390/kernel/irq.c      |    3 +-
+ arch/s390/kernel/smp.c      |   17 ++++++++++++++--
+ arch/s390/kernel/topology.c |   45 +++++++++++++++++++++++++++++++++++++-------
+ 6 files changed, 59 insertions(+), 13 deletions(-)
+
+--- a/arch/s390/include/asm/irq.h
++++ b/arch/s390/include/asm/irq.h
+@@ -8,7 +8,8 @@ enum interruption_class {
+ 	EXTERNAL_INTERRUPT,
+ 	IO_INTERRUPT,
+ 	EXTINT_CLK,
+-	EXTINT_IPI,
++	EXTINT_EXC,
++	EXTINT_EMS,
+ 	EXTINT_TMR,
+ 	EXTINT_TLA,
+ 	EXTINT_PFL,
+--- a/arch/s390/kernel/head31.S
++++ b/arch/s390/kernel/head31.S
+@@ -93,7 +93,7 @@ _stext:	basr	%r13,0			# get base
+ .LPG3:
+ # check control registers
+ 	stctl	%c0,%c15,0(%r15)
+-	oi	2(%r15),0x40		# enable sigp emergency signal
++	oi	2(%r15),0x60		# enable sigp emergency & external call
+ 	oi	0(%r15),0x10		# switch on low address protection
+ 	lctl	%c0,%c15,0(%r15)
+ 
+--- a/arch/s390/kernel/head64.S
++++ b/arch/s390/kernel/head64.S
+@@ -91,7 +91,7 @@ _stext:	basr	%r13,0			# get base
+ .LPG3:
+ # check control registers
+ 	stctg	%c0,%c15,0(%r15)
+-	oi	6(%r15),0x40		# enable sigp emergency signal
++	oi	6(%r15),0x60		# enable sigp emergency & external call
+ 	oi	4(%r15),0x10		# switch on low address proctection
+ 	lctlg	%c0,%c15,0(%r15)
+ 
+--- a/arch/s390/kernel/irq.c
++++ b/arch/s390/kernel/irq.c
+@@ -33,7 +33,8 @@ static const struct irq_class intrclass_
+ 	{.name = "EXT" },
+ 	{.name = "I/O" },
+ 	{.name = "CLK", .desc = "[EXT] Clock Comparator" },
+-	{.name = "IPI", .desc = "[EXT] Signal Processor" },
++	{.name = "EXC", .desc = "[EXT] External Call" },
++	{.name = "EMS", .desc = "[EXT] Emergency Signal" },
+ 	{.name = "TMR", .desc = "[EXT] CPU Timer" },
+ 	{.name = "TAL", .desc = "[EXT] Timing Alert" },
+ 	{.name = "PFL", .desc = "[EXT] Pseudo Page Fault" },
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@ -161,7 +161,10 @@ static void do_ext_call_interrupt(unsign
+ {
+ 	unsigned long bits;
+ 
+-	kstat_cpu(smp_processor_id()).irqs[EXTINT_IPI]++;
++	if (ext_int_code == 0x1202)
++		kstat_cpu(smp_processor_id()).irqs[EXTINT_EXC]++;
++	else
++		kstat_cpu(smp_processor_id()).irqs[EXTINT_EMS]++;
+ 	/*
+ 	 * handle bit signal external calls
+ 	 */
+@@ -183,12 +186,19 @@ static void do_ext_call_interrupt(unsign
+  */
+ static void smp_ext_bitcall(int cpu, int sig)
+ {
++	int order;
++
+ 	/*
+ 	 * Set signaling bit in lowcore of target cpu and kick it
+ 	 */
+ 	set_bit(sig, (unsigned long *) &lowcore_ptr[cpu]->ext_call_fast);
+-	while (sigp(cpu, sigp_emergency_signal) == sigp_busy)
++	while (1) {
++		order = smp_vcpu_scheduled(cpu) ?
++			sigp_external_call : sigp_emergency_signal;
++		if (sigp(cpu, order) != sigp_busy)
++			break;
+ 		udelay(10);
++	}
+ }
+ 
+ void arch_send_call_function_ipi_mask(const struct cpumask *mask)
+@@ -703,6 +713,9 @@ void __init smp_prepare_cpus(unsigned in
+ 	/* request the 0x1201 emergency signal external interrupt */
+ 	if (register_external_interrupt(0x1201, do_ext_call_interrupt) != 0)
+ 		panic("Couldn't request external interrupt 0x1201");
++	/* request the 0x1202 external call external interrupt */
++	if (register_external_interrupt(0x1202, do_ext_call_interrupt) != 0)
++		panic("Couldn't request external interrupt 0x1202");
+ 
+ 	/* Reallocate current lowcore, but keep its contents. */
+ 	lowcore = (void *) __get_free_pages(GFP_KERNEL | GFP_DMA, LC_ORDER);
+--- a/arch/s390/kernel/topology.c
++++ b/arch/s390/kernel/topology.c
+@@ -68,8 +68,10 @@ static cpumask_t cpu_group_map(struct ma
+ 	return mask;
+ }
+ 
+-static void add_cpus_to_mask(struct topology_cpu *tl_cpu,
+-			     struct mask_info *book, struct mask_info *core)
++static struct mask_info *add_cpus_to_mask(struct topology_cpu *tl_cpu,
++					  struct mask_info *book,
++					  struct mask_info *core,
++					  int z10)
+ {
+ 	unsigned int cpu;
+ 
+@@ -88,10 +90,16 @@ static void add_cpus_to_mask(struct topo
+ 			cpu_book_id[lcpu] = book->id;
+ #endif
+ 			cpumask_set_cpu(lcpu, &core->mask);
+-			cpu_core_id[lcpu] = core->id;
++			if (z10) {
++				cpu_core_id[lcpu] = rcpu;
++				core = core->next;
++			} else {
++				cpu_core_id[lcpu] = core->id;
++			}
+ 			smp_cpu_polarization[lcpu] = tl_cpu->pp;
+ 		}
+ 	}
++	return core;
+ }
+ 
+ static void clear_masks(void)
+@@ -123,18 +131,41 @@ static void tl_to_cores(struct sysinfo_1
+ {
+ #ifdef CONFIG_SCHED_BOOK
+ 	struct mask_info *book = &book_info;
++	struct cpuid cpu_id;
+ #else
+ 	struct mask_info *book = NULL;
+ #endif
+ 	struct mask_info *core = &core_info;
+ 	union topology_entry *tle, *end;
++	int z10 = 0;
+ 
+-
++#ifdef CONFIG_SCHED_BOOK
++	get_cpu_id(&cpu_id);
++	z10 = cpu_id.machine == 0x2097 || cpu_id.machine == 0x2098;
++#endif
+ 	spin_lock_irq(&topology_lock);
+ 	clear_masks();
+ 	tle = info->tle;
+ 	end = (union topology_entry *)((unsigned long)info + info->length);
+ 	while (tle < end) {
++#ifdef CONFIG_SCHED_BOOK
++		if (z10) {
++			switch (tle->nl) {
++			case 1:
++				book = book->next;
++				book->id = tle->container.id;
++				break;
++			case 0:
++				core = add_cpus_to_mask(&tle->cpu, book, core, z10);
++				break;
++			default:
++				clear_masks();
++				goto out;
++			}
++			tle = next_tle(tle);
++			continue;
++		}
++#endif
+ 		switch (tle->nl) {
+ #ifdef CONFIG_SCHED_BOOK
+ 		case 2:
+@@ -147,7 +178,7 @@ static void tl_to_cores(struct sysinfo_1
+ 			core->id = tle->container.id;
+ 			break;
+ 		case 0:
+-			add_cpus_to_mask(&tle->cpu, book, core);
++			add_cpus_to_mask(&tle->cpu, book, core, z10);
+ 			break;
+ 		default:
+ 			clear_masks();
+@@ -328,8 +359,8 @@ void __init s390_init_cpu_topology(void)
+ 	for (i = 0; i < TOPOLOGY_NR_MAG; i++)
+ 		printk(" %d", info->mag[i]);
+ 	printk(" / %d\n", info->mnest);
+-	alloc_masks(info, &core_info, 2);
++	alloc_masks(info, &core_info, 1);
+ #ifdef CONFIG_SCHED_BOOK
+-	alloc_masks(info, &book_info, 3);
++	alloc_masks(info, &book_info, 2);
+ #endif
+ }
