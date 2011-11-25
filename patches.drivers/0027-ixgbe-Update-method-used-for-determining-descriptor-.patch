@@ -1,0 +1,124 @@
+From a535c30e9e98d201089503a0ffa0093cba16e796 Mon Sep 17 00:00:00 2001
+From: Alexander Duyck <alexander.h.duyck@intel.com>
+Date: Fri, 27 May 2011 05:31:52 +0000
+Subject: [PATCH 27/32] ixgbe: Update method used for determining descriptor count for an skb
+Git-commit: a535c30e9e98d201089503a0ffa0093cba16e796
+Patch-mainline: v3.1-rc1~316^2~327^2~4
+References: bnc#714789
+
+This patch updates the current methods used for determining if we have
+enough space to transmit a given skb.  The current method is quite wasteful
+as it has us go through and determine how each page is going to be broken
+up.  That only needs to be done if pages are larger than our maximum data
+per TXD.  As such I have wrapped that in a page size check.
+
+Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Acked-by: Michal Marek <mmarek@suse.cz>
+
+---
+ drivers/net/ixgbe/ixgbe.h      |    7 +++++
+ drivers/net/ixgbe/ixgbe_main.c |   55 +++++++++++++++++++----------------------
+ 2 files changed, 33 insertions(+), 29 deletions(-)
+
+--- a/drivers/net/ixgbe/ixgbe.h
++++ b/drivers/net/ixgbe/ixgbe.h
+@@ -131,6 +131,13 @@ struct vf_macvlans {
+ 	u8 vf_macvlan[ETH_ALEN];
+ };
+ 
++#define IXGBE_MAX_TXD_PWR	14
++#define IXGBE_MAX_DATA_PER_TXD	(1 << IXGBE_MAX_TXD_PWR)
++
++/* Tx Descriptors needed, worst case */
++#define TXD_USE_COUNT(S) DIV_ROUND_UP((S), IXGBE_MAX_DATA_PER_TXD)
++#define DESC_NEEDED ((MAX_SKB_FRAGS * TXD_USE_COUNT(PAGE_SIZE)) + 4)
++
+ /* wrapper around a pointer to a socket buffer,
+  * so a DMA handle can be stored along with the buffer */
+ struct ixgbe_tx_buffer {
+--- a/drivers/net/ixgbe/ixgbe_main.c
++++ b/drivers/net/ixgbe/ixgbe_main.c
+@@ -832,15 +832,6 @@ static inline bool ixgbe_check_tx_hang(s
+ 	return ret;
+ }
+ 
+-#define IXGBE_MAX_TXD_PWR       14
+-#define IXGBE_MAX_DATA_PER_TXD  (1 << IXGBE_MAX_TXD_PWR)
+-
+-/* Tx Descriptors needed, worst case */
+-#define TXD_USE_COUNT(S) (((S) >> IXGBE_MAX_TXD_PWR) + \
+-			 (((S) & (IXGBE_MAX_DATA_PER_TXD - 1)) ? 1 : 0))
+-#define DESC_NEEDED (TXD_USE_COUNT(IXGBE_MAX_DATA_PER_TXD) /* skb->data */ + \
+-	MAX_SKB_FRAGS * TXD_USE_COUNT(PAGE_SIZE) + 1) /* for context */
+-
+ /**
+  * ixgbe_tx_timeout_reset - initiate reset due to Tx timeout
+  * @adapter: driver private struct
+@@ -6992,14 +6983,34 @@ netdev_tx_t ixgbe_xmit_frame_ring(struct
+ 			  struct ixgbe_adapter *adapter,
+ 			  struct ixgbe_ring *tx_ring)
+ {
+-	unsigned int tx_flags = 0;
+ 	int tso;
+-	u16 count = 0;
++	u32  tx_flags = 0;
++#if PAGE_SIZE > IXGBE_MAX_DATA_PER_TXD
++	unsigned short f;
++#endif
+ 	u16 first;
+-	unsigned int f;
++	u16 count = TXD_USE_COUNT(skb_headlen(skb));
+ 	__be16 protocol;
+ 	u8 hdr_len = 0;
+ 
++	/*
++	 * need: 1 descriptor per page * PAGE_SIZE/IXGBE_MAX_DATA_PER_TXD,
++	 *       + 1 desc for skb_head_len/IXGBE_MAX_DATA_PER_TXD,
++	 *       + 2 desc gap to keep tail from touching head,
++	 *       + 1 desc for context descriptor,
++	 * otherwise try next time
++	 */
++#if PAGE_SIZE > IXGBE_MAX_DATA_PER_TXD
++	for (f = 0; f < skb_shinfo(skb)->nr_frags; f++)
++		count += TXD_USE_COUNT(skb_shinfo(skb)->frags[f].size);
++#else
++	count += skb_shinfo(skb)->nr_frags;
++#endif
++	if (ixgbe_maybe_stop_tx(tx_ring, count + 3)) {
++		tx_ring->tx_stats.tx_busy++;
++		return NETDEV_TX_BUSY;
++	}
++
+ 	protocol = vlan_get_protocol(skb);
+ 
+ 	if (vlan_tx_tag_present(skb)) {
+@@ -7023,25 +7034,11 @@ netdev_tx_t ixgbe_xmit_frame_ring(struct
+ 	if (adapter->flags & IXGBE_FLAG_FCOE_ENABLED &&
+ 	    (protocol == htons(ETH_P_FCOE)))
+ 		tx_flags |= IXGBE_TX_FLAGS_FCOE;
+-#endif
+-
+-	/* four things can cause us to need a context descriptor */
+-	if (skb_is_gso(skb) ||
+-	    (skb->ip_summed == CHECKSUM_PARTIAL) ||
+-	    (tx_flags & IXGBE_TX_FLAGS_VLAN) ||
+-	    (tx_flags & IXGBE_TX_FLAGS_FCOE))
+-		count++;
+-
+-	count += TXD_USE_COUNT(skb_headlen(skb));
+-	for (f = 0; f < skb_shinfo(skb)->nr_frags; f++)
+-		count += TXD_USE_COUNT(skb_shinfo(skb)->frags[f].size);
+-
+-	if (ixgbe_maybe_stop_tx(tx_ring, count)) {
+-		tx_ring->tx_stats.tx_busy++;
+-		return NETDEV_TX_BUSY;
+-	}
+ 
++#endif
++	/* record the location of the first descriptor for this packet */
+ 	first = tx_ring->next_to_use;
++
+ 	if (tx_flags & IXGBE_TX_FLAGS_FCOE) {
+ #ifdef IXGBE_FCOE
+ 		/* setup tx offload for FCoE */
