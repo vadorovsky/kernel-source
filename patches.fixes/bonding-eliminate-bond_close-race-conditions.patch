@@ -1,0 +1,365 @@
+From: Jay Vosburgh <fubar@us.ibm.com>
+Subject: bonding: eliminate bond_close race conditions
+Patch-mainline: 3.2
+Git-commit: e6d265e8504ab4a3368b8645d318b344ee88b280
+References: bnc#602969, bnc#735277
+Acked-by: Jiri Bohac <jbohac@suse.cz>
+
+This patch resolves two sets of race conditions.
+
+Mitsuo Hayasaka <mitsuo.hayasaka.hu@hitachi.com> reported the
+first, as follows:
+
+The bond_close() calls cancel_delayed_work() to cancel delayed works.
+It, however, cannot cancel works that were already queued in workqueue.
+The bond_open() initializes work->data, and proccess_one_work() refers
+get_work_cwq(work)->wq->flags. The get_work_cwq() returns NULL when
+work->data has been initialized. Thus, a panic occurs.
+
+He included a patch that converted the cancel_delayed_work calls
+in bond_close to flush_delayed_work_sync, which eliminated the above
+problem.
+
+His patch is incorporated, at least in principle, into this
+patch.  In this patch, we use cancel_delayed_work_sync in place of
+flush_delayed_work_sync, and also convert bond_uninit in addition to
+bond_close.
+
+This conversion to _sync, however, opens new races between
+bond_close and three periodically executing workqueue functions:
+bond_mii_monitor, bond_alb_monitor and bond_activebackup_arp_mon.
+
+The race occurs because bond_close and bond_uninit are always
+called with RTNL held, and these workqueue functions may acquire RTNL to
+perform failover-related activities.  If bond_close or bond_uninit is
+waiting in cancel_delayed_work_sync, deadlock occurs.
+
+These deadlocks are resolved by having the workqueue functions
+acquire RTNL conditionally.  If the rtnl_trylock() fails, the functions
+reschedule and return immediately.  For the cases that are attempting to
+perform link failover, a delay of 1 is used; for the other cases, the
+normal interval is used (as those activities are not as time critical).
+
+Additionally, the bond_mii_monitor function now stores the delay
+in a variable (mimicing the structure of activebackup_arp_mon).
+
+Lastly, all of the above renders the kill_timers sentinel moot,
+and therefore it has been removed.
+
+Tested-by: Mitsuo Hayasaka <mitsuo.hayasaka.hu@hitachi.com>
+Signed-off-by: Jay Vosburgh <fubar@us.ibm.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/bonding/bond_3ad.c b/drivers/net/bonding/bond_3ad.c
+index 218063e..930ab16 100644
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@ -2120,9 +2120,6 @@ void bond_3ad_state_machine_handler(struct work_struct *work)
+ 
+ 	read_lock(&bond->lock);
+ 
+-	if (bond->kill_timers)
+-		goto out;
+-
+ 	//check if there are any slaves
+ 	if (bond->slave_cnt == 0)
+ 		goto re_arm;
+@@ -2171,9 +2168,8 @@ void bond_3ad_state_machine_handler(struct work_struct *work)
+ 	}
+ 
+ re_arm:
+-	if (!bond->kill_timers)
+-		queue_delayed_work(bond->wq, &bond->ad_work, ad_delta_in_ticks);
+-out:
++	queue_delayed_work(bond->wq, &bond->ad_work, ad_delta_in_ticks);
++
+ 	read_unlock(&bond->lock);
+ }
+ 
+diff --git a/drivers/net/bonding/bond_alb.c b/drivers/net/bonding/bond_alb.c
+index 3995393..74e6f95 100644
+--- a/drivers/net/bonding/bond_alb.c
++++ b/drivers/net/bonding/bond_alb.c
+@@ -1343,10 +1343,6 @@ void bond_alb_monitor(struct work_struct *work)
+ 
+ 	read_lock(&bond->lock);
+ 
+-	if (bond->kill_timers) {
+-		goto out;
+-	}
+-
+ 	if (bond->slave_cnt == 0) {
+ 		bond_info->tx_rebalance_counter = 0;
+ 		bond_info->lp_counter = 0;
+@@ -1401,10 +1397,13 @@ void bond_alb_monitor(struct work_struct *work)
+ 
+ 			/*
+ 			 * dev_set_promiscuity requires rtnl and
+-			 * nothing else.
++			 * nothing else.  Avoid race with bond_close.
+ 			 */
+ 			read_unlock(&bond->lock);
+-			rtnl_lock();
++			if (!rtnl_trylock()) {
++				read_lock(&bond->lock);
++				goto re_arm;
++			}
+ 
+ 			bond_info->rlb_promisc_timeout_counter = 0;
+ 
+@@ -1440,9 +1439,8 @@ void bond_alb_monitor(struct work_struct *work)
+ 	}
+ 
+ re_arm:
+-	if (!bond->kill_timers)
+-		queue_delayed_work(bond->wq, &bond->alb_work, alb_delta_in_ticks);
+-out:
++	queue_delayed_work(bond->wq, &bond->alb_work, alb_delta_in_ticks);
++
+ 	read_unlock(&bond->lock);
+ }
+ 
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index eeaeb67..ec683f9 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -845,9 +845,6 @@ static void bond_resend_igmp_join_requests(struct bonding *bond)
+ 
+ 	read_lock(&bond->lock);
+ 
+-	if (bond->kill_timers)
+-		goto out;
+-
+ 	/* rejoin all groups on bond device */
+ 	__bond_resend_igmp_join_requests(bond->dev);
+ 
+@@ -861,9 +858,9 @@ static void bond_resend_igmp_join_requests(struct bonding *bond)
+ 		}
+ 	}
+ 
+-	if ((--bond->igmp_retrans > 0) && !bond->kill_timers)
++	if (--bond->igmp_retrans > 0)
+ 		queue_delayed_work(bond->wq, &bond->mcast_work, HZ/5);
+-out:
++
+ 	read_unlock(&bond->lock);
+ }
+ 
+@@ -2590,10 +2587,11 @@ void bond_mii_monitor(struct work_struct *work)
+ 	struct bonding *bond = container_of(work, struct bonding,
+ 					    mii_work.work);
+ 	bool should_notify_peers = false;
++	unsigned long delay;
+ 
+ 	read_lock(&bond->lock);
+-	if (bond->kill_timers)
+-		goto out;
++
++	delay = msecs_to_jiffies(bond->params.miimon);
+ 
+ 	if (bond->slave_cnt == 0)
+ 		goto re_arm;
+@@ -2602,7 +2600,15 @@ void bond_mii_monitor(struct work_struct *work)
+ 
+ 	if (bond_miimon_inspect(bond)) {
+ 		read_unlock(&bond->lock);
+-		rtnl_lock();
++
++		/* Race avoidance with bond_close cancel of workqueue */
++		if (!rtnl_trylock()) {
++			read_lock(&bond->lock);
++			delay = 1;
++			should_notify_peers = false;
++			goto re_arm;
++		}
++
+ 		read_lock(&bond->lock);
+ 
+ 		bond_miimon_commit(bond);
+@@ -2613,14 +2619,18 @@ void bond_mii_monitor(struct work_struct *work)
+ 	}
+ 
+ re_arm:
+-	if (bond->params.miimon && !bond->kill_timers)
+-		queue_delayed_work(bond->wq, &bond->mii_work,
+-				   msecs_to_jiffies(bond->params.miimon));
+-out:
++	if (bond->params.miimon)
++		queue_delayed_work(bond->wq, &bond->mii_work, delay);
++
+ 	read_unlock(&bond->lock);
+ 
+ 	if (should_notify_peers) {
+-		rtnl_lock();
++		if (!rtnl_trylock()) {
++			read_lock(&bond->lock);
++			bond->send_peer_notif++;
++			read_unlock(&bond->lock);
++			return;
++		}
+ 		netdev_bonding_change(bond->dev, NETDEV_NOTIFY_PEERS);
+ 		rtnl_unlock();
+ 	}
+@@ -2859,9 +2869,6 @@ void bond_loadbalance_arp_mon(struct work_struct *work)
+ 
+ 	delta_in_ticks = msecs_to_jiffies(bond->params.arp_interval);
+ 
+-	if (bond->kill_timers)
+-		goto out;
+-
+ 	if (bond->slave_cnt == 0)
+ 		goto re_arm;
+ 
+@@ -2958,9 +2965,9 @@ void bond_loadbalance_arp_mon(struct work_struct *work)
+ 	}
+ 
+ re_arm:
+-	if (bond->params.arp_interval && !bond->kill_timers)
++	if (bond->params.arp_interval)
+ 		queue_delayed_work(bond->wq, &bond->arp_work, delta_in_ticks);
+-out:
++
+ 	read_unlock(&bond->lock);
+ }
+ 
+@@ -3201,9 +3208,6 @@ void bond_activebackup_arp_mon(struct work_struct *work)
+ 
+ 	read_lock(&bond->lock);
+ 
+-	if (bond->kill_timers)
+-		goto out;
+-
+ 	delta_in_ticks = msecs_to_jiffies(bond->params.arp_interval);
+ 
+ 	if (bond->slave_cnt == 0)
+@@ -3213,7 +3217,15 @@ void bond_activebackup_arp_mon(struct work_struct *work)
+ 
+ 	if (bond_ab_arp_inspect(bond, delta_in_ticks)) {
+ 		read_unlock(&bond->lock);
+-		rtnl_lock();
++
++		/* Race avoidance with bond_close flush of workqueue */
++		if (!rtnl_trylock()) {
++			read_lock(&bond->lock);
++			delta_in_ticks = 1;
++			should_notify_peers = false;
++			goto re_arm;
++		}
++
+ 		read_lock(&bond->lock);
+ 
+ 		bond_ab_arp_commit(bond, delta_in_ticks);
+@@ -3226,13 +3238,18 @@ void bond_activebackup_arp_mon(struct work_struct *work)
+ 	bond_ab_arp_probe(bond);
+ 
+ re_arm:
+-	if (bond->params.arp_interval && !bond->kill_timers)
++	if (bond->params.arp_interval)
+ 		queue_delayed_work(bond->wq, &bond->arp_work, delta_in_ticks);
+-out:
++
+ 	read_unlock(&bond->lock);
+ 
+ 	if (should_notify_peers) {
+-		rtnl_lock();
++		if (!rtnl_trylock()) {
++			read_lock(&bond->lock);
++			bond->send_peer_notif++;
++			read_unlock(&bond->lock);
++			return;
++		}
+ 		netdev_bonding_change(bond->dev, NETDEV_NOTIFY_PEERS);
+ 		rtnl_unlock();
+ 	}
+@@ -3493,8 +3510,6 @@ static int bond_open(struct net_device *bond_dev)
+ {
+ 	struct bonding *bond = netdev_priv(bond_dev);
+ 
+-	bond->kill_timers = 0;
+-
+ 	INIT_DELAYED_WORK(&bond->mcast_work, bond_resend_igmp_join_requests_delayed);
+ 
+ 	if (bond_is_lb(bond)) {
+@@ -3547,33 +3562,30 @@ static int bond_close(struct net_device *bond_dev)
+ 
+ 	bond->send_peer_notif = 0;
+ 
+-	/* signal timers not to re-arm */
+-	bond->kill_timers = 1;
+-
+ 	write_unlock_bh(&bond->lock);
+ 
+ 	if (bond->params.miimon) {  /* link check interval, in milliseconds. */
+-		cancel_delayed_work(&bond->mii_work);
++		cancel_delayed_work_sync(&bond->mii_work);
+ 	}
+ 
+ 	if (bond->params.arp_interval) {  /* arp interval, in milliseconds. */
+-		cancel_delayed_work(&bond->arp_work);
++		cancel_delayed_work_sync(&bond->arp_work);
+ 	}
+ 
+ 	switch (bond->params.mode) {
+ 	case BOND_MODE_8023AD:
+-		cancel_delayed_work(&bond->ad_work);
++		cancel_delayed_work_sync(&bond->ad_work);
+ 		break;
+ 	case BOND_MODE_TLB:
+ 	case BOND_MODE_ALB:
+-		cancel_delayed_work(&bond->alb_work);
++		cancel_delayed_work_sync(&bond->alb_work);
+ 		break;
+ 	default:
+ 		break;
+ 	}
+ 
+ 	if (delayed_work_pending(&bond->mcast_work))
+-		cancel_delayed_work(&bond->mcast_work);
++		cancel_delayed_work_sync(&bond->mcast_work);
+ 
+ 	if (bond_is_lb(bond)) {
+ 		/* Must be called only after all
+@@ -4437,26 +4449,22 @@ static void bond_setup(struct net_device *bond_dev)
+ 
+ static void bond_work_cancel_all(struct bonding *bond)
+ {
+-	write_lock_bh(&bond->lock);
+-	bond->kill_timers = 1;
+-	write_unlock_bh(&bond->lock);
+-
+ 	if (bond->params.miimon && delayed_work_pending(&bond->mii_work))
+-		cancel_delayed_work(&bond->mii_work);
++		cancel_delayed_work_sync(&bond->mii_work);
+ 
+ 	if (bond->params.arp_interval && delayed_work_pending(&bond->arp_work))
+-		cancel_delayed_work(&bond->arp_work);
++		cancel_delayed_work_sync(&bond->arp_work);
+ 
+ 	if (bond->params.mode == BOND_MODE_ALB &&
+ 	    delayed_work_pending(&bond->alb_work))
+-		cancel_delayed_work(&bond->alb_work);
++		cancel_delayed_work_sync(&bond->alb_work);
+ 
+ 	if (bond->params.mode == BOND_MODE_8023AD &&
+ 	    delayed_work_pending(&bond->ad_work))
+-		cancel_delayed_work(&bond->ad_work);
++		cancel_delayed_work_sync(&bond->ad_work);
+ 
+ 	if (delayed_work_pending(&bond->mcast_work))
+-		cancel_delayed_work(&bond->mcast_work);
++		cancel_delayed_work_sync(&bond->mcast_work);
+ }
+ 
+ /*
+diff --git a/drivers/net/bonding/bonding.h b/drivers/net/bonding/bonding.h
+index ea1d005..603359f 100644
+--- a/drivers/net/bonding/bonding.h
++++ b/drivers/net/bonding/bonding.h
+@@ -221,7 +221,6 @@ struct bonding {
+ 			       struct slave *);
+ 	rwlock_t lock;
+ 	rwlock_t curr_slave_lock;
+-	s8       kill_timers;
+ 	u8	 send_peer_notif;
+ 	s8	 setup_by_slave;
+ 	s8       igmp_retrans;
