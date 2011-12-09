@@ -1,0 +1,215 @@
+From 23b2f8bb92feb83127679c53633def32d3108e70 Mon Sep 17 00:00:00 2001
+From: Jesse Barnes <jbarnes@virtuousgeek.org>
+Date: Tue, 28 Jun 2011 13:04:16 -0700
+Subject: [PATCH] drm/i915: load a ring frequency scaling table v3
+Git-commit: 23b2f8bb92feb83127679c53633def32d3108e70
+Patch-mainline: 3.1-rc1
+References: bnc#728329
+
+The ring frequency scaling table tells the PCU to treat certain GPU
+frequencies as if they were a given CPU frequency for purposes of
+scaling the ring frequency.  Normally the PCU will scale the ring
+frequency based on the CPU P-state, but with the table present, it will
+also take the GPU frequency into account.
+
+The main downside of keeping the ring frequency high while the CPU is
+at a low frequency (or asleep altogether) is increased power
+consumption.  But then if you're keeping your GPU busy, you probably
+want the extra performance.
+
+V2: - add units to debug table header (from Eric)
+  - use tsc_khz as a fallback if the cpufreq driver doesn't give us a freq
+    (from Chris)
+V3: - fix comments & debug output
+  - remove unneeded force wake get/put
+
+Reviewed-by: Ben Widawsky <ben@bwidawsk.net>
+Tested-by: Eric Anholt <eric@anholt.net>
+Reviewed-by: Eric Anholt <eric@anholt.net>
+Signed-off-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-off-by: Keith Packard <keithp@keithp.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_debugfs.c  |   39 +++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_reg.h      |    4 +-
+ drivers/gpu/drm/i915/i915_suspend.c  |    4 +-
+ drivers/gpu/drm/i915/intel_display.c |   58 ++++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_drv.h     |    1 
+ 5 files changed, 103 insertions(+), 3 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -1123,6 +1123,44 @@
+ 	return 0;
+ }
+ 
++static int i915_ring_freq_table(struct seq_file *m, void *unused)
++{
++	struct drm_info_node *node = (struct drm_info_node *) m->private;
++	struct drm_device *dev = node->minor->dev;
++	drm_i915_private_t *dev_priv = dev->dev_private;
++	int ret;
++	int gpu_freq, ia_freq;
++
++	if (!IS_GEN6(dev)) {
++		seq_printf(m, "unsupported on this chipset\n");
++		return 0;
++	}
++
++	ret = mutex_lock_interruptible(&dev->struct_mutex);
++	if (ret)
++		return ret;
++
++	seq_printf(m, "GPU freq (MHz)\tEffective CPU freq (MHz)\n");
++
++	for (gpu_freq = dev_priv->min_delay; gpu_freq <= dev_priv->max_delay;
++	     gpu_freq++) {
++		I915_WRITE(GEN6_PCODE_DATA, gpu_freq);
++		I915_WRITE(GEN6_PCODE_MAILBOX, GEN6_PCODE_READY |
++			   GEN6_PCODE_READ_MIN_FREQ_TABLE);
++		if (wait_for((I915_READ(GEN6_PCODE_MAILBOX) &
++			      GEN6_PCODE_READY) == 0, 10)) {
++			DRM_ERROR("pcode read of freq table timed out\n");
++			continue;
++		}
++		ia_freq = I915_READ(GEN6_PCODE_DATA);
++		seq_printf(m, "%d\t\t%d\n", gpu_freq * 50, ia_freq * 100);
++	}
++
++	mutex_unlock(&dev->struct_mutex);
++
++	return 0;
++}
++
+ static int i915_gfxec(struct seq_file *m, void *unused)
+ {
+ 	struct drm_info_node *node = (struct drm_info_node *) m->private;
+@@ -1430,6 +1468,7 @@
+ 	{"i915_inttoext_table", i915_inttoext_table, 0},
+ 	{"i915_drpc_info", i915_drpc_info, 0},
+ 	{"i915_emon_status", i915_emon_status, 0},
++	{"i915_ring_freq_table", i915_ring_freq_table, 0},
+ 	{"i915_gfxec", i915_gfxec, 0},
+ 	{"i915_fbc_status", i915_fbc_status, 0},
+ 	{"i915_sr_status", i915_sr_status, 0},
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -3448,8 +3448,10 @@
+ #define GEN6_PCODE_MAILBOX			0x138124
+ #define   GEN6_PCODE_READY			(1<<31)
+ #define   GEN6_READ_OC_PARAMS			0xc
+-#define   GEN6_PCODE_WRITE_MIN_FREQ_TABLE	0x9
++#define   GEN6_PCODE_WRITE_MIN_FREQ_TABLE	0x8
++#define   GEN6_PCODE_READ_MIN_FREQ_TABLE	0x9
+ #define GEN6_PCODE_DATA				0x138128
++#define   GEN6_PCODE_FREQ_IA_RATIO_SHIFT	8
+ 
+ #define G4X_AUD_VID_DID			0x62020
+ #define INTEL_AUDIO_DEVCL		0x808629FB
+--- a/drivers/gpu/drm/i915/i915_suspend.c
++++ b/drivers/gpu/drm/i915/i915_suspend.c
+@@ -882,8 +882,10 @@
+ 		intel_init_emon(dev);
+ 	}
+ 
+-	if (IS_GEN6(dev))
++	if (IS_GEN6(dev)) {
+ 		gen6_enable_rps(dev_priv);
++		gen6_update_ring_freq(dev_priv);
++	}
+ 
+ 	mutex_lock(&dev->struct_mutex);
+ 
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -24,6 +24,7 @@
+  *	Eric Anholt <eric@anholt.net>
+  */
+ 
++#include <linux/cpufreq.h>
+ #include <linux/module.h>
+ #include <linux/input.h>
+ #include <linux/i2c.h>
+@@ -7517,6 +7518,59 @@
+ 	mutex_unlock(&dev_priv->dev->struct_mutex);
+ }
+ 
++void gen6_update_ring_freq(struct drm_i915_private *dev_priv)
++{
++	int min_freq = 15;
++	int gpu_freq, ia_freq, max_ia_freq;
++	int scaling_factor = 180;
++
++	max_ia_freq = cpufreq_quick_get_max(0);
++	/*
++	 * Default to measured freq if none found, PCU will ensure we don't go
++	 * over
++	 */
++	if (!max_ia_freq)
++		max_ia_freq = tsc_khz;
++
++	/* Convert from kHz to MHz */
++	max_ia_freq /= 1000;
++
++	mutex_lock(&dev_priv->dev->struct_mutex);
++
++	/*
++	 * For each potential GPU frequency, load a ring frequency we'd like
++	 * to use for memory access.  We do this by specifying the IA frequency
++	 * the PCU should use as a reference to determine the ring frequency.
++	 */
++	for (gpu_freq = dev_priv->max_delay; gpu_freq >= dev_priv->min_delay;
++	     gpu_freq--) {
++		int diff = dev_priv->max_delay - gpu_freq;
++
++		/*
++		 * For GPU frequencies less than 750MHz, just use the lowest
++		 * ring freq.
++		 */
++		if (gpu_freq < min_freq)
++			ia_freq = 800;
++		else
++			ia_freq = max_ia_freq - ((diff * scaling_factor) / 2);
++		ia_freq = DIV_ROUND_CLOSEST(ia_freq, 100);
++
++		I915_WRITE(GEN6_PCODE_DATA,
++			   (ia_freq << GEN6_PCODE_FREQ_IA_RATIO_SHIFT) |
++			   gpu_freq);
++		I915_WRITE(GEN6_PCODE_MAILBOX, GEN6_PCODE_READY |
++			   GEN6_PCODE_WRITE_MIN_FREQ_TABLE);
++		if (wait_for((I915_READ(GEN6_PCODE_MAILBOX) &
++			      GEN6_PCODE_READY) == 0, 10)) {
++			DRM_ERROR("pcode write of freq table timed out\n");
++			continue;
++		}
++	}
++
++	mutex_unlock(&dev_priv->dev->struct_mutex);
++}
++
+ static void ironlake_init_clock_gating(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -8215,8 +8269,10 @@
+ 		intel_init_emon(dev);
+ 	}
+ 
+-	if (IS_GEN6(dev) || IS_GEN7(dev))
++	if (IS_GEN6(dev) || IS_GEN7(dev)) {
+ 		gen6_enable_rps(dev_priv);
++		gen6_update_ring_freq(dev_priv);
++	}
+ 
+ 	INIT_WORK(&dev_priv->idle_work, intel_idle_update);
+ 	setup_timer(&dev_priv->idle_timer, intel_gpu_idle_timer,
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -317,6 +317,7 @@
+ extern void ironlake_enable_drps(struct drm_device *dev);
+ extern void ironlake_disable_drps(struct drm_device *dev);
+ extern void gen6_enable_rps(struct drm_i915_private *dev_priv);
++extern void gen6_update_ring_freq(struct drm_i915_private *dev_priv);
+ extern void gen6_disable_rps(struct drm_device *dev);
+ extern void intel_init_emon(struct drm_device *dev);
+ 
