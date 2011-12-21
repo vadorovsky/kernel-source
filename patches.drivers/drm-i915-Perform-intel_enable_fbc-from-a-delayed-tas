@@ -1,0 +1,170 @@
+From 1630fe754c83b3e57efa51c85f1a21e612a63a0e Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 8 Jul 2011 12:22:42 +0100
+Subject: [PATCH] drm/i915: Perform intel_enable_fbc() from a delayed task
+Git-commit: 1630fe754c83b3e57efa51c85f1a21e612a63a0e
+Patch-mainline: 3.1-rc1
+
+In order to accommodate the requirements of re-enabling FBC after
+page-flipping, but to avoid doing so and incurring the cost of a wait
+for vblank in the middle of a page-flip sequence, we defer the actual
+enablement by 50ms. If any request to disable FBC arrive within that
+interval, the enablement is cancelled and we are saved from blocking on
+the wait.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-off-by: Keith Packard <keithp@keithp.com>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    2 
+ drivers/gpu/drm/i915/intel_display.c |   83 ++++++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/i915/intel_drv.h     |    7 ++
+ 3 files changed, 90 insertions(+), 2 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -272,6 +272,7 @@
+ #define QUIRK_LVDS_SSC_DISABLE (1<<1)
+ 
+ struct intel_fbdev;
++struct intel_fbc_work;
+ 
+ typedef struct drm_i915_private {
+ 	struct drm_device *dev;
+@@ -341,6 +342,7 @@
+ 	int cfb_fence;
+ 	int cfb_plane;
+ 	int cfb_y;
++	struct intel_fbc_work *fbc_work;
+ 
+ 	struct intel_opregion opregion;
+ 
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -1708,20 +1708,96 @@
+ 	return dev_priv->display.fbc_enabled(dev);
+ }
+ 
++static void intel_fbc_work_fn(struct work_struct *__work)
++{
++	struct intel_fbc_work *work =
++		container_of(to_delayed_work(__work),
++			     struct intel_fbc_work, work);
++	struct drm_device *dev = work->crtc->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	mutex_lock(&dev->struct_mutex);
++	if (work == dev_priv->fbc_work) {
++		/* Double check that we haven't switched fb without cancelling
++		 * the prior work.
++		 */
++		if (work->crtc->fb == work->fb)
++			dev_priv->display.enable_fbc(work->crtc,
++						     work->interval);
++
++		dev_priv->fbc_work = NULL;
++	}
++	mutex_unlock(&dev->struct_mutex);
++
++	kfree(work);
++}
++
++static void intel_cancel_fbc_work(struct drm_i915_private *dev_priv)
++{
++	if (dev_priv->fbc_work == NULL)
++		return;
++
++	DRM_DEBUG_KMS("cancelling pending FBC enable\n");
++
++	/* Synchronisation is provided by struct_mutex and checking of
++	 * dev_priv->fbc_work, so we can perform the cancellation
++	 * entirely asynchronously.
++	 */
++	if (cancel_delayed_work(&dev_priv->fbc_work->work))
++		/* tasklet was killed before being run, clean up */
++		kfree(dev_priv->fbc_work);
++
++	/* Mark the work as no longer wanted so that if it does
++	 * wake-up (because the work was already running and waiting
++	 * for our mutex), it will discover that is no longer
++	 * necessary to run.
++	 */
++	dev_priv->fbc_work = NULL;
++}
++
+ static void intel_enable_fbc(struct drm_crtc *crtc, unsigned long interval)
+ {
+-	struct drm_i915_private *dev_priv = crtc->dev->dev_private;
++	struct intel_fbc_work *work;
++	struct drm_device *dev = crtc->dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+ 	if (!dev_priv->display.enable_fbc)
+ 		return;
+ 
+-	dev_priv->display.enable_fbc(crtc, interval);
++	intel_cancel_fbc_work(dev_priv);
++
++	work = kzalloc(sizeof *work, GFP_KERNEL);
++	if (work == NULL) {
++		dev_priv->display.enable_fbc(crtc, interval);
++		return;
++	}
++
++	work->crtc = crtc;
++	work->fb = crtc->fb;
++	work->interval = interval;
++	INIT_DELAYED_WORK(&work->work, intel_fbc_work_fn);
++
++	dev_priv->fbc_work = work;
++
++	DRM_DEBUG_KMS("scheduling delayed FBC enable\n");
++
++	/* Delay the actual enabling to let pageflipping cease and the
++	 * display to settle before starting the compression.
++	 *
++	 * A more complicated solution would involve tracking vblanks
++	 * following the termination of the page-flipping sequence
++	 * and indeed performing the enable as a co-routine and not
++	 * waiting synchronously upon the vblank.
++	 */
++	schedule_delayed_work(&work->work, msecs_to_jiffies(50));
+ }
+ 
+ void intel_disable_fbc(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
++	intel_cancel_fbc_work(dev_priv);
++
+ 	if (!dev_priv->display.disable_fbc)
+ 		return;
+ 
+@@ -8584,6 +8660,9 @@
+ 	drm_irq_uninstall(dev);
+ 	cancel_work_sync(&dev_priv->hotplug_work);
+ 
++	/* flush any delayed tasks or pending work */
++	flush_scheduled_work();
++
+ 	/* Shut off idle work before the crtcs get freed. */
+ 	list_for_each_entry(crtc, &dev->mode_config.crtc_list, head) {
+ 		intel_crtc = to_intel_crtc(crtc);
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -234,6 +234,13 @@
+ 	bool enable_stall_check;
+ };
+ 
++struct intel_fbc_work {
++	struct delayed_work work;
++	struct drm_crtc *crtc;
++	struct drm_framebuffer *fb;
++	int interval;
++};
++
+ int intel_ddc_get_modes(struct drm_connector *c, struct i2c_adapter *adapter);
+ extern bool intel_ddc_probe(struct intel_encoder *intel_encoder, int ddc_bus);
+ 

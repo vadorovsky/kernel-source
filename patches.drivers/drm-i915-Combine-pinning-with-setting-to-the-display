@@ -1,0 +1,168 @@
+From 2da3b9b940e2a18147422c54ed8b29d01e1ade88 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Thu, 14 Apr 2011 09:41:17 +0100
+Subject: [PATCH] drm/i915: Combine pinning with setting to the display plane
+Git-commit: 2da3b9b940e2a18147422c54ed8b29d01e1ade88
+Patch-mainline: 3.1-rc1
+
+We need to perform a few operations in order to move the object into the
+display plane (where it can be accessed coherently by the display
+engine) that are important for future safety to forbid whilst pinned. As a
+result, we want to need to perform some of the operations before pinning,
+but some are required once we have been bound into the GTT. So combine
+the pinning performed by all the callers with set_to_display_plane(), so
+this complication is contained within the single function.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.h      |    3 +-
+ drivers/gpu/drm/i915/i915_gem.c      |   37 ++++++++++++++++++++++++-----------
+ drivers/gpu/drm/i915/intel_display.c |   18 +++--------------
+ drivers/gpu/drm/i915/intel_overlay.c |    6 -----
+ 4 files changed, 33 insertions(+), 31 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1189,7 +1189,8 @@
+ i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj,
+ 				  bool write);
+ int __must_check
+-i915_gem_object_set_to_display_plane(struct drm_i915_gem_object *obj,
++i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
++				     u32 alignment,
+ 				     struct intel_ring_buffer *pipelined);
+ int i915_gem_attach_phys_object(struct drm_device *dev,
+ 				struct drm_i915_gem_object *obj,
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -3086,40 +3086,55 @@
+ }
+ 
+ /*
+- * Prepare buffer for display plane. Use uninterruptible for possible flush
+- * wait, as in modesetting process we're not supposed to be interrupted.
++ * Prepare buffer for display plane (scanout, cursors, etc).
++ * Can be called from an uninterruptible phase (modesetting) and allows
++ * any flushes to be pipelined (for pageflips).
++ *
++ * For the display plane, we want to be in the GTT but out of any write
++ * domains. So in many ways this looks like set_to_gtt_domain() apart from the
++ * ability to pipeline the waits, pinning and any additional subtleties
++ * that may differentiate the display plane from ordinary buffers.
+  */
+ int
+-i915_gem_object_set_to_display_plane(struct drm_i915_gem_object *obj,
++i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
++				     u32 alignment,
+ 				     struct intel_ring_buffer *pipelined)
+ {
+-	uint32_t old_read_domains;
++	u32 old_read_domains, old_write_domain;
+ 	int ret;
+ 
+-	/* Not valid to be called on unbound objects. */
+-	if (obj->gtt_space == NULL)
+-		return -EINVAL;
+-
+ 	ret = i915_gem_object_flush_gpu_write_domain(obj);
+ 	if (ret)
+ 		return ret;
+ 
+-
+-	/* Currently, we are always called from an non-interruptible context. */
+ 	if (pipelined != obj->ring) {
+ 		ret = i915_gem_object_wait_rendering(obj);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
++	/* As the user may map the buffer once pinned in the display plane
++	 * (e.g. libkms for the bootup splash), we have to ensure that we
++	 * always use map_and_fenceable for all scanout buffers.
++	 */
++	ret = i915_gem_object_pin(obj, alignment, true);
++	if (ret)
++		return ret;
++
+ 	i915_gem_object_flush_cpu_write_domain(obj);
+ 
++	old_write_domain = obj->base.write_domain;
+ 	old_read_domains = obj->base.read_domains;
++
++	/* It should now be out of any other write domains, and we can update
++	 * the domain values for our changes.
++	 */
++	BUG_ON((obj->base.write_domain & ~I915_GEM_DOMAIN_GTT) != 0);
+ 	obj->base.read_domains |= I915_GEM_DOMAIN_GTT;
+ 
+ 	trace_i915_gem_object_change_domain(obj,
+ 					    old_read_domains,
+-					    obj->base.write_domain);
++					    old_write_domain);
+ 
+ 	return 0;
+ }
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -1885,14 +1885,10 @@
+ 	}
+ 
+ 	dev_priv->mm.interruptible = false;
+-	ret = i915_gem_object_pin(obj, alignment, true);
++	ret = i915_gem_object_pin_to_display_plane(obj, alignment, pipelined);
+ 	if (ret)
+ 		goto err_interruptible;
+ 
+-	ret = i915_gem_object_set_to_display_plane(obj, pipelined);
+-	if (ret)
+-		goto err_unpin;
+-
+ 	/* Install a fence for tiled scan-out. Pre-i965 always needs a
+ 	 * fence, whereas 965+ only requires a fence if using
+ 	 * framebuffer compression.  For simplicity, we always install
+@@ -5710,21 +5706,15 @@
+ 			goto fail_locked;
+ 		}
+ 
+-		ret = i915_gem_object_pin(obj, PAGE_SIZE, true);
+-		if (ret) {
+-			DRM_ERROR("failed to pin cursor bo\n");
+-			goto fail_locked;
+-		}
+-
+-		ret = i915_gem_object_set_to_display_plane(obj, NULL);
++		ret = i915_gem_object_pin_to_display_plane(obj, 0, NULL);
+ 		if (ret) {
+ 			DRM_ERROR("failed to move cursor bo into the GTT\n");
+-			goto fail_unpin;
++			goto fail_locked;
+ 		}
+ 
+ 		ret = i915_gem_object_put_fence(obj);
+ 		if (ret) {
+-			DRM_ERROR("failed to move cursor bo into the GTT\n");
++			DRM_ERROR("failed to release fence for cursor");
+ 			goto fail_unpin;
+ 		}
+ 
+--- a/drivers/gpu/drm/i915/intel_overlay.c
++++ b/drivers/gpu/drm/i915/intel_overlay.c
+@@ -773,14 +773,10 @@
+ 	if (ret != 0)
+ 		return ret;
+ 
+-	ret = i915_gem_object_pin(new_bo, PAGE_SIZE, true);
++	ret = i915_gem_object_pin_to_display_plane(new_bo, 0, NULL);
+ 	if (ret != 0)
+ 		return ret;
+ 
+-	ret = i915_gem_object_set_to_display_plane(new_bo, NULL);
+-	if (ret != 0)
+-		goto out_unpin;
+-
+ 	ret = i915_gem_object_put_fence(new_bo);
+ 	if (ret)
+ 		goto out_unpin;
