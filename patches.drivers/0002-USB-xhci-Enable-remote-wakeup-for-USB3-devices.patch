@@ -1,0 +1,144 @@
+From 623bef9e03a60adc623b09673297ca7a1cdfb367 Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Fri, 11 Nov 2011 14:57:33 -0800
+Subject: [PATCH 2/8] USB/xhci: Enable remote wakeup for USB3 devices.
+Patch-Mainline: 3.4
+References: bnc#714604
+
+When the USB 3.0 hub support went in, I disabled selective suspend for
+all external USB 3.0 hubs because they used a different mechanism to
+enable remote wakeup.  In fact, other USB 3.0 devices that could signal
+remote wakeup would have been prevented from going into suspend because
+they would have stalled the SetFeature Device Remote Wakeup request.
+
+This patch adds support for the USB 3.0 way of enabling remote wake up
+(with a SetFeature Function Suspend request), and enables selective
+suspend for all hubs during hub_probe.  It assumes that all USB 3.0 have
+only one "function" as defined by the interface association descriptor,
+which is true of all the USB 3.0 devices I've seen so far.  FIXME if
+that turns out to change later.
+
+After a device signals a remote wakeup, it is supposed to send a Device
+Notification packet to the host controller, signaling which function
+sent the remote wakeup.  The host can then put any other functions back
+into function suspend.  Since we don't have support for function suspend
+(and no devices currently support it), we'll just assume the hub
+function will resume the device properly when it received the port
+status change notification, and simply ignore any device notification
+events from the xHCI host controller.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+---
+ drivers/usb/core/hub.c       |   25 ++++++++++++++++++++-----
+ drivers/usb/host/xhci-mem.c  |   11 ++++++++++-
+ drivers/usb/host/xhci-ring.c |   21 +++++++++++++++++++++
+ 3 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 2d773cb..50411cd 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -2421,11 +2421,26 @@ int usb_port_suspend(struct usb_device *udev, pm_message_t msg)
+ 	 * we don't explicitly enable it here.
+ 	 */
+ 	if (udev->do_remote_wakeup) {
+-		status = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+-				USB_REQ_SET_FEATURE, USB_RECIP_DEVICE,
+-				USB_DEVICE_REMOTE_WAKEUP, 0,
+-				NULL, 0,
+-				USB_CTRL_SET_TIMEOUT);
++		if (!hub_is_superspeed(hub->hdev)) {
++			status = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
++					USB_REQ_SET_FEATURE, USB_RECIP_DEVICE,
++					USB_DEVICE_REMOTE_WAKEUP, 0,
++					NULL, 0,
++					USB_CTRL_SET_TIMEOUT);
++		} else {
++			/* Assume there's only one function on the USB 3.0
++			 * device and enable remote wake for the first
++			 * interface. FIXME if the interface association
++			 * descriptor shows there's more than one function.
++			 */
++			status = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
++					USB_REQ_SET_FEATURE,
++					USB_RECIP_INTERFACE,
++					USB_INTRF_FUNC_SUSPEND,
++					USB_INTRF_FUNC_SUSPEND_RW,
++					NULL, 0,
++					USB_CTRL_SET_TIMEOUT);
++		}
+ 		if (status) {
+ 			dev_dbg(&udev->dev, "won't remote wakeup, status %d\n",
+ 					status);
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index 36cbe22..6b70e7f 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -2141,7 +2141,7 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
+ 	unsigned int	val, val2;
+ 	u64		val_64;
+ 	struct xhci_segment	*seg;
+-	u32 page_size;
++	u32 page_size, temp;
+ 	int i;
+ 
+ 	page_size = xhci_readl(xhci, &xhci->op_regs->page_size);
+@@ -2324,6 +2324,15 @@ int xhci_mem_init(struct xhci_hcd *xhci, gfp_t flags)
+ 
+ 	INIT_LIST_HEAD(&xhci->lpm_failed_devs);
+ 
++	/* Enable USB 3.0 device notifications for function remote wake, which
++	 * is necessary for allowing USB 3.0 devices to do remote wakeup from
++	 * U3 (device suspend).
++	 */
++	temp = xhci_readl(xhci, &xhci->op_regs->dev_notification);
++	temp &= ~DEV_NOTE_MASK;
++	temp |= DEV_NOTE_FWAKE;
++	xhci_writel(xhci, temp, &xhci->op_regs->dev_notification);
++
+ 	return 0;
+ 
+ fail:
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index ca38483..ffe5493 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1237,6 +1237,24 @@ static unsigned int find_faked_portnum_from_hw_portnum(struct usb_hcd *hcd,
+ 	return num_similar_speed_ports;
+ }
+ 
++static void handle_device_notification(struct xhci_hcd *xhci,
++		union xhci_trb *event)
++{
++	u32 slot_id;
++
++	slot_id = TRB_TO_SLOT_ID(event->generic.field[3]);
++	if (!xhci->devs[slot_id])
++		xhci_warn(xhci, "Device Notification event for "
++				"unused slot %u\n", slot_id);
++	else
++		xhci_dbg(xhci, "Device Notification event for slot ID %u\n",
++				slot_id);
++	/* XXX should we kick khubd for the parent hub?  It should have send an
++	 * interrupt transfer when the port started signaling resume, so there's
++	 * probably no need to do so.
++	 */
++}
++
+ static void handle_port_status(struct xhci_hcd *xhci,
+ 		union xhci_trb *event)
+ {
+@@ -2282,6 +2300,9 @@ static int xhci_handle_event(struct xhci_hcd *xhci)
+ 		else
+ 			update_ptrs = 0;
+ 		break;
++	case TRB_TYPE(TRB_DEV_NOTE):
++		handle_device_notification(xhci, event);
++		break;
+ 	default:
+ 		if ((le32_to_cpu(event->event_cmd.flags) & TRB_TYPE_BITMASK) >=
+ 		    TRB_TYPE(48))
+-- 
+1.7.1
+

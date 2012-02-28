@@ -1,0 +1,165 @@
+From 4296c70a5ec316903ef037ed15f154dd3d354ad7 Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Fri, 6 Jan 2012 10:34:31 -0800
+Subject: [PATCH 4/8] USB/xHCI: Enable USB 3.0 hub remote wakeup.
+Patch-Mainline: 3.4
+References: bnc#714604
+
+USB 3.0 hubs have a different remote wakeup policy than USB 2.0 hubs.
+USB 2.0 hubs, once they have remote wakeup enabled, will always send
+remote wakes when anything changes on a port.
+
+However, USB 3.0 hubs have a per-port remote wake up policy that is off
+by default.  The Set Feature remote wake mask can be changed for any
+port, enabling remote wakeup for a connect, disconnect, or overcurrent
+event, much like EHCI and xHCI host controller "wake on" port status
+bits.  The bits are cleared to zero on the initial hub power on, or
+after the hub has been reset.
+
+Without this patch, when a USB 3.0 hub gets suspended, it will not send
+a remote wakeup on device connect or disconnect.  This would show up to
+the user as "dead ports" unless they ran lsusb -v (since newer versions
+of lsusb use the sysfs files, rather than sending control transfers).
+
+Change the hub driver's suspend method to enable remote wake up for
+disconnect, connect, and overcurrent for all ports on the hub.  Modify
+the xHCI driver's roothub code to handle that request, and set the "wake
+on" bits in the port status registers accordingly.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+---
+ drivers/usb/core/hub.c      |   12 ++++++++++++
+ drivers/usb/host/xhci-hub.c |   41 +++++++++++++++++++++++++++++++++++++++++
+ include/linux/usb/ch11.h    |    5 +++++
+ 3 files changed, 58 insertions(+), 0 deletions(-)
+
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 70622d6..b3137fa 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -2731,6 +2731,7 @@ static int hub_suspend(struct usb_interface *intf, pm_message_t msg)
+ 	struct usb_hub		*hub = usb_get_intfdata (intf);
+ 	struct usb_device	*hdev = hub->hdev;
+ 	unsigned		port1;
++	int			status;
+ 
+ 	/* Warn if children aren't already suspended */
+ 	for (port1 = 1; port1 <= hdev->maxchild; port1++) {
+@@ -2743,6 +2744,17 @@ static int hub_suspend(struct usb_interface *intf, pm_message_t msg)
+ 				return -EBUSY;
+ 		}
+ 	}
++	if (hub_is_superspeed(hdev) && hdev->do_remote_wakeup) {
++		/* Enable hub to send remote wakeup for all ports. */
++		for (port1 = 1; port1 <= hdev->maxchild; port1++) {
++			status = set_port_feature(hdev,
++					port1 |
++					USB_PORT_FEAT_REMOTE_WAKE_CONNECT |
++					USB_PORT_FEAT_REMOTE_WAKE_DISCONNECT |
++					USB_PORT_FEAT_REMOTE_WAKE_OVER_CURRENT,
++					USB_PORT_FEAT_REMOTE_WAKE_MASK);
++		}
++	}
+ 
+ 	dev_dbg(&intf->dev, "%s\n", __func__);
+ 
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index 557b6f3..673ad12 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -410,6 +410,32 @@ static int xhci_get_ports(struct usb_hcd
+ 	return max_ports;
+ }
+ 
++void xhci_set_remote_wake_mask(struct xhci_hcd *xhci,
++		__le32 __iomem **port_array, int port_id, u16 wake_mask)
++{
++	u32 temp;
++
++	temp = xhci_readl(xhci, port_array[port_id]);
++	temp = xhci_port_state_to_neutral(temp);
++
++	if (wake_mask & USB_PORT_FEAT_REMOTE_WAKE_CONNECT)
++		temp |= PORT_WKCONN_E;
++	else
++		temp &= ~PORT_WKCONN_E;
++
++	if (wake_mask & USB_PORT_FEAT_REMOTE_WAKE_DISCONNECT)
++		temp |= PORT_WKDISC_E;
++	else
++		temp &= ~PORT_WKDISC_E;
++
++	if (wake_mask & USB_PORT_FEAT_REMOTE_WAKE_OVER_CURRENT)
++		temp |= PORT_WKOC_E;
++	else
++		temp &= ~PORT_WKOC_E;
++
++	xhci_writel(xhci, temp, port_array[port_id]);
++}
++
+ /* Test and clear port RWC bit */
+ void xhci_test_and_clear_bit(struct xhci_hcd *xhci, __le32 __iomem **port_array,
+ 				int port_id, u32 port_bit)
+@@ -448,6 +474,7 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+ 	int slot_id;
+ 	struct xhci_bus_state *bus_state;
+ 	u16 link_state = 0;
++	u16 wake_mask = 0;
+ 
+ 	max_ports = xhci_get_ports(hcd, &port_array);
+ 	bus_state = &xhci->bus_state[hcd_index(hcd)];
+@@ -593,6 +620,8 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+ 	case SetPortFeature:
+ 		if (wValue == USB_PORT_FEAT_LINK_STATE)
+ 			link_state = (wIndex & 0xff00) >> 3;
++		if (wValue == USB_PORT_FEAT_REMOTE_WAKE_MASK)
++			wake_mask = wIndex & 0xff00;
+ 		wIndex &= 0xff;
+ 		if (!wIndex || wIndex > max_ports)
+ 			goto error;
+@@ -703,6 +732,14 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+ 			temp = xhci_readl(xhci, port_array[wIndex]);
+ 			xhci_dbg(xhci, "set port reset, actual port %d status  = 0x%x\n", wIndex, temp);
+ 			break;
++		case USB_PORT_FEAT_REMOTE_WAKE_MASK:
++			xhci_set_remote_wake_mask(xhci, port_array,
++					wIndex, wake_mask);
++			temp = xhci_readl(xhci, port_array[wIndex]);
++			xhci_dbg(xhci, "set port remote wake mask, "
++					"actual port %d status  = 0x%x\n",
++					wIndex, temp);
++			break;
+ 		case USB_PORT_FEAT_BH_PORT_RESET:
+ 			temp |= PORT_WR;
+ 			xhci_writel(xhci, temp, port_array[wIndex]);
+@@ -883,6 +920,10 @@ int xhci_bus_suspend(struct usb_hcd *hcd)
+ 			t2 |= PORT_LINK_STROBE | XDEV_U3;
+ 			set_bit(port_index, &bus_state->bus_suspended);
+ 		}
++		/* USB core sets remote wake mask for USB 3.0 hubs,
++		 * including the USB 3.0 roothub, but only if CONFIG_USB_SUSPEND
++		 * is enabled, so also enable remote wake here.
++		 */
+ 		if (hcd->self.root_hub->do_remote_wakeup) {
+ 			if (t1 & PORT_CONNECT) {
+ 				t2 |= PORT_WKOC_E | PORT_WKDISC_E;
+diff --git a/include/linux/usb/ch11.h b/include/linux/usb/ch11.h
+index 0b83acd..f1d26b6 100644
+--- a/include/linux/usb/ch11.h
++++ b/include/linux/usb/ch11.h
+@@ -76,6 +76,11 @@
+ #define USB_PORT_FEAT_C_BH_PORT_RESET		29
+ #define USB_PORT_FEAT_FORCE_LINKPM_ACCEPT	30
+ 
++/* USB 3.0 hub remote wake mask bits, see table 10-14 */
++#define USB_PORT_FEAT_REMOTE_WAKE_CONNECT	(1 << 8)
++#define USB_PORT_FEAT_REMOTE_WAKE_DISCONNECT	(1 << 9)
++#define USB_PORT_FEAT_REMOTE_WAKE_OVER_CURRENT	(1 << 10)
++
+ /*
+  * Hub Status and Hub Change results
+  * See USB 2.0 spec Table 11-19 and Table 11-20
+-- 
+1.7.1
+
