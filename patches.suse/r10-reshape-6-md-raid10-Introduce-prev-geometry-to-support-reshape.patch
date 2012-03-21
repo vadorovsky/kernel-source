@@ -1,0 +1,320 @@
+From: NeilBrown <neilb@suse.de>
+Date: Wed, 14 Mar 2012 18:04:56 +1100
+Subject: [PATCH] md/raid10: Introduce 'prev' geometry to support reshape.
+Patch-mainline: maybe 3.5
+References: 
+
+When RAID10 supports reshape it will need a 'previous' and a 'current'
+geometry, so introduce that here.
+Use the 'prev' geometry when before the reshape_position, and the
+current 'geo' when beyond it.  At other times, use both as
+appropriate.
+
+For now, both are identical (And reshape_position is never set).
+
+When we use the 'prev' geometry, we must use the old data_offset.
+When we use the current (And a reshape is happening) we must use
+the new_data_offset.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+
+---
+ drivers/md/raid10.c |  100 +++++++++++++++++++++++++++++++++++++++++-----------
+ drivers/md/raid10.h |    8 +++-
+ 2 files changed, 87 insertions(+), 21 deletions(-)
+
+--- linux-3.0-SLE11-SP2.orig/drivers/md/raid10.c
++++ linux-3.0-SLE11-SP2/drivers/md/raid10.c
+@@ -399,15 +399,13 @@ static void raid10_end_write_request(str
+  * sector offset to a virtual address
+  */
+ 
+-static void raid10_find_phys(conf_t *conf, r10bio_t *r10bio)
++static void __raid10_find_phys(struct geom *geo, r10bio_t *r10bio)
+ {
+ 	int n,f;
+ 	sector_t sector;
+ 	sector_t chunk;
+ 	sector_t stripe;
+ 	int dev;
+-	struct geom *geo = &conf->geo;
+-
+ 	int slot = 0;
+ 
+ 	/* now calculate first sector/dev */
+@@ -445,12 +443,29 @@ static void raid10_find_phys(conf_t *con
+ 			sector += (geo->chunk_mask + 1);
+ 		}
+ 	}
+-	BUG_ON(slot != conf->copies);
++}
++
++static void raid10_find_phys(conf_t *conf, r10bio_t *r10bio)
++{
++	struct geom *geo = &conf->geo;
++
++	if (conf->reshape_progress != MaxSector &&
++	    ((r10bio->sector >= conf->reshape_progress) !=
++	     conf->mddev->reshape_backwards)) {
++		set_bit(R10BIO_Previous, &r10bio->state);
++		geo = &conf->prev;
++	} else
++		clear_bit(R10BIO_Previous, &r10bio->state);
++
++	__raid10_find_phys(geo, r10bio);
+ }
+ 
+ static sector_t raid10_find_virt(conf_t *conf, sector_t sector, int dev)
+ {
+ 	sector_t offset, chunk, vchunk;
++	/* Never use conf->prev as this is only called during resync
++	 * or recovery, so reshape isn't happening
++	 */
+ 	struct geom *geo = &conf->geo;
+ 
+ 	offset = sector & geo->chunk_mask;
+@@ -498,6 +513,11 @@ static int raid10_mergeable_bvec(struct
+ 	unsigned int bio_sectors = bvm->bi_size >> 9;
+ 	struct geom *geo = &conf->geo;
+ 
++	if (conf->reshape_progress != MaxSector &&
++	    ((sector >= conf->reshape_progress) !=
++	     conf->mddev->reshape_backwards))
++		geo = &conf->prev;
++
+ 	if (geo->near_copies < geo->raid_disks) {
+ 		max = (chunk_sectors - ((sector & (chunk_sectors - 1))
+ 					+ bio_sectors)) << 9;
+@@ -512,6 +532,12 @@ static int raid10_mergeable_bvec(struct
+ 	if (mddev->merge_check_needed) {
+ 		struct r10bio_s r10_bio;
+ 		int s;
++		if (conf->reshape_progress != MaxSector) {
++			/* Cannot give any guidance during reshape */
++			if (max <= biovec->bv_len && bio_sectors == 0)
++				return biovec->bv_len;
++			return 0;
++		}
+ 		r10_bio.sector = sector;
+ 		raid10_find_phys(conf, &r10_bio);
+ 		rcu_read_lock();
+@@ -650,7 +676,10 @@ static int raid10_congested(void *data,
+ 	if (mddev_congested(mddev, bits))
+ 		return 1;
+ 	rcu_read_lock();
+-	for (i = 0; i < conf->geo.raid_disks && ret == 0; i++) {
++	for (i = 0;
++	     (i < conf->geo.raid_disks || i < conf->prev.raid_disks)
++		     && ret == 0;
++	     i++) {
+ 		mdk_rdev_t *rdev = rcu_dereference(conf->mirrors[i].rdev);
+ 		if (rdev && !test_bit(Faulty, &rdev->flags)) {
+ 			struct request_queue *q = bdev_get_queue(rdev->bdev);
+@@ -796,6 +825,16 @@ static void unfreeze_array(conf_t *conf)
+ 	spin_unlock_irq(&conf->resync_lock);
+ }
+ 
++static sector_t choose_data_offset(r10bio_t *r10_bio,
++				   mdk_rdev_t *rdev)
++{
++	if (!test_bit(MD_RECOVERY_RESHAPE, &rdev->mddev->recovery) ||
++	    test_bit(R10BIO_Previous, &r10_bio->state))
++		return rdev->data_offset;
++	else
++		return rdev->new_data_offset;
++}
++
+ static int enough(conf_t *conf, int ignore);
+ static int make_request(mddev_t *mddev, struct bio * bio)
+ {
+@@ -804,7 +843,7 @@ static int make_request(mddev_t *mddev,
+ 	r10bio_t *r10_bio;
+ 	struct bio *read_bio;
+ 	int i;
+-	sector_t chunk_mask = conf->geo.chunk_mask;
++	sector_t chunk_mask = (conf->geo.chunk_mask & conf->prev.chunk_mask);
+ 	int chunk_sects = chunk_mask + 1;
+ 	const int rw = bio_data_dir(bio);
+ 	const unsigned long do_sync = (bio->bi_rw & REQ_SYNC);
+@@ -823,7 +862,8 @@ static int make_request(mddev_t *mddev,
+ 	 */
+ 	if (unlikely((bio->bi_sector & chunk_mask) + (bio->bi_size >> 9)
+ 		     > chunk_sects
+-		     && conf->geo.near_copies < conf->geo.raid_disks)) {
++		     && (conf->geo.near_copies < conf->geo.raid_disks
++			 || conf->prev.near_copies < conf->prev.raid_disks))) {
+ 		struct bio_pair *bp;
+ 		/* Sanity check -- queue functions should prevent this happening */
+ 		if (bio->bi_vcnt != 1 ||
+@@ -903,7 +943,7 @@ static int make_request(mddev_t *mddev,
+ 		r10_bio->devs[slot].bio = read_bio;
+ 
+ 		read_bio->bi_sector = r10_bio->devs[slot].addr +
+-			mirror->rdev->data_offset;
++			choose_data_offset(r10_bio, mirror->rdev);
+ 		read_bio->bi_bdev = mirror->rdev->bdev;
+ 		read_bio->bi_end_io = raid10_end_read_request;
+ 		read_bio->bi_rw = READ | do_sync;
+@@ -977,7 +1017,8 @@ static int make_request(mddev_t *mddev,
+ 		r10_bio->devs[i].bio = mbio;
+ 
+ 		mbio->bi_sector	= r10_bio->devs[i].addr+
+-			conf->mirrors[d].rdev->data_offset;
++			choose_data_offset(r10_bio,
++					      conf->mirrors[d].rdev);
+ 		mbio->bi_bdev = conf->mirrors[d].rdev->bdev;
+ 		mbio->bi_end_io	= raid10_end_write_request;
+ 		mbio->bi_rw = WRITE | do_sync | do_fua;
+@@ -1039,7 +1080,7 @@ static void status(struct seq_file *seq,
+  * Don't consider the device numbered 'ignore'
+  * as we might be about to remove it.
+  */
+-static int enough(conf_t *conf, int ignore)
++static int _enough(conf_t *conf, struct geom *geo, int ignore)
+ {
+ 	int first = 0;
+ 
+@@ -1052,7 +1093,7 @@ static int enough(conf_t *conf, int igno
+ 			    test_bit(In_sync, &rdev->flags) &&
+ 			    first != ignore)
+ 				cnt++;
+-			first = (first+1) % conf->geo.raid_disks;
++			first = (first+1) % geo->raid_disks;
+ 		}
+ 		if (cnt == 0)
+ 			return 0;
+@@ -1065,6 +1106,12 @@ static void error(mddev_t *mddev, mdk_rd
+ {
+ 	int force = 0;
+ #else
++static int enough(conf_t *conf, int ignore)
++{
++	return _enough(conf, &conf->geo, ignore) &&
++		_enough(conf, &conf->prev, ignore);
++}
++
+ static void error(mddev_t *mddev, mdk_rdev_t *rdev, int force)
+ {
+ #endif
+@@ -1649,7 +1696,9 @@ static void fix_read_error(conf_t *conf,
+ 					       " (%d sectors at %llu on %s)\n",
+ 					       mdname(mddev), s,
+ 					       (unsigned long long)(
+-						       sect + rdev->data_offset),
++						       sect +
++					       choose_data_offset(r10_bio,
++								  rdev)),
+ 					       bdevname(rdev->bdev, b));
+ 					printk(KERN_NOTICE "md/raid10:%s: %s: failing "
+ 					       "drive\n",
+@@ -1686,7 +1735,8 @@ static void fix_read_error(conf_t *conf,
+ 					       " (%d sectors at %llu on %s)\n",
+ 					       mdname(mddev), s,
+ 					       (unsigned long long)(
+-						       sect + rdev->data_offset),
++						       sect +
++					       choose_data_offset(r10_bio, rdev)),
+ 					       bdevname(rdev->bdev, b));
+ 					printk(KERN_NOTICE "md/raid10:%s: %s: failing drive\n",
+ 					       mdname(mddev),
+@@ -1699,7 +1749,8 @@ static void fix_read_error(conf_t *conf,
+ 					       " (%d sectors at %llu on %s)\n",
+ 					       mdname(mddev), s,
+ 					       (unsigned long long)(
+-						       sect + rdev->data_offset),
++						       sect +
++					       choose_data_offset(r10_bio, rdev)),
+ 					       bdevname(rdev->bdev, b));
+ 				}
+ 
+@@ -1760,7 +1811,7 @@ static void handle_write_error(conf_t *c
+ 
+ 		d = r10_bio->devs[slot].devnum;
+ 		rdev = conf->mirrors[d].rdev;
+-		wbio->bi_sector += rdev->data_offset;
++		wbio->bi_sector += choose_data_offset(r10_bio, rdev) ;
+ 		wbio->bi_bdev = rdev->bdev;
+ 		if (submit_bio_wait(WRITE, wbio) != 0)
+ 			set_bit(R10BIO_Uptodate, &r10_bio->state);
+@@ -1865,7 +1916,7 @@ static void raid10d(mddev_t *mddev)
+ 						      GFP_NOIO, mddev);
+ 				r10_bio->devs[slot].bio = bio;
+ 				bio->bi_sector = r10_bio->devs[slot].addr
+-					+ rdev->data_offset;
++					+ choose_data_offset(r10_bio, rdev);
+ 				bio->bi_bdev = rdev->bdev;
+ 				bio->bi_rw = READ | do_sync;
+ 				if (test_bit(FailFast, &rdev->flags) &&
+@@ -2400,7 +2451,8 @@ static conf_t *setup_conf(mddev_t *mddev
+ 	else
+ 		sector_div(stride, fc);
+ 	conf->geo.stride = stride << conf->geo.chunk_shift;
+-
++	conf->prev = conf->geo;
++	conf->reshape_progress = MaxSector;
+ 
+ 	spin_lock_init(&conf->device_lock);
+ 	INIT_LIST_HEAD(&conf->retry_list);
+@@ -2465,8 +2517,10 @@ static int run(mddev_t *mddev)
+ 
+ 	list_for_each_entry(rdev, &mddev->disks, same_set) {
+ 		disk_idx = rdev->raid_disk;
+-		if (disk_idx >= conf->geo.raid_disks
+-		    || disk_idx < 0)
++		if (disk_idx < 0)
++			continue;
++		if (disk_idx >= conf->geo.raid_disks &&
++		    disk_idx >= conf->prev.raid_disks)
+ 			continue;
+ 		disk = conf->mirrors + disk_idx;
+ 
+@@ -2484,7 +2538,10 @@ static int run(mddev_t *mddev)
+ 	}
+ 
+ 	mddev->degraded = 0;
+-	for (i = 0; i < conf->geo.raid_disks; i++) {
++	for (i = 0;
++	     i < conf->geo.raid_disks
++		     || i < conf->prev.raid_disks;
++	     i++) {
+ 
+ 		disk = conf->mirrors + i;
+ 
+@@ -2595,6 +2652,9 @@ static int raid10_resize(mddev_t *mddev,
+ 	conf_t *conf = mddev->private;
+ 	sector_t oldsize, size;
+ 
++	if (mddev->reshape_position != MaxSector)
++		return -EBUSY;
++
+ 	if (conf->geo.far_copies > 1 && !conf->geo.far_offset)
+ 		return -EINVAL;
+ 
+--- linux-3.0-SLE11-SP2.orig/drivers/md/raid10.h
++++ linux-3.0-SLE11-SP2/drivers/md/raid10.h
+@@ -32,13 +32,14 @@ struct r10_private_data_s {
+ 					       */
+ 		int		chunk_shift; /* shift from chunks to sectors */
+ 		sector_t	chunk_mask;
+-	} geo;
++	} prev, geo;
+ 	int copies;	      /* near_copies * far_copies.
+ 					       * must be <= raid_disks
+ 					       */
+ 
+ 	sector_t dev_sectors;  /* temp copy of
+ 					       * mddev->dev_sectors */
++	sector_t		reshape_progress;
+ 
+ 	struct list_head	retry_list;
+ 	/* queue pending writes and submit them on unplug */
+@@ -124,4 +125,9 @@ struct r10bio_s {
+ /* failfast devices did receive failfast requests. */
+ #define	R10BIO_FailFast 4
+ #define	R10BIO_WriteError 8
++/* During a reshape we might be performing IO on the
++ * 'previous' part of the array, in which case this
++ * flag is set
++ */
++#define	R10BIO_Previous 9
+ #endif
