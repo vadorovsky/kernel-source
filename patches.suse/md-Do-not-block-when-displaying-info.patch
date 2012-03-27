@@ -1,0 +1,458 @@
+From fef57c3b999cf17897b6756482bf3e08c16c726f Mon Sep 17 00:00:00 2001
+From: Hannes Reinecke <hare@suse.de>
+Date: Thu, 22 Mar 2012 08:53:46 +0100
+Subject: [PATCH 2/4] md: Do not block when displaying info
+Patch-mainline: No
+References: bnc#753617
+
+Any informational content like /proc/mdstat are purely that,
+informational. So no state change involved here.
+Hence we don't need to lock it, we just need to make sure
+the objects we're displaying are present while we're gathering
+the information.
+
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+Acked-by: NeilBrown <neilb@suse.de>
+
+---
+ drivers/md/bitmap.c    |   10 ++-
+ drivers/md/md.c        |  123 ++++++++++++++++++++++++++++++++++---------------
+ drivers/md/multipath.c |   11 +---
+ drivers/md/raid1.c     |    2 
+ drivers/md/raid10.c    |   13 ++---
+ drivers/md/raid5.c     |    4 -
+ 6 files changed, 108 insertions(+), 55 deletions(-)
+
+--- linux-3.0-SLE11-SP2-BTMU.orig/drivers/md/bitmap.c
++++ linux-3.0-SLE11-SP2-BTMU/drivers/md/bitmap.c
+@@ -823,9 +823,11 @@ static void bitmap_file_put(struct bitma
+ 	bitmap->file = NULL;
+ 	spin_unlock_irqrestore(&bitmap->lock, flags);
+ 
+-	if (file)
++	if (file) {
++		synchronize_rcu();
+ 		wait_event(bitmap->write_wait,
+ 			   atomic_read(&bitmap->pending_writes)==0);
++	}
+ 	bitmap_file_unmap(bitmap);
+ 
+ 	if (file) {
+@@ -1739,8 +1741,10 @@ void bitmap_destroy(mddev_t *mddev)
+ 		return;
+ 
+ 	mutex_lock(&mddev->bitmap_info.mutex);
+-	mddev->bitmap = NULL; /* disconnect from the md device */
++	rcu_assign_pointer(mddev->bitmap, NULL); /* disconnect from the
++						  * md device */
+ 	mutex_unlock(&mddev->bitmap_info.mutex);
++	synchronize_rcu();
+ 	if (mddev->thread)
+ 		mddev->thread->timeout = MAX_SCHEDULE_TIMEOUT;
+ 
+@@ -1850,7 +1854,7 @@ int bitmap_create(mddev_t *mddev)
+ 	printk(KERN_INFO "created bitmap (%lu pages) for device %s\n",
+ 		pages, bmname(bitmap));
+ 
+-	mddev->bitmap = bitmap;
++	rcu_assign_pointer(mddev->bitmap, bitmap);
+ 
+ 
+ 	return (bitmap->flags & BITMAP_WRITE_ERROR) ? -EIO : 0;
+--- linux-3.0-SLE11-SP2-BTMU.orig/drivers/md/md.c
++++ linux-3.0-SLE11-SP2-BTMU/drivers/md/md.c
+@@ -515,6 +515,21 @@ static inline mddev_t *mddev_get(mddev_t
+ 	return mddev;
+ }
+ 
++static inline mddev_t *mddev_get_safe(mddev_t *mddev)
++{
++	mddev_t *ret = NULL;
++
++	if (mddev) {
++		spin_lock(&all_mddevs_lock);
++		if (!list_empty(&mddev->all_mddevs)) {
++			atomic_inc(&mddev->active);
++			ret = mddev;
++		}
++		spin_unlock(&all_mddevs_lock);
++	}
++	return ret;
++}
++
+ static void mddev_delayed_delete(struct work_struct *ws);
+ 
+ static void mddev_put(mddev_t *mddev)
+@@ -708,7 +723,7 @@ static mdk_rdev_t * find_rdev_nr(mddev_t
+ {
+ 	mdk_rdev_t *rdev;
+ 
+-	list_for_each_entry(rdev, &mddev->disks, same_set)
++	rdev_for_each_rcu(rdev, mddev)
+ 		if (rdev->desc_nr == nr)
+ 			return rdev;
+ 
+@@ -2278,12 +2293,14 @@ static void md_print_devices(void)
+ 			bitmap_print_sb(mddev->bitmap);
+ 		else
+ 			printk("%s: ", mdname(mddev));
+-		list_for_each_entry(rdev, &mddev->disks, same_set)
++		rcu_read_lock();
++		rdev_for_each_rcu(rdev, mddev)
+ 			printk("<%s>", bdevname(rdev->bdev,b));
+ 		printk("\n");
+ 
+-		list_for_each_entry(rdev, &mddev->disks, same_set)
++		rdev_for_each_rcu(rdev, mddev)
+ 			print_rdev(rdev, mddev->major_version);
++		rcu_read_unlock();
+ 	}
+ 	printk("md:	**********************************\n");
+ 	printk("\n");
+@@ -3224,7 +3241,7 @@ level_store(mddev_t *mddev, const char *
+ {
+ 	char clevel[16];
+ 	ssize_t rv = len;
+-	struct mdk_personality *pers;
++	struct mdk_personality *pers, *oldpers;
+ 	long level;
+ 	void *priv;
+ 	mdk_rdev_t *rdev;
+@@ -3373,10 +3390,13 @@ level_store(mddev_t *mddev, const char *
+ 				       nm, mdname(mddev));
+ 		}
+ 	}
+-
+-	module_put(mddev->pers->owner);
++	spin_lock(&pers_lock);
++	oldpers = mddev->pers;
+ 	mddev->pers = pers;
+ 	mddev->private = priv;
++	spin_unlock(&pers_lock);
++	synchronize_rcu();
++	module_put(oldpers->owner);
+ 	strlcpy(mddev->clevel, pers->name, sizeof(mddev->clevel));
+ 	mddev->level = mddev->new_level;
+ 	mddev->layout = mddev->new_layout;
+@@ -5062,12 +5082,17 @@ EXPORT_SYMBOL_GPL(md_stop_writes);
+ 
+ void md_stop(mddev_t *mddev)
+ {
++	struct mdk_personality *pers = mddev->pers;
+ 	mddev->ready = 0;
+-	mddev->pers->stop(mddev);
+-	if (mddev->pers->sync_request && mddev->to_remove == NULL)
+-		mddev->to_remove = &md_redundancy_group;
+-	module_put(mddev->pers->owner);
+ 	mddev->pers = NULL;
++	/* Make sure md_seq_show() doesn't see the mddev
++	 * being stopped
++	 */
++	synchronize_rcu();
++	pers->stop(mddev);
++	if (pers->sync_request && mddev->to_remove == NULL)
++		mddev->to_remove = &md_redundancy_group;
++	module_put(pers->owner);
+ 	clear_bit(MD_RECOVERY_FROZEN, &mddev->recovery);
+ }
+ EXPORT_SYMBOL_GPL(md_stop);
+@@ -5311,7 +5336,8 @@ static int get_array_info(mddev_t * mdde
+ 	mdk_rdev_t *rdev;
+ 
+ 	nr=working=insync=failed=spare=0;
+-	list_for_each_entry(rdev, &mddev->disks, same_set) {
++	rcu_read_lock();
++	rdev_for_each_rcu(rdev, mddev) {
+ 		nr++;
+ 		if (test_bit(Faulty, &rdev->flags))
+ 			failed++;
+@@ -5323,6 +5349,7 @@ static int get_array_info(mddev_t * mdde
+ 				spare++;
+ 		}
+ 	}
++	rcu_read_unlock();
+ 
+ 	info.major_version = mddev->major_version;
+ 	info.minor_version = mddev->minor_version;
+@@ -5405,6 +5432,7 @@ static int get_disk_info(mddev_t * mddev
+ 	if (copy_from_user(&info, arg, sizeof(info)))
+ 		return -EFAULT;
+ 
++	rcu_read_lock();
+ 	rdev = find_rdev_nr(mddev, info.number);
+ 	if (rdev) {
+ 		info.major = MAJOR(rdev->bdev->bd_dev);
+@@ -5426,6 +5454,7 @@ static int get_disk_info(mddev_t * mddev
+ 		info.raid_disk = -1;
+ 		info.state = (1<<MD_DISK_REMOVED);
+ 	}
++	rcu_read_unlock();
+ 
+ 	if (copy_to_user(arg, &info, sizeof(info)))
+ 		return -EFAULT;
+@@ -6101,6 +6130,30 @@ static int md_ioctl(struct block_device
+ 			autostart_arrays(arg);
+ 			goto done;
+ #endif
++		case GET_ARRAY_INFO:
++			mddev = mddev_get_safe(bdev->bd_disk->private_data);
++			if (mddev) {
++				err = get_array_info(mddev, argp);
++				mddev_put(mddev);
++			}
++			goto done;
++
++		case GET_BITMAP_FILE:
++			mddev = mddev_get_safe(bdev->bd_disk->private_data);
++			if (mddev) {
++				err = get_bitmap_file(mddev, argp);
++				mddev_put(mddev);
++			}
++			goto done;
++
++		case GET_DISK_INFO:
++			mddev = mddev_get_safe(bdev->bd_disk->private_data);
++			if (mddev) {
++				err = get_disk_info(mddev, argp);
++				mddev_put(mddev);
++			}
++			goto done;
++
+ 		default:;
+ 	}
+ 
+@@ -6187,18 +6240,6 @@ static int md_ioctl(struct block_device
+ 	 */
+ 	switch (cmd)
+ 	{
+-		case GET_ARRAY_INFO:
+-			err = get_array_info(mddev, argp);
+-			goto done_unlock;
+-
+-		case GET_BITMAP_FILE:
+-			err = get_bitmap_file(mddev, argp);
+-			goto done_unlock;
+-
+-		case GET_DISK_INFO:
+-			err = get_disk_info(mddev, argp);
+-			goto done_unlock;
+-
+ 		case RESTART_ARRAY_RW:
+ 			err = restart_array(mddev);
+ 			goto done_unlock;
+@@ -6713,6 +6754,7 @@ static int md_seq_show(struct seq_file *
+ 	mdk_rdev_t *rdev;
+ 	struct mdstat_info *mi = seq->private;
+ 	struct bitmap *bitmap;
++	struct mdk_personality *pers;
+ 
+ 	if (v == (void*)1) {
+ 		struct mdk_personality *pers;
+@@ -6731,22 +6773,21 @@ static int md_seq_show(struct seq_file *
+ 		return 0;
+ 	}
+ 
+-	if (mddev_lock(mddev) < 0)
+-		return -EINTR;
+-
+-	if (mddev->pers || mddev->raid_disks || !list_empty(&mddev->disks)) {
++	rcu_read_lock();
++	pers = rcu_dereference(mddev->pers);
++	if (pers || mddev->raid_disks || !list_empty(&mddev->disks)) {
+ 		seq_printf(seq, "%s : %sactive", mdname(mddev),
+ 						mddev->pers ? "" : "in");
+-		if (mddev->pers) {
++		if (pers) {
+ 			if (mddev->ro==1)
+ 				seq_printf(seq, " (read-only)");
+ 			if (mddev->ro==2)
+ 				seq_printf(seq, " (auto-read-only)");
+-			seq_printf(seq, " %s", mddev->pers->name);
++			seq_printf(seq, " %s", pers->name);
+ 		}
+ 
+ 		sectors = 0;
+-		list_for_each_entry(rdev, &mddev->disks, same_set) {
++		rdev_for_each_rcu(rdev, mddev) {
+ 			char b[BDEVNAME_SIZE];
+ 			seq_printf(seq, " %s[%d]",
+ 				bdevname(rdev->bdev,b), rdev->desc_nr);
+@@ -6761,7 +6802,7 @@ static int md_seq_show(struct seq_file *
+ 		}
+ 
+ 		if (!list_empty(&mddev->disks)) {
+-			if (mddev->pers)
++			if (pers)
+ 				seq_printf(seq, "\n      %llu blocks",
+ 					   (unsigned long long)
+ 					   mddev->array_sectors / 2);
+@@ -6782,10 +6823,15 @@ static int md_seq_show(struct seq_file *
+ 		else
+ 			seq_printf(seq, " super non-persistent");
+ 
+-		if (mddev->pers) {
+-			mddev->pers->status(seq, mddev);
++		/* rcu locking protects against mddev being stopped.
++		 * Need pers_lock as well to protect against a level change.
++		 */
++		spin_lock(&pers_lock);
++		if (pers && pers == mddev->pers &&
++		    rcu_dereference(mddev->private)) {
++			pers->status(seq, mddev);
+ 	 		seq_printf(seq, "\n      ");
+-			if (mddev->pers->sync_request) {
++			if (pers->sync_request) {
+ 				if (mddev->curr_resync > 2) {
+ 					status_resync(seq, mddev);
+ 					seq_printf(seq, "\n      ");
+@@ -6796,10 +6842,12 @@ static int md_seq_show(struct seq_file *
+ 			}
+ 		} else
+ 			seq_printf(seq, "\n       ");
++		spin_unlock(&pers_lock);
+ 
+-		if ((bitmap = mddev->bitmap)) {
++		if ((bitmap = rcu_dereference(mddev->bitmap)) != NULL) {
+ 			unsigned long chunk_kb;
+ 			unsigned long flags;
++			struct file *file;
+ 			spin_lock_irqsave(&bitmap->lock, flags);
+ 			chunk_kb = mddev->bitmap_info.chunksize >> 10;
+ 			seq_printf(seq, "bitmap: %lu/%lu pages [%luKB], "
+@@ -6810,7 +6858,8 @@ static int md_seq_show(struct seq_file *
+ 					<< (PAGE_SHIFT - 10),
+ 				chunk_kb ? chunk_kb : mddev->bitmap_info.chunksize,
+ 				chunk_kb ? "KB" : "B");
+-			if (bitmap->file) {
++			file = rcu_dereference(bitmap->file);
++			if (file) {
+ 				seq_printf(seq, ", file: ");
+ 				seq_path(seq, &bitmap->file->f_path, " \t\n");
+ 			}
+@@ -6821,7 +6870,7 @@ static int md_seq_show(struct seq_file *
+ 
+ 		seq_printf(seq, "\n");
+ 	}
+-	mddev_unlock(mddev);
++	rcu_read_unlock();
+ 	
+ 	return 0;
+ }
+--- linux-3.0-SLE11-SP2-BTMU.orig/drivers/md/multipath.c
++++ linux-3.0-SLE11-SP2-BTMU/drivers/md/multipath.c
+@@ -140,7 +140,7 @@ static int multipath_make_request(mddev_
+ 	return 0;
+ }
+ 
+-static void multipath_status (struct seq_file *seq, mddev_t *mddev)
++static void multipath_status(struct seq_file *seq, mddev_t *mddev)
+ {
+ 	multipath_conf_t *conf = mddev->private;
+ 	int i;
+@@ -410,7 +410,6 @@ static int multipath_run (mddev_t *mddev
+ 	 */
+ 
+ 	conf = kzalloc(sizeof(multipath_conf_t), GFP_KERNEL);
+-	mddev->private = conf;
+ 	if (!conf) {
+ 		printk(KERN_ERR 
+ 			"multipath: couldn't allocate memory for %s\n",
+@@ -491,12 +490,13 @@ static int multipath_run (mddev_t *mddev
+ 	 */
+ 	md_set_array_sectors(mddev, multipath_size(mddev, 0, 0));
+ 
+-	mddev->queue->backing_dev_info.congested_fn = multipath_congested;
+-	mddev->queue->backing_dev_info.congested_data = mddev;
+-
+ 	if (md_integrity_register(mddev))
+ 		goto out_free_conf;
+ 
++	mddev->queue->backing_dev_info.congested_fn = multipath_congested;
++	mddev->queue->backing_dev_info.congested_data = mddev;
++
++	rcu_assign_pointer(mddev->private, conf);
+ 	return 0;
+ 
+ out_free_conf:
+@@ -504,7 +504,6 @@ out_free_conf:
+ 		mempool_destroy(conf->pool);
+ 	kfree(conf->multipaths);
+ 	kfree(conf);
+-	mddev->private = NULL;
+ out:
+ 	return -EIO;
+ }
+--- linux-3.0-SLE11-SP2-BTMU.orig/drivers/md/raid1.c
++++ linux-3.0-SLE11-SP2-BTMU/drivers/md/raid1.c
+@@ -2164,7 +2164,7 @@ static int run(mddev_t *mddev)
+ 	 */
+ 	mddev->thread = conf->thread;
+ 	conf->thread = NULL;
+-	mddev->private = conf;
++	rcu_assign_pointer(mddev->private, conf);
+ 
+ 	md_set_array_sectors(mddev, raid1_size(mddev, 0, 0));
+ 
+--- linux-3.0-SLE11-SP2-BTMU.orig/drivers/md/raid10.c
++++ linux-3.0-SLE11-SP2-BTMU/drivers/md/raid10.c
+@@ -2613,9 +2613,8 @@ static int run(mddev_t *mddev)
+ 		conf = setup_conf(mddev);
+ 		if (IS_ERR(conf))
+ 			return PTR_ERR(conf);
+-		mddev->private = conf;
+-	}
+-	conf = mddev->private;
++	} else
++		conf = mddev->private;
+ 	if (!conf)
+ 		goto out;
+ 
+@@ -2694,6 +2693,11 @@ static int run(mddev_t *mddev)
+ 		}
+ 	}
+ 
++	if (md_integrity_register(mddev))
++		goto out_free_conf;
++
++	rcu_assign_pointer(mddev->private, conf);
++
+ 	if (mddev->recovery_cp != MaxSector)
+ 		printk(KERN_NOTICE "md/raid10:%s: not clean"
+ 		       " -- starting background reconstruction\n",
+@@ -2727,9 +2731,6 @@ static int run(mddev_t *mddev)
+ 
+ 	blk_queue_merge_bvec(mddev->queue, raid10_mergeable_bvec);
+ 
+-	if (md_integrity_register(mddev))
+-		goto out_free_conf;
+-
+ 	if (conf->reshape_progress != MaxSector) {
+ 		unsigned long before_size, before_length;
+ 		unsigned long after_size, after_length;
+--- linux-3.0-SLE11-SP2-BTMU.orig/drivers/md/raid5.c
++++ linux-3.0-SLE11-SP2-BTMU/drivers/md/raid5.c
+@@ -5051,7 +5051,6 @@ static int run(mddev_t *mddev)
+ 
+ 	mddev->thread = conf->thread;
+ 	conf->thread = NULL;
+-	mddev->private = conf;
+ 
+ 	/*
+ 	 * 0 for a fully functional array, 1 or 2 for a degraded array.
+@@ -5121,6 +5120,8 @@ static int run(mddev_t *mddev)
+ 		}
+ 	}
+ 
++	rcu_assign_pointer(mddev->private, conf);
++
+ 	if (mddev->degraded == 0)
+ 		printk(KERN_INFO "md/raid:%s: raid level %d active with %d out of %d"
+ 		       " devices, algorithm %d\n", mdname(mddev), conf->level,
+@@ -5191,7 +5192,6 @@ abort:
+ 		print_raid5_conf(conf);
+ 		free_conf(conf);
+ 	}
+-	mddev->private = NULL;
+ 	printk(KERN_ALERT "md/raid:%s: failed to run raid set.\n", mdname(mddev));
+ 	return -EIO;
+ }
