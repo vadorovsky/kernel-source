@@ -1,0 +1,361 @@
+From: NeilBrown <neilb@suse.de>
+Date: Thu, 12 Apr 2012 16:27:07 +1000
+Subject: [PATCH 01/23] md/bitmap: disentangle two different 'pending' flags.
+Patch-mainline: 3.5
+References: FATE#311379
+
+There are two different 'pending' concepts in the handling of the
+write intent bitmap.
+
+Firstly, a 'page' from the bitmap (which container PAGE_SIZE*8 bits)
+may have changes (bits cleared) that should be written in due course.
+There is no hurry for these and the page will transition from
+PENDING to NEEDWRITE and will then be written, though if it ever
+becomes DIRTY it will be written much sooner and PENDING will be
+cleared.
+
+Secondly, a page of counters - which contains PAGE_SIZE/2 counters, one
+for each bit, can usefully have a 'pending' flag which indicates if
+any of the counters are low (2 or 1) and ready to be processed by
+bitmap_daemon_work().  If this flag is clear we can skip the whole
+page.
+
+These two concepts are currently combined in the bitmap-file flag.
+This causes a tighter connection between the counters and the bitmap
+file than I would like - as I want to add some flexibility to the
+bitmap file.
+
+So introduce a new flag with the page-of-counters, and rewrite
+bitmap_daemon_work() so that it handles the two different 'pending'
+concepts separately.
+
+This also allows us to clear BITMAP_PAGE_PENDING when we write out
+a dirty page, which may occasionally reduce the number of times we
+write a page.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Acked-by: NeilBrown <neilb@suse.de>
+
+---
+ drivers/md/bitmap.c |  215 ++++++++++++++++++++++++++++------------------------
+ drivers/md/bitmap.h |    7 +
+ 2 files changed, 122 insertions(+), 100 deletions(-)
+
+--- linux-3.0-SLE11-SP2-BTMU.orig/drivers/md/bitmap.c
++++ linux-3.0-SLE11-SP2-BTMU/drivers/md/bitmap.c
+@@ -870,7 +870,7 @@ static void bitmap_file_kick(struct bitm
+ 
+ enum bitmap_page_attr {
+ 	BITMAP_PAGE_DIRTY = 0,     /* there are set bits that need to be synced */
+-	BITMAP_PAGE_CLEAN = 1,     /* there are bits that might need to be cleared */
++	BITMAP_PAGE_PENDING = 1,     /* there are bits that might need to be cleared */
+ 	BITMAP_PAGE_NEEDWRITE = 2, /* there are cleared bits that need to be synced */
+ };
+ 
+@@ -952,6 +952,8 @@ void bitmap_unplug(struct bitmap *bitmap
+ 		need_write = test_page_attr(bitmap, page, BITMAP_PAGE_NEEDWRITE);
+ 		clear_page_attr(bitmap, page, BITMAP_PAGE_DIRTY);
+ 		clear_page_attr(bitmap, page, BITMAP_PAGE_NEEDWRITE);
++		if (dirty || need_write)
++			clear_page_attr(bitmap, page, BITMAP_PAGE_PENDING);
+ 		if (dirty)
+ 			wait = 1;
+ 		spin_unlock_irqrestore(&bitmap->lock, flags);
+@@ -1113,7 +1115,7 @@ static int bitmap_init_from_disk(struct
+ 					       (sector_t)i << bitmap->chunkshift,
+ 					       needed);
+ 			bit_cnt++;
+-			set_page_attr(bitmap, page, BITMAP_PAGE_CLEAN);
++			set_page_attr(bitmap, page, BITMAP_PAGE_PENDING);
+ 		}
+ 	}
+ 
+@@ -1157,6 +1159,17 @@ static void bitmap_count_page(struct bit
+ 	bitmap->bp[page].count += inc;
+ 	bitmap_checkfree(bitmap, page);
+ }
++
++static void bitmap_set_pending(struct bitmap *bitmap, sector_t offset)
++{
++	sector_t chunk = offset >> bitmap->chunkshift;
++	unsigned long page = chunk >> PAGE_COUNTER_SHIFT;
++	struct bitmap_page *bp = &bitmap->bp[page];
++
++	if (!bp->pending)
++		bp->pending = 1;
++}
++
+ static bitmap_counter_t *bitmap_get_counter(struct bitmap *bitmap,
+ 					    sector_t offset, sector_t *blocks,
+ 					    int create);
+@@ -1170,8 +1183,8 @@ void bitmap_daemon_work(mddev_t *mddev)
+ {
+ 	struct bitmap *bitmap;
+ 	unsigned long j;
++	unsigned long nextpage;
+ 	unsigned long flags;
+-	struct page *page = NULL, *lastpage = NULL;
+ 	sector_t blocks;
+ 	void *paddr;
+ 
+@@ -1195,108 +1208,120 @@ void bitmap_daemon_work(mddev_t *mddev)
+ 	}
+ 	bitmap->allclean = 1;
+ 
++	/* Any file-page which is PENDING now needs to be written.
++	 * So set NEEDWRITE now, then after we make any last-minute changes
++	 * we will write it.
++	 */
+ 	spin_lock_irqsave(&bitmap->lock, flags);
++	if (!bitmap->filemap)
++		/* error or shutdown */
++		goto out;
++
++	for (j = 0; j < bitmap->file_pages; j++)
++		if (test_page_attr(bitmap, bitmap->filemap[j],
++				   BITMAP_PAGE_PENDING)) {
++			set_page_attr(bitmap, bitmap->filemap[j],
++				      BITMAP_PAGE_NEEDWRITE);
++			clear_page_attr(bitmap, bitmap->filemap[j],
++					BITMAP_PAGE_PENDING);
++		}
++
++	if (bitmap->need_sync &&
++	    mddev->bitmap_info.external == 0) {
++		/* Arrange for superblock update as well as
++		 * other changes */
++		bitmap_super_t *sb;
++		bitmap->need_sync = 0;
++		sb = kmap_atomic(bitmap->sb_page, KM_USER0);
++		sb->events_cleared =
++			cpu_to_le64(bitmap->events_cleared);
++		kunmap_atomic(sb, KM_USER0);
++		set_page_attr(bitmap, bitmap->sb_page, BITMAP_PAGE_NEEDWRITE);
++	}
++	/* Now look at the bitmap counters and if any are '2' or '1',
++	 * decrement and handle accordingly.
++	 */
++	nextpage = 0;
+ 	for (j = 0; j < bitmap->chunks; j++) {
+ 		bitmap_counter_t *bmc;
+-		if (!bitmap->filemap)
+-			/* error or shutdown */
+-			break;
+ 
+-		page = filemap_get_page(bitmap, j);
+-
+-		if (page != lastpage) {
+-			/* skip this page unless it's marked as needing cleaning */
+-			if (!test_page_attr(bitmap, page, BITMAP_PAGE_CLEAN)) {
+-				int need_write = test_page_attr(bitmap, page,
+-								BITMAP_PAGE_NEEDWRITE);
+-				if (need_write)
+-					clear_page_attr(bitmap, page, BITMAP_PAGE_NEEDWRITE);
+-
+-				spin_unlock_irqrestore(&bitmap->lock, flags);
+-				if (need_write) {
+-					write_page(bitmap, page, 0);
+-					bitmap->allclean = 0;
+-				}
+-				spin_lock_irqsave(&bitmap->lock, flags);
+-				j |= (PAGE_BITS - 1);
++		if (j == nextpage) {
++			nextpage += PAGE_COUNTER_RATIO;
++			if (!bitmap->bp[j >> PAGE_COUNTER_SHIFT].pending) {
++				j |= PAGE_COUNTER_MASK;
+ 				continue;
+ 			}
+-
+-			/* grab the new page, sync and release the old */
+-			if (lastpage != NULL) {
+-				if (test_page_attr(bitmap, lastpage, BITMAP_PAGE_NEEDWRITE)) {
+-					clear_page_attr(bitmap, lastpage, BITMAP_PAGE_NEEDWRITE);
+-					spin_unlock_irqrestore(&bitmap->lock, flags);
+-					write_page(bitmap, lastpage, 0);
+-				} else {
+-					set_page_attr(bitmap, lastpage, BITMAP_PAGE_NEEDWRITE);
+-					spin_unlock_irqrestore(&bitmap->lock, flags);
+-				}
+-			} else
+-				spin_unlock_irqrestore(&bitmap->lock, flags);
+-			lastpage = page;
+-
+-			/* We are possibly going to clear some bits, so make
+-			 * sure that events_cleared is up-to-date.
+-			 */
+-			if (bitmap->need_sync &&
+-			    bitmap->mddev->bitmap_info.external == 0) {
+-				bitmap_super_t *sb;
+-				bitmap->need_sync = 0;
+-				sb = kmap_atomic(bitmap->sb_page, KM_USER0);
+-				sb->events_cleared =
+-					cpu_to_le64(bitmap->events_cleared);
+-				kunmap_atomic(sb, KM_USER0);
+-				write_page(bitmap, bitmap->sb_page, 1);
+-			}
+-			spin_lock_irqsave(&bitmap->lock, flags);
+-			if (!bitmap->need_sync)
+-				clear_page_attr(bitmap, page, BITMAP_PAGE_CLEAN);
++			bitmap->bp[j >> PAGE_COUNTER_SHIFT].pending = 0;
+ 		}
+ 		bmc = bitmap_get_counter(bitmap,
+ 					 (sector_t)j << bitmap->chunkshift,
+ 					 &blocks, 0);
+-		if (bmc) {
+-			if (*bmc)
+-				bitmap->allclean = 0;
+ 
+-			if (*bmc == 2) {
+-				*bmc = 1; /* maybe clear the bit next time */
+-				set_page_attr(bitmap, page, BITMAP_PAGE_CLEAN);
+-			} else if (*bmc == 1 && !bitmap->need_sync) {
+-				/* we can clear the bit */
+-				*bmc = 0;
+-				bitmap_count_page(bitmap,
+-						  (sector_t)j << bitmap->chunkshift,
+-						  -1);
+-
+-				/* clear the bit */
+-				paddr = kmap_atomic(page, KM_USER0);
+-				if (bitmap->flags & BITMAP_HOSTENDIAN)
+-					clear_bit(file_page_offset(bitmap, j),
+-						  paddr);
+-				else
+-					__test_and_clear_bit_le(file_page_offset(bitmap, j),
+-							       paddr);
+-				kunmap_atomic(paddr, KM_USER0);
+-			}
+-		} else
++		if (!bmc) {
+ 			j |= PAGE_COUNTER_MASK;
++			continue;
++		}
++		if (*bmc == 1 && !bitmap->need_sync) {
++			/* We can clear the bit */
++			struct page *page;
++			*bmc = 0;
++			bitmap_count_page(
++				bitmap,
++				(sector_t)j << bitmap->chunkshift,
++				-1);
++
++			page = filemap_get_page(bitmap, j);
++			paddr = kmap_atomic(page, KM_USER0);
++			if (bitmap->flags & BITMAP_HOSTENDIAN)
++				clear_bit(file_page_offset(bitmap, j),
++					  paddr);
++			else
++				__test_and_clear_bit_le(file_page_offset(bitmap, j),
++							paddr);
++			kunmap_atomic(paddr, KM_USER0);
++			if (!test_page_attr(bitmap, page,
++					    BITMAP_PAGE_NEEDWRITE)) {
++				set_page_attr(bitmap, page,
++					      BITMAP_PAGE_PENDING);
++				bitmap->allclean = 0;
++			}
++		} else if (*bmc && *bmc <= 2) {
++			*bmc = 1;
++			bitmap_set_pending(
++				bitmap,
++				(sector_t)j << bitmap->chunkshift);
++			bitmap->allclean = 0;
++		}
+ 	}
+-	spin_unlock_irqrestore(&bitmap->lock, flags);
+ 
+-	/* now sync the final page */
+-	if (lastpage != NULL) {
+-		spin_lock_irqsave(&bitmap->lock, flags);
+-		if (test_page_attr(bitmap, lastpage, BITMAP_PAGE_NEEDWRITE)) {
+-			clear_page_attr(bitmap, lastpage, BITMAP_PAGE_NEEDWRITE);
+-			spin_unlock_irqrestore(&bitmap->lock, flags);
+-			write_page(bitmap, lastpage, 0);
+-		} else {
+-			set_page_attr(bitmap, lastpage, BITMAP_PAGE_NEEDWRITE);
++	/* Now start writeout on any page in NEEDWRITE that isn't DIRTY.
++	 * DIRTY pages need to be written by bitmap_unplug so it can wait
++	 * for them.
++	 * If we find any DIRTY page we stop there and let bitmap_unplug
++	 * handle all the rest.  This is important in the case where
++	 * the first blocking holds the superblock and it has been updated.
++	 * We mustn't write any other blocks before the superblock.
++	 */
++	for (j = 0; j < bitmap->file_pages; j++) {
++		struct page *page = bitmap->filemap[j];
++
++		if (test_page_attr(bitmap, page,
++				    BITMAP_PAGE_DIRTY))
++			/* bitmap_unplug will handle the rest */
++			break;
++		if (test_page_attr(bitmap, page,
++				   BITMAP_PAGE_NEEDWRITE)) {
++			clear_page_attr(bitmap, page,
++					BITMAP_PAGE_NEEDWRITE);
+ 			spin_unlock_irqrestore(&bitmap->lock, flags);
++			write_page(bitmap, page, 0);
++			spin_lock_irqsave(&bitmap->lock, flags);
++			if (!bitmap->filemap)
++				break;
+ 		}
+ 	}
++out:
++	spin_unlock_irqrestore(&bitmap->lock, flags);
+ 
+  done:
+ 	if (bitmap->allclean == 0)
+@@ -1454,11 +1479,7 @@ void bitmap_endwrite(struct bitmap *bitm
+ 
+ 		(*bmc)--;
+ 		if (*bmc <= 2)
+-			set_page_attr(bitmap,
+-				      filemap_get_page(
+-					      bitmap,
+-					      offset >> bitmap->chunkshift),
+-				      BITMAP_PAGE_CLEAN);
++			bitmap_set_pending(bitmap, offset);
+ 
+ 		spin_unlock_irqrestore(&bitmap->lock, flags);
+ 		offset += blocks;
+@@ -1544,9 +1565,7 @@ void bitmap_end_sync(struct bitmap *bitm
+ 			*bmc |= NEEDED_MASK;
+ 		else {
+ 			if (*bmc <= 2)
+-				set_page_attr(bitmap,
+-					      filemap_get_page(bitmap, offset >> bitmap->chunkshift),
+-					      BITMAP_PAGE_CLEAN);
++				bitmap_set_pending(bitmap, offset);
+ 		}
+ 	}
+  unlock:
+@@ -1618,11 +1637,9 @@ static void bitmap_set_memory_bits(struc
+ 		return;
+ 	}
+ 	if (!*bmc) {
+-		struct page *page;
+ 		*bmc = 1 | (needed ? NEEDED_MASK : 0);
+ 		bitmap_count_page(bitmap, offset, 1);
+-		page = filemap_get_page(bitmap, offset >> bitmap->chunkshift);
+-		set_page_attr(bitmap, page, BITMAP_PAGE_CLEAN);
++		bitmap_set_pending(bitmap, offset);
+ 	}
+ 	spin_unlock_irq(&bitmap->lock);
+ 	bitmap->allclean = 0;
+--- linux-3.0-SLE11-SP2-BTMU.orig/drivers/md/bitmap.h
++++ linux-3.0-SLE11-SP2-BTMU/drivers/md/bitmap.h
+@@ -175,9 +175,14 @@ struct bitmap_page {
+ 	 */
+ 	unsigned int hijacked:1;
+ 	/*
++	 * If any counter in this page is '1' or '2' - and so could be
++	 * cleared then that page is marked as 'pending'
++	 */
++	unsigned int pending:1;
++	/*
+ 	 * count of dirty bits on the page
+ 	 */
+-	unsigned int  count:31;
++	unsigned int  count:30;
+ };
+ 
+ /* keep track of bitmap file pages that have pending writes on them */
