@@ -1,0 +1,238 @@
+From: Li Dongyang <lidongyang@novell.com>
+Subject: blkback: Implement discard requests handling
+References: fate#309305
+Patch-mainline: n/a
+
+If the backend device (or loopback file) supports discard requests then
+advertise it to the frontend via 'feature-discard'.
+
+Implementation wise: If the backend is 'phy', use blkdev_issue_discard,
+while if it is 'file', then punch a hole in the image file.
+
+Signed-off-by: Li Dongyang <lidongyang@novell.com>
+
+--- sle11sp2.orig/drivers/xen/blkback/blkback.c	2012-04-05 09:44:16.000000000 +0200
++++ sle11sp2/drivers/xen/blkback/blkback.c	2012-04-05 10:15:06.000000000 +0200
+@@ -40,6 +40,9 @@
+ #include <linux/freezer.h>
+ #include <linux/list.h>
+ #include <linux/delay.h>
++#include <linux/loop.h>
++#include <linux/falloc.h>
++#include <linux/fs.h>
+ #include <xen/balloon.h>
+ #include <xen/evtchn.h>
+ #include <xen/gnttab.h>
+@@ -195,16 +198,17 @@ static void fast_flush_area(pending_req_
+ static void print_stats(blkif_t *blkif)
+ {
+ 	printk(KERN_DEBUG "%s: oo %3d  |  rd %4d  |  wr %4d  |  br %4d"
+-	       "  |  fl %4d\n",
++	       "  |  fl %4d  |  ds %4d\n",
+ 	       current->comm, blkif->st_oo_req,
+ 	       blkif->st_rd_req, blkif->st_wr_req,
+-	       blkif->st_br_req, blkif->st_fl_req);
++	       blkif->st_br_req, blkif->st_fl_req, blkif->st_ds_req);
+ 	blkif->st_print = jiffies + msecs_to_jiffies(10 * 1000);
+ 	blkif->st_rd_req = 0;
+ 	blkif->st_wr_req = 0;
+ 	blkif->st_oo_req = 0;
+ 	blkif->st_br_req = 0;
+ 	blkif->st_fl_req = 0;
++	blkif->st_ds_req = 0;
+ }
+ 
+ int blkif_schedule(void *arg)
+@@ -337,6 +341,60 @@ irqreturn_t blkif_be_int(int irq, void *
+  * DOWNWARD CALLS -- These interface with the block-device layer proper.
+  */
+ 
++static void dispatch_discard(blkif_t *blkif, struct blkif_request_discard *req)
++{
++	struct phys_req preq;
++	int err = -EOPNOTSUPP, status;
++
++	blkif->st_ds_req++;
++
++	preq.dev           = req->handle;
++	preq.sector_number = req->sector_number;
++	preq.nr_sects      = req->nr_sectors;
++
++	if (vbd_translate(&preq, blkif, REQ_DISCARD) != 0) {
++		DPRINTK("access denied: discard of [%Lu,%Lu) on dev=%04x\n",
++			preq.sector_number,
++			preq.sector_number + preq.nr_sects, preq.dev);
++		make_response(blkif, req->id, req->operation, BLKIF_RSP_ERROR);
++		msleep(1); /* back off a bit */
++		return;
++	}
++
++	plug_queue(blkif, preq.bdev);
++
++	if (blkif->blk_backend_type == BLKIF_BACKEND_PHY)
++		/* just forward the discard request */
++		err = blkdev_issue_discard(preq.bdev, preq.sector_number,
++					   preq.nr_sects, GFP_KERNEL, 0);
++	else if (blkif->blk_backend_type == BLKIF_BACKEND_FILE) {
++		/* punch a hole in the backing file */
++		struct loop_device *lo = preq.bdev->bd_disk->private_data;
++		struct file *file = lo->lo_backing_file;
++
++		if (file->f_op && file->f_op->fallocate)
++			err = file->f_op->fallocate(file,
++				FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
++				lo->lo_offset + (preq.sector_number << 9),
++				preq.nr_sects << 9);
++	}
++
++	switch (err) {
++	case 0:
++		status = BLKIF_RSP_OKAY;
++		break;
++	case -EOPNOTSUPP:
++		DPRINTK("discard op failed, not supported\n");
++		status = BLKIF_RSP_EOPNOTSUPP;
++		break;
++	default:
++		status = BLKIF_RSP_ERROR;
++		break;
++	}
++
++	make_response(blkif, req->id, req->operation, status);
++}
++
+ static int _do_block_io_op(blkif_t *blkif)
+ {
+ 	blkif_back_rings_t *blk_rings = &blkif->blk_rings;
+@@ -391,6 +449,11 @@ static int _do_block_io_op(blkif_t *blki
+ 
+ 			dispatch_rw_block_io(blkif, &req, pending_req);
+ 			break;
++		case BLKIF_OP_DISCARD:
++			blk_rings->common.req_cons = rc;
++			barrier();
++			dispatch_discard(blkif, (void *)&req);
++			break;
+ 		default:
+ 			/* A good sign something is wrong: sleep for a while to
+ 			 * avoid excessive CPU consumption by a bad guest. */
+--- sle11sp2.orig/drivers/xen/blkback/common.h	2012-02-24 15:16:46.000000000 +0100
++++ sle11sp2/drivers/xen/blkback/common.h	2012-04-05 10:15:10.000000000 +0200
+@@ -43,6 +43,11 @@
+ 	pr_debug("(file=%s, line=%d) " _f,	\
+ 		 __FILE__ , __LINE__ , ## _a )
+ 
++enum blkif_backend_type {
++	BLKIF_BACKEND_PHY  = 1,
++	BLKIF_BACKEND_FILE = 2,
++};
++
+ struct vbd {
+ 	blkif_vdev_t   handle;      /* what the domain refers to this vbd as */
+ 	fmode_t        mode;        /* FMODE_xxx */
+@@ -63,6 +68,7 @@ typedef struct blkif_st {
+ 	unsigned int      irq;
+ 	/* Comms information. */
+ 	enum blkif_protocol blk_protocol;
++	enum blkif_backend_type blk_backend_type;
+ 	blkif_back_rings_t blk_rings;
+ 	struct vm_struct *blk_ring_area;
+ 	/* The VBD attached to this interface. */
+@@ -88,6 +94,7 @@ typedef struct blkif_st {
+ 	int                 st_oo_req;
+ 	int                 st_br_req;
+ 	int                 st_fl_req;
++	int                 st_ds_req;
+ 	int                 st_rd_sect;
+ 	int                 st_wr_sect;
+ 
+@@ -127,7 +134,7 @@ unsigned long vbd_secsize(struct vbd *vb
+ 
+ struct phys_req {
+ 	unsigned short       dev;
+-	unsigned short       nr_sects;
++	blkif_sector_t       nr_sects;
+ 	struct block_device *bdev;
+ 	blkif_sector_t       sector_number;
+ };
+--- sle11sp2.orig/drivers/xen/blkback/xenbus.c	2012-03-19 11:42:35.000000000 +0100
++++ sle11sp2/drivers/xen/blkback/xenbus.c	2012-04-05 10:15:11.000000000 +0200
+@@ -120,6 +120,7 @@ VBD_SHOW(rd_req,  "%d\n", be->blkif->st_
+ VBD_SHOW(wr_req,  "%d\n", be->blkif->st_wr_req);
+ VBD_SHOW(br_req,  "%d\n", be->blkif->st_br_req);
+ VBD_SHOW(fl_req,  "%d\n", be->blkif->st_fl_req);
++VBD_SHOW(ds_req,  "%d\n", be->blkif->st_ds_req);
+ VBD_SHOW(rd_sect, "%d\n", be->blkif->st_rd_sect);
+ VBD_SHOW(wr_sect, "%d\n", be->blkif->st_wr_sect);
+ 
+@@ -129,6 +130,7 @@ static struct attribute *vbdstat_attrs[]
+ 	&dev_attr_wr_req.attr,
+ 	&dev_attr_br_req.attr,
+ 	&dev_attr_fl_req.attr,
++	&dev_attr_ds_req.attr,
+ 	&dev_attr_rd_sect.attr,
+ 	&dev_attr_wr_sect.attr,
+ 	NULL
+@@ -222,6 +224,54 @@ void blkback_flush_diskcache(struct xenb
+ 		xenbus_dev_error(dev, err, "writing feature-flush-cache");
+ }
+ 
++static void blkback_discard(struct xenbus_transaction xbt,
++			    struct backend_info *be)
++{
++	struct xenbus_device *dev = be->dev;
++	blkif_t *blkif = be->blkif;
++	char *type = xenbus_read(XBT_NIL, dev->nodename, "type", NULL);
++	int err, state = 0;
++
++	if (!IS_ERR(type)) {
++		if (strncmp(type, "file", 4) == 0) {
++			state = 1;
++			blkif->blk_backend_type = BLKIF_BACKEND_FILE;
++		}
++		if (strncmp(type, "phy", 3) == 0) {
++			struct request_queue *q;
++
++			q = bdev_get_queue(blkif->vbd.bdev);
++			if (blk_queue_discard(q)) {
++				blkif->blk_backend_type = BLKIF_BACKEND_PHY;
++				err = xenbus_printf(xbt, dev->nodename,
++					"discard-granularity", "%u",
++					q->limits.discard_granularity);
++				if (!err)
++					state = 1;
++				else
++					xenbus_dev_error(dev, err,
++						"writing discard-granularity");
++				err = xenbus_printf(xbt, dev->nodename,
++					"discard-alignment", "%u",
++					q->limits.discard_alignment);
++				if (err) {
++					xenbus_dev_error(dev, err,
++						"writing discard-alignment");
++					state = 0;
++				}
++			}
++		}
++		kfree(type);
++	} else
++		xenbus_dev_error(dev, PTR_ERR(type),
++				 "reading type for discard");
++
++	err = xenbus_printf(xbt, dev->nodename, "feature-discard",
++			    "%d", state);
++	if (err)
++		xenbus_dev_error(dev, err, "writing feature-discard");
++}
++
+ /**
+  * Entry point to this code when a new device is created.  Allocate the basic
+  * structures, and watch the store waiting for the hotplug scripts to tell us
+@@ -443,6 +493,7 @@ again:
+ 
+ 	blkback_flush_diskcache(xbt, be, be->blkif->vbd.flush_support);
+ 	blkback_barrier(xbt, be, be->blkif->vbd.flush_support);
++	blkback_discard(xbt, be);
+ 
+ 	err = xenbus_printf(xbt, dev->nodename, "sectors", "%llu",
+ 			    vbd_size(&be->blkif->vbd));
