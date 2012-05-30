@@ -1,0 +1,159 @@
+From: Michal Hocko <mhocko@suse.cz>
+Subject: memcg: prevent from OOM with too many dirty pages
+Patch-mainline: no
+References: bnc#763198
+
+Current implementation of dirty pages throttling is not memcg aware which makes
+it easy to have LRUs full of dirty pages which might lead to memcg OOM if the
+hard limit is small and so the lists are scanned faster than pages written
+back.
+
+This patch fixes the problem by throttling the allocating process (possibly
+a writer) during the hard limit reclaim by waiting on PageReclaim pages.
+The solution is far from being ideal - long term solution is memcg aware
+dirty throttling - but it is meant to be a band aid until we have a real
+fix.
+We are seeing this happening during nightly backups which are placed into
+containers to prevent from eviction of the real working set.
+
+The change affects only memcg reclaim and only when we encounter PageReclaim
+pages which is a signal that the reclaim doesn't catch up on with the writers
+so somebody should be throttled. This could be potentially unfair because it
+could be somebody else from the group who gets throttled on behalf of the
+writer but as writers need to allocate as well and they allocate in higher rate
+the probability that only innocent processes would be penalized is not that
+high.
+
+I have tested this change by a simple dd copying /dev/zero to tmpfs or ext3
+running under small memcg (1G copy under 5M, 60M, 300M and 2G containers) and
+dd got killed by OOM killer every time. With the patch I could run the dd with
+the same size under 5M controller without any OOM.
+
+* With the patch 
+================
+* tmpfs size=2G
+---------------
+cuk:/home/mhocko # ./cgroup_cache_oom_test.sh 5M
+using Limit 5M for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 27.2763 s, 38.4 MB/s
+cuk:/home/mhocko # ./cgroup_cache_oom_test.sh 60M
+using Limit 60M for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 26.2362 s, 40.0 MB/s
+cuk:/home/mhocko # ./cgroup_cache_oom_test.sh 300M
+using Limit 300M for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 20.0147 s, 52.4 MB/s
+cuk:/home/mhocko # ./cgroup_cache_oom_test.sh 2G
+using Limit 2G for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 1.47723 s, 710 MB/s
+
+* ext3
+------
+cuk:/home/mhocko # ./cgroup_cache_oom_test.sh 5M
+using Limit 5M for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 29.1462 s, 36.0 MB/s
+cuk:/home/mhocko # ./cgroup_cache_oom_test.sh 60M
+using Limit 60M for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 28.7612 s, 36.5 MB/s
+cuk:/home/mhocko # ./cgroup_cache_oom_test.sh 300M
+using Limit 300M for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 31.6292 s, 33.2 MB/s
+cuk:/home/mhocko # ./cgroup_cache_oom_test.sh 2G
+using Limit 2G for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 3.20449 s, 327 MB/s
+
+* Without the patch
+===================
+* tmpfs size=2G
+---------------
+$ ./cgroup_cache_oom_test.sh 5M
+using Limit 5M for group
+./cgroup_cache_oom_test.sh: line 46:  4494 Killed                  dd if=/dev/zero of=$OUT/zero bs=1M count=$count
+$ ./cgroup_cache_oom_test.sh 60M
+using Limit 60M for group
+./cgroup_cache_oom_test.sh: line 46:  4497 Killed                  dd if=/dev/zero of=$OUT/zero bs=1M count=$count
+$ ./cgroup_cache_oom_test.sh 300M
+using Limit 300M for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 22.6703 s, 46.3 MB/s
+$ ./cgroup_cache_oom_test.sh 2G
+using Limit 2G for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 1.51596 s, 692 MB/s
+
+* ext3
+------
+$ ./cgroup_cache_oom_test.sh 5M
+using Limit 5M for group
+./cgroup_cache_oom_test.sh: line 46:  4522 Killed                  dd if=/dev/zero of=$OUT/zero bs=1M count=$count
+$ ./cgroup_cache_oom_test.sh 60M
+using Limit 60M for group
+./cgroup_cache_oom_test.sh: line 46:  4525 Killed                  dd if=/dev/zero of=$OUT/zero bs=1M count=$count
+$ ./cgroup_cache_oom_test.sh 300M
+using Limit 300M for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 20.567 s, 51.0 MB/s
+$ ./cgroup_cache_oom_test.sh 2G
+using Limit 2G for group
+1000+0 records in
+1000+0 records out
+1048576000 bytes (1.0 GB) copied, 3.30617 s, 317 MB/s
+
+
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+---
+ mm/vmscan.c |   17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+Index: linux-3.0-bnc763198/mm/vmscan.c
+===================================================================
+--- linux-3.0-bnc763198.orig/mm/vmscan.c
++++ linux-3.0-bnc763198/mm/vmscan.c
+@@ -776,6 +776,7 @@ static unsigned long shrink_page_list(st
+ 	unsigned long nr_dirty = 0;
+ 	unsigned long nr_congested = 0;
+ 	unsigned long nr_reclaimed = 0;
++	bool global_reclaim = scanning_global_lru(sc);
+ 
+ 	cond_resched();
+ 
+@@ -824,8 +825,20 @@ static unsigned long shrink_page_list(st
+ 			    may_enter_fs)
+ 				wait_on_page_writeback(page);
+ 			else {
+-				unlock_page(page);
+-				goto keep_lumpy;
++				/*
++				 * memcg doesn't have any dirty pages
++				 * throttling so we could easily OOM just
++				 * because too many pages are in writeback
++				 * from reclaim and there is nothing else to
++				 * reclaim.
++				 */
++				if (!global_reclaim && may_enter_fs
++						&& PageReclaim(page))
++					wait_on_page_writeback(page);
++				else {
++					unlock_page(page);
++					goto keep_lumpy;
++				}
+ 			}
+ 		}
+ 
