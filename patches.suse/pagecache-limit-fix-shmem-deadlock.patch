@@ -1,0 +1,92 @@
+From: Michal Hocko <mhocko@suse.cz>
+Subject: pagecache limit: Fix the shmem deadlock
+Patch-mainline: never
+References: bnc#755537
+
+shmem_getpage uses info->lock spinlock to make sure (among other things)
+that the shmem inode information is synchronized with the page cache
+status so we are calling add_to_page_cache_lru with the lock held.
+Unfortunately add_to_page_cache_lru calls add_to_page_cache which handles
+page cache limit and it might end up in the direct reclaim which in turn might
+sleep even though the given gfp_mask is GFP_NOWAIT so we end up sleeping
+in an atomic context -> kaboom.
+
+Let's fix this by enforcing that add_to_page_cache doesn't go into the reclaim
+if the gfp_mask says it should be atomic. Caller is then responsible for the
+shrinking and we are doing that when we preallocate a page for shmem. Other
+callers are not relying on GFP_NOWAIT when adding to page cache.
+
+I really do _hate_ abusing page (NULL) parameter but I was too lazy to 
+prepare a cleanup patch which would get rid of __shrink_page_cache and merge
+it with shrink_page_cache so we would get rid of the page argument which is
+of no use.
+
+Also be strict and BUG_ON when we get into __shrink_page_cache with an atomic
+gfp_mask.
+
+Please also note that this change might lead to a more extensive reclaim if we
+have more threads fighting for the same shmem page because then the shrinking
+is not linearized by the lock and so they might race with the limit evaluation
+and start reclaiming all at once. The risk is not that big though becase we
+would end up reclaiming NR_CPUs * over_limit pages at maximum.
+
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+
+Index: linux-3.0-SLE11-SP2/mm/filemap.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/mm/filemap.c
++++ linux-3.0-SLE11-SP2/mm/filemap.c
+@@ -495,7 +495,13 @@ int add_to_page_cache(struct page *page,
+ {
+ 	int error;
+ 
+-	if (unlikely(vm_pagecache_limit_mb) && pagecache_over_limit() > 0)
++	/* 
++	 * Make sure we are not going into reclaim if we are requiring
++	 * atomicity (e.g. shmem_getpage). The caller has to handle pagecache
++	 * limiting on its own.
++	 */
++	if (unlikely(vm_pagecache_limit_mb) && (gfp_mask & __GFP_WAIT) &&
++			pagecache_over_limit() > 0)
+ 		shrink_page_cache(gfp_mask, page);
+ 	/* FIXME: If we add dirty pages to pagecache here, and we call
+ 	 * shrink_page_cache(), it might need to write out some pages to
+Index: linux-3.0-SLE11-SP2/mm/shmem.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/mm/shmem.c
++++ linux-3.0-SLE11-SP2/mm/shmem.c
+@@ -1313,6 +1313,18 @@ repeat:
+ 	radix_tree_preload_end();
+ 
+ 	if (sgp != SGP_READ && !prealloc_page) {
++		/* 
++		 * try to shrink the page cache proactively even though
++		 * we might already have the page in so the shrinking is
++		 * not necessary but this is much easier than dropping 
++		 * the lock before add_to_page_cache_lru.
++		 * GFP_NOWAIT makes sure that we do not shrink when adding
++		 * to page cache
++		 */
++		if (unlikely(vm_pagecache_limit_mb) &&
++				pagecache_over_limit() > 0)
++			shrink_page_cache(GFP_KERNEL, NULL);
++
+ 		prealloc_page = shmem_alloc_page(gfp, info, idx);
+ 		if (prealloc_page) {
+ 			SetPageSwapBacked(prealloc_page);
+Index: linux-3.0-SLE11-SP2/mm/vmscan.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/mm/vmscan.c
++++ linux-3.0-SLE11-SP2/mm/vmscan.c
+@@ -3178,6 +3178,11 @@ static void __shrink_page_cache(gfp_t ma
+ 	struct reclaim_state *old_rs = current->reclaim_state;
+ 	long nr_pages;
+ 
++	/* We might sleep during direct reclaim so make atomic context
++	 * is certainly a bug.
++	 */
++	BUG_ON(!(mask & __GFP_WAIT));
++
+ 	/* How many pages are we over the limit?
+ 	 * But don't enforce limit if there's plenty of free mem */
+ 	nr_pages = pagecache_over_limit();

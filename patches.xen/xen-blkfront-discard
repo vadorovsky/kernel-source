@@ -1,0 +1,145 @@
+From: Li Dongyang <lidongyang@novell.com>
+Subject: blkfront: Handle discard requests
+References: fate#309305
+Patch-mainline: n/a
+
+If the backend advertises 'feature-discard', then interrogate the
+backend for alignment, granularity, and max discard block size. Setup
+the request queue with the appropiate values and send the discard
+operation as required.
+
+Signed-off-by: Li Dongyang <lidongyang@novell.com>
+
+--- sle11sp2.orig/drivers/xen/blkfront/blkfront.c	2012-04-05 09:44:44.000000000 +0200
++++ sle11sp2/drivers/xen/blkfront/blkfront.c	2012-03-19 12:11:00.000000000 +0100
+@@ -319,6 +319,32 @@ static void backend_changed(struct xenbu
+ 
+ /* ** Connection ** */
+ 
++static void blkfront_setup_discard(struct blkfront_info *info)
++{
++	int err;
++	char *type;
++	unsigned int discard_granularity;
++	unsigned int discard_alignment;
++
++	type = xenbus_read(XBT_NIL, info->xbdev->otherend, "type", NULL);
++	if (IS_ERR(type))
++		return;
++
++	if (strncmp(type, "phy", 3) == 0) {
++		err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
++			"discard-granularity", "%u", &discard_granularity,
++			"discard-alignment", "%u", &discard_alignment,
++			NULL);
++		if (!err) {
++			info->feature_discard = 1;
++			info->discard_granularity = discard_granularity;
++			info->discard_alignment = discard_alignment;
++		}
++	} else if (strncmp(type, "file", 4) == 0)
++		info->feature_discard = 1;
++
++	kfree(type);
++}
+ 
+ /*
+  * Invoked when the backend is finally 'ready' (and has told produced
+@@ -329,7 +355,7 @@ static void connect(struct blkfront_info
+ 	unsigned long long sectors;
+ 	unsigned long sector_size;
+ 	unsigned int binfo;
+-	int err, barrier, flush;
++	int err, barrier, flush, discard;
+ 
+ 	switch (info->connected) {
+ 	case BLKIF_STATE_CONNECTED:
+@@ -400,6 +426,12 @@ static void connect(struct blkfront_info
+ 		info->feature_flush = QUEUE_ORDERED_NONE;
+ #endif
+ 
++	err = xenbus_scanf(XBT_NIL, info->xbdev->otherend,
++			   "feature-discard", "%d", &discard);
++
++	if (err > 0 && discard)
++		blkfront_setup_discard(info);
++
+ 	err = xlvbd_add(sectors, info->vdevice, binfo, sector_size, info);
+ 	if (err) {
+ 		xenbus_dev_fatal(info->xbdev, err, "xlvbd_add at %s",
+@@ -725,9 +757,17 @@ static int blkif_queue_request(struct re
+ #endif
+ 		ring_req->operation = info->flush_op;
+ 
+-	ring_req->nr_segments = blk_rq_map_sg(req->q, req, info->sg);
+-	BUG_ON(ring_req->nr_segments > BLKIF_MAX_SEGMENTS_PER_REQUEST);
+-	for_each_sg(info->sg, sg, ring_req->nr_segments, i) {
++	if (unlikely(req->cmd_flags & REQ_DISCARD)) {
++		struct blkif_request_discard *discard = (void *)ring_req;
++
++		/* id, sector_number and handle are set above. */
++		discard->operation = BLKIF_OP_DISCARD;
++		discard->flag = 0;
++		discard->nr_sectors = blk_rq_sectors(req);
++	} else {
++		ring_req->nr_segments = blk_rq_map_sg(req->q, req, info->sg);
++		BUG_ON(ring_req->nr_segments > BLKIF_MAX_SEGMENTS_PER_REQUEST);
++		for_each_sg(info->sg, sg, ring_req->nr_segments, i) {
+ 			buffer_mfn = page_to_phys(sg_page(sg)) >> PAGE_SHIFT;
+ 			fsect = sg->offset >> 9;
+ 			lsect = fsect + (sg->length >> 9) - 1;
+@@ -747,6 +787,7 @@ static int blkif_queue_request(struct re
+ 					.gref       = ref,
+ 					.first_sect = fsect,
+ 					.last_sect  = lsect };
++		}
+ 	}
+ 
+ 	info->ring.req_prod_pvt++;
+@@ -881,6 +922,18 @@ static irqreturn_t blkif_int(int irq, vo
+ 
+ 			__blk_end_request_all(req, ret);
+ 			break;
++		case BLKIF_OP_DISCARD:
++			if (unlikely(bret->status == BLKIF_RSP_EOPNOTSUPP)) {
++				struct request_queue *rq = info->rq;
++
++				pr_warn("blkfront: %s: discard op failed\n",
++					info->gd->disk_name);
++				ret = -EOPNOTSUPP;
++				info->feature_discard = 0;
++				queue_flag_clear(QUEUE_FLAG_DISCARD, rq);
++			}
++			__blk_end_request_all(req, ret);
++			break;
+ 		default:
+ 			BUG();
+ 		}
+--- sle11sp2.orig/drivers/xen/blkfront/block.h	2012-04-05 09:30:22.000000000 +0200
++++ sle11sp2/drivers/xen/blkfront/block.h	2011-09-06 11:55:34.000000000 +0200
+@@ -114,6 +114,9 @@ struct blkfront_info
+ 	unsigned long shadow_free;
+ 	unsigned int feature_flush;
+ 	unsigned int flush_op;
++	unsigned int feature_discard;
++	unsigned int discard_granularity;
++	unsigned int discard_alignment;
+ 	int is_ready;
+ 
+ 	/**
+--- sle11sp2.orig/drivers/xen/blkfront/vbd.c	2012-04-05 09:30:24.000000000 +0200
++++ sle11sp2/drivers/xen/blkfront/vbd.c	2012-04-05 10:17:36.000000000 +0200
+@@ -306,6 +306,13 @@ xlvbd_init_blk_queue(struct gendisk *gd,
+ 	queue_flag_set_unlocked(QUEUE_FLAG_VIRT, rq);
+ #endif
+ 
++	if (info->feature_discard) {
++		queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, rq);
++		blk_queue_max_discard_sectors(rq, get_capacity(gd));
++		rq->limits.discard_granularity = info->discard_granularity;
++		rq->limits.discard_alignment = info->discard_alignment;
++	}
++
+ 	/* Hard sector size and max sectors impersonate the equiv. hardware. */
+ 	blk_queue_logical_block_size(rq, sector_size);
+ 	blk_queue_max_hw_sectors(rq, 512);
