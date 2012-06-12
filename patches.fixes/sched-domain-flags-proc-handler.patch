@@ -1,0 +1,148 @@
+Subject: sched: add SD_SHARE_PKG_RESOURCES domain flags proc handler
+From: Mike Galbraith <efault@gmx.de>
+Date: Tue Jun 12 06:14:01 CEST 2012
+Patch-mainline: not yet, submitted
+References: References: Scheduler enhancements for I7 (bnc#754690)
+
+Let the user turn select_idle_sibling() on/off again.
+
+518cd62 - sched: Only queue remote wakeups when crossing cache boundaries
+introduced sd_llc and used it in select_idle_sibling() to avoid pointer
+chasing, which had the unfortunate side-effect of removing the user's
+ability to turn select_idle_sibling() on/off via domain flags.  Add a
+simple proc handler to restore that capability.
+
+While rearrainging things to do this, rename ttwu_share_cache() to the
+much more sensible and generic mainline cpus_share_cache().
+
+Signed-off-by: Mike Galbraith <efault@gmx.de>
+Acked-by: Mike Galbraith <mgalbraith@suse.de>
+
+---
+ kernel/sched.c      |   60 ++++++++++++++++++++++++++++++++++++++++------------
+ kernel/sched_fair.c |    2 -
+ 2 files changed, 48 insertions(+), 14 deletions(-)
+
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -757,6 +757,9 @@ static inline struct sched_domain *highe
+ 	return hsd;
+ }
+ 
++DECLARE_PER_CPU(struct sched_domain *, sd_llc);
++DECLARE_PER_CPU(int, sd_llc_id);
++
+ #ifdef CONFIG_CGROUP_SCHED
+ 
+ /*
+@@ -2823,17 +2826,9 @@ static int ttwu_activate_remote(struct t
+ }
+ #endif /* __ARCH_WANT_INTERRUPTS_ON_CTXSW */
+ 
+-/*
+- * Keep a unique ID per domain (we use the first cpu number in
+- * the cpumask of the domain), this allows us to quickly tell if
+- * two cpus are in the same cache domain, see ttwu_share_cache().
+- */
+-DEFINE_PER_CPU(int, sd_top_spr_id);
+-
+-static inline int ttwu_share_cache(int this_cpu, int that_cpu)
++static inline int cpus_share_cache(int this_cpu, int that_cpu)
+ {
+-	return per_cpu(sd_top_spr_id, this_cpu) ==
+-		per_cpu(sd_top_spr_id, that_cpu);
++	return per_cpu(sd_llc_id, this_cpu) == per_cpu(sd_llc_id, that_cpu);
+ }
+ #endif /* CONFIG_SMP */
+ 
+@@ -2842,7 +2837,7 @@ static void ttwu_queue(struct task_struc
+ 	struct rq *rq = cpu_rq(cpu);
+ 
+ #if defined(CONFIG_SMP)
+-	if (sched_feat(TTWU_QUEUE) && !ttwu_share_cache(smp_processor_id(), cpu)) {
++	if (sched_feat(TTWU_QUEUE) && !cpus_share_cache(smp_processor_id(), cpu)) {
+ 		sched_clock_cpu(cpu); /* sync clocks x-cpu */
+ 		ttwu_queue_remote(p, cpu);
+ 		return;
+@@ -6538,6 +6533,32 @@ static struct ctl_table sd_ctl_root[] =
+ 	{}
+ };
+ 
++int domain_flags_handler(struct ctl_table *table, int write,
++		void __user *buffer, size_t *lenp,
++		loff_t *ppos)
++{
++	int ret, cpu;
++	struct sched_domain *sd;
++	static DEFINE_MUTEX(mutex);
++
++	mutex_lock(&mutex);
++	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
++
++	if (!ret && write) {
++		get_online_cpus();
++		rcu_read_lock();
++		for_each_cpu(cpu, cpu_online_mask) {
++			sd = highest_flag_domain(cpu, SD_SHARE_PKG_RESOURCES);
++			rcu_assign_pointer(per_cpu(sd_llc, cpu), sd);
++		}
++		rcu_read_unlock();
++		put_online_cpus();
++	}
++	mutex_unlock(&mutex);
++
++	return ret;
++}
++
+ static struct ctl_table *sd_alloc_ctl_entry(int n)
+ {
+ 	struct ctl_table *entry =
+@@ -6609,7 +6630,7 @@ sd_alloc_ctl_domain_table(struct sched_d
+ 		&sd->cache_nice_tries,
+ 		sizeof(int), 0644, proc_dointvec_minmax);
+ 	set_table_entry(&table[10], "flags", &sd->flags,
+-		sizeof(int), 0644, proc_dointvec_minmax);
++		sizeof(int), 0644, domain_flags_handler);
+ 	set_table_entry(&table[11], "name", sd->name,
+ 		CORENAME_MAX_SIZE, 0444, proc_dostring);
+ 	/* &table[12] is terminator */
+@@ -7140,6 +7161,18 @@ static void destroy_sched_domains(struct
+ 		destroy_sched_domain(sd, cpu);
+ }
+ 
++/*
++ * Keep a special pointer to the highest sched_domain that has
++ * SD_SHARE_PKG_RESOURCE set (Last Level Cache Domain) for this
++ * allows us to avoid some pointer chasing select_idle_sibling().
++ *
++ * Also keep a unique ID per domain (we use the first cpu number in
++ * the cpumask of the domain), this allows us to quickly tell if
++ * two cpus are in the same cache domain, see cpus_share_cache().
++ */
++DEFINE_PER_CPU(struct sched_domain *, sd_llc);
++DEFINE_PER_CPU(int, sd_llc_id);
++
+ static void update_top_cache_domain(int cpu)
+ {
+ 	struct sched_domain *sd;
+@@ -7149,7 +7182,8 @@ static void update_top_cache_domain(int
+ 	if (sd)
+ 		id = cpumask_first(sched_domain_span(sd));
+ 
+-	per_cpu(sd_top_spr_id, cpu) = id;
++	rcu_assign_pointer(per_cpu(sd_llc, cpu), sd);
++	per_cpu(sd_llc_id, cpu) = id;
+ }
+ 
+ /*
+--- a/kernel/sched_fair.c
++++ b/kernel/sched_fair.c
+@@ -2279,7 +2279,7 @@ static int select_idle_sibling(struct ta
+ 	/*
+ 	 * Otherwise, iterate the domains and find an elegible idle cpu.
+ 	 */
+-	sd = highest_flag_domain(target, SD_SHARE_PKG_RESOURCES);
++	sd = rcu_dereference(per_cpu(sd_llc, target));
+ 	for_each_lower_domain(sd) {
+ 		sg = sd->groups;
+ 		do {
