@@ -11,68 +11,121 @@ sets the device to 'faulty'. And as MD has to wait for
 the last I/O on the faulty device to finish we'll actually
 have to wait for two times the pre-defined timeout.
 
-So what we're doing now is setting a new stop flag
-DASD_STOPPED_TIMEOUT, which is getting removed after
-dasd_block_tasklet has run.
-This ensures that all requests have been flushed.
+To handle this I've introduced a new stop flag
+DASD_STOPPED_TIMEOUT, which is similar to QUIESCE,
+but only affects request with the FAILFAST bit set.
+There are two new ioctls 'BIODASDTIMEOUT' and
+'BIODASDRESYNC' for setting an removing this bit.
+The ioctl for setting the TIMEOUT flag will also
+terminate the first request on the device list,
+as this might already been stuck in a timeout.
+
+So whenever a timeout error is received by
+the application it can now set the TIMEOUT bit
+on all affected drives and ensure that all
+non-FAILFAST I/O is aborted on them.
+
+The application can then check with a
+non-FAILFAST I/O if the timeout condition
+persists and remove the TIMEOUT bit once
+the condition is gone.
 
 Signed-off-by: Hannes Reinecke <hare@suse.de>
 
+diff --git a/arch/s390/include/asm/dasd.h b/arch/s390/include/asm/dasd.h
+index 0be28ef..52cd02a 100644
+--- a/arch/s390/include/asm/dasd.h
++++ b/arch/s390/include/asm/dasd.h
+@@ -262,6 +262,10 @@ struct dasd_snid_ioctl_data {
+ #define BIODASDQUIESCE _IO(DASD_IOCTL_LETTER,6) 
+ /* Resume IO on device */
+ #define BIODASDRESUME  _IO(DASD_IOCTL_LETTER,7) 
++/* IO timeout on device */
++#define BIODASDTIMEOUT _IO(DASD_IOCTL_LETTER,240) 
++/* Resync IO on device */
++#define BIODASDRESYNC  _IO(DASD_IOCTL_LETTER,241) 
+ 
+ 
+ /* retrieve API version number */
 diff --git a/drivers/s390/block/dasd.c b/drivers/s390/block/dasd.c
-index 2119c66..170b366 100644
+index 2119c66..198aa27 100644
 --- a/drivers/s390/block/dasd.c
 +++ b/drivers/s390/block/dasd.c
-@@ -1396,7 +1396,11 @@ static void __dasd_device_start_head(struct dasd_device *device)
- 	if (device->stopped &&
- 	    !(!(device->stopped & ~(DASD_STOPPED_DC_WAIT | DASD_UNRESUMED_PM))
- 	      && test_bit(DASD_CQR_VERIFY_PATH, &cqr->flags))) {
--		cqr->intrc = -EAGAIN;
-+		if (device->stopped & DASD_STOPPED_TIMEOUT) {
-+			cqr->retries = -1;
-+			cqr->intrc = -ETIMEDOUT;
-+		} else
-+			cqr->intrc = -EAGAIN;
- 		cqr->status = DASD_CQR_CLEARED;
- 		dasd_schedule_device_bh(device);
- 		return;
-@@ -1944,6 +1948,13 @@ static void __dasd_process_request_queue(struct dasd_block *block)
- 			__blk_end_request_all(req, -EIO);
- 			continue;
- 		}
-+		if ((basedev->stopped & DASD_STOPPED_TIMEOUT) &&
-+		    (basedev->features & DASD_FEATURE_FAILFAST) &&
-+		    blk_noretry_request(req)) {
-+			blk_start_request(req);
-+			__blk_end_request_all(req, -ETIMEDOUT);
-+			continue;
-+		}
- 		cqr = basedev->discipline->build_cp(basedev, block, req);
- 		if (IS_ERR(cqr)) {
- 			if (PTR_ERR(cqr) == -EBUSY)
-@@ -2089,8 +2100,11 @@ static void __dasd_block_start_head(struct dasd_block *block)
+@@ -1382,6 +1382,7 @@ static void __dasd_device_check_expire(struct dasd_device *device)
+ static void __dasd_device_start_head(struct dasd_device *device)
  {
  	struct dasd_ccw_req *cqr;
++	struct request *req = NULL;
+ 	int rc;
  
--	if (list_empty(&block->ccw_queue))
-+	if (list_empty(&block->ccw_queue)) {
-+		dasd_device_remove_stop_bits(block->base, DASD_STOPPED_TIMEOUT);
+ 	if (list_empty(&device->ccw_queue))
+@@ -1393,7 +1394,7 @@ static void __dasd_device_start_head(struct dasd_device *device)
+ 	 * exception: only the disconnect or unresumed bits are set and the
+ 	 * cqr is a path verification request
+ 	 */
+-	if (device->stopped &&
++	if ((device->stopped  & ~DASD_STOPPED_TIMEOUT) &&
+ 	    !(!(device->stopped & ~(DASD_STOPPED_DC_WAIT | DASD_UNRESUMED_PM))
+ 	      && test_bit(DASD_CQR_VERIFY_PATH, &cqr->flags))) {
+ 		cqr->intrc = -EAGAIN;
+@@ -1402,6 +1403,25 @@ static void __dasd_device_start_head(struct dasd_device *device)
  		return;
+ 	}
+ 
++	/* If the device is stopped due to a timeout
++	 * return all failfast requests to the previous layer.
++	 */
++	if (cqr->callback_data &&
++	    cqr->callback_data != DASD_SLEEPON_END_TAG &&
++	    cqr->callback_data != DASD_SLEEPON_START_TAG)
++		req = cqr->callback_data;
++
++	if ((device->stopped & DASD_STOPPED_TIMEOUT) &&
++	    req && blk_noretry_request(req)) {
++		DBF_DEV_EVENT(DBF_NOTICE, device,
++			      "timeout, not starting I/O on cqr %p", cqr);
++		cqr->retries = -1;
++		cqr->intrc = -ETIMEDOUT;
++		cqr->status = DASD_CQR_CLEARED;
++		dasd_schedule_device_bh(device);
++		return;
 +	}
 +
- 	/* We allways begin with the first requests on the queue, as some
- 	 * of previously started requests have to be enqueued on a
- 	 * dasd_device again for error recovery.
-@@ -2110,12 +2124,16 @@ static void __dasd_block_start_head(struct dasd_block *block)
+ 	rc = device->discipline->start_IO(cqr);
+ 	if (rc == 0)
+ 		dasd_device_set_timer(device, cqr->expires);
+@@ -2105,8 +2125,29 @@ static void __dasd_block_start_head(struct dasd_block *block)
+ 			dasd_schedule_block_bh(block);
+ 			continue;
+ 		}
++		/*
++		 * Terminate noretry requests when TIMEOUT is set
++		 */
++		if (block->base->stopped & DASD_STOPPED_TIMEOUT) {
++			struct request *req = NULL;
++
++			if (cqr->callback_data &&
++			    cqr->callback_data != DASD_SLEEPON_END_TAG &&
++			    cqr->callback_data != DASD_SLEEPON_START_TAG)
++				req = cqr->callback_data;
++			if (req && blk_noretry_request(req)) {
++				DBF_DEV_EVENT(DBF_NOTICE, block->base,
++					      "timeout, not queueing cqr %p",
++					      cqr);
++				cqr->status = DASD_CQR_FAILED;
++				cqr->retries = -1;
++				cqr->intrc = -ETIMEDOUT;
++				dasd_schedule_block_bh(block);
++				continue;
++			}
++		}
+ 		/* Non-temporary stop condition will trigger fail fast */
+-		if (block->base->stopped & ~DASD_STOPPED_PENDING &&
++		if (block->base->stopped & ~(DASD_STOPPED_PENDING | DASD_STOPPED_TIMEOUT) &&
  		    test_bit(DASD_CQR_FLAGS_FAILFAST, &cqr->flags) &&
  		    (!dasd_eer_enabled(block->base))) {
  			cqr->status = DASD_CQR_FAILED;
--			cqr->intrc = -ENOLINK;
-+			if (block->base->stopped & DASD_STOPPED_TIMEOUT) {
-+				cqr->retries = -1;
-+				cqr->intrc = -ETIMEDOUT;
-+			} else
-+				cqr->intrc = -ENOLINK;
- 			dasd_schedule_block_bh(block);
+@@ -2115,7 +2156,7 @@ static void __dasd_block_start_head(struct dasd_block *block)
  			continue;
  		}
  		/* Don't try to start requests if device is stopped */
@@ -81,22 +134,29 @@ index 2119c66..170b366 100644
  			return;
  
  		/* just a fail safe check, should not happen */
-@@ -2127,6 +2145,7 @@ static void __dasd_block_start_head(struct dasd_block *block)
+@@ -2280,7 +2321,7 @@ enum blk_eh_timer_return dasd_times_out(struct request *req)
+ 	if (!cqr)
+ 		return BLK_EH_NOT_HANDLED;
  
- 		dasd_add_request_tail(cqr);
- 	}
-+	dasd_device_remove_stop_bits(block->base, DASD_STOPPED_TIMEOUT);
- }
+-	if (!test_bit(DASD_CQR_FLAGS_FAILFAST, &cqr->flags))
++	if (!blk_noretry_request(req))
+ 		return BLK_EH_RESET_TIMER;
  
- /*
-@@ -2292,6 +2311,7 @@ enum blk_eh_timer_return dasd_times_out(struct request *req)
- 	spin_lock(get_ccwdev_lock(device->cdev));
- 	cqr->retries = -1;
- 	cqr->intrc = -ETIMEDOUT;
-+	dasd_device_set_stop_bits(device, DASD_STOPPED_TIMEOUT);
- 	spin_unlock(get_ccwdev_lock(device->cdev));
- 	if (cqr->status >= DASD_CQR_QUEUED) {
- 		rc = dasd_cancel_req(cqr);
+ 	device = cqr->startdev ? cqr->startdev : block->base;
+diff --git a/drivers/s390/block/dasd_alias.c b/drivers/s390/block/dasd_alias.c
+index b3beed5..e4e3f65 100644
+--- a/drivers/s390/block/dasd_alias.c
++++ b/drivers/s390/block/dasd_alias.c
+@@ -674,7 +674,8 @@ struct dasd_device *dasd_alias_get_start_dev(struct dasd_device *base_device)
+ 					       struct dasd_device, alias_list);
+ 	spin_unlock_irqrestore(&lcu->lock, flags);
+ 	alias_priv = (struct dasd_eckd_private *) alias_device->private;
+-	if ((alias_priv->count < private->count) && !alias_device->stopped)
++	if ((alias_priv->count < private->count) &&
++	    !(alias_device->stopped & ~DASD_STOPPED_TIMEOUT))
+ 		return alias_device;
+ 	else
+ 		return NULL;
 diff --git a/drivers/s390/block/dasd_int.h b/drivers/s390/block/dasd_int.h
 index bd48b60..de9e30d 100644
 --- a/drivers/s390/block/dasd_int.h
@@ -109,3 +169,87 @@ index bd48b60..de9e30d 100644
  
  /* per device flags */
  #define DASD_FLAG_OFFLINE	3	/* device is in offline processing */
+diff --git a/drivers/s390/block/dasd_ioctl.c b/drivers/s390/block/dasd_ioctl.c
+index 9caeaea5..d93bfe1 100644
+--- a/drivers/s390/block/dasd_ioctl.c
++++ b/drivers/s390/block/dasd_ioctl.c
+@@ -141,6 +141,66 @@ static int dasd_ioctl_resume(struct dasd_block *block)
+ }
+ 
+ /*
++ * Timeout device.
++ */
++static int dasd_ioctl_timeout(struct dasd_block *block)
++{
++	unsigned long flags;
++	struct dasd_device *base;
++	struct dasd_ccw_req *cqr, *n;
++	struct request *req;
++
++	base = block->base;
++	if (!capable (CAP_SYS_ADMIN))
++		return -EACCES;
++
++	spin_lock_irqsave(&block->request_queue_lock, flags);
++	spin_lock(get_ccwdev_lock(base->cdev));
++	dasd_device_set_stop_bits(base, DASD_STOPPED_TIMEOUT);
++	/*
++	 * We need to abort all noretry requests as they might
++	 * be stuck in a timeout. But we need to drop the
++	 * lock before calling blk_abort_request() as it'll
++	 * call dasd_times_out() directly.
++	 */
++	list_for_each_entry_safe(cqr, n, &base->ccw_queue, devlist) {
++		if (cqr->callback_data &&
++		    cqr->callback_data != (void *)1 &&
++		    cqr->callback_data != (void *)2 )
++			req = cqr->callback_data;
++		else
++			req = NULL;
++		if (req && blk_noretry_request(req)) {
++			spin_unlock(get_ccwdev_lock(base->cdev));
++			blk_abort_request(req);
++			spin_lock(get_ccwdev_lock(base->cdev));
++		}
++	}
++	spin_unlock(get_ccwdev_lock(base->cdev));
++	spin_unlock_irqrestore(&block->request_queue_lock, flags);
++
++	return 0;
++}
++
++/*
++ * Resync a device
++ */
++static int dasd_ioctl_resync(struct dasd_block *block)
++{
++	unsigned long flags;
++	struct dasd_device *base;
++
++	base = block->base;
++	if (!capable (CAP_SYS_ADMIN))
++		return -EACCES;
++
++	spin_lock_irqsave(get_ccwdev_lock(base->cdev), flags);
++	dasd_device_remove_stop_bits(base, DASD_STOPPED_TIMEOUT);
++	spin_unlock_irqrestore(get_ccwdev_lock(base->cdev), flags);
++	return 0;
++}
++
++/*
+  * performs formatting of _device_ according to _fdata_
+  * Note: The discipline's format_function is assumed to deliver formatting
+  * commands to format a single unit of the device. In terms of the ECKD
+@@ -433,6 +493,12 @@ int dasd_ioctl(struct block_device *bdev, fmode_t mode,
+ 	case BIODASDRESUME:
+ 		rc = dasd_ioctl_resume(block);
+ 		break;
++	case BIODASDTIMEOUT:
++		rc = dasd_ioctl_timeout(block);
++		break;
++	case BIODASDRESYNC:
++		rc = dasd_ioctl_resync(block);
++		break;
+ 	case BIODASDFMT:
+ 		rc = dasd_ioctl_format(bdev, argp);
+ 		break;
