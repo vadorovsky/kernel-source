@@ -1,0 +1,218 @@
+From: Chris Mason <chris.mason@oracle.com>
+Date: Sun, 6 May 2012 07:23:47 -0400
+Patch-mainline: yes
+References: FATE#306586
+Git-commit: b9fab919b748c7b39c19ff236ed6c5682c266dde
+Subject: [PATCH] Btrfs: avoid sleeping in verify_parent_transid while
+ atomic
+
+verify_parent_transid needs to lock the extent range to make
+sure no IO is underway, and so it can safely clear the
+uptodate bits if our checks fail.
+
+But, a few callers are using it with spinlocks held.  Most
+of the time, the generation numbers are going to match, and
+we don't want to switch to a blocking lock just for the error
+case.  This adds an atomic flag to verify_parent_transid,
+and changes it to return EAGAIN if it needs to block to
+properly verifiy things.
+
+Signed-off-by: Chris Mason <chris.mason@oracle.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/ctree.c       |   26 +++++++++++++++++---------
+ fs/btrfs/disk-io.c     |   19 +++++++++++++------
+ fs/btrfs/disk-io.h     |    3 ++-
+ fs/btrfs/extent-tree.c |    2 +-
+ fs/btrfs/tree-log.c    |    2 +-
+ 5 files changed, 34 insertions(+), 18 deletions(-)
+
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@ -712,7 +712,7 @@ int btrfs_realloc_node(struct btrfs_tran
+ 
+ 		cur = btrfs_find_tree_block(root, blocknr, blocksize);
+ 		if (cur)
+-			uptodate = btrfs_buffer_uptodate(cur, gen);
++			uptodate = btrfs_buffer_uptodate(cur, gen, 0);
+ 		else
+ 			uptodate = 0;
+ 		if (!cur || !uptodate) {
+@@ -1347,7 +1347,12 @@ static noinline int reada_for_balance(st
+ 		block1 = btrfs_node_blockptr(parent, slot - 1);
+ 		gen = btrfs_node_ptr_generation(parent, slot - 1);
+ 		eb = btrfs_find_tree_block(root, block1, blocksize);
+-		if (eb && btrfs_buffer_uptodate(eb, gen))
++		/*
++		 * if we get -eagain from btrfs_buffer_uptodate, we
++		 * don't want to return eagain here.  That will loop
++		 * forever
++		 */
++		if (eb && btrfs_buffer_uptodate(eb, gen, 1) != 0)
+ 			block1 = 0;
+ 		free_extent_buffer(eb);
+ 	}
+@@ -1355,7 +1360,7 @@ static noinline int reada_for_balance(st
+ 		block2 = btrfs_node_blockptr(parent, slot + 1);
+ 		gen = btrfs_node_ptr_generation(parent, slot + 1);
+ 		eb = btrfs_find_tree_block(root, block2, blocksize);
+-		if (eb && btrfs_buffer_uptodate(eb, gen))
++		if (eb && btrfs_buffer_uptodate(eb, gen, 1) != 0)
+ 			block2 = 0;
+ 		free_extent_buffer(eb);
+ 	}
+@@ -1493,8 +1498,9 @@ read_block_for_search(struct btrfs_trans
+ 
+ 	tmp = btrfs_find_tree_block(root, blocknr, blocksize);
+ 	if (tmp) {
+-		if (btrfs_buffer_uptodate(tmp, 0)) {
+-			if (btrfs_buffer_uptodate(tmp, gen)) {
++		/* first we do an atomic uptodate check */
++		if (btrfs_buffer_uptodate(tmp, 0, 1) > 0) {
++			if (btrfs_buffer_uptodate(tmp, gen, 1) > 0) {
+ 				/*
+ 				 * we found an up to date block without
+ 				 * sleeping, return
+@@ -1512,8 +1518,9 @@ read_block_for_search(struct btrfs_trans
+ 			free_extent_buffer(tmp);
+ 			btrfs_set_path_blocking(p);
+ 
++			/* now we're allowed to do a blocking uptodate check */
+ 			tmp = read_tree_block(root, blocknr, blocksize, gen);
+-			if (tmp && btrfs_buffer_uptodate(tmp, gen)) {
++			if (tmp && btrfs_buffer_uptodate(tmp, gen, 0) > 0) {
+ 				*eb_ret = tmp;
+ 				return 0;
+ 			}
+@@ -1548,7 +1555,7 @@ read_block_for_search(struct btrfs_trans
+ 		 * and give up so that our caller doesn't loop forever
+ 		 * on our EAGAINs.
+ 		 */
+-		if (!btrfs_buffer_uptodate(tmp, 0))
++		if (!btrfs_buffer_uptodate(tmp, 0, 0))
+ 			ret = -EIO;
+ 		free_extent_buffer(tmp);
+ 	}
+@@ -3996,7 +4003,7 @@ again:
+ 			tmp = btrfs_find_tree_block(root, blockptr,
+ 					    btrfs_level_size(root, level - 1));
+ 
+-			if (tmp && btrfs_buffer_uptodate(tmp, gen)) {
++			if (tmp && btrfs_buffer_uptodate(tmp, gen, 1) > 0) {
+ 				free_extent_buffer(tmp);
+ 				break;
+ 			}
+@@ -4119,7 +4126,8 @@ next:
+ 				struct extent_buffer *cur;
+ 				cur = btrfs_find_tree_block(root, blockptr,
+ 					    btrfs_level_size(root, level - 1));
+-				if (!cur || !btrfs_buffer_uptodate(cur, gen)) {
++				if (!cur ||
++				    btrfs_buffer_uptodate(cur, gen, 1) <= 0) {
+ 					slot++;
+ 					if (cur)
+ 						free_extent_buffer(cur);
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -322,7 +322,8 @@ static int csum_tree_block(struct btrfs_
+  * in the wrong place.
+  */
+ static int verify_parent_transid(struct extent_io_tree *io_tree,
+-				 struct extent_buffer *eb, u64 parent_transid)
++				 struct extent_buffer *eb, u64 parent_transid,
++				 int atomic)
+ {
+ 	struct extent_state *cached_state = NULL;
+ 	int ret;
+@@ -330,6 +331,9 @@ static int verify_parent_transid(struct
+ 	if (!parent_transid || btrfs_header_generation(eb) == parent_transid)
+ 		return 0;
+ 
++	if (atomic)
++		return -EAGAIN;
++
+ 	lock_extent_bits(io_tree, eb->start, eb->start + eb->len - 1,
+ 			 0, &cached_state);
+ 	if (extent_buffer_uptodate(io_tree, eb, cached_state) &&
+@@ -370,7 +374,7 @@ static int btree_read_extent_buffer_page
+ 					       WAIT_COMPLETE,
+ 					       btree_get_extent, mirror_num);
+ 		if (!ret &&
+-		    !verify_parent_transid(io_tree, eb, parent_transid))
++		    !verify_parent_transid(io_tree, eb, parent_transid, 0))
+ 			return ret;
+ 
+ 		/*
+@@ -1249,7 +1253,7 @@ static int __must_check find_and_setup_r
+ 	root->commit_root = NULL;
+ 	root->node = read_tree_block(root, btrfs_root_bytenr(&root->root_item),
+ 				     blocksize, generation);
+-	if (!root->node || !btrfs_buffer_uptodate(root->node, generation)) {
++	if (!root->node || !btrfs_buffer_uptodate(root->node, generation, 0)) {
+ 		free_extent_buffer(root->node);
+ 		root->node = NULL;
+ 		return -EIO;
+@@ -1400,7 +1404,7 @@ struct btrfs_root *btrfs_read_fs_root_no
+ 	blocksize = btrfs_level_size(root, btrfs_root_level(&root->root_item));
+ 	root->node = read_tree_block(root, btrfs_root_bytenr(&root->root_item),
+ 				     blocksize, generation);
+-	if (!root->node || !btrfs_buffer_uptodate(root->node, generation)) {
++	if (!root->node || !btrfs_buffer_uptodate(root->node, generation, 0)) {
+ 		ret = -EIO;
+ 		goto error;
+ 	}
+@@ -3199,7 +3203,8 @@ int close_ctree(struct btrfs_root *root)
+ 	return 0;
+ }
+ 
+-int btrfs_buffer_uptodate(struct extent_buffer *buf, u64 parent_transid)
++int btrfs_buffer_uptodate(struct extent_buffer *buf, u64 parent_transid,
++			  int atomic)
+ {
+ 	int ret;
+ 	struct inode *btree_inode = buf->first_page->mapping->host;
+@@ -3210,7 +3215,9 @@ int btrfs_buffer_uptodate(struct extent_
+ 		return ret;
+ 
+ 	ret = verify_parent_transid(&BTRFS_I(btree_inode)->io_tree, buf,
+-				    parent_transid);
++				    parent_transid, atomic);
++	if (ret == -EAGAIN)
++		return ret;
+ 	return !ret;
+ }
+ 
+--- a/fs/btrfs/disk-io.h
++++ b/fs/btrfs/disk-io.h
+@@ -66,7 +66,8 @@ void btrfs_btree_balance_dirty(struct bt
+ void __btrfs_btree_balance_dirty(struct btrfs_root *root, unsigned long nr);
+ void btrfs_free_fs_root(struct btrfs_fs_info *fs_info, struct btrfs_root *root);
+ void btrfs_mark_buffer_dirty(struct extent_buffer *buf);
+-int btrfs_buffer_uptodate(struct extent_buffer *buf, u64 parent_transid);
++int btrfs_buffer_uptodate(struct extent_buffer *buf, u64 parent_transid,
++			  int atomic);
+ int btrfs_set_buffer_uptodate(struct extent_buffer *buf);
+ int btrfs_read_buffer(struct extent_buffer *buf, u64 parent_transid);
+ u32 btrfs_csum_data(struct btrfs_root *root, char *data, u32 seed, size_t len);
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -6689,7 +6689,7 @@ static noinline int do_walk_down(struct
+ 			goto skip;
+ 	}
+ 
+-	if (!btrfs_buffer_uptodate(next, generation)) {
++	if (!btrfs_buffer_uptodate(next, generation, 0)) {
+ 		btrfs_tree_unlock(next);
+ 		free_extent_buffer(next);
+ 		next = NULL;
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -279,7 +279,7 @@ static int process_one_buffer(struct btr
+ 						log->fs_info->extent_root,
+ 						eb->start, eb->len);
+ 
+-	if (btrfs_buffer_uptodate(eb, gen)) {
++	if (btrfs_buffer_uptodate(eb, gen, 0)) {
+ 		if (wc->write)
+ 			btrfs_write_tree_block(eb);
+ 		if (wc->wait)
