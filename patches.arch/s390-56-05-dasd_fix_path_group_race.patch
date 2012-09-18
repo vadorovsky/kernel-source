@@ -1,0 +1,140 @@
+Subject: dasd: System hang after all channel were lost.
+From: Stefan Haberland <stefan.haberland@de.ibm.com>
+Patch-mainline: not yet, IBM has not submitted
+References: bnc#780012,LTC#85025
+
+Symptom:      After all channel to a device were lost the system hangs or 
+              a device is unaccessible even if channel paths are available
+              again.
+Problem:      If a new path is available we need to verify the path data.
+              If it is the first path for a device the stop bits are removed 
+              after path verification.
+              If a pathgroup is established we need to set system
+              characteristics for the lcu. Therefor IO has to be started.
+              If the device is stopped the set system characteristics worker
+              may block the path verification worker and the device is blocked.
+Solution:     Turn on failfast for set system characteristics CQR to prevent a
+              deadlock with the path verification worker.
+Reproduction: Switch on and off channel paths to a device.
+
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/block/dasd.c      |   10 ++++++++++
+ drivers/s390/block/dasd_eckd.c |   32 +++++++++++++++++++++++++-------
+ 2 files changed, 35 insertions(+), 7 deletions(-)
+
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -2877,6 +2877,16 @@ void dasd_generic_path_event(struct ccw_
+ 			dasd_schedule_device_bh(device);
+ 		}
+ 		if (path_event[chp] & PE_PATHGROUP_ESTABLISHED) {
++			if (!(device->path_data.opm & eventlpm) &&
++			    !(device->path_data.tbvpm & eventlpm)) {
++				/*
++				 * we can not establish a pathgroup on an
++				 * unavailable path, so trigger a path
++				 * verification first
++				 */
++				device->path_data.tbvpm |= eventlpm;
++				dasd_schedule_device_bh(device);
++			}
+ 			DBF_DEV_EVENT(DBF_WARNING, device, "%s",
+ 				      "Pathgroup re-established\n");
+ 			if (device->discipline->kick_validate)
+--- a/drivers/s390/block/dasd_eckd.c
++++ b/drivers/s390/block/dasd_eckd.c
+@@ -1306,7 +1306,8 @@ static struct dasd_ccw_req *dasd_eckd_bu
+  * call might change behaviour of DASD devices.
+  */
+ static int
+-dasd_eckd_psf_ssc(struct dasd_device *device, int enable_pav)
++dasd_eckd_psf_ssc(struct dasd_device *device, int enable_pav,
++		  unsigned long flags)
+ {
+ 	struct dasd_ccw_req *cqr;
+ 	int rc;
+@@ -1315,10 +1316,19 @@ dasd_eckd_psf_ssc(struct dasd_device *de
+ 	if (IS_ERR(cqr))
+ 		return PTR_ERR(cqr);
+ 
++	/*
++	 * set flags e.g. turn on failfast, to prevent blocking
++	 * the calling function should handle failed requests
++	 */
++	cqr->flags |= flags;
++
+ 	rc = dasd_sleep_on(cqr);
+ 	if (!rc)
+ 		/* trigger CIO to reprobe devices */
+ 		css_schedule_reprobe();
++	else if (cqr->intrc == -ENOLINK)
++		rc = -EAGAIN;
++
+ 	dasd_sfree_request(cqr, cqr->memdev);
+ 	return rc;
+ }
+@@ -1326,7 +1336,8 @@ dasd_eckd_psf_ssc(struct dasd_device *de
+ /*
+  * Valide storage server of current device.
+  */
+-static void dasd_eckd_validate_server(struct dasd_device *device)
++static int dasd_eckd_validate_server(struct dasd_device *device,
++				     unsigned long flags)
+ {
+ 	int rc;
+ 	struct dasd_eckd_private *private;
+@@ -1335,17 +1346,18 @@ static void dasd_eckd_validate_server(st
+ 	private = (struct dasd_eckd_private *) device->private;
+ 	if (private->uid.type == UA_BASE_PAV_ALIAS ||
+ 	    private->uid.type == UA_HYPER_PAV_ALIAS)
+-		return;
++		return 0;
+ 	if (dasd_nopav || MACHINE_IS_VM)
+ 		enable_pav = 0;
+ 	else
+ 		enable_pav = 1;
+-	rc = dasd_eckd_psf_ssc(device, enable_pav);
++	rc = dasd_eckd_psf_ssc(device, enable_pav, flags);
+ 
+ 	/* may be requested feature is not available on server,
+ 	 * therefore just report error and go ahead */
+ 	DBF_EVENT_DEVID(DBF_WARNING, device->cdev, "PSF-SSC for SSID %04x "
+ 			"returned rc=%d", private->uid.ssid, rc);
++	return rc;
+ }
+ 
+ /*
+@@ -1355,7 +1367,13 @@ static void dasd_eckd_do_validate_server
+ {
+ 	struct dasd_device *device = container_of(work, struct dasd_device,
+ 						  kick_validate);
+-	dasd_eckd_validate_server(device);
++	if (dasd_eckd_validate_server(device, DASD_CQR_FLAGS_FAILFAST)
++	    == -EAGAIN) {
++		/* schedule worker again if failed */
++		schedule_work(&device->kick_validate);
++		return;
++	}
++
+ 	dasd_put_device(device);
+ }
+ 
+@@ -1492,7 +1510,7 @@ dasd_eckd_check_characteristics(struct d
+ 	if (rc)
+ 		goto out_err2;
+ 
+-	dasd_eckd_validate_server(device);
++	dasd_eckd_validate_server(device, 0);
+ 
+ 	/* device may report different configuration data after LCU setup */
+ 	rc = dasd_eckd_read_conf(device);
+@@ -3963,7 +3981,7 @@ static int dasd_eckd_restore_device(stru
+ 	rc = dasd_alias_make_device_known_to_lcu(device);
+ 	if (rc)
+ 		return rc;
+-	dasd_eckd_validate_server(device);
++	dasd_eckd_validate_server(device, DASD_CQR_FLAGS_FAILFAST);
+ 
+ 	/* RE-Read Configuration Data */
+ 	rc = dasd_eckd_read_conf(device);
