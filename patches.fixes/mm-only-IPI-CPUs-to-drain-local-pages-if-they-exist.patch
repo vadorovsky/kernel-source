@@ -1,0 +1,128 @@
+From: Gilad Ben-Yossef <gilad@benyossef.com>
+Date: Wed, 28 Mar 2012 14:42:45 -0700
+Subject: [PATCH] mm: only IPI CPUs to drain local pages if they exist
+
+References: Page allocator performance
+Patch-mainline: Yes (v3.4)
+Git-commit: 74046494ea68676d29ef6501a4bd950f08112a2c
+
+Calculate a cpumask of CPUs with per-cpu pages in any zone and only send
+an IPI requesting CPUs to drain these pages to the buddy allocator if they
+actually have pages when asked to flush.
+
+This patch saves 85%+ of IPIs asking to drain per-cpu pages in case of
+severe memory pressure that leads to OOM since in these cases multiple,
+possibly concurrent, allocation requests end up in the direct reclaim code
+path so when the per-cpu pages end up reclaimed on first allocation
+failure for most of the proceeding allocation attempts until the memory
+pressure is off (possibly via the OOM killer) there are no per-cpu pages
+on most CPUs (and there can easily be hundreds of them).
+
+This also has the side effect of shortening the average latency of direct
+reclaim by 1 or more order of magnitude since waiting for all the CPUs to
+ACK the IPI takes a long time.
+
+Tested by running "hackbench 400" on a 8 CPU x86 VM and observing the
+difference between the number of direct reclaim attempts that end up in
+drain_all_pages() and those were more then 1/2 of the online CPU had any
+per-cpu page in them, using the vmstat counters introduced in the next
+patch in the series and using proc/interrupts.
+
+In the test sceanrio, this was seen to save around 3600 global
+IPIs after trigerring an OOM on a concurrent workload:
+
+$ cat /proc/vmstat | tail -n 2
+pcp_global_drain 0
+pcp_global_ipi_saved 0
+
+$ cat /proc/interrupts | grep CAL
+CAL:          1          2          1          2
+          2          2          2          2   Function call interrupts
+
+$ hackbench 400
+[OOM messages snipped]
+
+$ cat /proc/vmstat | tail -n 2
+pcp_global_drain 3647
+pcp_global_ipi_saved 3642
+
+$ cat /proc/interrupts | grep CAL
+CAL:          6         13          6          3
+          3          3         1 2          7   Function call interrupts
+
+Please note that if the global drain is removed from the direct reclaim
+path as a patch from Mel Gorman currently suggests this should be replaced
+with an on_each_cpu_cond invocation.
+
+Signed-off-by: Gilad Ben-Yossef <gilad@benyossef.com>
+Acked-by: Mel Gorman <mgorman@suse.de>
+Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+Acked-by: Christoph Lameter <cl@linux.com>
+Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: Rik van Riel <riel@redhat.com>
+Cc: Andi Kleen <andi@firstfloor.org>
+Acked-by: Michal Nazarewicz <mina86@mina86.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ mm/page_alloc.c |   41 +++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 3b3d0c0..7ce4c32 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1125,12 +1125,49 @@ void drain_local_pages(void *arg)
+ }
+ 
+ /*
+- * Spill all the per-cpu pages from all CPUs back into the buddy allocator
++ * Spill all the per-cpu pages from all CPUs back into the buddy allocator.
++ *
++ * Note that this code is protected against sending an IPI to an offline
++ * CPU but does not guarantee sending an IPI to newly hotplugged CPUs:
++ * on_each_cpu_mask() blocks hotplug and won't talk to offlined CPUs but
++ * nothing keeps CPUs from showing up after we populated the cpumask and
++ * before the call to on_each_cpu_mask().
+  */
+ void drain_all_pages(void)
+ {
++	int cpu;
++	struct per_cpu_pageset *pcp;
++	struct zone *zone;
++
++	/*
++	 * Allocate in the BSS so we wont require allocation in
++	 * direct reclaim path for CONFIG_CPUMASK_OFFSTACK=y
++	 */
++	static cpumask_t cpus_with_pcps;
++
+ 	get_online_cpus();
+-	on_each_cpu(drain_local_pages, NULL, 1);
++
++	/*
++	 * We don't care about racing with CPU hotplug event
++	 * as offline notification will cause the notified
++	 * cpu to drain that CPU pcps and on_each_cpu_mask
++	 * disables preemption as part of its processing
++	 */
++	for_each_online_cpu(cpu) {
++		bool has_pcps = false;
++		for_each_populated_zone(zone) {
++			pcp = per_cpu_ptr(zone->pageset, cpu);
++			if (pcp->pcp.count) {
++				has_pcps = true;
++				break;
++			}
++		}
++		if (has_pcps)
++			cpumask_set_cpu(cpu, &cpus_with_pcps);
++		else
++			cpumask_clear_cpu(cpu, &cpus_with_pcps);
++	}
++	on_each_cpu_mask(&cpus_with_pcps, drain_local_pages, NULL, 1);
+ 	put_online_cpus();
+ }
+ 
