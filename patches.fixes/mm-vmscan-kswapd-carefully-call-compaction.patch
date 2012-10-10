@@ -1,0 +1,175 @@
+From: Rik van Riel <riel@redhat.com>
+Date: Wed, 21 Mar 2012 16:33:52 -0700
+Subject: [PATCH] vmscan: kswapd carefully call compaction
+
+References: Page reclaim functionality
+Patch-mainline: Yes (v3.4)
+Git-commit: 7be62de99adcab4449d416977b4274985c5fe023
+
+With CONFIG_COMPACTION enabled, kswapd does not try to free contiguous
+free pages, even when it is woken for a higher order request.
+
+This could be bad for eg.  jumbo frame network allocations, which are done
+from interrupt context and cannot compact memory themselves.  Higher than
+before allocation failure rates in the network receive path have been
+observed in kernels with compaction enabled.
+
+Teach kswapd to defragment the memory zones in a node, but only if
+required and compaction is not deferred in a zone.
+
+[akpm@linux-foundation.org: reduce scope of zones_need_compaction]
+Signed-off-by: Rik van Riel <riel@redhat.com>
+Acked-by: Mel Gorman <mgorman@suse.de>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Minchan Kim <minchan.kim@gmail.com>
+Cc: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+Cc: Hillf Danton <dhillf@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/compaction.h |    6 +++++
+ mm/compaction.c            |   53 +++++++++++++++++++++++++++++---------------
+ mm/vmscan.c                |   10 +++++++++
+ 3 files changed, 51 insertions(+), 18 deletions(-)
+
+diff --git a/include/linux/compaction.h b/include/linux/compaction.h
+index cc9f7a4..c0f8f35 100644
+--- a/include/linux/compaction.h
++++ b/include/linux/compaction.h
+@@ -23,6 +23,7 @@ extern int fragmentation_index(struct zone *zone, unsigned int order);
+ extern unsigned long try_to_compact_pages(struct zonelist *zonelist,
+ 			int order, gfp_t gfp_mask, nodemask_t *mask,
+ 			bool sync);
++extern int compact_pgdat(pg_data_t *pgdat, int order);
+ extern unsigned long compaction_suitable(struct zone *zone, int order);
+ extern unsigned long compact_zone_order(struct zone *zone, int order,
+ 					gfp_t gfp_mask, bool sync);
+@@ -64,6 +65,11 @@ static inline unsigned long try_to_compact_pages(struct zonelist *zonelist,
+ 	return COMPACT_CONTINUE;
+ }
+ 
++static inline int compact_pgdat(pg_data_t *pgdat, int order)
++{
++	return COMPACT_CONTINUE;
++}
++
+ static inline unsigned long compaction_suitable(struct zone *zone, int order)
+ {
+ 	return COMPACT_SKIPPED;
+diff --git a/mm/compaction.c b/mm/compaction.c
+index b6d853f..0bae503 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -676,44 +676,61 @@ unsigned long try_to_compact_pages(struct zonelist *zonelist,
+ 
+ 
+ /* Compact all zones within a node */
+-static int compact_node(int nid)
++static int __compact_pgdat(pg_data_t *pgdat, struct compact_control *cc)
+ {
+ 	int zoneid;
+-	pg_data_t *pgdat;
+ 	struct zone *zone;
+ 
+-	if (nid < 0 || nid >= nr_node_ids || !node_online(nid))
+-		return -EINVAL;
+-	pgdat = NODE_DATA(nid);
+-
+ 	/* Flush pending updates to the LRU lists */
+ 	lru_add_drain_all();
+ 
+ 	for (zoneid = 0; zoneid < MAX_NR_ZONES; zoneid++) {
+-		struct compact_control cc = {
+-			.nr_freepages = 0,
+-			.nr_migratepages = 0,
+-			.order = -1,
+-			.sync = true,
+-		};
+ 
+ 		zone = &pgdat->node_zones[zoneid];
+ 		if (!populated_zone(zone))
+ 			continue;
+ 
+-		cc.zone = zone;
+-		INIT_LIST_HEAD(&cc.freepages);
+-		INIT_LIST_HEAD(&cc.migratepages);
++		cc->nr_freepages = 0;
++		cc->nr_migratepages = 0;
++		cc->zone = zone;
++		INIT_LIST_HEAD(&cc->freepages);
++		INIT_LIST_HEAD(&cc->migratepages);
+ 
+-		compact_zone(zone, &cc);
++		if (cc->order < 0 || !compaction_deferred(zone))
++			compact_zone(zone, cc);
+ 
+-		VM_BUG_ON(!list_empty(&cc.freepages));
+-		VM_BUG_ON(!list_empty(&cc.migratepages));
++		VM_BUG_ON(!list_empty(&cc->freepages));
++		VM_BUG_ON(!list_empty(&cc->migratepages));
+ 	}
+ 
+ 	return 0;
+ }
+ 
++int compact_pgdat(pg_data_t *pgdat, int order)
++{
++	struct compact_control cc = {
++		.order = order,
++		.sync = false,
++	};
++
++	return __compact_pgdat(pgdat, &cc);
++}
++
++static int compact_node(int nid)
++{
++	pg_data_t *pgdat;
++	struct compact_control cc = {
++		.order = -1,
++		.sync = true,
++	};
++
++	if (nid < 0 || nid >= nr_node_ids || !node_online(nid))
++		return -EINVAL;
++	pgdat = NODE_DATA(nid);
++
++	return __compact_pgdat(pgdat, &cc);
++}
++
+ /* Compact all nodes in the system */
+ static int compact_nodes(void)
+ {
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index 9b563af..00e77d6 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -2972,6 +2972,8 @@ out:
+ 	 * and it is potentially going to sleep here.
+ 	 */
+ 	if (order) {
++		int zones_need_compaction = 1;
++
+ 		for (i = 0; i <= end_zone; i++) {
+ 			struct zone *zone = pgdat->node_zones + i;
+ 
+@@ -2992,9 +2994,17 @@ out:
+ 				goto loop_again;
+ 			}
+ 
++			/* Check if the memory needs to be defragmented. */
++			if (zone_watermark_ok(zone, order,
++				    low_wmark_pages(zone), *classzone_idx, 0))
++				zones_need_compaction = 0;
++
+ 			/* If balanced, clear the congested flag */
+ 			zone_clear_flag(zone, ZONE_CONGESTED);
+ 		}
++
++		if (zones_need_compaction)
++			compact_pgdat(pgdat, order);
+ 	}
+ 
+ 	/*
