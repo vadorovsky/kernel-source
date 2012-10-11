@@ -1,0 +1,223 @@
+From: Mel Gorman <mgorman@suse.de>
+Date: Wed, 10 Oct 2012 23:31:26 +0100
+Subject: [PATCH] netvm: Propagate page->pfmemalloc from netdev_alloc_page to
+ skb
+
+References: Swap over NFS (fate#304949)
+Patch-mainline: No, never
+
+Backport equivalent to upstream commit 0614002bb5f7411e61ffa0dfe5be1f2c84df3da3.
+
+The skb->pfmemalloc flag gets set to true iff during the slab allocation
+of data in __alloc_skb that the the PFMEMALLOC reserves were used. If page
+splitting is used, it is possible that pages will be allocated from the
+PFMEMALLOC reserve without propagating this information to the skb. This
+patch propagates page->pfmemalloc from pages allocated for fragments to
+the skb.
+
+It works by reintroducing and expanding the netdev_alloc_page() API to
+take an skb. If the page was allocated from pfmemalloc reserves, it is
+automatically copied. If the driver allocates the page before the skb,
+it should call propagate_pfmemalloc_skb() after the skb is allocated to
+ensure the flag is copied properly.
+
+Failure to do so is not critical. The resulting driver may perform slower
+if it is used for swap-over-NBD or swap-over-NFS but it should not result
+in failure.
+
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ drivers/net/cxgb4/sge.c       |    4 +-
+ drivers/net/cxgb4vf/sge.c     |    6 +--
+ drivers/net/usb/cdc-phonet.c  |    2 +-
+ drivers/usb/gadget/f_phonet.c |    2 +-
+ include/linux/skbuff.h        |   97 +++++++++++++++++++++++++++++------------
+ 5 files changed, 77 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/net/cxgb4/sge.c b/drivers/net/cxgb4/sge.c
+index 56adf44..f263cd4 100644
+--- a/drivers/net/cxgb4/sge.c
++++ b/drivers/net/cxgb4/sge.c
+@@ -497,7 +497,7 @@ static unsigned int refill_fl(struct adapter *adap, struct sge_fl *q, int n,
+ 	 * Prefer large buffers
+ 	 */
+ 	while (n) {
+-		pg = alloc_pages(gfp | __GFP_COMP, FL_PG_ORDER);
++		pg = __netdev_alloc_pages(NULL, gfp | __GFP_COMP, NULL, FL_PG_ORDER);
+ 		if (unlikely(!pg)) {
+ 			q->large_alloc_failed++;
+ 			break;       /* fall back to single pages */
+@@ -527,7 +527,7 @@ static unsigned int refill_fl(struct adapter *adap, struct sge_fl *q, int n,
+ #endif
+ 
+ 	while (n--) {
+-		pg = __netdev_alloc_page(adap->port[0], gfp);
++		pg = __netdev_alloc_page(adap->port[0], gfp, NULL);
+ 		if (unlikely(!pg)) {
+ 			q->alloc_failed++;
+ 			break;
+diff --git a/drivers/net/cxgb4vf/sge.c b/drivers/net/cxgb4vf/sge.c
+index 5fd75fd..0e2b209 100644
+--- a/drivers/net/cxgb4vf/sge.c
++++ b/drivers/net/cxgb4vf/sge.c
+@@ -608,8 +608,8 @@ static unsigned int refill_fl(struct adapter *adapter, struct sge_fl *fl,
+ 		goto alloc_small_pages;
+ 
+ 	while (n) {
+-		page = alloc_pages(gfp | __GFP_COMP | __GFP_NOWARN,
+-				   FL_PG_ORDER);
++		page = __netdev_alloc_pages(NULL, gfp | __GFP_COMP | __GFP_NOWARN,
++				   NULL, FL_PG_ORDER);
+ 		if (unlikely(!page)) {
+ 			/*
+ 			 * We've failed inour attempt to allocate a "large
+@@ -654,7 +654,7 @@ static unsigned int refill_fl(struct adapter *adapter, struct sge_fl *fl,
+ alloc_small_pages:
+ 	while (n--) {
+ 		page = __netdev_alloc_page(adapter->port[0],
+-					   gfp | __GFP_NOWARN);
++					   gfp | __GFP_NOWARN, NULL);
+ 		if (unlikely(!page)) {
+ 			fl->alloc_failed++;
+ 			break;
+diff --git a/drivers/net/usb/cdc-phonet.c b/drivers/net/usb/cdc-phonet.c
+index f967913..864244d 100644
+--- a/drivers/net/usb/cdc-phonet.c
++++ b/drivers/net/usb/cdc-phonet.c
+@@ -129,7 +129,7 @@ static int rx_submit(struct usbpn_dev *pnd, struct urb *req, gfp_t gfp_flags)
+ 	struct page *page;
+ 	int err;
+ 
+-	page = __netdev_alloc_page(dev, gfp_flags);
++	page = __netdev_alloc_page(dev, gfp_flags, NULL);
+ 	if (!page)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/usb/gadget/f_phonet.c b/drivers/usb/gadget/f_phonet.c
+index 5e14950..9737c5e 100644
+--- a/drivers/usb/gadget/f_phonet.c
++++ b/drivers/usb/gadget/f_phonet.c
+@@ -311,7 +311,7 @@ pn_rx_submit(struct f_phonet *fp, struct usb_request *req, gfp_t gfp_flags)
+ 	struct page *page;
+ 	int err;
+ 
+-	page = __netdev_alloc_page(dev, gfp_flags);
++	page = __netdev_alloc_page(dev, NULL, gfp_flags);
+ 	if (!page)
+ 		return -ENOMEM;
+ 
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 6f1975e..7868c84 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1592,33 +1592,6 @@ static inline struct sk_buff *netdev_alloc_skb_ip_align(struct net_device *dev,
+ 	return skb;
+ }
+ 
+-/**
+- *	__netdev_alloc_page - allocate a page for ps-rx on a specific device
+- *	@dev: network device to receive on
+- *	@gfp_mask: alloc_pages_node mask
+- *
+- * 	Allocate a new page. dev currently unused.
+- *
+- * 	%NULL is returned if there is no free memory.
+- */
+-static inline struct page *__netdev_alloc_page(struct net_device *dev, gfp_t gfp_mask)
+-{
+-	return alloc_pages_node(NUMA_NO_NODE, gfp_mask, 0);
+-}
+-
+-/**
+- *	netdev_alloc_page - allocate a page for ps-rx on a specific device
+- *	@dev: network device to receive on
+- *
+- * 	Allocate a new page. dev currently unused.
+- *
+- * 	%NULL is returned if there is no free memory.
+- */
+-static inline struct page *netdev_alloc_page(struct net_device *dev)
+-{
+-	return __netdev_alloc_page(dev, GFP_ATOMIC);
+-}
+-
+ static inline void netdev_free_page(struct net_device *dev, struct page *page)
+ {
+ 	__free_page(page);
+@@ -1752,6 +1725,76 @@ static inline int skb_linearize(struct sk_buff *skb)
+ 	return skb_is_nonlinear(skb) ? __skb_linearize(skb) : 0;
+ }
+ 
++/*
++ *	__netdev_alloc_page - allocate a page for ps-rx on a specific device
++ *	@gfp_mask: alloc_pages_node mask. Set __GFP_NOMEMALLOC if not for network packet RX
++ *	@skb: skb to set pfmemalloc on if __GFP_MEMALLOC is used
++ *	@order: size of the allocation
++ *
++ * 	Allocate a new page. dev currently unused.
++ *
++ * 	%NULL is returned if there is no free memory.
++*/
++static inline struct page *__netdev_alloc_pages(struct net_device *dev,
++						gfp_t gfp_mask,
++						struct sk_buff *skb,
++						unsigned int order)
++{
++	struct page *page;
++
++	gfp_mask |= __GFP_COLD;
++
++	if (!(gfp_mask & __GFP_NOMEMALLOC))
++		gfp_mask |= __GFP_MEMALLOC;
++
++	page = alloc_pages_node(NUMA_NO_NODE, gfp_mask, order);
++	if (skb && page && page->pfmemalloc)
++		skb->pfmemalloc = true;
++
++	return page;
++}
++
++/**
++ *	__netdev_alloc_page - allocate a page for ps-rx on a specific device
++ *	@gfp_mask: alloc_pages_node mask. Set __GFP_NOMEMALLOC if not for network packet RX
++ *	@skb: skb to set pfmemalloc on if __GFP_MEMALLOC is used
++ *
++ * 	Allocate a new page. dev currently unused.
++ *
++ * 	%NULL is returned if there is no free memory.
++ */
++static inline struct page *__netdev_alloc_page(struct net_device *dev,
++						gfp_t gfp_mask,
++						struct sk_buff *skb)
++{
++	return __netdev_alloc_pages(NULL, gfp_mask, skb, 0);
++}
++
++/**
++ *	netdev_alloc_page - allocate a page for ps-rx on a specific device
++ *	@dev: network device to receive on
++ *
++ * 	Allocate a new page. dev currently unused.
++ *
++ * 	%NULL is returned if there is no free memory.
++ */
++static inline struct page *netdev_alloc_page(struct net_device *dev)
++{
++	return __netdev_alloc_page(dev, GFP_ATOMIC, NULL);
++}
++
++/**
++ *	propagate_pfmemalloc_skb - Propagate pfmemalloc if skb is allocated after RX page
++ *	@page: The page that was allocated from netdev_alloc_page
++ *	@skb: The skb that may need pfmemalloc set
++ */
++static inline void propagate_pfmemalloc_skb(struct page *page,
++						struct sk_buff *skb)
++{
++	if (page && page->pfmemalloc)
++		skb->pfmemalloc = true;
++}
++
+ /**
+  *	skb_linearize_cow - make sure skb is linear and writable
+  *	@skb: buffer to process
