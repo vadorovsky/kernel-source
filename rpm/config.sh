@@ -4,4 +4,4 @@ SRCVERSION=3.0
 VARIANT=
 # buildservice projects to build the kernel against
 OBS_PROJECT=SUSE:SLE-11:SP2
-IBS_PROJECT=SUSE:SLE-11-SP2:GA
+IBS_PROJECT=SUSE:SLE-11-SP3:GA
