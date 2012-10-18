@@ -1,0 +1,390 @@
+From 51e0a01206613ad80a3841388ecfa46476dabdf5 Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Mon, 20 Feb 2012 12:02:19 -0800
+Subject: [PATCH] USB: Calculate USB 3.0 exit latencies for LPM.
+Patch-Mainline: v3.5
+References: FATE#313675
+
+There are several different exit latencies associated with coming out of
+the U1 or U2 lower power link state.
+
+Device Exit Latency (DEL) is the maximum time it takes for the USB
+device to bring its upstream link into U0.  That can be found in the
+SuperSpeed Extended Capabilities BOS descriptor for the device.  The
+time it takes for a particular link in the tree to exit to U0 is the
+maximum of either the parent hub's U1/U2 DEL, or the child's U1/U2 DEL.
+
+Hubs introduce a further delay that effects how long it takes a child
+device to transition to U0.  When a USB 3.0 hub receives a header
+packet, it takes some time to decode that header and figure out which
+downstream port the packet was destined for.  If the port is not in U0,
+this hub header decode latency will cause an additional delay for
+bringing the child device to U0.  This Hub Header Decode Latency is
+found in the USB 3.0 hub descriptor.
+
+We can use DEL and the header decode latency, along with additional
+latencies imposed by each additional hub tier, to figure out the exit
+latencies for both host-initiated and device-initiated exit to U0.
+
+The Max Exit Latency (MEL) is the worst-case time it will take for a
+host-initiated exit to U0, based on whether U1 or U2 link states are
+enabled.  The ping or packet must traverse the path to the device, and
+each hub along the way incurs the hub header decode latency in order to
+figure out which device the transfer was bound for.  We say worst-case,
+because some hubs may not be in the lowest link state that is enabled.
+See the examples in section C.2.2.1.
+
+Note that "HSD" is a "host specific delay" that the power appendix
+architect has not been able to tell me how to calculate.  There's no way
+to get HSD from the xHCI registers either, so I'm simply ignoring it.
+
+The Path Exit Latency (PEL) is the worst-case time it will take for a
+device-initiate exit to U0 to place all the links from the device to the
+host into U0.
+
+The System Exit Latency (SEL) is another device-initiated exit latency.
+SEL is useful for USB 3.0 devices that need to send data to the host at
+specific intervals.  The device may send an NRDY to indicate it isn't
+ready to send data, then put its link into a lower power state.  If it
+needs to have that data transmitted at a specific time, it can use SEL
+to back calculate when it will need to bring the link back into U0 to
+meet its deadlines.
+
+SEL is the worst-case time from the device-initiated exit to U0, to when
+the device will receive a packet from the host controller.  It includes
+PEL, the time it takes for an ERDY to get to the host, a host-specific
+delay for the host to process that ERDY, and the time it takes for the
+packet to traverse the path to the device.  See Figure C-2 in the USB
+3.0 bus specification.
+
+Note: I have not been able to get good answers about what the
+host-specific delay to process the ERDY should be.  The Intel HW
+developers say it will be specific to the platform the xHCI host is
+integrated into, and they say it's negligible.  Ignore this too.
+
+Separate from these four exit latencies are the U1/U2 timeout values we
+program into the parent hubs.  These timeouts tell the hub to attempt to
+place the device into a lower power link state after the link has been
+idle for that amount of time.
+
+Create two arrays (one for U1 and one for U2) to store mel, pel, sel,
+and the timeout values.  Store the exit latency values in nanosecond
+units, since that's the smallest units used (DEL is in us, but the Hub
+Header Decode Latency is in ns).
+
+If a USB 3.0 device doesn't have a SuperSpeed Extended Capabilities BOS
+descriptor, it's highly unlikely it will be able to handle LPM requests
+properly.  So it's best to disable LPM for devices that don't have this
+descriptor, and any children beneath it, if it's a USB 3.0 hub.  Warn
+users when that happens, since it means they have a non-compliant USB
+3.0 device or hub.
+
+This patch assumes a simplified design where links deep in the tree will
+not have U1 or U2 enabled unless all their parent links have the
+corresponding LPM state enabled.  Eventually, we might want to allow a
+different policy, and we can revisit this patch when that happens.
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Cc: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Oliver Neukum <oneukum@suse.de>
+---
+ drivers/usb/core/hub.c |  211 +++++++++++++++++++++++++++++++++++++++++++++++-
+ include/linux/usb.h    |   37 +++++++++
+ 2 files changed, 247 insertions(+), 1 deletions(-)
+
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 100e08f..5219507 100644
+--- a/drivers/usb/core/hub.c	2012-10-16 15:58:25.000000000 +0200
++++ b/drivers/usb/core/hub.c	2012-10-16 15:59:31.000000000 +0200
+@@ -190,9 +190,216 @@ static int usb_device_supports_lpm(struc
+ 			return 1;
+ 		return 0;
+ 	}
++
++	/* All USB 3.0 must support LPM, but we need their max exit latency
++	 * information from the SuperSpeed Extended Capabilities BOS descriptor.
++	 */
++	if (!udev->bos->ss_cap) {
++		dev_warn(&udev->dev, "No LPM exit latency info found.  "
++				"Power management will be impacted.\n");
++		return 0;
++	}
++	if (udev->parent->lpm_capable)
++		return 1;
++
++	dev_warn(&udev->dev, "Parent hub missing LPM exit latency info.  "
++			"Power management will be impacted.\n");
+ 	return 0;
+ }
+ 
++/*
++ * Set the Maximum Exit Latency (MEL) for the host to initiate a transition from
++ * either U1 or U2.
++ */
++static void usb_set_lpm_mel(struct usb_device *udev,
++		struct usb3_lpm_parameters *udev_lpm_params,
++		unsigned int udev_exit_latency,
++		struct usb_hub *hub,
++		struct usb3_lpm_parameters *hub_lpm_params,
++		unsigned int hub_exit_latency)
++{
++	unsigned int total_mel;
++	unsigned int device_mel;
++	unsigned int hub_mel;
++
++	/*
++	 * Calculate the time it takes to transition all links from the roothub
++	 * to the parent hub into U0.  The parent hub must then decode the
++	 * packet (hub header decode latency) to figure out which port it was
++	 * bound for.
++	 *
++	 * The Hub Header decode latency is expressed in 0.1us intervals (0x1
++	 * means 0.1us).  Multiply that by 100 to get nanoseconds.
++	 */
++	total_mel = hub_lpm_params->mel +
++		(hub->descriptor->u.ss.bHubHdrDecLat * 100);
++
++	/*
++	 * How long will it take to transition the downstream hub's port into
++	 * U0?  The greater of either the hub exit latency or the device exit
++	 * latency.
++	 *
++	 * The BOS U1/U2 exit latencies are expressed in 1us intervals.
++	 * Multiply that by 1000 to get nanoseconds.
++	 */
++	device_mel = udev_exit_latency * 1000;
++	hub_mel = hub_exit_latency * 1000;
++	if (device_mel > hub_mel)
++		total_mel += device_mel;
++	else
++		total_mel += hub_mel;
++
++	udev_lpm_params->mel = total_mel;
++}
++
++/*
++ * Set the maximum Device to Host Exit Latency (PEL) for the device to initiate
++ * a transition from either U1 or U2.
++ */
++static void usb_set_lpm_pel(struct usb_device *udev,
++		struct usb3_lpm_parameters *udev_lpm_params,
++		unsigned int udev_exit_latency,
++		struct usb_hub *hub,
++		struct usb3_lpm_parameters *hub_lpm_params,
++		unsigned int hub_exit_latency,
++		unsigned int port_to_port_exit_latency)
++{
++	unsigned int first_link_pel;
++	unsigned int hub_pel;
++
++	/*
++	 * First, the device sends an LFPS to transition the link between the
++	 * device and the parent hub into U0.  The exit latency is the bigger of
++	 * the device exit latency or the hub exit latency.
++	 */
++	if (udev_exit_latency > hub_exit_latency)
++		first_link_pel = udev_exit_latency * 1000;
++	else
++		first_link_pel = hub_exit_latency * 1000;
++
++	/*
++	 * When the hub starts to receive the LFPS, there is a slight delay for
++	 * it to figure out that one of the ports is sending an LFPS.  Then it
++	 * will forward the LFPS to its upstream link.  The exit latency is the
++	 * delay, plus the PEL that we calculated for this hub.
++	 */
++	hub_pel = port_to_port_exit_latency * 1000 + hub_lpm_params->pel;
++
++	/*
++	 * According to figure C-7 in the USB 3.0 spec, the PEL for this device
++	 * is the greater of the two exit latencies.
++	 */
++	if (first_link_pel > hub_pel)
++		udev_lpm_params->pel = first_link_pel;
++	else
++		udev_lpm_params->pel = hub_pel;
++}
++
++/*
++ * Set the System Exit Latency (SEL) to indicate the total worst-case time from
++ * when a device initiates a transition to U0, until when it will receive the
++ * first packet from the host controller.
++ *
++ * Section C.1.5.1 describes the four components to this:
++ *  - t1: device PEL
++ *  - t2: time for the ERDY to make it from the device to the host.
++ *  - t3: a host-specific delay to process the ERDY.
++ *  - t4: time for the packet to make it from the host to the device.
++ *
++ * t3 is specific to both the xHCI host and the platform the host is integrated
++ * into.  The Intel HW folks have said it's negligible, FIXME if a different
++ * vendor says otherwise.
++ */
++static void usb_set_lpm_sel(struct usb_device *udev,
++		struct usb3_lpm_parameters *udev_lpm_params)
++{
++	struct usb_device *parent;
++	unsigned int num_hubs;
++	unsigned int total_sel;
++
++	/* t1 = device PEL */
++	total_sel = udev_lpm_params->pel;
++	/* How many external hubs are in between the device & the root port. */
++	for (parent = udev->parent, num_hubs = 0; parent->parent;
++			parent = parent->parent)
++		num_hubs++;
++	/* t2 = 2.1us + 250ns * (num_hubs - 1) */
++	if (num_hubs > 0)
++		total_sel += 2100 + 250 * (num_hubs - 1);
++
++	/* t4 = 250ns * num_hubs */
++	total_sel += 250 * num_hubs;
++
++	udev_lpm_params->sel = total_sel;
++}
++
++static void usb_set_lpm_parameters(struct usb_device *udev)
++{
++	struct usb_hub *hub;
++	unsigned int port_to_port_delay;
++	unsigned int udev_u1_del;
++	unsigned int udev_u2_del;
++	unsigned int hub_u1_del;
++	unsigned int hub_u2_del;
++
++	if (!udev->lpm_capable || udev->speed != USB_SPEED_SUPER)
++		return;
++
++	hub = hdev_to_hub(udev->parent);
++	/* It doesn't take time to transition the roothub into U0, since it
++	 * doesn't have an upstream link.
++	 */
++	if (!hub)
++		return;
++
++	udev_u1_del = udev->bos->ss_cap->bU1devExitLat;
++	udev_u2_del = udev->bos->ss_cap->bU2DevExitLat;
++	hub_u1_del = udev->parent->bos->ss_cap->bU1devExitLat;
++	hub_u2_del = udev->parent->bos->ss_cap->bU2DevExitLat;
++
++	usb_set_lpm_mel(udev, &udev->u1_params, udev_u1_del,
++			hub, &udev->parent->u1_params, hub_u1_del);
++
++	usb_set_lpm_mel(udev, &udev->u2_params, udev_u2_del,
++			hub, &udev->parent->u2_params, hub_u2_del);
++
++	/*
++	 * Appendix C, section C.2.2.2, says that there is a slight delay from
++	 * when the parent hub notices the downstream port is trying to
++	 * transition to U0 to when the hub initiates a U0 transition on its
++	 * upstream port.  The section says the delays are tPort2PortU1EL and
++	 * tPort2PortU2EL, but it doesn't define what they are.
++	 *
++	 * The hub chapter, sections 10.4.2.4 and 10.4.2.5 seem to be talking
++	 * about the same delays.  Use the maximum delay calculations from those
++	 * sections.  For U1, it's tHubPort2PortExitLat, which is 1us max.  For
++	 * U2, it's tHubPort2PortExitLat + U2DevExitLat - U1DevExitLat.  I
++	 * assume the device exit latencies they are talking about are the hub
++	 * exit latencies.
++	 *
++	 * What do we do if the U2 exit latency is less than the U1 exit
++	 * latency?  It's possible, although not likely...
++	 */
++	port_to_port_delay = 1;
++
++	usb_set_lpm_pel(udev, &udev->u1_params, udev_u1_del,
++			hub, &udev->parent->u1_params, hub_u1_del,
++			port_to_port_delay);
++
++	if (hub_u2_del > hub_u1_del)
++		port_to_port_delay = 1 + hub_u2_del - hub_u1_del;
++	else
++		port_to_port_delay = 1 + hub_u1_del;
++
++	usb_set_lpm_pel(udev, &udev->u2_params, udev_u2_del,
++			hub, &udev->parent->u2_params, hub_u2_del,
++			port_to_port_delay);
++
++	/* Now that we've got PEL, calculate SEL. */
++	usb_set_lpm_sel(udev, &udev->u1_params);
++	usb_set_lpm_sel(udev, &udev->u2_params);
++}
++
+ /* USB 2.0 spec Section 11.24.4.5 */
+ static int get_hub_descriptor(struct usb_device *hdev, void *data)
+ {
+@@ -3197,8 +3404,10 @@ hub_port_init (struct usb_hub *hub, stru
+ 
+ 	if (udev->wusb == 0 && le16_to_cpu(udev->descriptor.bcdUSB) >= 0x0201) {
+ 		retval = usb_get_bos_descriptor(udev);
+-		if (!retval)
++		if (!retval) {
+ 			udev->lpm_capable = usb_device_supports_lpm(udev);
++			usb_set_lpm_parameters(udev);
++		}
+ 	}
+ 
+ 	retval = 0;
+
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index 1493345..e6c8155 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -376,6 +376,39 @@ struct usb_bus {
+ 
+ struct usb_tt;
+ 
++/*
++ * USB 3.0 Link Power Management (LPM) parameters.
++ *
++ * PEL and SEL are USB 3.0 Link PM latencies for device-initiated LPM exit.
++ * MEL is the USB 3.0 Link PM latency for host-initiated LPM exit.
++ * All three are stored in nanoseconds.
++ */
++struct usb3_lpm_parameters {
++	/*
++	 * Maximum exit latency (MEL) for the host to send a packet to the
++	 * device (either a Ping for isoc endpoints, or a data packet for
++	 * interrupt endpoints), the hubs to decode the packet, and for all hubs
++	 * in the path to transition the links to U0.
++	 */
++	unsigned int mel;
++	/*
++	 * Maximum exit latency for a device-initiated LPM transition to bring
++	 * all links into U0.  Abbreviated as "PEL" in section 9.4.12 of the USB
++	 * 3.0 spec, with no explanation of what "P" stands for.  "Path"?
++	 */
++	unsigned int pel;
++
++	/*
++	 * The System Exit Latency (SEL) includes PEL, and three other
++	 * latencies.  After a device initiates a U0 transition, it will take
++	 * some time from when the device sends the ERDY to when it will finally
++	 * receive the data packet.  Basically, SEL should be the worse-case
++	 * latency from when a device starts initiating a U0 transition to when
++	 * it will get data.
++	 */
++	unsigned int sel;
++};
++
+ /**
+  * struct usb_device - kernel's representation of a USB device
+  * @devnum: device number; address on a USB bus
+@@ -432,6 +465,8 @@ struct usb_tt;
+  * @wusb_dev: if this is a Wireless USB device, link to the WUSB
+  *	specific data for the device.
+  * @slot_id: Slot ID assigned by xHCI
++ * @u1_params: exit latencies for U1 (USB 3.0 LPM).
++ * @u2_params: exit latencies for U2 (USB 3.0 LPM).
+  *
+  * Notes:
+  * Usbcore drivers should not set usbdev->state directly.  Instead use
+@@ -509,6 +544,8 @@ struct usb_device {
+ #endif
+ 	struct wusb_dev *wusb_dev;
+ 	int slot_id;
++	struct usb3_lpm_parameters u1_params;
++	struct usb3_lpm_parameters u2_params;
+ };
+ #define	to_usb_device(d) container_of(d, struct usb_device, dev)
+ 
