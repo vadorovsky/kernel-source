@@ -1,0 +1,327 @@
+From: Jiri Slaby <jslaby@suse.cz>
+Subject: Linux 3.0.23
+Patch-mainline: 3.0.23
+
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+Automatically created from "patches.kernel.org/patch-3.0.22-23" by xen-port-patches.py
+
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ sle11sp3/arch/x86/include/mach-xen/asm/i387.h	2012-10-19 12:29:05.000000000 +0200
+@@ -0,0 +1,55 @@
++#ifndef _ASM_X86_I387_H
++#define switch_fpu_prepare native_switch_fpu_prepare
++#define __thread_fpu_begin native_thread_fpu_begin
++#include_next <asm/i387.h>
++#undef __thread_fpu_begin
++#undef switch_fpu_prepare
++
++#ifndef __ASSEMBLY__
++static inline void xen_thread_fpu_begin(struct task_struct *tsk,
++					multicall_entry_t *mcl)
++{
++	if (mcl) {
++		mcl->op = __HYPERVISOR_fpu_taskswitch;
++		mcl->args[0] = 0;
++	}
++	__thread_set_has_fpu(tsk);
++}
++
++static inline fpu_switch_t xen_switch_fpu_prepare(struct task_struct *old,
++						  struct task_struct *new,
++						  multicall_entry_t **mcl)
++{
++	fpu_switch_t fpu;
++
++	fpu.preload = tsk_used_math(new) && new->fpu_counter > 5;
++	if (__thread_has_fpu(old)) {
++		if (!__save_init_fpu(old))
++			fpu_lazy_state_intact(old);
++		__thread_clear_has_fpu(old);
++		old->fpu_counter++;
++
++		/* Don't change CR0.TS if we just switch! */
++		if (fpu.preload) {
++			__thread_set_has_fpu(new);
++			prefetch(new->thread.fpu.state);
++		} else {
++			(*mcl)->op = __HYPERVISOR_fpu_taskswitch;
++			(*mcl)++->args[0] = 1;
++		}
++	} else {
++		old->fpu_counter = 0;
++		if (fpu.preload) {
++			new->fpu_counter++;
++			if (fpu_lazy_restore(new))
++				fpu.preload = 0;
++			else
++				prefetch(new->thread.fpu.state);
++			xen_thread_fpu_begin(new, (*mcl)++);
++		}
++	}
++	return fpu;
++}
++#endif /* __ASSEMBLY__ */
++
++#endif /* _ASM_X86_I387_H */
+--- sle11sp3.orig/arch/x86/include/mach-xen/asm/processor.h	2011-07-01 15:19:34.000000000 +0200
++++ sle11sp3/arch/x86/include/mach-xen/asm/processor.h	2012-10-19 12:29:44.000000000 +0200
+@@ -471,6 +471,7 @@ struct thread_struct {
+ 	unsigned long		trap_no;
+ 	unsigned long		error_code;
+ 	/* floating point and extended processor state */
++	unsigned long		has_fpu;
+ 	struct fpu		fpu;
+ #ifdef CONFIG_X86_32
+ 	/* Virtual 86 mode info */
+--- sle11sp3.orig/arch/x86/kernel/process_32-xen.c	2012-10-19 12:05:46.000000000 +0200
++++ sle11sp3/arch/x86/kernel/process_32-xen.c	2012-10-19 12:29:44.000000000 +0200
+@@ -299,11 +299,11 @@ __switch_to(struct task_struct *prev_p, 
+ {
+ 	struct thread_struct *prev = &prev_p->thread,
+ 				 *next = &next_p->thread;
+-	int cpu = smp_processor_id(), cr0_ts = 0;
++	int cpu = smp_processor_id(), cr0_ts;
+ #ifndef CONFIG_X86_NO_TSS
+ 	struct tss_struct *tss = &per_cpu(init_tss, cpu);
+ #endif
+-	bool preload_fpu;
++	fpu_switch_t fpu;
+ #if CONFIG_XEN_COMPAT > 0x030002
+ 	struct physdev_set_iopl iopl_op;
+ 	struct physdev_set_iobitmap iobmp_op;
+@@ -316,26 +316,7 @@ __switch_to(struct task_struct *prev_p, 
+ 
+ 	/* XEN NOTE: FS/GS saved in switch_mm(), not here. */
+ 
+-	/*
+-	 * If the task has used fpu the last 5 timeslices, just do a full
+-	 * restore of the math state immediately to avoid the trap; the
+-	 * chances of needing FPU soon are obviously high now
+-	 */
+-	preload_fpu = tsk_used_math(next_p) && next_p->fpu_counter > 5;
+-
+-	/*
+-	 * This is basically '__unlazy_fpu', except that we queue a
+-	 * multicall to indicate FPU task switch, rather than
+-	 * synchronously trapping to Xen.
+-	 */
+-	if (task_thread_info(prev_p)->status & TS_USEDFPU) {
+-		__save_init_fpu(prev_p); /* _not_ save_init_fpu() */
+-		if (!preload_fpu) {
+-			mcl->op = __HYPERVISOR_fpu_taskswitch;
+-			mcl++->args[0] = 1;
+-			cr0_ts = 1;
+-		}
+-	}
++	fpu = xen_switch_fpu_prepare(prev_p, next_p, &mcl);
+ 
+ 	/*
+ 	 * Reload sp0.
+@@ -377,14 +358,6 @@ __switch_to(struct task_struct *prev_p, 
+ 		mcl++;
+ 	}
+ 
+-	/* If we're going to preload the fpu context, make sure clts
+-	   is run while we're batching the cpu state updates. */
+-	if (preload_fpu) {
+-		mcl->op = __HYPERVISOR_fpu_taskswitch;
+-		mcl++->args[0] = 0;
+-		cr0_ts = -1;
+-	}
+-
+ 	if (unlikely(prev->io_bitmap_ptr || next->io_bitmap_ptr)) {
+ 		set_xen_guest_handle(iobmp_op.bitmap,
+ 				     (char *)next->io_bitmap_ptr);
+@@ -405,8 +378,11 @@ __switch_to(struct task_struct *prev_p, 
+ 	BUG_ON(pdo > _pdo + ARRAY_SIZE(_pdo));
+ #endif
+ 	BUG_ON(mcl > _mcl + ARRAY_SIZE(_mcl));
+-	if (cr0_ts)
++	if (_mcl->op == __HYPERVISOR_fpu_taskswitch) {
+ 		percpu_write(xen_x86_cr0_upd, X86_CR0_TS);
++		cr0_ts = _mcl->args[0] ? 1 : -1;
++	} else
++		cr0_ts = 0;
+ 	if (unlikely(HYPERVISOR_multicall_check(_mcl, mcl - _mcl, NULL)))
+ 		BUG();
+ 	if (cr0_ts) {
+@@ -417,10 +393,6 @@ __switch_to(struct task_struct *prev_p, 
+ 		xen_clear_cr0_upd();
+ 	}
+ 
+-	/* we're going to use this soon, after a few expensive things */
+-	if (preload_fpu)
+-		prefetch(next->fpu.state);
+-
+ 	/*
+ 	 * Now maybe handle debug registers
+ 	 */
+@@ -437,15 +409,14 @@ __switch_to(struct task_struct *prev_p, 
+ 	 */
+ 	arch_end_context_switch(next_p);
+ 
+-	if (preload_fpu)
+-		__math_state_restore();
+-
+ 	/*
+ 	 * Restore %gs if needed (which is common)
+ 	 */
+ 	if (prev->gs | next->gs)
+ 		lazy_load_gs(next->gs);
+ 
++	switch_fpu_finish(next_p, fpu);
++
+ 	percpu_write(current_task, next_p);
+ 
+ 	return prev_p;
+--- sle11sp3.orig/arch/x86/kernel/process_64-xen.c	2012-10-19 12:05:47.000000000 +0200
++++ sle11sp3/arch/x86/kernel/process_64-xen.c	2012-10-19 12:29:44.000000000 +0200
+@@ -388,7 +388,7 @@ __switch_to(struct task_struct *prev_p, 
+ #ifndef CONFIG_X86_NO_TSS
+ 	struct tss_struct *tss = &per_cpu(init_tss, cpu);
+ #endif
+-	bool preload_fpu;
++	fpu_switch_t fpu;
+ #if CONFIG_XEN_COMPAT > 0x030002
+ 	struct physdev_set_iopl iopl_op;
+ 	struct physdev_set_iobitmap iobmp_op;
+@@ -399,38 +399,7 @@ __switch_to(struct task_struct *prev_p, 
+ #endif
+ 	multicall_entry_t _mcl[8], *mcl = _mcl;
+ 
+-	/*
+-	 * If the task has used fpu the last 5 timeslices, just do a full
+-	 * restore of the math state immediately to avoid the trap; the
+-	 * chances of needing FPU soon are obviously high now
+-	 */
+-	preload_fpu = tsk_used_math(next_p) && next_p->fpu_counter > 5;
+-
+-	/* we're going to use this soon, after a few expensive things */
+-	if (preload_fpu)
+-		prefetch(next->fpu.state);
+-
+-	/*
+-	 * This is basically '__unlazy_fpu', except that we queue a
+-	 * multicall to indicate FPU task switch, rather than
+-	 * synchronously trapping to Xen.
+-	 * The AMD workaround requires it to be after DS reload, or
+-	 * after DS has been cleared, which we do in __prepare_arch_switch.
+-	 */
+-	if (task_thread_info(prev_p)->status & TS_USEDFPU) {
+-		__save_init_fpu(prev_p); /* _not_ save_init_fpu() */
+-		if (!preload_fpu) {
+-			mcl->op = __HYPERVISOR_fpu_taskswitch;
+-			mcl++->args[0] = 1;
+-		}
+-	} else
+-		prev_p->fpu_counter = 0;
+-
+-	/* Make sure cpu is ready for new context */
+-	if (preload_fpu) {
+-		mcl->op = __HYPERVISOR_fpu_taskswitch;
+-		mcl++->args[0] = 0;
+-	}
++	fpu = xen_switch_fpu_prepare(prev_p, next_p, &mcl);
+ 
+ 	/*
+ 	 * Reload sp0.
+@@ -545,6 +514,8 @@ __switch_to(struct task_struct *prev_p, 
+ 	if (next->gs)
+ 		WARN_ON(HYPERVISOR_set_segment_base(SEGBASE_GS_USER, next->gs));
+ 
++	switch_fpu_finish(next_p, fpu);
++
+ 	/*
+ 	 * Switch the PDA context.
+ 	 */
+@@ -561,13 +532,6 @@ __switch_to(struct task_struct *prev_p, 
+ 		     task_thread_info(prev_p)->flags & _TIF_WORK_CTXSW_PREV))
+ 		__switch_to_xtra(prev_p, next_p);
+ 
+-	/*
+-	 * Preload the FPU context, now that we've determined that the
+-	 * task is likely to be using it.
+-	 */
+-	if (preload_fpu)
+-		__math_state_restore();
+-
+ 	return prev_p;
+ }
+ 
+--- sle11sp3.orig/arch/x86/kernel/traps-xen.c	2011-07-21 12:21:48.000000000 +0200
++++ sle11sp3/arch/x86/kernel/traps-xen.c	2012-10-19 12:29:44.000000000 +0200
+@@ -710,25 +710,34 @@ asmlinkage void __attribute__((weak)) sm
+ #endif /* CONFIG_XEN */
+ 
+ /*
+- * __math_state_restore assumes that cr0.TS is already clear and the
+- * fpu state is all ready for use.  Used during context switch.
++ * This gets called with the process already owning the
++ * FPU state, and with CR0.TS cleared. It just needs to
++ * restore the FPU register state.
+  */
+-void __math_state_restore(void)
++void __math_state_restore(struct task_struct *tsk)
+ {
+-	struct thread_info *thread = current_thread_info();
+-	struct task_struct *tsk = thread->task;
++	/* We need a safe address that is cheap to find and that is already
++	   in L1. We've just brought in "tsk->thread.has_fpu", so use that */
++#define safe_address (tsk->thread.has_fpu)
++
++	/* AMD K7/K8 CPUs don't save/restore FDP/FIP/FOP unless an exception
++	   is pending.  Clear the x87 state here by setting it to fixed
++	   values. safe_address is a random variable that should be in L1 */
++	alternative_input(
++		ASM_NOP8 ASM_NOP2,
++		"emms\n\t"	  	/* clear stack tags */
++		"fildl %P[addr]",	/* set F?P to defined value */
++		X86_FEATURE_FXSAVE_LEAK,
++		[addr] "m" (safe_address));
+ 
+ 	/*
+ 	 * Paranoid restore. send a SIGSEGV if we fail to restore the state.
+ 	 */
+ 	if (unlikely(restore_fpu_checking(tsk))) {
+-		stts();
++		__thread_fpu_end(tsk);
+ 		force_sig(SIGSEGV, tsk);
+ 		return;
+ 	}
+-
+-	thread->status |= TS_USEDFPU;	/* So we fnsave on switch_to() */
+-	tsk->fpu_counter++;
+ }
+ 
+ /*
+@@ -738,13 +747,12 @@ void __math_state_restore(void)
+  * Careful.. There are problems with IBM-designed IRQ13 behaviour.
+  * Don't touch unless you *really* know how it works.
+  *
+- * Must be called with kernel preemption disabled (in this case,
+- * local interrupts are disabled at the call-site in entry.S).
++ * Must be called with kernel preemption disabled (eg with local
++ * local interrupts as in the case of do_device_not_available).
+  */
+-asmlinkage void math_state_restore(void)
++void math_state_restore(void)
+ {
+-	struct thread_info *thread = current_thread_info();
+-	struct task_struct *tsk = thread->task;
++	struct task_struct *tsk = current;
+ 
+ 	/* NB. 'clts' is done for us by Xen during virtual trap. */
+ 	percpu_and(xen_x86_cr0, ~X86_CR0_TS);
+@@ -764,8 +772,10 @@ asmlinkage void math_state_restore(void)
+ 		local_irq_disable();
+ 	}
+ 
+-	/* clts();			Allow maths ops (or we recurse) */
+-	__math_state_restore();
++	xen_thread_fpu_begin(tsk, NULL);
++	__math_state_restore(tsk);
++
++	tsk->fpu_counter++;
+ }
+ 
+ dotraplinkage void __kprobes
