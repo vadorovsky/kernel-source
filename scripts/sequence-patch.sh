@@ -20,20 +20,15 @@
 # you may find current contact information at www.novell.com
 #############################################################################
 
-source $(dirname $0)/config.sh
+source $(dirname $0)/../rpm/config.sh
 source $(dirname $0)/wd-functions.sh
 
 have_arch_patches=false
-have_defconfig_files=false
 fuzz="-F0"
-case "$DIST_SET" in
-sles9 | sles10)
+case "$IBS_PROJECT" in
+SUSE:SLE-9*)
 	fuzz=
-esac
-case "$DIST_SET" in
-sles9* | sles10* | sle10* | 9.* | 10.* | 11.0)
 	have_arch_patches=true
-	have_defconfig_files=true
 esac
 
 usage() {
@@ -481,15 +476,8 @@ if $QUILT; then
     [ ${QUILT_PATCHES-patches} != patches ] \
         && ln -s $PWD $PATCH_DIR/${QUILT_PATCHES-patches}
 fi
-# If there are any remaining patches, add them to the series so
-# they can be fixed up with quilt (or similar).
-if [ -n "$*" ]; then
-    ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
-fi
-
 echo "[ Tree: $PATCH_DIR ]"
 
-append=
 if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     mkdir -p "$SP_BUILD_DIR"
     echo "[ Build Dir: $SP_BUILD_DIR ]"
@@ -497,6 +485,13 @@ if test "$SP_BUILD_DIR" != "$PATCH_DIR"; then
     rm -f "$SP_BUILD_DIR/patches"
     ln -sf "$PATCH_DIR" "$SP_BUILD_DIR/source"
     ln -sf "source/patches" "$SP_BUILD_DIR/patches"
+fi
+
+# If there are any remaining patches, add them to the series so
+# they can be fixed up with quilt (or similar).
+if [ -n "$*" ]; then
+    ( IFS=$'\n' ; echo "$*" ) >> $PATCH_DIR/series
+    exit $status
 fi
 
 if test -e supported.conf; then
@@ -543,37 +538,3 @@ if $CSCOPE; then
     fi
 fi
 
-[ $# -gt 0 ] && exit $status
-
-if ! $have_defconfig_files || test ! -e config.conf; then
-    exit 0
-fi
-
-# Copy the config files that apply for this kernel.
-echo "[ Copying config files ]" >> $PATCH_LOG
-echo "[ Copying config files ]"
-TMPFILE=$(mktemp /tmp/$(basename $0).XXXXXX)
-chmod a+r $TMPFILE
-CONFIGS=$(scripts/guards --list < config.conf)
-for config in $CONFIGS; do
-    if ! [ -e config/$config ]; then
-	echo "Configuration file config/$config not found"
-    fi
-    name=$(basename $config)
-    path=arch/$(dirname $config)/defconfig.$name
-    mkdir -p $(dirname $PATCH_DIR/$path)
-
-    chmod +x rpm/config-subst
-    cat config/$config \
-    | rpm/config-subst CONFIG_CFGNAME \"$name\" \
-    | rpm/config-subst CONFIG_RELEASE \"0\" \
-    | rpm/config-subst CONFIG_SUSE_KERNEL y \
-    > $TMPFILE
-
-    echo $path >> $PATCH_LOG
-    [ -z "$QUIET" ] && echo $path
-    # Make sure we don't override a hard-linked file.
-    rm -f $PATCH_DIR/$path
-    cp -f $TMPFILE $PATCH_DIR/$path
-done
-rm -f $TMPFILE
