@@ -1,0 +1,627 @@
+From 31ef22579302ac42054bebecb528710f46580925 Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Thu, 1 Dec 2011 17:41:36 +0100
+Subject: [PATCH] ALSA: hda - Integrate input-jack stuff into kctl-jack
+Git-commit: 31ef22579302ac42054bebecb528710f46580925
+Patch-mainline: 3.3-rc1
+References: FATE#314311
+
+Instead of managing input-jack stuff separately, call all stuff inside
+the kctl-jack creation, deletion and report.  The caller no longer needs
+to care about input-jack.
+
+The better integration between input-jack and kctl-jack should be done
+in the upper layer in near future, but for now, it's implemented locally
+for more tests.
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ sound/pci/hda/hda_jack.c       |  159 +++++++++++++++--------------------------
+ sound/pci/hda/hda_local.h      |   20 -----
+ sound/pci/hda/patch_conexant.c |   61 ++-------------
+ sound/pci/hda/patch_hdmi.c     |   22 +----
+ sound/pci/hda/patch_realtek.c  |   52 -------------
+ sound/pci/hda/patch_sigmatel.c |   46 -----------
+ 6 files changed, 74 insertions(+), 286 deletions(-)
+
+--- a/sound/pci/hda/hda_jack.c
++++ b/sound/pci/hda/hda_jack.c
+@@ -89,15 +89,19 @@ snd_hda_jack_tbl_new(struct hda_codec *c
+ }
+ EXPORT_SYMBOL_HDA(snd_hda_jack_tbl_new);
+ 
+-#ifdef CONFIG_SND_HDA_INPUT_JACK
+-static void snd_hda_input_jack_free(struct hda_codec *codec);
+-#else
+-#define snd_hda_input_jack_free(codec)
+-#endif
+-
+ void snd_hda_jack_tbl_clear(struct hda_codec *codec)
+ {
+-	snd_hda_input_jack_free(codec);
++#ifdef CONFIG_SND_HDA_INPUT_JACK
++	/* free jack instances manually when clearing/reconfiguring */
++	if (!codec->bus->shutdown && codec->jacktbl.list) {
++		struct hda_jack_tbl *jack = codec->jacktbl.list;
++		int i;
++		for (i = 0; i < codec->jacktbl.used; i++, jack++) {
++			if (jack->jack)
++				snd_device_free(codec->bus->card, jack->jack);
++		}
++	}
++#endif
+ 	snd_array_free(&codec->jacktbl);
+ }
+ 
+@@ -198,10 +202,44 @@ void snd_hda_jack_report_sync(struct hda
+ 				continue;
+ 			state = get_jack_plug_state(jack->pin_sense);
+ 			snd_kctl_jack_report(codec->bus->card, jack->kctl, state);
++#ifdef CONFIG_SND_HDA_INPUT_JACK
++			if (jack->jack)
++				snd_jack_report(jack->jack,
++						state ? jack->type : 0);
++#endif
+ 		}
+ }
+ EXPORT_SYMBOL_HDA(snd_hda_jack_report_sync);
+ 
++#ifdef CONFIG_SND_HDA_INPUT_JACK
++/* guess the jack type from the pin-config */
++static int get_input_jack_type(struct hda_codec *codec, hda_nid_t nid)
++{
++	unsigned int def_conf = snd_hda_codec_get_pincfg(codec, nid);
++	switch (get_defcfg_device(def_conf)) {
++	case AC_JACK_LINE_OUT:
++	case AC_JACK_SPEAKER:
++		return SND_JACK_LINEOUT;
++	case AC_JACK_HP_OUT:
++		return SND_JACK_HEADPHONE;
++	case AC_JACK_SPDIF_OUT:
++	case AC_JACK_DIG_OTHER_OUT:
++		return SND_JACK_AVOUT;
++	case AC_JACK_MIC_IN:
++		return SND_JACK_MICROPHONE;
++	default:
++		return SND_JACK_LINEIN;
++	}
++}
++
++static void hda_free_jack_priv(struct snd_jack *jack)
++{
++	struct hda_jack_tbl *jacks = jack->private_data;
++	jacks->nid = 0;
++	jacks->jack = NULL;
++}
++#endif
++
+ /**
+  * snd_hda_jack_add_kctl - Add a kctl for the given pin
+  *
+@@ -213,6 +251,7 @@ int snd_hda_jack_add_kctl(struct hda_cod
+ {
+ 	struct hda_jack_tbl *jack;
+ 	struct snd_kcontrol *kctl;
++	int err, state;
+ 
+ 	jack = snd_hda_jack_tbl_new(codec, nid);
+ 	if (!jack)
+@@ -222,11 +261,21 @@ int snd_hda_jack_add_kctl(struct hda_cod
+ 	kctl = snd_kctl_jack_new(name, idx, codec);
+ 	if (!kctl)
+ 		return -ENOMEM;
+-	if (snd_hda_ctl_add(codec, nid, kctl) < 0)
+-		return -ENOMEM;
++	err = snd_hda_ctl_add(codec, nid, kctl);
++	if (err < 0)
++		return err;
+ 	jack->kctl = kctl;
+-	snd_kctl_jack_report(codec->bus->card, kctl,
+-			     snd_hda_jack_detect(codec, nid));
++	state = snd_hda_jack_detect(codec, nid);
++	snd_kctl_jack_report(codec->bus->card, kctl, state);
++#ifdef CONFIG_SND_HDA_INPUT_JACK
++	jack->type = get_input_jack_type(codec, nid);
++	err = snd_jack_new(codec->bus->card, name, jack->type, &jack->jack);
++	if (err < 0)
++		return err;
++	jack->jack->private_data = jack;
++	jack->jack->private_free = hda_free_jack_priv;
++	snd_jack_report(jack->jack, state ? jack->type : 0);
++#endif
+ 	return 0;
+ }
+ EXPORT_SYMBOL_HDA(snd_hda_jack_add_kctl);
+@@ -301,91 +350,3 @@ int snd_hda_jack_add_kctls(struct hda_co
+ 	return 0;
+ }
+ EXPORT_SYMBOL_HDA(snd_hda_jack_add_kctls);
+-
+-#ifdef CONFIG_SND_HDA_INPUT_JACK
+-/*
+- * Input-jack notification support
+- */
+-static const char *get_jack_default_name(struct hda_codec *codec, hda_nid_t nid,
+-					 int type)
+-{
+-	switch (type) {
+-	case SND_JACK_HEADPHONE:
+-		return "Headphone";
+-	case SND_JACK_MICROPHONE:
+-		return "Mic";
+-	case SND_JACK_LINEOUT:
+-		return "Line-out";
+-	case SND_JACK_LINEIN:
+-		return "Line-in";
+-	case SND_JACK_HEADSET:
+-		return "Headset";
+-	case SND_JACK_VIDEOOUT:
+-		return "HDMI/DP";
+-	default:
+-		return "Misc";
+-	}
+-}
+-
+-static void hda_free_jack_priv(struct snd_jack *jack)
+-{
+-	struct hda_jack_tbl *jacks = jack->private_data;
+-	jacks->nid = 0;
+-	jacks->jack = NULL;
+-}
+-
+-int snd_hda_input_jack_add(struct hda_codec *codec, hda_nid_t nid, int type,
+-			   const char *name)
+-{
+-	struct hda_jack_tbl *jack = snd_hda_jack_tbl_new(codec, nid);
+-	int err;
+-
+-	if (!jack)
+-		return -ENOMEM;
+-	if (!name)
+-		name = get_jack_default_name(codec, nid, type);
+-	err = snd_jack_new(codec->bus->card, name, type, &jack->jack);
+-	if (err < 0)
+-		return err;
+-	jack->type = type;
+-	jack->jack->private_data = jack;
+-	jack->jack->private_free = hda_free_jack_priv;
+-	return 0;
+-}
+-EXPORT_SYMBOL_HDA(snd_hda_input_jack_add);
+-
+-void snd_hda_input_jack_report(struct hda_codec *codec, hda_nid_t nid)
+-{
+-	struct hda_jack_tbl *jack = snd_hda_jack_tbl_get(codec, nid);
+-	unsigned int pin_ctl;
+-	unsigned int present;
+-	int type;
+-
+-	if (!jack || !jack->jack)
+-		return;
+-
+-	present = snd_hda_jack_detect(codec, nid);
+-	type = jack->type;
+-	if (type == (SND_JACK_HEADPHONE | SND_JACK_LINEOUT)) {
+-		pin_ctl = snd_hda_codec_read(codec, nid, 0,
+-					     AC_VERB_GET_PIN_WIDGET_CONTROL, 0);
+-		type = (pin_ctl & AC_PINCTL_HP_EN) ?
+-			SND_JACK_HEADPHONE : SND_JACK_LINEOUT;
+-	}
+-	snd_jack_report(jack->jack, present ? type : 0);
+-}
+-EXPORT_SYMBOL_HDA(snd_hda_input_jack_report);
+-
+-/* free jack instances manually when clearing/reconfiguring */
+-static void snd_hda_input_jack_free(struct hda_codec *codec)
+-{
+-	if (!codec->bus->shutdown && codec->jacktbl.list) {
+-		struct hda_jack_tbl *jack = codec->jacktbl.list;
+-		int i;
+-		for (i = 0; i < codec->jacktbl.used; i++, jack++) {
+-			if (jack->jack)
+-				snd_device_free(codec->bus->card, jack->jack);
+-		}
+-	}
+-}
+-#endif /* CONFIG_SND_HDA_INPUT_JACK */
+--- a/sound/pci/hda/hda_local.h
++++ b/sound/pci/hda/hda_local.h
+@@ -679,24 +679,4 @@ static inline void snd_hda_eld_proc_free
+ #define SND_PRINT_CHANNEL_ALLOCATION_ADVISED_BUFSIZE 80
+ void snd_print_channel_allocation(int spk_alloc, char *buf, int buflen);
+ 
+-/*
+- * Input-jack notification support
+- */
+-#ifdef CONFIG_SND_HDA_INPUT_JACK
+-int snd_hda_input_jack_add(struct hda_codec *codec, hda_nid_t nid, int type,
+-			   const char *name);
+-void snd_hda_input_jack_report(struct hda_codec *codec, hda_nid_t nid);
+-#else /* CONFIG_SND_HDA_INPUT_JACK */
+-static inline int snd_hda_input_jack_add(struct hda_codec *codec,
+-					 hda_nid_t nid, int type,
+-					 const char *name)
+-{
+-	return 0;
+-}
+-static inline void snd_hda_input_jack_report(struct hda_codec *codec,
+-					     hda_nid_t nid)
+-{
+-}
+-#endif /* CONFIG_SND_HDA_INPUT_JACK */
+-
+ #endif /* __SOUND_HDA_LOCAL_H */
+--- a/sound/pci/hda/patch_conexant.c
++++ b/sound/pci/hda/patch_conexant.c
+@@ -415,40 +415,6 @@ static int conexant_mux_enum_put(struct
+ 				     &spec->cur_mux[adc_idx]);
+ }
+ 
+-static int conexant_init_jacks(struct hda_codec *codec)
+-{
+-#ifdef CONFIG_SND_HDA_INPUT_JACK
+-	struct conexant_spec *spec = codec->spec;
+-	int i;
+-
+-	for (i = 0; i < spec->num_init_verbs; i++) {
+-		const struct hda_verb *hv;
+-
+-		hv = spec->init_verbs[i];
+-		while (hv->nid) {
+-			int err = 0;
+-			switch (hv->param ^ AC_USRSP_EN) {
+-			case CONEXANT_HP_EVENT:
+-				err = snd_hda_input_jack_add(codec, hv->nid,
+-						SND_JACK_HEADPHONE, NULL);
+-				snd_hda_input_jack_report(codec, hv->nid);
+-				break;
+-			case CXT5051_PORTC_EVENT:
+-			case CONEXANT_MIC_EVENT:
+-				err = snd_hda_input_jack_add(codec, hv->nid,
+-						SND_JACK_MICROPHONE, NULL);
+-				snd_hda_input_jack_report(codec, hv->nid);
+-				break;
+-			}
+-			if (err < 0)
+-				return err;
+-			++hv;
+-		}
+-	}
+-#endif /* CONFIG_SND_HDA_INPUT_JACK */
+-	return 0;
+-}
+-
+ static void conexant_set_power(struct hda_codec *codec, hda_nid_t fg,
+ 			       unsigned int power_state)
+ {
+@@ -1749,7 +1715,6 @@ static void cxt5051_hp_automute(struct h
+ static void cxt5051_hp_unsol_event(struct hda_codec *codec,
+ 				   unsigned int res)
+ {
+-	int nid = (res & AC_UNSOL_RES_SUBTAG) >> 20;
+ 	switch (res >> 26) {
+ 	case CONEXANT_HP_EVENT:
+ 		cxt5051_hp_automute(codec);
+@@ -1761,7 +1726,6 @@ static void cxt5051_hp_unsol_event(struc
+ 		cxt5051_portc_automic(codec);
+ 		break;
+ 	}
+-	snd_hda_input_jack_report(codec, nid);
+ }
+ 
+ static const struct snd_kcontrol_new cxt5051_playback_mixers[] = {
+@@ -1902,12 +1866,6 @@ static void cxt5051_init_mic_port(struct
+ 			    AC_USRSP_EN | event);
+ }
+ 
+-static void cxt5051_init_mic_jack(struct hda_codec *codec, hda_nid_t nid)
+-{
+-	snd_hda_input_jack_add(codec, nid, SND_JACK_MICROPHONE, NULL);
+-	snd_hda_input_jack_report(codec, nid);
+-}
+-
+ static const struct hda_verb cxt5051_ideapad_init_verbs[] = {
+ 	/* Subwoofer */
+ 	{0x1b, AC_VERB_SET_PIN_WIDGET_CONTROL, PIN_OUT},
+@@ -2041,12 +1999,6 @@ static int patch_cxt5051(struct hda_code
+ 	if (spec->beep_amp)
+ 		snd_hda_attach_beep_device(codec, spec->beep_amp);
+ 
+-	conexant_init_jacks(codec);
+-	if (spec->auto_mic & AUTO_MIC_PORTB)
+-		cxt5051_init_mic_jack(codec, 0x17);
+-	if (spec->auto_mic & AUTO_MIC_PORTC)
+-		cxt5051_init_mic_jack(codec, 0x18);
+-
+ 	return 0;
+ }
+ 
+@@ -3458,7 +3410,6 @@ static int detect_jacks(struct hda_codec
+ 		hda_nid_t nid = pins[i];
+ 		if (!nid || !is_jack_detectable(codec, nid))
+ 			break;
+-		snd_hda_input_jack_report(codec, nid);
+ 		present |= snd_hda_jack_detect(codec, nid);
+ 	}
+ 	return present;
+@@ -3763,8 +3714,6 @@ static void cx_auto_automic(struct hda_c
+ 
+ static void cx_auto_unsol_event(struct hda_codec *codec, unsigned int res)
+ {
+-	int nid = (res & AC_UNSOL_RES_SUBTAG) >> 20;
+-
+ 	switch (snd_hda_jack_get_action(codec, res >> 26)) {
+ 	case CONEXANT_HP_EVENT:
+ 		cx_auto_hp_automute(codec);
+@@ -3774,7 +3723,6 @@ static void cx_auto_unsol_event(struct h
+ 		break;
+ 	case CONEXANT_MIC_EVENT:
+ 		cx_auto_automic(codec);
+-		snd_hda_input_jack_report(codec, nid);
+ 		break;
+ 	}
+ 	snd_hda_jack_report_sync(codec);
+@@ -4339,6 +4287,7 @@ static int cx_auto_build_input_controls(
+ 
+ static int cx_auto_build_controls(struct hda_codec *codec)
+ {
++	struct conexant_spec *spec = codec->spec;
+ 	int err;
+ 
+ 	err = cx_auto_build_output_controls(codec);
+@@ -4347,7 +4296,13 @@ static int cx_auto_build_controls(struct
+ 	err = cx_auto_build_input_controls(codec);
+ 	if (err < 0)
+ 		return err;
+-	return conexant_build_controls(codec);
++	err = conexant_build_controls(codec);
++	if (err < 0)
++		return err;
++	err = snd_hda_jack_add_kctls(codec, &spec->autocfg);
++	if (err < 0)
++		return err;
++	return 0;
+ }
+ 
+ static int cx_auto_search_adcs(struct hda_codec *codec)
+--- a/sound/pci/hda/patch_hdmi.c
++++ b/sound/pci/hda/patch_hdmi.c
+@@ -1006,8 +1006,6 @@ static void hdmi_present_sense(struct hd
+ 					   msecs_to_jiffies(300));
+ 		}
+ 	}
+-
+-	snd_hda_input_jack_report(codec, pin_nid);
+ }
+ 
+ static void hdmi_repoll_eld(struct work_struct *work)
+@@ -1236,21 +1234,15 @@ static int generic_hdmi_build_pcms(struc
+ 
+ static int generic_hdmi_build_jack(struct hda_codec *codec, int pin_idx)
+ {
+-	int err;
+-	char hdmi_str[32];
++	char hdmi_str[32] = "HDMI/DP";
+ 	struct hdmi_spec *spec = codec->spec;
+ 	struct hdmi_spec_per_pin *per_pin = &spec->pins[pin_idx];
+ 	int pcmdev = spec->pcm_rec[pin_idx].device;
+ 
+-	snprintf(hdmi_str, sizeof(hdmi_str), "HDMI/DP,pcm=%d", pcmdev);
+-
+-	err = snd_hda_input_jack_add(codec, per_pin->pin_nid,
+-			     SND_JACK_VIDEOOUT, pcmdev > 0 ? hdmi_str : NULL);
+-	if (err < 0)
+-		return err;
++	if (pcmdev > 0)
++		sprintf(hdmi_str + strlen(hdmi_str), ",pcm=%d", pcmdev);
+ 
+-	hdmi_present_sense(per_pin, 0);
+-	return 0;
++	return snd_hda_jack_add_kctl(codec, per_pin->pin_nid, hdmi_str, 0);
+ }
+ 
+ static int generic_hdmi_build_controls(struct hda_codec *codec)
+@@ -1280,10 +1272,8 @@ static int generic_hdmi_build_controls(s
+ 
+ 		if (err < 0)
+ 			return err;
+-		err = snd_hda_jack_add_kctl(codec, per_pin->pin_nid,
+-					    "HDMI", pin_idx);
+-		if (err < 0)
+-			return err;
++
++		hdmi_present_sense(per_pin, false);
+ 	}
+ 
+ 	return 0;
+--- a/sound/pci/hda/patch_realtek.c
++++ b/sound/pci/hda/patch_realtek.c
+@@ -467,46 +467,6 @@ static void alc_fix_pll_init(struct hda_
+ }
+ 
+ /*
+- * Jack-reporting via input-jack layer
+- */
+-
+-/* initialization of jacks; currently checks only a few known pins */
+-static int alc_init_jacks(struct hda_codec *codec)
+-{
+-#ifdef CONFIG_SND_HDA_INPUT_JACK
+-	struct alc_spec *spec = codec->spec;
+-	int err;
+-	unsigned int hp_nid = spec->autocfg.hp_pins[0];
+-	unsigned int mic_nid = spec->ext_mic_pin;
+-	unsigned int dock_nid = spec->dock_mic_pin;
+-
+-	if (hp_nid) {
+-		err = snd_hda_input_jack_add(codec, hp_nid,
+-					     SND_JACK_HEADPHONE, NULL);
+-		if (err < 0)
+-			return err;
+-		snd_hda_input_jack_report(codec, hp_nid);
+-	}
+-
+-	if (mic_nid) {
+-		err = snd_hda_input_jack_add(codec, mic_nid,
+-					     SND_JACK_MICROPHONE, NULL);
+-		if (err < 0)
+-			return err;
+-		snd_hda_input_jack_report(codec, mic_nid);
+-	}
+-	if (dock_nid) {
+-		err = snd_hda_input_jack_add(codec, dock_nid,
+-					     SND_JACK_MICROPHONE, NULL);
+-		if (err < 0)
+-			return err;
+-		snd_hda_input_jack_report(codec, dock_nid);
+-	}
+-#endif /* CONFIG_SND_HDA_INPUT_JACK */
+-	return 0;
+-}
+-
+-/*
+  * Jack detections for HP auto-mute and mic-switch
+  */
+ 
+@@ -519,7 +479,6 @@ static bool detect_jacks(struct hda_code
+ 		hda_nid_t nid = pins[i];
+ 		if (!nid)
+ 			break;
+-		snd_hda_input_jack_report(codec, nid);
+ 		present |= snd_hda_jack_detect(codec, nid);
+ 	}
+ 	return present;
+@@ -659,10 +618,6 @@ static void alc_mic_automute(struct hda_
+ 		alc_mux_select(codec, 0, spec->dock_mic_idx, false);
+ 	else
+ 		alc_mux_select(codec, 0, spec->int_mic_idx, false);
+-
+-	snd_hda_input_jack_report(codec, pins[spec->ext_mic_idx]);
+-	if (spec->dock_mic_idx >= 0)
+-		snd_hda_input_jack_report(codec, pins[spec->dock_mic_idx]);
+ }
+ 
+ /* unsolicited event for HP jack sensing */
+@@ -4736,7 +4691,6 @@ static int patch_alc882(struct hda_codec
+ 	if (board_config == ALC_MODEL_AUTO)
+ 		spec->init_hook = alc_auto_init_std;
+ 
+-	alc_init_jacks(codec);
+ #ifdef CONFIG_SND_HDA_POWER_SAVE
+ 	if (!spec->loopback.amplist)
+ 		spec->loopback.amplist = alc882_loopbacks;
+@@ -4914,7 +4868,6 @@ static int patch_alc262(struct hda_codec
+ 	spec->init_hook = alc_auto_init_std;
+ 	spec->shutup = alc_eapd_shutup;
+ 
+-	alc_init_jacks(codec);
+ #ifdef CONFIG_SND_HDA_POWER_SAVE
+ 	if (!spec->loopback.amplist)
+ 		spec->loopback.amplist = alc262_loopbacks;
+@@ -5025,8 +4978,6 @@ static int patch_alc268(struct hda_codec
+ 	spec->init_hook = alc_auto_init_std;
+ 	spec->shutup = alc_eapd_shutup;
+ 
+-	alc_init_jacks(codec);
+-
+ 	return 0;
+ 
+  error:
+@@ -5582,7 +5533,6 @@ static int patch_alc269(struct hda_codec
+ 	spec->init_hook = alc_auto_init_std;
+ 	spec->shutup = alc269_shutup;
+ 
+-	alc_init_jacks(codec);
+ #ifdef CONFIG_SND_HDA_POWER_SAVE
+ 	if (!spec->loopback.amplist)
+ 		spec->loopback.amplist = alc269_loopbacks;
+@@ -6202,8 +6152,6 @@ static int patch_alc662(struct hda_codec
+ 	spec->init_hook = alc_auto_init_std;
+ 	spec->shutup = alc_eapd_shutup;
+ 
+-	alc_init_jacks(codec);
+-
+ #ifdef CONFIG_SND_HDA_POWER_SAVE
+ 	if (!spec->loopback.amplist)
+ 		spec->loopback.amplist = alc662_loopbacks;
+--- a/sound/pci/hda/patch_sigmatel.c
++++ b/sound/pci/hda/patch_sigmatel.c
+@@ -1082,13 +1082,10 @@ static const char * const slave_sws[] =
+ };
+ 
+ static void stac92xx_free_kctls(struct hda_codec *codec);
+-static int stac92xx_add_jack(struct hda_codec *codec, hda_nid_t nid, int type);
+ 
+ static int stac92xx_build_controls(struct hda_codec *codec)
+ {
+ 	struct sigmatel_spec *spec = codec->spec;
+-	struct auto_pin_cfg *cfg = &spec->autocfg;
+-	hda_nid_t nid;
+ 	int err;
+ 	int i;
+ 
+@@ -1174,32 +1171,6 @@ static int stac92xx_build_controls(struc
+ 
+ 	stac92xx_free_kctls(codec); /* no longer needed */
+ 
+-	/* create jack input elements */
+-	if (spec->hp_detect) {
+-		for (i = 0; i < cfg->hp_outs; i++) {
+-			int type = SND_JACK_HEADPHONE;
+-			nid = cfg->hp_pins[i];
+-			/* jack detection */
+-			if (cfg->hp_outs == i)
+-				type |= SND_JACK_LINEOUT;
+-			err = stac92xx_add_jack(codec, nid, type);
+-			if (err < 0)
+-				return err;
+-		}
+-	}
+-	for (i = 0; i < cfg->line_outs; i++) {
+-		err = stac92xx_add_jack(codec, cfg->line_out_pins[i],
+-					SND_JACK_LINEOUT);
+-		if (err < 0)
+-			return err;
+-	}
+-	for (i = 0; i < cfg->num_inputs; i++) {
+-		nid = cfg->inputs[i].pin;
+-		err = stac92xx_add_jack(codec, nid, SND_JACK_MICROPHONE);
+-		if (err < 0)
+-			return err;
+-	}
+-
+ 	err = snd_hda_jack_add_kctls(codec, &spec->autocfg);
+ 	if (err < 0)
+ 		return err;
+@@ -4155,22 +4126,6 @@ static void stac_gpio_set(struct hda_cod
+ 			   AC_VERB_SET_GPIO_DATA, gpiostate); /* sync */
+ }
+ 
+-static int stac92xx_add_jack(struct hda_codec *codec,
+-		hda_nid_t nid, int type)
+-{
+-#ifdef CONFIG_SND_HDA_INPUT_JACK
+-	int def_conf = snd_hda_codec_get_pincfg(codec, nid);
+-	int connectivity = get_defcfg_connect(def_conf);
+-
+-	if (connectivity && connectivity != AC_JACK_PORT_FIXED)
+-		return 0;
+-
+-	return snd_hda_input_jack_add(codec, nid, type, NULL);
+-#else
+-	return 0;
+-#endif /* CONFIG_SND_HDA_INPUT_JACK */
+-}
+-
+ static int stac_add_event(struct hda_codec *codec, hda_nid_t nid,
+ 			  unsigned char type, int data)
+ {
+@@ -4779,7 +4734,6 @@ static void handle_unsol_event(struct hd
+ 	case STAC_PWR_EVENT:
+ 		if (spec->num_pwrs > 0)
+ 			stac92xx_pin_sense(codec, event->nid);
+-		snd_hda_input_jack_report(codec, event->nid);
+ 
+ 		switch (codec->subsystem_id) {
+ 		case 0x103c308f:
