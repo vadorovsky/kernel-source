@@ -1,0 +1,182 @@
+From 18478e8b626edc2d181dcb1b93e1f99ad72095e9 Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Fri, 9 Mar 2012 17:51:10 +0100
+Subject: [PATCH] ALSA: hda - Initialize vmaster slave volumes
+Git-commit: 18478e8b626edc2d181dcb1b93e1f99ad72095e9
+Patch-mainline: 3.4-rc3
+References: FATE#313695
+
+When the driver is changed to use vmaster or a new slave element is
+added by the improvement of the parser code, user may face often the
+silent output because of the muted slave mixer although Master volume
+is properly set.  And they complain.  And I get upset.
+
+Although such a mixer element should be initialized via "alsactl init",
+it'd be more user-friendly if the known output slaves are unmuted and
+set to 0dB so that user can control the volume only with Master as
+default.  Since Master is still set muted as default even with this
+change, no risk of the speaker blow up, too.
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ sound/pci/hda/hda_codec.c    |   65 +++++++++++++++++++++++++++++++++++++++++--
+ sound/pci/hda/hda_local.h    |    6 ++-
+ sound/pci/hda/patch_analog.c |    8 +++--
+ 3 files changed, 72 insertions(+), 7 deletions(-)
+
+--- a/sound/pci/hda/hda_codec.c
++++ b/sound/pci/hda/hda_codec.c
+@@ -19,6 +19,7 @@
+  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+  */
+ 
++#include <linux/mm.h>
+ #include <linux/init.h>
+ #include <linux/delay.h>
+ #include <linux/slab.h>
+@@ -2339,6 +2340,56 @@ static int check_slave_present(void *dat
+ 	return 1;
+ }
+ 
++/* guess the value corresponding to 0dB */
++static int get_kctl_0dB_offset(struct snd_kcontrol *kctl)
++{
++	int _tlv[4];
++	const int *tlv = NULL;
++	int val = -1;
++
++	if (kctl->vd[0].access & SNDRV_CTL_ELEM_ACCESS_TLV_CALLBACK) {
++		/* FIXME: set_fs() hack for obtaining user-space TLV data */
++		mm_segment_t fs = get_fs();
++		set_fs(get_ds());
++		if (!kctl->tlv.c(kctl, 0, sizeof(_tlv), _tlv))
++			tlv = _tlv;
++		set_fs(fs);
++	} else if (kctl->vd[0].access & SNDRV_CTL_ELEM_ACCESS_TLV_READ)
++		tlv = kctl->tlv.p;
++	if (tlv && tlv[0] == SNDRV_CTL_TLVT_DB_SCALE)
++		val = -tlv[2] / tlv[3];
++	return val;
++}
++
++/* call kctl->put with the given value(s) */
++static int put_kctl_with_value(struct snd_kcontrol *kctl, int val)
++{
++	struct snd_ctl_elem_value *ucontrol;
++	ucontrol = kzalloc(sizeof(*ucontrol), GFP_KERNEL);
++	if (!ucontrol)
++		return -ENOMEM;
++	ucontrol->value.integer.value[0] = val;
++	ucontrol->value.integer.value[1] = val;
++	kctl->put(kctl, ucontrol);
++	kfree(ucontrol);
++	return 0;
++}
++
++/* initialize the slave volume with 0dB */
++static int init_slave_0dB(void *data, struct snd_kcontrol *slave)
++{
++	int offset = get_kctl_0dB_offset(slave);
++	if (offset > 0)
++		put_kctl_with_value(slave, offset);
++	return 0;
++}
++
++/* unmute the slave */
++static int init_slave_unmute(void *data, struct snd_kcontrol *slave)
++{
++	return put_kctl_with_value(slave, 1);
++}
++
+ /**
+  * snd_hda_add_vmaster - create a virtual master control and add slaves
+  * @codec: HD-audio codec
+@@ -2346,6 +2397,7 @@ static int check_slave_present(void *dat
+  * @tlv: TLV data (optional)
+  * @slaves: slave control names (optional)
+  * @suffix: suffix string to each slave name (optional)
++ * @init_slave_vol: initialize slaves to unmute/0dB
+  *
+  * Create a virtual master control with the given name.  The TLV data
+  * must be either NULL or a valid data.
+@@ -2356,9 +2408,9 @@ static int check_slave_present(void *dat
+  *
+  * This function returns zero if successful or a negative error code.
+  */
+-int snd_hda_add_vmaster(struct hda_codec *codec, char *name,
++int __snd_hda_add_vmaster(struct hda_codec *codec, char *name,
+ 			unsigned int *tlv, const char * const *slaves,
+-			const char *suffix)
++			const char *suffix, bool init_slave_vol)
+ {
+ 	struct snd_kcontrol *kctl;
+ 	int err;
+@@ -2379,9 +2431,16 @@ int snd_hda_add_vmaster(struct hda_codec
+ 			 (map_slave_func_t)snd_ctl_add_slave, kctl);
+ 	if (err < 0)
+ 		return err;
++
++	/* init with master mute & zero volume */
++	put_kctl_with_value(kctl, 0);
++	if (init_slave_vol)
++		map_slaves(codec, slaves, suffix,
++			   tlv ? init_slave_0dB : init_slave_unmute, kctl);
++
+ 	return 0;
+ }
+-EXPORT_SYMBOL_HDA(snd_hda_add_vmaster);
++EXPORT_SYMBOL_HDA(__snd_hda_add_vmaster);
+ 
+ /**
+  * snd_hda_mixer_amp_switch_info - Info callback for a standard AMP mixer switch
+--- a/sound/pci/hda/hda_local.h
++++ b/sound/pci/hda/hda_local.h
+@@ -139,9 +139,11 @@ void snd_hda_set_vmaster_tlv(struct hda_
+ 			     unsigned int *tlv);
+ struct snd_kcontrol *snd_hda_find_mixer_ctl(struct hda_codec *codec,
+ 					    const char *name);
+-int snd_hda_add_vmaster(struct hda_codec *codec, char *name,
++int __snd_hda_add_vmaster(struct hda_codec *codec, char *name,
+ 			unsigned int *tlv, const char * const *slaves,
+-			const char *suffix);
++			const char *suffix, bool init_slave_vol);
++#define snd_hda_add_vmaster(codec, name, tlv, slaves, suffix) \
++	__snd_hda_add_vmaster(codec, name, tlv, slaves, suffix, true)
+ int snd_hda_codec_reset(struct hda_codec *codec);
+ 
+ /* amp value bits */
+--- a/sound/pci/hda/patch_analog.c
++++ b/sound/pci/hda/patch_analog.c
+@@ -81,6 +81,7 @@ struct ad198x_spec {
+ 	unsigned int inv_jack_detect: 1;/* inverted jack-detection */
+ 	unsigned int inv_eapd: 1;	/* inverted EAPD implementation */
+ 	unsigned int analog_beep: 1;	/* analog beep input present */
++	unsigned int avoid_init_slave_vol:1;
+ 
+ #ifdef CONFIG_SND_HDA_POWER_SAVE
+ 	struct hda_loopback_check loopback;
+@@ -222,11 +223,12 @@ static int ad198x_build_controls(struct
+ 		unsigned int vmaster_tlv[4];
+ 		snd_hda_set_vmaster_tlv(codec, spec->vmaster_nid,
+ 					HDA_OUTPUT, vmaster_tlv);
+-		err = snd_hda_add_vmaster(codec, "Master Playback Volume",
++		err = __snd_hda_add_vmaster(codec, "Master Playback Volume",
+ 					  vmaster_tlv,
+ 					  (spec->slave_vols ?
+ 					   spec->slave_vols : ad_slave_pfxs),
+-					  "Playback Volume");
++					  "Playback Volume",
++					  !spec->avoid_init_slave_vol);
+ 		if (err < 0)
+ 			return err;
+ 	}
+@@ -3603,6 +3605,8 @@ static int patch_ad1884(struct hda_codec
+ 	spec->vmaster_nid = 0x04;
+ 	/* we need to cover all playback volumes */
+ 	spec->slave_vols = ad1884_slave_vols;
++	/* slaves may contain input volumes, so we can't raise to 0dB blindly */
++	spec->avoid_init_slave_vol = 1;
+ 
+ 	codec->patch_ops = ad198x_patch_ops;
+ 
