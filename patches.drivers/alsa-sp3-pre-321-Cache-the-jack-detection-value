@@ -1,0 +1,709 @@
+From 1835a0f9a2121ce3198dab67507d4d3e960cc09e Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Thu, 27 Oct 2011 22:12:46 +0200
+Subject: [PATCH] ALSA: hda - Cache the jack-detection value
+Git-commit: 1835a0f9a2121ce3198dab67507d4d3e960cc09e
+Patch-mainline: 3.3-rc1
+References: FATE#314106
+
+Introduce a table containing the pins and their jack-detection states
+for avoiding the unnecessary verbs to check the pin status at each time.
+
+When the unsol event is enabled via snd_hda_jack_detect_enable(), it
+automatically adds the given NID to the table.  Then the driver supposes
+that the codec driver will set the dirty flag appropariately when an
+unsolicited event is invoked for that pin.
+
+The behavior for reading other pins that aren't registered in the table
+doesn't change.  Only the pins assigned to the table are cached, so far.
+
+In near futre, this table can be extended to use the central place for
+the unsolicited events of all pins, etc, and eventually include the
+jack-detect kcontrols that replace the current input-jack stuff.
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ sound/pci/hda/Makefile         |    2 
+ sound/pci/hda/hda_codec.c      |   40 -----------
+ sound/pci/hda/hda_codec.h      |    3 
+ sound/pci/hda/hda_jack.c       |  148 +++++++++++++++++++++++++++++++++++++++++
+ sound/pci/hda/hda_jack.h       |   63 +++++++++++++++++
+ sound/pci/hda/hda_local.h      |   15 ----
+ sound/pci/hda/patch_analog.c   |    1 
+ sound/pci/hda/patch_cirrus.c   |   14 +--
+ sound/pci/hda/patch_conexant.c |   20 ++---
+ sound/pci/hda/patch_hdmi.c     |    8 +-
+ sound/pci/hda/patch_realtek.c  |   20 ++---
+ sound/pci/hda/patch_sigmatel.c |   46 +++++++-----
+ sound/pci/hda/patch_via.c      |   19 ++---
+ 13 files changed, 284 insertions(+), 115 deletions(-)
+ create mode 100644 sound/pci/hda/hda_jack.c
+ create mode 100644 sound/pci/hda/hda_jack.h
+
+--- a/sound/pci/hda/Makefile
++++ b/sound/pci/hda/Makefile
+@@ -1,6 +1,6 @@
+ snd-hda-intel-objs := hda_intel.o
+ 
+-snd-hda-codec-y := hda_codec.o
++snd-hda-codec-y := hda_codec.o hda_jack.o
+ snd-hda-codec-$(CONFIG_SND_HDA_GENERIC) += hda_generic.o
+ snd-hda-codec-$(CONFIG_PROC_FS) += hda_proc.o
+ snd-hda-codec-$(CONFIG_SND_HDA_HWDEP) += hda_hwdep.o
+--- a/sound/pci/hda/hda_codec.c
++++ b/sound/pci/hda/hda_codec.c
+@@ -32,6 +32,7 @@
+ #include <sound/jack.h>
+ #include "hda_local.h"
+ #include "hda_beep.h"
++#include "hda_jack.h"
+ #include <sound/hda_hwdep.h>
+ 
+ #define CREATE_TRACE_POINTS
+@@ -1722,43 +1723,6 @@ int snd_hda_override_pin_caps(struct hda
+ }
+ EXPORT_SYMBOL_HDA(snd_hda_override_pin_caps);
+ 
+-/**
+- * snd_hda_pin_sense - execute pin sense measurement
+- * @codec: the CODEC to sense
+- * @nid: the pin NID to sense
+- *
+- * Execute necessary pin sense measurement and return its Presence Detect,
+- * Impedance, ELD Valid etc. status bits.
+- */
+-u32 snd_hda_pin_sense(struct hda_codec *codec, hda_nid_t nid)
+-{
+-	u32 pincap;
+-
+-	if (!codec->no_trigger_sense) {
+-		pincap = snd_hda_query_pin_caps(codec, nid);
+-		if (pincap & AC_PINCAP_TRIG_REQ) /* need trigger? */
+-			snd_hda_codec_read(codec, nid, 0,
+-					AC_VERB_SET_PIN_SENSE, 0);
+-	}
+-	return snd_hda_codec_read(codec, nid, 0,
+-				  AC_VERB_GET_PIN_SENSE, 0);
+-}
+-EXPORT_SYMBOL_HDA(snd_hda_pin_sense);
+-
+-/**
+- * snd_hda_jack_detect - query pin Presence Detect status
+- * @codec: the CODEC to sense
+- * @nid: the pin NID to sense
+- *
+- * Query and return the pin's Presence Detect status.
+- */
+-int snd_hda_jack_detect(struct hda_codec *codec, hda_nid_t nid)
+-{
+-	u32 sense = snd_hda_pin_sense(codec, nid);
+-	return !!(sense & AC_PINSENSE_PRESENCE);
+-}
+-EXPORT_SYMBOL_HDA(snd_hda_jack_detect);
+-
+ /*
+  * read the current volume to info
+  * if the cache exists, read the cache value.
+@@ -2311,6 +2275,7 @@ int snd_hda_codec_reset(struct hda_codec
+ 	}
+ 	if (codec->patch_ops.free)
+ 		codec->patch_ops.free(codec);
++	snd_hda_jack_tbl_clear(codec);
+ 	codec->proc_widget_hook = NULL;
+ 	codec->spec = NULL;
+ 	free_hda_cache(&codec->amp_cache);
+@@ -3367,6 +3332,7 @@ static void hda_call_codec_resume(struct
+ 	restore_pincfgs(codec); /* restore all current pin configs */
+ 	restore_shutup_pins(codec);
+ 	hda_exec_init_verbs(codec);
++	snd_hda_jack_set_dirty_all(codec);
+ 	if (codec->patch_ops.resume)
+ 		codec->patch_ops.resume(codec);
+ 	else {
+--- a/sound/pci/hda/hda_codec.h
++++ b/sound/pci/hda/hda_codec.h
+@@ -869,6 +869,9 @@ struct hda_codec {
+ 	void (*proc_widget_hook)(struct snd_info_buffer *buffer,
+ 				 struct hda_codec *codec, hda_nid_t nid);
+ 
++	/* jack detection */
++	struct snd_array jacktbl;
++
+ #ifdef CONFIG_SND_HDA_INPUT_JACK
+ 	/* jack detection */
+ 	struct snd_array jacks;
+--- /dev/null
++++ b/sound/pci/hda/hda_jack.c
+@@ -0,0 +1,148 @@
++/*
++ * Jack-detection handling for HD-audio
++ *
++ * Copyright (c) 2011 Takashi Iwai <tiwai@suse.de>
++ *
++ * This driver is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <sound/core.h>
++#include "hda_codec.h"
++#include "hda_local.h"
++#include "hda_jack.h"
++
++/* execute pin sense measurement */
++static u32 read_pin_sense(struct hda_codec *codec, hda_nid_t nid)
++{
++	u32 pincap;
++
++	if (!codec->no_trigger_sense) {
++		pincap = snd_hda_query_pin_caps(codec, nid);
++		if (pincap & AC_PINCAP_TRIG_REQ) /* need trigger? */
++			snd_hda_codec_read(codec, nid, 0,
++					AC_VERB_SET_PIN_SENSE, 0);
++	}
++	return snd_hda_codec_read(codec, nid, 0,
++				  AC_VERB_GET_PIN_SENSE, 0);
++}
++
++/**
++ * snd_hda_jack_tbl_get - query the jack-table entry for the given NID
++ */
++struct hda_jack_tbl *
++snd_hda_jack_tbl_get(struct hda_codec *codec, hda_nid_t nid)
++{
++	struct hda_jack_tbl *jack = codec->jacktbl.list;
++	int i;
++
++	if (!nid || !jack)
++		return NULL;
++	for (i = 0; i < codec->jacktbl.used; i++, jack++)
++		if (jack->nid == nid)
++			return jack;
++	return NULL;
++}
++EXPORT_SYMBOL_HDA(snd_hda_jack_tbl_get);
++
++/**
++ * snd_hda_jack_tbl_new - create a jack-table entry for the given NID
++ */
++struct hda_jack_tbl *
++snd_hda_jack_tbl_new(struct hda_codec *codec, hda_nid_t nid)
++{
++	struct hda_jack_tbl *jack = snd_hda_jack_tbl_get(codec, nid);
++	if (jack)
++		return jack;
++	snd_array_init(&codec->jacktbl, sizeof(*jack), 16);
++	jack = snd_array_new(&codec->jacktbl);
++	if (!jack)
++		return NULL;
++	jack->nid = nid;
++	jack->jack_dirty = 1;
++	return jack;
++}
++
++void snd_hda_jack_tbl_clear(struct hda_codec *codec)
++{
++	snd_array_free(&codec->jacktbl);
++}
++
++/* update the cached value and notification flag if needed */
++static void jack_detect_update(struct hda_codec *codec,
++			       struct hda_jack_tbl *jack)
++{
++	if (jack->jack_dirty) {
++		jack->pin_sense = read_pin_sense(codec, jack->nid);
++		jack->jack_dirty = 0;
++	}
++}
++
++/**
++ * snd_hda_set_dirty_all - Mark all the cached as dirty
++ *
++ * This function sets the dirty flag to all entries of jack table.
++ * It's called from the resume path in hda_codec.c.
++ */
++void snd_hda_jack_set_dirty_all(struct hda_codec *codec)
++{
++	struct hda_jack_tbl *jack = codec->jacktbl.list;
++	int i;
++
++	for (i = 0; i < codec->jacktbl.used; i++, jack++)
++		if (jack->nid)
++			jack->jack_dirty = 1;
++}
++EXPORT_SYMBOL_HDA(snd_hda_jack_set_dirty_all);
++
++/**
++ * snd_hda_pin_sense - execute pin sense measurement
++ * @codec: the CODEC to sense
++ * @nid: the pin NID to sense
++ *
++ * Execute necessary pin sense measurement and return its Presence Detect,
++ * Impedance, ELD Valid etc. status bits.
++ */
++u32 snd_hda_pin_sense(struct hda_codec *codec, hda_nid_t nid)
++{
++	struct hda_jack_tbl *jack = snd_hda_jack_tbl_get(codec, nid);
++	if (jack) {
++		jack_detect_update(codec, jack);
++		return jack->pin_sense;
++	}
++	return read_pin_sense(codec, nid);
++}
++EXPORT_SYMBOL_HDA(snd_hda_pin_sense);
++
++/**
++ * snd_hda_jack_detect - query pin Presence Detect status
++ * @codec: the CODEC to sense
++ * @nid: the pin NID to sense
++ *
++ * Query and return the pin's Presence Detect status.
++ */
++int snd_hda_jack_detect(struct hda_codec *codec, hda_nid_t nid)
++{
++	u32 sense = snd_hda_pin_sense(codec, nid);
++	return !!(sense & AC_PINSENSE_PRESENCE);
++}
++EXPORT_SYMBOL_HDA(snd_hda_jack_detect);
++
++/**
++ * snd_hda_jack_detect_enable - enable the jack-detection
++ */
++int snd_hda_jack_detect_enable(struct hda_codec *codec, hda_nid_t nid,
++			       unsigned int tag)
++{
++	struct hda_jack_tbl *jack = snd_hda_jack_tbl_new(codec, nid);
++	if (!jack)
++		return -ENOMEM;
++	return snd_hda_codec_write_cache(codec, nid, 0,
++					 AC_VERB_SET_UNSOLICITED_ENABLE,
++					 AC_USRSP_EN | tag);
++}
++EXPORT_SYMBOL_HDA(snd_hda_jack_detect_enable);
+--- /dev/null
++++ b/sound/pci/hda/hda_jack.h
+@@ -0,0 +1,63 @@
++/*
++ * Jack-detection handling for HD-audio
++ *
++ * Copyright (c) 2011 Takashi Iwai <tiwai@suse.de>
++ *
++ * This driver is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef __SOUND_HDA_JACK_H
++#define __SOUND_HDA_JACK_H
++
++struct hda_jack_tbl {
++	hda_nid_t nid;
++	unsigned int pin_sense;		/* cached pin-sense value */
++	unsigned int jack_dirty:1;	/* needs to update? */
++};
++
++struct hda_jack_tbl *
++snd_hda_jack_tbl_get(struct hda_codec *codec, hda_nid_t nid);
++
++struct hda_jack_tbl *
++snd_hda_jack_tbl_new(struct hda_codec *codec, hda_nid_t nid);
++void snd_hda_jack_tbl_clear(struct hda_codec *codec);
++
++/**
++ * snd_hda_jack_set_dirty - set the dirty flag for the given jack-entry
++ *
++ * Call this function when a pin-state may change, e.g. when the hardware
++ * notifies via an unsolicited event.
++ */
++static inline void snd_hda_jack_set_dirty(struct hda_codec *codec,
++					  hda_nid_t nid)
++{
++	struct hda_jack_tbl *jack = snd_hda_jack_tbl_get(codec, nid);
++	if (jack)
++		jack->jack_dirty = 1;
++}
++
++void snd_hda_jack_set_dirty_all(struct hda_codec *codec);
++
++int snd_hda_jack_detect_enable(struct hda_codec *codec, hda_nid_t nid,
++			       unsigned int tag);
++
++u32 snd_hda_pin_sense(struct hda_codec *codec, hda_nid_t nid);
++int snd_hda_jack_detect(struct hda_codec *codec, hda_nid_t nid);
++
++static inline bool is_jack_detectable(struct hda_codec *codec, hda_nid_t nid)
++{
++	if (!(snd_hda_query_pin_caps(codec, nid) & AC_PINCAP_PRES_DETECT))
++		return false;
++	if (!codec->ignore_misc_bit &&
++	    (get_defcfg_misc(snd_hda_codec_get_pincfg(codec, nid)) &
++	     AC_DEFCFG_MISC_NO_PRESENCE))
++		return false;
++	if (!(get_wcaps(codec, nid) & AC_WCAP_UNSOL_CAP))
++		return false;
++	return true;
++}
++
++#endif /* __SOUND_HDA_JACK_H */
+--- a/sound/pci/hda/hda_local.h
++++ b/sound/pci/hda/hda_local.h
+@@ -510,21 +510,6 @@ int snd_hda_override_amp_caps(struct hda
+ u32 snd_hda_query_pin_caps(struct hda_codec *codec, hda_nid_t nid);
+ int snd_hda_override_pin_caps(struct hda_codec *codec, hda_nid_t nid,
+ 			      unsigned int caps);
+-u32 snd_hda_pin_sense(struct hda_codec *codec, hda_nid_t nid);
+-int snd_hda_jack_detect(struct hda_codec *codec, hda_nid_t nid);
+-
+-static inline bool is_jack_detectable(struct hda_codec *codec, hda_nid_t nid)
+-{
+-	if (!(snd_hda_query_pin_caps(codec, nid) & AC_PINCAP_PRES_DETECT))
+-		return false;
+-	if (!codec->ignore_misc_bit &&
+-	    (get_defcfg_misc(snd_hda_codec_get_pincfg(codec, nid)) &
+-	     AC_DEFCFG_MISC_NO_PRESENCE))
+-		return false;
+-	if (!(get_wcaps(codec, nid) & AC_WCAP_UNSOL_CAP))
+-		return false;
+-	return true;
+-}
+ 
+ /* flags for hda_nid_item */
+ #define HDA_NID_ITEM_AMP	(1<<0)
+--- a/sound/pci/hda/patch_analog.c
++++ b/sound/pci/hda/patch_analog.c
+@@ -28,6 +28,7 @@
+ #include "hda_codec.h"
+ #include "hda_local.h"
+ #include "hda_beep.h"
++#include "hda_jack.h"
+ 
+ struct ad198x_spec {
+ 	const struct snd_kcontrol_new *mixers[6];
+--- a/sound/pci/hda/patch_cirrus.c
++++ b/sound/pci/hda/patch_cirrus.c
+@@ -25,6 +25,8 @@
+ #include <sound/core.h>
+ #include "hda_codec.h"
+ #include "hda_local.h"
++#include "hda_jack.h"
++#include <sound/tlv.h>
+ 
+ /*
+  */
+@@ -917,10 +919,8 @@ static void init_output(struct hda_codec
+ 				    AC_VERB_SET_PIN_WIDGET_CONTROL, PIN_HP);
+ 		if (!cfg->speaker_outs)
+ 			continue;
+-		if (is_jack_detectable(codec, nid)) {
+-			snd_hda_codec_write(codec, nid, 0,
+-					    AC_VERB_SET_UNSOLICITED_ENABLE,
+-					    AC_USRSP_EN | HP_EVENT);
++		if (get_wcaps(codec, nid) & AC_WCAP_UNSOL_CAP) {
++			snd_hda_jack_detect_enable(codec, nid, HP_EVENT);
+ 			spec->hp_detect = 1;
+ 		}
+ 	}
+@@ -957,9 +957,7 @@ static void init_input(struct hda_codec
+ 				    AC_VERB_SET_AMP_GAIN_MUTE,
+ 				    AMP_IN_MUTE(spec->adc_idx[i]));
+ 		if (spec->mic_detect && spec->automic_idx == i)
+-			snd_hda_codec_write(codec, pin, 0,
+-					    AC_VERB_SET_UNSOLICITED_ENABLE,
+-					    AC_USRSP_EN | MIC_EVENT);
++			snd_hda_jack_detect_enable(codec, pin, MIC_EVENT);
+ 	}
+ 	change_cur_input(codec, spec->cur_input, 1);
+ 	if (spec->mic_detect)
+@@ -1109,6 +1107,8 @@ static void cs_free(struct hda_codec *co
+ 
+ static void cs_unsol_event(struct hda_codec *codec, unsigned int res)
+ {
++	snd_hda_jack_set_dirty_all(codec); /* FIXME: to be more fine-grained */
++
+ 	switch ((res >> 26) & 0x7f) {
+ 	case HP_EVENT:
+ 		cs_automute(codec);
+--- a/sound/pci/hda/patch_conexant.c
++++ b/sound/pci/hda/patch_conexant.c
+@@ -30,6 +30,7 @@
+ #include "hda_codec.h"
+ #include "hda_local.h"
+ #include "hda_beep.h"
++#include "hda_jack.h"
+ 
+ #define CXT_PIN_DIR_IN              0x00
+ #define CXT_PIN_DIR_OUT             0x01
+@@ -3764,6 +3765,7 @@ static void cx_auto_automic(struct hda_c
+ static void cx_auto_unsol_event(struct hda_codec *codec, unsigned int res)
+ {
+ 	int nid = (res & AC_UNSOL_RES_SUBTAG) >> 20;
++	snd_hda_jack_set_dirty(codec, nid);
+ 	switch (res >> 26) {
+ 	case CONEXANT_HP_EVENT:
+ 		cx_auto_hp_automute(codec);
+@@ -3991,9 +3993,7 @@ static void enable_unsol_pins(struct hda
+ {
+ 	int i;
+ 	for (i = 0; i < num_pins; i++)
+-		snd_hda_codec_write(codec, pins[i], 0,
+-				    AC_VERB_SET_UNSOLICITED_ENABLE,
+-				    AC_USRSP_EN | tag);
++		snd_hda_jack_detect_enable(codec, pins[i], tag);
+ }
+ 
+ static void cx_auto_init_output(struct hda_codec *codec)
+@@ -4073,16 +4073,14 @@ static void cx_auto_init_input(struct hd
+ 
+ 	if (spec->auto_mic) {
+ 		if (spec->auto_mic_ext >= 0) {
+-			snd_hda_codec_write(codec,
+-				cfg->inputs[spec->auto_mic_ext].pin, 0,
+-				AC_VERB_SET_UNSOLICITED_ENABLE,
+-				AC_USRSP_EN | CONEXANT_MIC_EVENT);
++			snd_hda_jack_detect_enable(codec,
++				cfg->inputs[spec->auto_mic_ext].pin,
++				CONEXANT_MIC_EVENT);
+ 		}
+ 		if (spec->auto_mic_dock >= 0) {
+-			snd_hda_codec_write(codec,
+-				cfg->inputs[spec->auto_mic_dock].pin, 0,
+-				AC_VERB_SET_UNSOLICITED_ENABLE,
+-				AC_USRSP_EN | CONEXANT_MIC_EVENT);
++			snd_hda_jack_detect_enable(codec,
++				cfg->inputs[spec->auto_mic_dock].pin,
++				CONEXANT_MIC_EVENT);
+ 		}
+ 		cx_auto_automic(codec);
+ 	} else {
+--- a/sound/pci/hda/patch_hdmi.c
++++ b/sound/pci/hda/patch_hdmi.c
+@@ -36,6 +36,7 @@
+ #include <sound/jack.h>
+ #include "hda_codec.h"
+ #include "hda_local.h"
++#include "hda_jack.h"
+ 
+ static bool static_hdmi_pcm;
+ module_param(static_hdmi_pcm, bool, 0644);
+@@ -767,7 +768,8 @@ static void hdmi_intrinsic_event(struct
+ 	if (pin_idx < 0)
+ 		return;
+ 
+-	hdmi_present_sense(&spec->pins[pin_idx], 1);
++	snd_hda_jack_set_dirty(codec, pin_nid);
++	hdmi_present_sense(&spec->pins[pin_idx], true);
+ }
+ 
+ static void hdmi_non_intrinsic_event(struct hda_codec *codec, unsigned int res)
+@@ -1286,9 +1288,7 @@ static int generic_hdmi_init(struct hda_
+ 		struct hdmi_eld *eld = &per_pin->sink_eld;
+ 
+ 		hdmi_init_pin(codec, pin_nid);
+-		snd_hda_codec_write(codec, pin_nid, 0,
+-				    AC_VERB_SET_UNSOLICITED_ENABLE,
+-				    AC_USRSP_EN | pin_nid);
++		snd_hda_jack_detect_enable(codec, pin_nid, pin_nid);
+ 
+ 		per_pin->codec = codec;
+ 		INIT_DELAYED_WORK(&per_pin->work, hdmi_repoll_eld);
+--- a/sound/pci/hda/patch_realtek.c
++++ b/sound/pci/hda/patch_realtek.c
+@@ -32,6 +32,7 @@
+ #include "hda_codec.h"
+ #include "hda_local.h"
+ #include "hda_beep.h"
++#include "hda_jack.h"
+ 
+ /* unsol event tags */
+ #define ALC_FRONT_EVENT		0x01
+@@ -670,6 +671,7 @@ static void alc_sku_unsol_event(struct h
+ 		res >>= 28;
+ 	else
+ 		res >>= 26;
++	snd_hda_jack_set_dirty_all(codec); /* FIXME: to be more fine-grained */
+ 	switch (res) {
+ 	case ALC_HP_EVENT:
+ 		alc_hp_automute(codec);
+@@ -970,9 +972,7 @@ static void alc_init_automute(struct hda
+ 			continue;
+ 		snd_printdd("realtek: Enable HP auto-muting on NID 0x%x\n",
+ 			    nid);
+-		snd_hda_codec_write_cache(codec, nid, 0,
+-				  AC_VERB_SET_UNSOLICITED_ENABLE,
+-				  AC_USRSP_EN | ALC_HP_EVENT);
++		snd_hda_jack_detect_enable(codec, nid, ALC_HP_EVENT);
+ 		spec->detect_hp = 1;
+ 	}
+ 
+@@ -984,9 +984,8 @@ static void alc_init_automute(struct hda
+ 					continue;
+ 				snd_printdd("realtek: Enable Line-Out "
+ 					    "auto-muting on NID 0x%x\n", nid);
+-				snd_hda_codec_write_cache(codec, nid, 0,
+-						AC_VERB_SET_UNSOLICITED_ENABLE,
+-						AC_USRSP_EN | ALC_FRONT_EVENT);
++				snd_hda_jack_detect_enable(codec, nid,
++							   ALC_FRONT_EVENT);
+ 				spec->detect_lo = 1;
+ 		}
+ 		spec->automute_lo_possible = spec->detect_hp;
+@@ -1125,13 +1124,10 @@ static bool alc_auto_mic_check_imux(stru
+ 		return false; /* no corresponding imux */
+ 	}
+ 
+-	snd_hda_codec_write_cache(codec, spec->ext_mic_pin, 0,
+-				  AC_VERB_SET_UNSOLICITED_ENABLE,
+-				  AC_USRSP_EN | ALC_MIC_EVENT);
++	snd_hda_jack_detect_enable(codec, spec->ext_mic_pin, ALC_MIC_EVENT);
+ 	if (spec->dock_mic_pin)
+-		snd_hda_codec_write_cache(codec, spec->dock_mic_pin, 0,
+-				  AC_VERB_SET_UNSOLICITED_ENABLE,
+-				  AC_USRSP_EN | ALC_MIC_EVENT);
++		snd_hda_jack_detect_enable(codec, spec->dock_mic_pin,
++					   ALC_MIC_EVENT);
+ 
+ 	spec->auto_mic_valid_imux = 1;
+ 	spec->auto_mic = 1;
+--- a/sound/pci/hda/patch_sigmatel.c
++++ b/sound/pci/hda/patch_sigmatel.c
+@@ -36,6 +36,7 @@
+ #include "hda_codec.h"
+ #include "hda_local.h"
+ #include "hda_beep.h"
++#include "hda_jack.h"
+ 
+ enum {
+ 	STAC_VREF_EVENT	= 1,
+@@ -4241,9 +4242,7 @@ static int enable_pin_detect(struct hda_
+ 		if (tag < 0)
+ 			return 0;
+ 	}
+-	snd_hda_codec_write_cache(codec, nid, 0,
+-				  AC_VERB_SET_UNSOLICITED_ENABLE,
+-				  AC_USRSP_EN | tag);
++	snd_hda_jack_detect_enable(codec, nid, tag);
+ 	return 1;
+ }
+ 
+@@ -4796,24 +4795,11 @@ static void stac92xx_mic_detect(struct h
+ 					  mic->mux_idx);
+ }
+ 
+-static void stac_issue_unsol_event(struct hda_codec *codec, hda_nid_t nid)
+-{
+-	struct sigmatel_event *event = stac_get_event(codec, nid);
+-	if (!event)
+-		return;
+-	codec->patch_ops.unsol_event(codec, (unsigned)event->tag << 26);
+-}
+-
+-static void stac92xx_unsol_event(struct hda_codec *codec, unsigned int res)
++static void handle_unsol_event(struct hda_codec *codec,
++			       struct sigmatel_event *event)
+ {
+ 	struct sigmatel_spec *spec = codec->spec;
+-	struct sigmatel_event *event;
+-	int tag, data;
+-
+-	tag = (res >> 26) & 0x7f;
+-	event = stac_get_event_from_tag(codec, tag);
+-	if (!event)
+-		return;
++	int data;
+ 
+ 	switch (event->type) {
+ 	case STAC_HP_EVENT:
+@@ -4863,6 +4849,28 @@ static void stac92xx_unsol_event(struct
+ 	}
+ }
+ 
++static void stac_issue_unsol_event(struct hda_codec *codec, hda_nid_t nid)
++{
++	struct sigmatel_event *event = stac_get_event(codec, nid);
++	if (!event)
++		return;
++	handle_unsol_event(codec, event);
++}
++
++static void stac92xx_unsol_event(struct hda_codec *codec, unsigned int res)
++{
++	struct sigmatel_spec *spec = codec->spec;
++	struct sigmatel_event *event;
++	int tag;
++
++	tag = (res >> 26) & 0x7f;
++	event = stac_get_event_from_tag(codec, tag);
++	if (!event)
++		return;
++	snd_hda_jack_set_dirty(codec, event->nid);
++	handle_unsol_event(codec, event);
++}
++
+ static int hp_blike_system(u32 subsystem_id);
+ 
+ static void set_hp_led_gpio(struct hda_codec *codec)
+--- a/sound/pci/hda/patch_via.c
++++ b/sound/pci/hda/patch_via.c
+@@ -53,6 +53,7 @@
+ #include <sound/asoundef.h>
+ #include "hda_codec.h"
+ #include "hda_local.h"
++#include "hda_jack.h"
+ 
+ /* Pin Widget NID */
+ #define VT1708_HP_PIN_NID	0x20
+@@ -1712,6 +1713,8 @@ static void via_gpio_control(struct hda_
+ static void via_unsol_event(struct hda_codec *codec,
+ 				  unsigned int res)
+ {
++	snd_hda_jack_set_dirty_all(codec); /* FIXME: to be more fine-grained */
++
+ 	res >>= 26;
+ 
+ 	if (res & VIA_JACK_EVENT)
+@@ -2735,9 +2738,8 @@ static void via_auto_init_unsol_event(st
+ 	int i;
+ 
+ 	if (cfg->hp_pins[0] && is_jack_detectable(codec, cfg->hp_pins[0]))
+-		snd_hda_codec_write(codec, cfg->hp_pins[0], 0,
+-				AC_VERB_SET_UNSOLICITED_ENABLE,
+-				AC_USRSP_EN | VIA_HP_EVENT | VIA_JACK_EVENT);
++		snd_hda_jack_detect_enable(codec, cfg->hp_pins[0],
++					   VIA_HP_EVENT | VIA_JACK_EVENT);
+ 
+ 	if (cfg->speaker_pins[0])
+ 		ev = VIA_LINE_EVENT;
+@@ -2746,16 +2748,14 @@ static void via_auto_init_unsol_event(st
+ 	for (i = 0; i < cfg->line_outs; i++) {
+ 		if (cfg->line_out_pins[i] &&
+ 		    is_jack_detectable(codec, cfg->line_out_pins[i]))
+-			snd_hda_codec_write(codec, cfg->line_out_pins[i], 0,
+-				AC_VERB_SET_UNSOLICITED_ENABLE,
+-				AC_USRSP_EN | ev | VIA_JACK_EVENT);
++			snd_hda_jack_detect_enable(codec, cfg->line_out_pins[i],
++						   ev | VIA_JACK_EVENT);
+ 	}
+ 
+ 	for (i = 0; i < cfg->num_inputs; i++) {
+ 		if (is_jack_detectable(codec, cfg->inputs[i].pin))
+-			snd_hda_codec_write(codec, cfg->inputs[i].pin, 0,
+-				AC_VERB_SET_UNSOLICITED_ENABLE,
+-				AC_USRSP_EN | VIA_JACK_EVENT);
++			snd_hda_jack_detect_enable(codec, cfg->inputs[i].pin,
++						   VIA_JACK_EVENT);
+ 	}
+ }
+ 
+@@ -2788,6 +2788,7 @@ static void vt1708_update_hp_jack_state(
+ 					     vt1708_hp_work.work);
+ 	if (spec->codec_type != VT1708)
+ 		return;
++	snd_hda_jack_set_dirty_all(spec->codec);
+ 	/* if jack state toggled */
+ 	if (spec->vt1708_hp_present
+ 	    != snd_hda_jack_detect(spec->codec, spec->autocfg.hp_pins[0])) {
