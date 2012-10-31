@@ -1,0 +1,268 @@
+From 09cf03b80c593b08e8b630a145e14f485200b5af Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Sat, 19 May 2012 17:21:25 +0200
+Subject: [PATCH] ALSA: hda - Fix possible races of accesses to connection list array
+Git-commit: 09cf03b80c593b08e8b630a145e14f485200b5af
+Patch-mainline: 3.5-rc1
+References: FATE#314106
+
+Like the previous fixes for cache hash accesses, a protection over
+accesses to the widget connection list array must be provided.
+Together with this action, remove snd_hda_get_conn_list() which can be
+always race, and replace it with either snd_hda_get_num_conns() or
+snd_hda_get_connections() calls.
+
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ sound/pci/hda/hda_codec.c     |   82 ++++++++++++++++++------------------------
+ sound/pci/hda/hda_codec.h     |    7 ++-
+ sound/pci/hda/patch_realtek.c |   17 ++++----
+ sound/pci/hda/patch_via.c     |    2 -
+ 4 files changed, 52 insertions(+), 56 deletions(-)
+
+--- a/sound/pci/hda/hda_codec.c
++++ b/sound/pci/hda/hda_codec.c
+@@ -333,78 +333,67 @@ static hda_nid_t *lookup_conn_list(struc
+ 	return NULL;
+ }
+ 
++/* read the connection and add to the cache */
++static int read_and_add_raw_conns(struct hda_codec *codec, hda_nid_t nid)
++{
++	hda_nid_t list[HDA_MAX_CONNECTIONS];
++	int len;
++
++	len = snd_hda_get_raw_connections(codec, nid, list, ARRAY_SIZE(list));
++	if (len < 0)
++		return len;
++	return snd_hda_override_conn_list(codec, nid, len, list);
++}
++
+ /**
+- * snd_hda_get_conn_list - get connection list
++ * snd_hda_get_connections - copy connection list
+  * @codec: the HDA codec
+  * @nid: NID to parse
+- * @listp: the pointer to store NID list
++ * @conn_list: connection list array; when NULL, checks only the size
++ * @max_conns: max. number of connections to store
+  *
+  * Parses the connection list of the given widget and stores the list
+  * of NIDs.
+  *
+  * Returns the number of connections, or a negative error code.
+  */
+-int snd_hda_get_conn_list(struct hda_codec *codec, hda_nid_t nid,
+-			  const hda_nid_t **listp)
++int snd_hda_get_connections(struct hda_codec *codec, hda_nid_t nid,
++			    hda_nid_t *conn_list, int max_conns)
+ {
+ 	struct snd_array *array = &codec->conn_lists;
+-	int len, err;
+-	hda_nid_t list[HDA_MAX_CONNECTIONS];
++	int len;
+ 	hda_nid_t *p;
+ 	bool added = false;
+ 
+  again:
++	mutex_lock(&codec->hash_mutex);
++	len = -1;
+ 	/* if the connection-list is already cached, read it */
+ 	p = lookup_conn_list(array, nid);
+ 	if (p) {
+-		if (listp)
+-			*listp = p + 2;
+-		return p[1];
++		len = p[1];
++		if (conn_list && len > max_conns) {
++			snd_printk(KERN_ERR "hda_codec: "
++				   "Too many connections %d for NID 0x%x\n",
++				   len, nid);
++			mutex_unlock(&codec->hash_mutex);
++			return -EINVAL;
++		}
++		if (conn_list && len)
++			memcpy(conn_list, p + 2, len * sizeof(hda_nid_t));
+ 	}
++	mutex_unlock(&codec->hash_mutex);
++	if (len >= 0)
++		return len;
+ 	if (snd_BUG_ON(added))
+ 		return -EINVAL;
+ 
+-	/* read the connection and add to the cache */
+-	len = snd_hda_get_raw_connections(codec, nid, list, HDA_MAX_CONNECTIONS);
++	len = read_and_add_raw_conns(codec, nid);
+ 	if (len < 0)
+ 		return len;
+-	err = snd_hda_override_conn_list(codec, nid, len, list);
+-	if (err < 0)
+-		return err;
+ 	added = true;
+ 	goto again;
+ }
+-EXPORT_SYMBOL_HDA(snd_hda_get_conn_list);
+-
+-/**
+- * snd_hda_get_connections - copy connection list
+- * @codec: the HDA codec
+- * @nid: NID to parse
+- * @conn_list: connection list array
+- * @max_conns: max. number of connections to store
+- *
+- * Parses the connection list of the given widget and stores the list
+- * of NIDs.
+- *
+- * Returns the number of connections, or a negative error code.
+- */
+-int snd_hda_get_connections(struct hda_codec *codec, hda_nid_t nid,
+-			     hda_nid_t *conn_list, int max_conns)
+-{
+-	const hda_nid_t *list;
+-	int len = snd_hda_get_conn_list(codec, nid, &list);
+-
+-	if (len <= 0)
+-		return len;
+-	if (len > max_conns) {
+-		snd_printk(KERN_ERR "hda_codec: "
+-			   "Too many connections %d for NID 0x%x\n",
+-			   len, nid);
+-		return -EINVAL;
+-	}
+-	memcpy(conn_list, list, len * sizeof(hda_nid_t));
+-	return len;
+-}
+ EXPORT_SYMBOL_HDA(snd_hda_get_connections);
+ 
+ /**
+@@ -542,6 +531,7 @@ int snd_hda_override_conn_list(struct hd
+ 	hda_nid_t *p;
+ 	int i, old_used;
+ 
++	mutex_lock(&codec->hash_mutex);
+ 	p = lookup_conn_list(array, nid);
+ 	if (p)
+ 		*p = -1; /* invalidate the old entry */
+@@ -552,10 +542,12 @@ int snd_hda_override_conn_list(struct hd
+ 	for (i = 0; i < len; i++)
+ 		if (!add_conn_list(array, list[i]))
+ 			goto error_add;
++	mutex_unlock(&codec->hash_mutex);
+ 	return 0;
+ 
+  error_add:
+ 	array->used = old_used;
++	mutex_unlock(&codec->hash_mutex);
+ 	return -ENOMEM;
+ }
+ EXPORT_SYMBOL_HDA(snd_hda_override_conn_list);
+--- a/sound/pci/hda/hda_codec.h
++++ b/sound/pci/hda/hda_codec.h
+@@ -911,10 +911,13 @@ int snd_hda_get_sub_nodes(struct hda_cod
+ 			  hda_nid_t *start_id);
+ int snd_hda_get_connections(struct hda_codec *codec, hda_nid_t nid,
+ 			    hda_nid_t *conn_list, int max_conns);
++static inline int
++snd_hda_get_num_conns(struct hda_codec *codec, hda_nid_t nid)
++{
++	return snd_hda_get_connections(codec, nid, NULL, 0);
++}
+ int snd_hda_get_raw_connections(struct hda_codec *codec, hda_nid_t nid,
+ 			    hda_nid_t *conn_list, int max_conns);
+-int snd_hda_get_conn_list(struct hda_codec *codec, hda_nid_t nid,
+-			  const hda_nid_t **listp);
+ int snd_hda_override_conn_list(struct hda_codec *codec, hda_nid_t nid, int nums,
+ 			  const hda_nid_t *list);
+ int snd_hda_get_conn_index(struct hda_codec *codec, hda_nid_t mux,
+--- a/sound/pci/hda/patch_realtek.c
++++ b/sound/pci/hda/patch_realtek.c
+@@ -348,7 +348,7 @@ static int alc_mux_select(struct hda_cod
+ 	nid = get_capsrc(spec, adc_idx);
+ 
+ 	/* no selection? */
+-	num_conns = snd_hda_get_conn_list(codec, nid, NULL);
++	num_conns = snd_hda_get_num_conns(codec, nid);
+ 	if (num_conns <= 1)
+ 		return 1;
+ 
+@@ -2542,7 +2542,6 @@ static int alc_auto_fill_adc_caps(struct
+ 	nid = codec->start_nid;
+ 	for (i = 0; i < codec->num_nodes; i++, nid++) {
+ 		hda_nid_t src;
+-		const hda_nid_t *list;
+ 		unsigned int caps = get_wcaps(codec, nid);
+ 		int type = get_wcaps_type(caps);
+ 
+@@ -2553,6 +2552,7 @@ static int alc_auto_fill_adc_caps(struct
+ 		src = nid;
+ 		for (;;) {
+ 			int n;
++			hda_nid_t conn_nid;
+ 			type = get_wcaps_type(get_wcaps(codec, src));
+ 			if (type == AC_WID_PIN)
+ 				break;
+@@ -2560,13 +2560,14 @@ static int alc_auto_fill_adc_caps(struct
+ 				cap_nids[nums] = src;
+ 				break;
+ 			}
+-			n = snd_hda_get_conn_list(codec, src, &list);
++			n = snd_hda_get_num_conns(codec, src);
+ 			if (n > 1) {
+ 				cap_nids[nums] = src;
+ 				break;
+ 			} else if (n != 1)
+ 				break;
+-			src = *list;
++			if (snd_hda_get_connections(codec, src, &src, 1) != 1)
++				break;
+ 		}
+ 		if (++nums >= max_nums)
+ 			break;
+@@ -2707,7 +2708,7 @@ static void alc_auto_init_analog_input(s
+ 
+ 	/* mute all loopback inputs */
+ 	if (spec->mixer_nid) {
+-		int nums = snd_hda_get_conn_list(codec, spec->mixer_nid, NULL);
++		int nums = snd_hda_get_num_conns(codec, spec->mixer_nid);
+ 		for (i = 0; i < nums; i++)
+ 			snd_hda_codec_write(codec, spec->mixer_nid, 0,
+ 					    AC_VERB_SET_AMP_GAIN_MUTE,
+@@ -3337,7 +3338,7 @@ static int alc_auto_add_sw_ctl(struct hd
+ 	if (wid_type == AC_WID_PIN || wid_type == AC_WID_AUD_OUT) {
+ 		type = ALC_CTL_WIDGET_MUTE;
+ 		val = HDA_COMPOSE_AMP_VAL(nid, chs, 0, HDA_OUTPUT);
+-	} else if (snd_hda_get_conn_list(codec, nid, NULL) == 1) {
++	} else if (snd_hda_get_num_conns(codec, nid) == 1) {
+ 		type = ALC_CTL_WIDGET_MUTE;
+ 		val = HDA_COMPOSE_AMP_VAL(nid, chs, 0, HDA_INPUT);
+ 	} else {
+@@ -3897,7 +3898,7 @@ static void alc_remove_invalid_adc_nids(
+ 	nums = 0;
+ 	for (n = 0; n < spec->num_adc_nids; n++) {
+ 		hda_nid_t cap = spec->private_capsrc_nids[n];
+-		int num_conns = snd_hda_get_conn_list(codec, cap, NULL);
++		int num_conns = snd_hda_get_num_conns(codec, cap);
+ 		for (i = 0; i < imux->num_items; i++) {
+ 			hda_nid_t pin = spec->imux_pins[i];
+ 			if (pin) {
+@@ -4026,7 +4027,7 @@ static void select_or_unmute_capsrc(stru
+ 	if (get_wcaps_type(get_wcaps(codec, cap)) == AC_WID_AUD_MIX) {
+ 		snd_hda_codec_amp_stereo(codec, cap, HDA_INPUT, idx,
+ 					 HDA_AMP_MUTE, 0);
+-	} else if (snd_hda_get_conn_list(codec, cap, NULL) > 1) {
++	} else if (snd_hda_get_num_conns(codec, cap) > 1) {
+ 		snd_hda_codec_write_cache(codec, cap, 0,
+ 					  AC_VERB_SET_CONNECT_SEL, idx);
+ 	}
+--- a/sound/pci/hda/patch_via.c
++++ b/sound/pci/hda/patch_via.c
+@@ -484,7 +484,7 @@ static void activate_output_mix(struct h
+ 
+ 	if (!path)
+ 		return;
+-	num = snd_hda_get_conn_list(codec, mix_nid, NULL);
++	num = snd_hda_get_num_conns(codec, mix_nid);
+ 	for (i = 0; i < num; i++) {
+ 		if (i == idx)
+ 			val = AMP_IN_UNMUTE(i);
