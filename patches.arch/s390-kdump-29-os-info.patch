@@ -1,0 +1,513 @@
+From: Michael Holzheu <holzheu@linux.vnet.ibm.com>
+Subject: [S390] kernel: Add OS info memory interface
+Date:   Sun Mar 11 11:59:34 2012 -0400
+Patch-mainline: v3.4-rc1
+Git-commit: 4857d4bbe9821c8d732cb84455e18e12b3d79add
+References: bnc#786472,ltc#82694,fate#314077
+    
+In order to allow kdump based stand-alone dump, some information
+has to be passed from the old kernel to the new dump kernel. This
+is done via a the struct "os_info" that contains the following fields:
+ * crashkernel base and size
+ * reipl block
+ * vmcoreinfo
+ * init function
+A pointer to os_info is stored at a well known storage location
+and the whole structure as well as all fields are secured with
+checksums.
+
+Signed-off-by: Michael Holzheu <holzheu@linux.vnet.ibm.com>
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: John L. Jolly <jjolly@suse.de>
+
+---
+ arch/s390/include/asm/lowcore.h |    8 +
+ arch/s390/include/asm/os_info.h |   50 +++++++++++
+ arch/s390/kernel/Makefile       |    2 
+ arch/s390/kernel/crash_dump.c   |   37 ++++++--
+ arch/s390/kernel/ipl.c          |   42 ++++++++-
+ arch/s390/kernel/os_info.c      |  169 ++++++++++++++++++++++++++++++++++++++++
+ arch/s390/kernel/setup.c        |    3 
+ arch/s390/kernel/smp.c          |   12 ++
+ 8 files changed, 303 insertions(+), 20 deletions(-)
+
+--- a/arch/s390/include/asm/lowcore.h
++++ b/arch/s390/include/asm/lowcore.h
+@@ -152,7 +152,9 @@ struct _lowcore {
+ 	__u32	ipib;				/* 0x0e00 */
+ 	__u32	ipib_checksum;			/* 0x0e04 */
+ 	__u32	vmcore_info;			/* 0x0e08 */
+-	__u8	pad_0x0e0c[0x0f00-0x0e0c];	/* 0x0e0c */
++	__u8	pad_0x0e0c[0x0e18-0x0e0c];	/* 0x0e0c */
++	__u32	os_info;			/* 0x0e18 */
++	__u8	pad_0x0e1c[0x0f00-0x0e1c];	/* 0x0e1c */
+ 
+ 	/* Extended facility list */
+ 	__u64	stfle_fac_list[32];		/* 0x0f00 */
+@@ -289,7 +291,9 @@ struct _lowcore {
+ 	__u64	ipib;				/* 0x0e00 */
+ 	__u32	ipib_checksum;			/* 0x0e08 */
+ 	__u64	vmcore_info;			/* 0x0e0c */
+-	__u8	pad_0x0e14[0x0f00-0x0e14];	/* 0x0e14 */
++	__u8	pad_0x0e14[0x0e18-0x0e14];	/* 0x0e14 */
++	__u64	os_info;			/* 0x0e18 */
++	__u8	pad_0x0e20[0x0f00-0x0e20];	/* 0x0e20 */
+ 
+ 	/* Extended facility list */
+ 	__u64	stfle_fac_list[32];		/* 0x0f00 */
+--- /dev/null
++++ b/arch/s390/include/asm/os_info.h
+@@ -0,0 +1,50 @@
++/*
++ * OS info memory interface
++ *
++ * Copyright IBM Corp. 2012
++ * Author(s): Michael Holzheu <holzheu@linux.vnet.ibm.com>
++ */
++#ifndef _ASM_S390_OS_INFO_H
++#define _ASM_S390_OS_INFO_H
++
++#define OS_INFO_VERSION_MAJOR	1
++#define OS_INFO_VERSION_MINOR	1
++#define OS_INFO_MAGIC		0x4f53494e464f535aULL /* OSINFOSZ */
++
++#define OS_INFO_VMCOREINFO	0
++#define OS_INFO_REIPL_BLOCK	1
++#define OS_INFO_INIT_FN		2
++
++struct os_info_entry {
++	u64	addr;
++	u64	size;
++	u32	csum;
++} __packed;
++
++struct os_info {
++	u64	magic;
++	u32	csum;
++	u16	version_major;
++	u16	version_minor;
++	u64	crashkernel_addr;
++	u64	crashkernel_size;
++	struct os_info_entry entry[3];
++	u8	reserved[4004];
++} __packed;
++
++void os_info_init(void);
++void os_info_entry_add(int nr, void *ptr, u64 len);
++void os_info_crashkernel_add(unsigned long base, unsigned long size);
++u32 os_info_csum(struct os_info *os_info);
++
++#ifdef CONFIG_CRASH_DUMP
++void *os_info_old_entry(int nr, unsigned long *size);
++int copy_from_oldmem(void *dest, void *src, size_t count);
++#else
++static inline void *os_info_old_entry(int nr, unsigned long *size)
++{
++	return NULL;
++}
++#endif
++
++#endif /* _ASM_S390_OS_INFO_H */
+--- a/arch/s390/kernel/Makefile
++++ b/arch/s390/kernel/Makefile
+@@ -23,7 +23,7 @@ CFLAGS_sysinfo.o += -Iinclude/math-emu -
+ obj-y	:=  bitmap.o traps.o time.o process.o base.o early.o setup.o vtime.o \
+ 	    processor.o sys_s390.o ptrace.o signal.o cpcmd.o ebcdic.o nmi.o \
+ 	    debug.o irq.o ipl.o dis.o diag.o mem_detect.o sclp.o vdso.o \
+-	    sysinfo.o jump_label.o lgr.o
++	    sysinfo.o jump_label.o lgr.o os_info.o
+ 
+ obj-y	+= $(if $(CONFIG_64BIT),entry64.o,entry.o)
+ obj-y	+= $(if $(CONFIG_64BIT),reipl64.o,reipl.o)
+--- a/arch/s390/kernel/crash_dump.c
++++ b/arch/s390/kernel/crash_dump.c
+@@ -15,6 +15,7 @@
+ #include <linux/bootmem.h>
+ #include <linux/elf.h>
+ #include <asm/ipl.h>
++#include <asm/os_info.h>
+ 
+ #define PTR_ADD(x, y) (((char *) (x)) + ((unsigned long) (y)))
+ #define PTR_SUB(x, y) (((char *) (x)) - ((unsigned long) (y)))
+@@ -52,7 +53,7 @@ ssize_t copy_oldmem_page(unsigned long p
+ /*
+  * Copy memory from old kernel
+  */
+-static int copy_from_oldmem(void *dest, void *src, size_t count)
++int copy_from_oldmem(void *dest, void *src, size_t count)
+ {
+ 	unsigned long copied = 0;
+ 	int rc;
+@@ -225,28 +226,44 @@ static void *nt_prpsinfo(void *ptr)
+ }
+ 
+ /*
+- * Initialize vmcoreinfo note (new kernel)
++ * Get vmcoreinfo using lowcore->vmcore_info (new kernel)
+  */
+-static void *nt_vmcoreinfo(void *ptr)
++static void *get_vmcoreinfo_old(unsigned long *size)
+ {
+ 	char nt_name[11], *vmcoreinfo;
+ 	Elf64_Nhdr note;
+ 	void *addr;
+ 
+ 	if (copy_from_oldmem(&addr, &S390_lowcore.vmcore_info, sizeof(addr)))
+-		return ptr;
++		return NULL;
+ 	memset(nt_name, 0, sizeof(nt_name));
+ 	if (copy_from_oldmem(&note, addr, sizeof(note)))
+-		return ptr;
++		return NULL;
+ 	if (copy_from_oldmem(nt_name, addr + sizeof(note), sizeof(nt_name) - 1))
+-		return ptr;
++		return NULL;
+ 	if (strcmp(nt_name, "VMCOREINFO") != 0)
+-		return ptr;
+-	vmcoreinfo = kzalloc_panic(note.n_descsz + 1);
++		return NULL;
++	vmcoreinfo = kzalloc_panic(note.n_descsz);
+ 	if (copy_from_oldmem(vmcoreinfo, addr + 24, note.n_descsz))
++		return NULL;
++	*size = note.n_descsz;
++	return vmcoreinfo;
++}
++
++/*
++ * Initialize vmcoreinfo note (new kernel)
++ */
++static void *nt_vmcoreinfo(void *ptr)
++{
++	unsigned long size;
++	void *vmcoreinfo;
++
++	vmcoreinfo = os_info_old_entry(OS_INFO_VMCOREINFO, &size);
++	if (!vmcoreinfo)
++		vmcoreinfo = get_vmcoreinfo_old(&size);
++	if (!vmcoreinfo)
+ 		return ptr;
+-	vmcoreinfo[note.n_descsz + 1] = 0;
+-	return nt_init(ptr, 0, vmcoreinfo, note.n_descsz, "VMCOREINFO");
++	return nt_init(ptr, 0, vmcoreinfo, size, "VMCOREINFO");
+ }
+ 
+ /*
+--- a/arch/s390/kernel/ipl.c
++++ b/arch/s390/kernel/ipl.c
+@@ -27,6 +27,7 @@
+ #include <asm/sclp.h>
+ #include <asm/sigp.h>
+ #include <asm/checksum.h>
++#include <asm/os_info.h>
+ 
+ #define IPL_PARM_BLOCK_VERSION 0
+ 
+@@ -949,6 +950,13 @@ static struct attribute_group reipl_nss_
+ 	.attrs = reipl_nss_attrs,
+ };
+ 
++static void set_reipl_block_actual(struct ipl_parameter_block *reipl_block)
++{
++	reipl_block_actual = reipl_block;
++	os_info_entry_add(OS_INFO_REIPL_BLOCK, reipl_block_actual,
++			  reipl_block->hdr.len);
++}
++
+ /* reipl type */
+ 
+ static int reipl_set_type(enum ipl_type type)
+@@ -964,7 +972,7 @@ static int reipl_set_type(enum ipl_type
+ 			reipl_method = REIPL_METHOD_CCW_VM;
+ 		else
+ 			reipl_method = REIPL_METHOD_CCW_CIO;
+-		reipl_block_actual = reipl_block_ccw;
++		set_reipl_block_actual(reipl_block_ccw);
+ 		break;
+ 	case IPL_TYPE_FCP:
+ 		if (diag308_set_works)
+@@ -973,7 +981,7 @@ static int reipl_set_type(enum ipl_type
+ 			reipl_method = REIPL_METHOD_FCP_RO_VM;
+ 		else
+ 			reipl_method = REIPL_METHOD_FCP_RO_DIAG;
+-		reipl_block_actual = reipl_block_fcp;
++		set_reipl_block_actual(reipl_block_fcp);
+ 		break;
+ 	case IPL_TYPE_FCP_DUMP:
+ 		reipl_method = REIPL_METHOD_FCP_DUMP;
+@@ -983,7 +991,7 @@ static int reipl_set_type(enum ipl_type
+ 			reipl_method = REIPL_METHOD_NSS_DIAG;
+ 		else
+ 			reipl_method = REIPL_METHOD_NSS;
+-		reipl_block_actual = reipl_block_nss;
++		set_reipl_block_actual(reipl_block_nss);
+ 		break;
+ 	case IPL_TYPE_UNKNOWN:
+ 		reipl_method = REIPL_METHOD_DEFAULT;
+@@ -1255,6 +1263,29 @@ static int __init reipl_fcp_init(void)
+ 	return 0;
+ }
+ 
++static int __init reipl_type_init(void)
++{
++	enum ipl_type reipl_type = ipl_info.type;
++	struct ipl_parameter_block *reipl_block;
++	unsigned long size;
++
++	reipl_block = os_info_old_entry(OS_INFO_REIPL_BLOCK, &size);
++	if (!reipl_block)
++		goto out;
++	/*
++	 * If we have an OS info reipl block, this will be used
++	 */
++	if (reipl_block->hdr.pbt == DIAG308_IPL_TYPE_FCP) {
++		memcpy(reipl_block_fcp, reipl_block, size);
++		reipl_type = IPL_TYPE_FCP;
++	} else if (reipl_block->hdr.pbt == DIAG308_IPL_TYPE_CCW) {
++		memcpy(reipl_block_ccw, reipl_block, size);
++		reipl_type = IPL_TYPE_CCW;
++	}
++out:
++	return reipl_set_type(reipl_type);
++}
++
+ static int __init reipl_init(void)
+ {
+ 	int rc;
+@@ -1276,10 +1307,7 @@ static int __init reipl_init(void)
+ 	rc = reipl_nss_init();
+ 	if (rc)
+ 		return rc;
+-	rc = reipl_set_type(ipl_info.type);
+-	if (rc)
+-		return rc;
+-	return 0;
++	return reipl_type_init();
+ }
+ 
+ static struct shutdown_action __refdata reipl_action = {
+--- /dev/null
++++ b/arch/s390/kernel/os_info.c
+@@ -0,0 +1,169 @@
++/*
++ * OS info memory interface
++ *
++ * Copyright IBM Corp. 2012
++ * Author(s): Michael Holzheu <holzheu@linux.vnet.ibm.com>
++ */
++
++#define KMSG_COMPONENT "os_info"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <linux/crash_dump.h>
++#include <linux/kernel.h>
++#include <asm/checksum.h>
++#include <asm/lowcore.h>
++#include <asm/system.h>
++#include <asm/os_info.h>
++
++/*
++ * OS info structure has to be page aligned
++ */
++static struct os_info os_info __page_aligned_data;
++
++/*
++ * Compute checksum over OS info structure
++ */
++u32 os_info_csum(struct os_info *os_info)
++{
++	int size = sizeof(*os_info) - offsetof(struct os_info, version_major);
++	return csum_partial(&os_info->version_major, size, 0);
++}
++
++/*
++ * Add crashkernel info to OS info and update checksum
++ */
++void os_info_crashkernel_add(unsigned long base, unsigned long size)
++{
++	os_info.crashkernel_addr = (u64)(unsigned long)base;
++	os_info.crashkernel_size = (u64)(unsigned long)size;
++	os_info.csum = os_info_csum(&os_info);
++}
++
++/*
++ * Add OS info entry and update checksum
++ */
++void os_info_entry_add(int nr, void *ptr, u64 size)
++{
++	os_info.entry[nr].addr = (u64)(unsigned long)ptr;
++	os_info.entry[nr].size = size;
++	os_info.entry[nr].csum = csum_partial(ptr, size, 0);
++	os_info.csum = os_info_csum(&os_info);
++}
++
++/*
++ * Initialize OS info struture and set lowcore pointer
++ */
++void __init os_info_init(void)
++{
++	void *ptr = &os_info;
++
++	os_info.version_major = OS_INFO_VERSION_MAJOR;
++	os_info.version_minor = OS_INFO_VERSION_MINOR;
++	os_info.magic = OS_INFO_MAGIC;
++	os_info.csum = os_info_csum(&os_info);
++	copy_to_absolute_zero(&S390_lowcore.os_info, &ptr, sizeof(ptr));
++}
++
++#ifdef CONFIG_CRASH_DUMP
++
++static struct os_info *os_info_old;
++
++/*
++ * Allocate and copy OS info entry from oldmem
++ */
++static void os_info_old_alloc(int nr, int align)
++{
++	unsigned long addr, size = 0;
++	char *buf, *buf_align, *msg;
++	u32 csum;
++
++	addr = os_info_old->entry[nr].addr;
++	if (!addr) {
++		msg = "not available";
++		goto fail;
++	}
++	size = os_info_old->entry[nr].size;
++	buf = kmalloc(size + align - 1, GFP_KERNEL);
++	if (!buf) {
++		msg = "alloc failed";
++		goto fail;
++	}
++	buf_align = PTR_ALIGN(buf, align);
++	if (copy_from_oldmem(buf_align, (void *) addr, size)) {
++		msg = "copy failed";
++		goto fail_free;
++	}
++	csum = csum_partial(buf_align, size, 0);
++	if (csum != os_info_old->entry[nr].csum) {
++		msg = "checksum failed";
++		goto fail_free;
++	}
++	os_info_old->entry[nr].addr = (u64)(unsigned long)buf_align;
++	msg = "copied";
++	goto out;
++fail_free:
++	kfree(buf);
++fail:
++	os_info_old->entry[nr].addr = 0;
++out:
++	pr_info("entry %i: %s (addr=0x%lx size=%lu)\n",
++		nr, msg, addr, size);
++}
++
++/*
++ * Initialize os info and os info entries from oldmem
++ */
++static void os_info_old_init(void)
++{
++	static int os_info_init;
++	unsigned long addr;
++
++	if (os_info_init)
++		return;
++	if (!OLDMEM_BASE)
++		goto fail;
++	if (copy_from_oldmem(&addr, &S390_lowcore.os_info, sizeof(addr)))
++		goto fail;
++	if (addr == 0 || addr % PAGE_SIZE)
++		goto fail;
++	os_info_old = kzalloc(sizeof(*os_info_old), GFP_KERNEL);
++	if (!os_info_old)
++		goto fail;
++	if (copy_from_oldmem(os_info_old, (void *) addr, sizeof(*os_info_old)))
++		goto fail_free;
++	if (os_info_old->magic != OS_INFO_MAGIC)
++		goto fail_free;
++	if (os_info_old->csum != os_info_csum(os_info_old))
++		goto fail_free;
++	if (os_info_old->version_major > OS_INFO_VERSION_MAJOR)
++		goto fail_free;
++	os_info_old_alloc(OS_INFO_VMCOREINFO, 1);
++	os_info_old_alloc(OS_INFO_REIPL_BLOCK, 1);
++	os_info_old_alloc(OS_INFO_INIT_FN, PAGE_SIZE);
++	pr_info("crashkernel: addr=0x%lx size=%lu\n",
++		(unsigned long) os_info_old->crashkernel_addr,
++		(unsigned long) os_info_old->crashkernel_size);
++	os_info_init = 1;
++	return;
++fail_free:
++	kfree(os_info_old);
++fail:
++	os_info_init = 1;
++	os_info_old = NULL;
++}
++
++/*
++ * Return pointer to os infor entry and its size
++ */
++void *os_info_old_entry(int nr, unsigned long *size)
++{
++	os_info_old_init();
++
++	if (!os_info_old)
++		return NULL;
++	if (!os_info_old->entry[nr].addr)
++		return NULL;
++	*size = (unsigned long) os_info_old->entry[nr].size;
++	return (void *)(unsigned long)os_info_old->entry[nr].addr;
++}
++#endif
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -62,6 +62,7 @@
+ #include <asm/compat.h>
+ #include <asm/kvm_virtio.h>
+ #include <asm/diag.h>
++#include <asm/os_info.h>
+ 
+ long psw_kernel_bits	= (PSW_BASE_BITS | PSW_MASK_DAT | PSW_ASC_PRIMARY |
+ 			   PSW_MASK_MCHECK | PSW_DEFAULT_KEY);
+@@ -748,6 +749,7 @@ static void __init reserve_crashkernel(v
+ 	pr_info("Reserving %lluMB of memory at %lluMB "
+ 		"for crashkernel (System RAM: %luMB)\n",
+ 		crash_size >> 20, crash_base >> 20, memory_end >> 20);
++	os_info_crashkernel_add(crash_base, crash_size);
+ #endif
+ }
+ 
+@@ -1027,6 +1029,7 @@ setup_arch(char **cmdline_p)
+ 
+ 	parse_early_param();
+ 
++	os_info_init();
+ 	setup_ipl();
+ 	setup_memory_end();
+ 	setup_addressing_mode();
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@ -54,6 +54,7 @@
+ #include <asm/vdso.h>
+ #include <asm/cpu.h>
+ #include <asm/debug.h>
++#include <asm/os_info.h>
+ #include "entry.h"
+ 
+ /* logical cpu to cpu address */
+@@ -782,6 +783,17 @@ void __noreturn cpu_die(void)
+ 
+ #endif /* CONFIG_HOTPLUG_CPU */
+ 
++static void smp_call_os_info_init_fn(void)
++{
++	int (*init_fn)(void);
++	unsigned long size;
++
++	init_fn = os_info_old_entry(OS_INFO_INIT_FN, &size);
++	if (!init_fn)
++		return;
++	init_fn();
++}
++
+ void __init smp_prepare_cpus(unsigned int max_cpus)
+ {
+ #ifndef CONFIG_64BIT
