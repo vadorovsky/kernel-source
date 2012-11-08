@@ -1,0 +1,689 @@
+Git-commit: 3caf6d73d4dc163b2d135e0b52b052a2b63e5216
+From: Joe Thornber <ejt@redhat.com>
+Date: Fri, 27 Jul 2012 15:07:58 +0100
+Subject: [PATCH] dm persistent data: remove debug space map checker
+Patch-mainline: v3.6-rc1
+Reference: FATE#313903
+
+Remove debug space map checker from dm persistent data.
+
+The space map checker is a wrapper for other space maps that double
+checks the reference counts are correct.  It holds all these reference
+counts in memory rather than on disk, so uses a lot of memory and is
+thus restricted to small pools.
+
+As yet, this checker hasn't found any issues, but has caused a few of
+its own due to people turning it on by default with larger pools.
+
+Removing.
+
+[refresh needed as we never included linux/export.h - neilb ]
+
+Signed-off-by: Joe Thornber <ejt@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Alasdair G Kergon <agk@redhat.com>
+Acked-by: NeilBrown <nfbrown@suse.com>
+
+---
+ drivers/md/Kconfig                                  |    9 
+ drivers/md/persistent-data/Makefile                 |    1 
+ drivers/md/persistent-data/dm-space-map-checker.c   |  445 --------------------
+ drivers/md/persistent-data/dm-space-map-checker.h   |   26 -
+ drivers/md/persistent-data/dm-space-map-disk.c      |   34 -
+ drivers/md/persistent-data/dm-transaction-manager.c |   29 -
+ 6 files changed, 11 insertions(+), 533 deletions(-)
+ delete mode 100644 drivers/md/persistent-data/dm-space-map-checker.c
+ delete mode 100644 drivers/md/persistent-data/dm-space-map-checker.h
+
+--- linux-3.0-SLE11-SP3.orig/drivers/md/Kconfig
++++ linux-3.0-SLE11-SP3/drivers/md/Kconfig
+@@ -260,15 +260,6 @@ config DM_DEBUG_BLOCK_STACK_TRACING
+ 
+ 	  If unsure, say N.
+ 
+-config DM_DEBUG_SPACE_MAPS
+-	boolean "Extra validation for thin provisioning space maps"
+-	depends on DM_THIN_PROVISIONING
+-	---help---
+-	  Enable this for messages that may help debug problems with the
+-	  space maps used by thin provisioning.
+-
+-          If unsure, say N.
+-
+ config DM_MIRROR
+        tristate "Mirror target"
+        depends on BLK_DEV_DM
+--- linux-3.0-SLE11-SP3.orig/drivers/md/persistent-data/Makefile
++++ linux-3.0-SLE11-SP3/drivers/md/persistent-data/Makefile
+@@ -1,7 +1,6 @@
+ obj-$(CONFIG_DM_PERSISTENT_DATA) += dm-persistent-data.o
+ dm-persistent-data-objs := \
+ 	dm-block-manager.o \
+-	dm-space-map-checker.o \
+ 	dm-space-map-common.o \
+ 	dm-space-map-disk.o \
+ 	dm-space-map-metadata.o \
+--- linux-3.0-SLE11-SP3.orig/drivers/md/persistent-data/dm-space-map-checker.c
++++ /dev/null
+@@ -1,445 +0,0 @@
+-/*
+- * Copyright (C) 2011 Red Hat, Inc.
+- *
+- * This file is released under the GPL.
+- */
+-
+-#include "dm-space-map-checker.h"
+-
+-#include <linux/device-mapper.h>
+-#include <linux/vmalloc.h>
+-
+-#ifdef CONFIG_DM_DEBUG_SPACE_MAPS
+-
+-#define DM_MSG_PREFIX "space map checker"
+-
+-/*----------------------------------------------------------------*/
+-
+-struct count_array {
+-	dm_block_t nr;
+-	dm_block_t nr_free;
+-
+-	uint32_t *counts;
+-};
+-
+-static int ca_get_count(struct count_array *ca, dm_block_t b, uint32_t *count)
+-{
+-	if (b >= ca->nr)
+-		return -EINVAL;
+-
+-	*count = ca->counts[b];
+-	return 0;
+-}
+-
+-static int ca_count_more_than_one(struct count_array *ca, dm_block_t b, int *r)
+-{
+-	if (b >= ca->nr)
+-		return -EINVAL;
+-
+-	*r = ca->counts[b] > 1;
+-	return 0;
+-}
+-
+-static int ca_set_count(struct count_array *ca, dm_block_t b, uint32_t count)
+-{
+-	uint32_t old_count;
+-
+-	if (b >= ca->nr)
+-		return -EINVAL;
+-
+-	old_count = ca->counts[b];
+-
+-	if (!count && old_count)
+-		ca->nr_free++;
+-
+-	else if (count && !old_count)
+-		ca->nr_free--;
+-
+-	ca->counts[b] = count;
+-	return 0;
+-}
+-
+-static int ca_inc_block(struct count_array *ca, dm_block_t b)
+-{
+-	if (b >= ca->nr)
+-		return -EINVAL;
+-
+-	ca_set_count(ca, b, ca->counts[b] + 1);
+-	return 0;
+-}
+-
+-static int ca_dec_block(struct count_array *ca, dm_block_t b)
+-{
+-	if (b >= ca->nr)
+-		return -EINVAL;
+-
+-	BUG_ON(ca->counts[b] == 0);
+-	ca_set_count(ca, b, ca->counts[b] - 1);
+-	return 0;
+-}
+-
+-static int ca_create(struct count_array *ca, struct dm_space_map *sm)
+-{
+-	int r;
+-	dm_block_t nr_blocks;
+-
+-	r = dm_sm_get_nr_blocks(sm, &nr_blocks);
+-	if (r)
+-		return r;
+-
+-	ca->nr = nr_blocks;
+-	ca->nr_free = nr_blocks;
+-
+-	if (!nr_blocks)
+-		ca->counts = NULL;
+-	else {
+-		ca->counts = vzalloc(sizeof(*ca->counts) * nr_blocks);
+-		if (!ca->counts)
+-			return -ENOMEM;
+-	}
+-
+-	return 0;
+-}
+-
+-static void ca_destroy(struct count_array *ca)
+-{
+-	vfree(ca->counts);
+-}
+-
+-static int ca_load(struct count_array *ca, struct dm_space_map *sm)
+-{
+-	int r;
+-	uint32_t count;
+-	dm_block_t nr_blocks, i;
+-
+-	r = dm_sm_get_nr_blocks(sm, &nr_blocks);
+-	if (r)
+-		return r;
+-
+-	BUG_ON(ca->nr != nr_blocks);
+-
+-	DMWARN("Loading debug space map from disk.  This may take some time");
+-	for (i = 0; i < nr_blocks; i++) {
+-		r = dm_sm_get_count(sm, i, &count);
+-		if (r) {
+-			DMERR("load failed");
+-			return r;
+-		}
+-
+-		ca_set_count(ca, i, count);
+-	}
+-	DMWARN("Load complete");
+-
+-	return 0;
+-}
+-
+-static int ca_extend(struct count_array *ca, dm_block_t extra_blocks)
+-{
+-	dm_block_t nr_blocks = ca->nr + extra_blocks;
+-	uint32_t *counts = vzalloc(sizeof(*counts) * nr_blocks);
+-	if (!counts)
+-		return -ENOMEM;
+-
+-	if (ca->counts) {
+-		memcpy(counts, ca->counts, sizeof(*counts) * ca->nr);
+-		ca_destroy(ca);
+-	}
+-	ca->nr = nr_blocks;
+-	ca->nr_free += extra_blocks;
+-	ca->counts = counts;
+-	return 0;
+-}
+-
+-static int ca_commit(struct count_array *old, struct count_array *new)
+-{
+-	if (old->nr != new->nr) {
+-		BUG_ON(old->nr > new->nr);
+-		ca_extend(old, new->nr - old->nr);
+-	}
+-
+-	BUG_ON(old->nr != new->nr);
+-	old->nr_free = new->nr_free;
+-	memcpy(old->counts, new->counts, sizeof(*old->counts) * old->nr);
+-	return 0;
+-}
+-
+-/*----------------------------------------------------------------*/
+-
+-struct sm_checker {
+-	struct dm_space_map sm;
+-
+-	struct count_array old_counts;
+-	struct count_array counts;
+-
+-	struct dm_space_map *real_sm;
+-};
+-
+-static void sm_checker_destroy(struct dm_space_map *sm)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-
+-	dm_sm_destroy(smc->real_sm);
+-	ca_destroy(&smc->old_counts);
+-	ca_destroy(&smc->counts);
+-	kfree(smc);
+-}
+-
+-static int sm_checker_get_nr_blocks(struct dm_space_map *sm, dm_block_t *count)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	int r = dm_sm_get_nr_blocks(smc->real_sm, count);
+-	if (!r)
+-		BUG_ON(smc->old_counts.nr != *count);
+-	return r;
+-}
+-
+-static int sm_checker_get_nr_free(struct dm_space_map *sm, dm_block_t *count)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	int r = dm_sm_get_nr_free(smc->real_sm, count);
+-	if (!r) {
+-		/*
+-		 * Slow, but we know it's correct.
+-		 */
+-		dm_block_t b, n = 0;
+-		for (b = 0; b < smc->old_counts.nr; b++)
+-			if (smc->old_counts.counts[b] == 0 &&
+-			    smc->counts.counts[b] == 0)
+-				n++;
+-
+-		if (n != *count)
+-			DMERR("free block counts differ, checker %u, sm-disk:%u",
+-			      (unsigned) n, (unsigned) *count);
+-	}
+-	return r;
+-}
+-
+-static int sm_checker_new_block(struct dm_space_map *sm, dm_block_t *b)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	int r = dm_sm_new_block(smc->real_sm, b);
+-
+-	if (!r) {
+-		BUG_ON(*b >= smc->old_counts.nr);
+-		BUG_ON(smc->old_counts.counts[*b] != 0);
+-		BUG_ON(*b >= smc->counts.nr);
+-		BUG_ON(smc->counts.counts[*b] != 0);
+-		ca_set_count(&smc->counts, *b, 1);
+-	}
+-
+-	return r;
+-}
+-
+-static int sm_checker_inc_block(struct dm_space_map *sm, dm_block_t b)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	int r = dm_sm_inc_block(smc->real_sm, b);
+-	int r2 = ca_inc_block(&smc->counts, b);
+-	BUG_ON(r != r2);
+-	return r;
+-}
+-
+-static int sm_checker_dec_block(struct dm_space_map *sm, dm_block_t b)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	int r = dm_sm_dec_block(smc->real_sm, b);
+-	int r2 = ca_dec_block(&smc->counts, b);
+-	BUG_ON(r != r2);
+-	return r;
+-}
+-
+-static int sm_checker_get_count(struct dm_space_map *sm, dm_block_t b, uint32_t *result)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	uint32_t result2 = 0;
+-	int r = dm_sm_get_count(smc->real_sm, b, result);
+-	int r2 = ca_get_count(&smc->counts, b, &result2);
+-
+-	BUG_ON(r != r2);
+-	if (!r)
+-		BUG_ON(*result != result2);
+-	return r;
+-}
+-
+-static int sm_checker_count_more_than_one(struct dm_space_map *sm, dm_block_t b, int *result)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	int result2 = 0;
+-	int r = dm_sm_count_is_more_than_one(smc->real_sm, b, result);
+-	int r2 = ca_count_more_than_one(&smc->counts, b, &result2);
+-
+-	BUG_ON(r != r2);
+-	if (!r)
+-		BUG_ON(!(*result) && result2);
+-	return r;
+-}
+-
+-static int sm_checker_set_count(struct dm_space_map *sm, dm_block_t b, uint32_t count)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	uint32_t old_rc;
+-	int r = dm_sm_set_count(smc->real_sm, b, count);
+-	int r2;
+-
+-	BUG_ON(b >= smc->counts.nr);
+-	old_rc = smc->counts.counts[b];
+-	r2 = ca_set_count(&smc->counts, b, count);
+-	BUG_ON(r != r2);
+-
+-	return r;
+-}
+-
+-static int sm_checker_commit(struct dm_space_map *sm)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	int r;
+-
+-	r = dm_sm_commit(smc->real_sm);
+-	if (r)
+-		return r;
+-
+-	r = ca_commit(&smc->old_counts, &smc->counts);
+-	if (r)
+-		return r;
+-
+-	return 0;
+-}
+-
+-static int sm_checker_extend(struct dm_space_map *sm, dm_block_t extra_blocks)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	int r = dm_sm_extend(smc->real_sm, extra_blocks);
+-	if (r)
+-		return r;
+-
+-	return ca_extend(&smc->counts, extra_blocks);
+-}
+-
+-static int sm_checker_root_size(struct dm_space_map *sm, size_t *result)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	return dm_sm_root_size(smc->real_sm, result);
+-}
+-
+-static int sm_checker_copy_root(struct dm_space_map *sm, void *copy_to_here_le, size_t len)
+-{
+-	struct sm_checker *smc = container_of(sm, struct sm_checker, sm);
+-	return dm_sm_copy_root(smc->real_sm, copy_to_here_le, len);
+-}
+-
+-/*----------------------------------------------------------------*/
+-
+-static struct dm_space_map ops_ = {
+-	.destroy = sm_checker_destroy,
+-	.get_nr_blocks = sm_checker_get_nr_blocks,
+-	.get_nr_free = sm_checker_get_nr_free,
+-	.inc_block = sm_checker_inc_block,
+-	.dec_block = sm_checker_dec_block,
+-	.new_block = sm_checker_new_block,
+-	.get_count = sm_checker_get_count,
+-	.count_is_more_than_one = sm_checker_count_more_than_one,
+-	.set_count = sm_checker_set_count,
+-	.commit = sm_checker_commit,
+-	.extend = sm_checker_extend,
+-	.root_size = sm_checker_root_size,
+-	.copy_root = sm_checker_copy_root
+-};
+-
+-struct dm_space_map *dm_sm_checker_create(struct dm_space_map *sm)
+-{
+-	int r;
+-	struct sm_checker *smc;
+-
+-	if (IS_ERR_OR_NULL(sm))
+-		return ERR_PTR(-EINVAL);
+-
+-	smc = kmalloc(sizeof(*smc), GFP_KERNEL);
+-	if (!smc)
+-		return ERR_PTR(-ENOMEM);
+-
+-	memcpy(&smc->sm, &ops_, sizeof(smc->sm));
+-	r = ca_create(&smc->old_counts, sm);
+-	if (r) {
+-		kfree(smc);
+-		return ERR_PTR(r);
+-	}
+-
+-	r = ca_create(&smc->counts, sm);
+-	if (r) {
+-		ca_destroy(&smc->old_counts);
+-		kfree(smc);
+-		return ERR_PTR(r);
+-	}
+-
+-	smc->real_sm = sm;
+-
+-	r = ca_load(&smc->counts, sm);
+-	if (r) {
+-		ca_destroy(&smc->counts);
+-		ca_destroy(&smc->old_counts);
+-		kfree(smc);
+-		return ERR_PTR(r);
+-	}
+-
+-	r = ca_commit(&smc->old_counts, &smc->counts);
+-	if (r) {
+-		ca_destroy(&smc->counts);
+-		ca_destroy(&smc->old_counts);
+-		kfree(smc);
+-		return ERR_PTR(r);
+-	}
+-
+-	return &smc->sm;
+-}
+-EXPORT_SYMBOL_GPL(dm_sm_checker_create);
+-
+-struct dm_space_map *dm_sm_checker_create_fresh(struct dm_space_map *sm)
+-{
+-	int r;
+-	struct sm_checker *smc;
+-
+-	if (IS_ERR_OR_NULL(sm))
+-		return ERR_PTR(-EINVAL);
+-
+-	smc = kmalloc(sizeof(*smc), GFP_KERNEL);
+-	if (!smc)
+-		return ERR_PTR(-ENOMEM);
+-
+-	memcpy(&smc->sm, &ops_, sizeof(smc->sm));
+-	r = ca_create(&smc->old_counts, sm);
+-	if (r) {
+-		kfree(smc);
+-		return ERR_PTR(r);
+-	}
+-
+-	r = ca_create(&smc->counts, sm);
+-	if (r) {
+-		ca_destroy(&smc->old_counts);
+-		kfree(smc);
+-		return ERR_PTR(r);
+-	}
+-
+-	smc->real_sm = sm;
+-	return &smc->sm;
+-}
+-EXPORT_SYMBOL_GPL(dm_sm_checker_create_fresh);
+-
+-/*----------------------------------------------------------------*/
+-
+-#else
+-
+-struct dm_space_map *dm_sm_checker_create(struct dm_space_map *sm)
+-{
+-	return sm;
+-}
+-EXPORT_SYMBOL_GPL(dm_sm_checker_create);
+-
+-struct dm_space_map *dm_sm_checker_create_fresh(struct dm_space_map *sm)
+-{
+-	return sm;
+-}
+-EXPORT_SYMBOL_GPL(dm_sm_checker_create_fresh);
+-
+-/*----------------------------------------------------------------*/
+-
+-#endif
+--- linux-3.0-SLE11-SP3.orig/drivers/md/persistent-data/dm-space-map-checker.h
++++ /dev/null
+@@ -1,26 +0,0 @@
+-/*
+- * Copyright (C) 2011 Red Hat, Inc.
+- *
+- * This file is released under the GPL.
+- */
+-
+-#ifndef SNAPSHOTS_SPACE_MAP_CHECKER_H
+-#define SNAPSHOTS_SPACE_MAP_CHECKER_H
+-
+-#include "dm-space-map.h"
+-
+-/*----------------------------------------------------------------*/
+-
+-/*
+- * This space map wraps a real on-disk space map, and verifies all of its
+- * operations.  It uses a lot of memory, so only use if you have a specific
+- * problem that you're debugging.
+- *
+- * Ownership of @sm passes.
+- */
+-struct dm_space_map *dm_sm_checker_create(struct dm_space_map *sm);
+-struct dm_space_map *dm_sm_checker_create_fresh(struct dm_space_map *sm);
+-
+-/*----------------------------------------------------------------*/
+-
+-#endif
+--- linux-3.0-SLE11-SP3.orig/drivers/md/persistent-data/dm-space-map-disk.c
++++ linux-3.0-SLE11-SP3/drivers/md/persistent-data/dm-space-map-disk.c
+@@ -4,7 +4,6 @@
+  * This file is released under the GPL.
+  */
+ 
+-#include "dm-space-map-checker.h"
+ #include "dm-space-map-common.h"
+ #include "dm-space-map-disk.h"
+ #include "dm-space-map.h"
+@@ -252,9 +251,8 @@ static struct dm_space_map ops = {
+ 	.copy_root = sm_disk_copy_root
+ };
+ 
+-static struct dm_space_map *dm_sm_disk_create_real(
+-	struct dm_transaction_manager *tm,
+-	dm_block_t nr_blocks)
++struct dm_space_map *dm_sm_disk_create(struct dm_transaction_manager *tm,
++				       dm_block_t nr_blocks)
+ {
+ 	int r;
+ 	struct sm_disk *smd;
+@@ -285,27 +283,10 @@ bad:
+ 	kfree(smd);
+ 	return ERR_PTR(r);
+ }
+-
+-struct dm_space_map *dm_sm_disk_create(struct dm_transaction_manager *tm,
+-				       dm_block_t nr_blocks)
+-{
+-	struct dm_space_map *sm = dm_sm_disk_create_real(tm, nr_blocks);
+-	struct dm_space_map *smc;
+-
+-	if (IS_ERR_OR_NULL(sm))
+-		return sm;
+-
+-	smc = dm_sm_checker_create_fresh(sm);
+-	if (IS_ERR(smc))
+-		dm_sm_destroy(sm);
+-
+-	return smc;
+-}
+ EXPORT_SYMBOL_GPL(dm_sm_disk_create);
+ 
+-static struct dm_space_map *dm_sm_disk_open_real(
+-	struct dm_transaction_manager *tm,
+-	void *root_le, size_t len)
++struct dm_space_map *dm_sm_disk_open(struct dm_transaction_manager *tm,
++				     void *root_le, size_t len)
+ {
+ 	int r;
+ 	struct sm_disk *smd;
+@@ -332,13 +313,6 @@ bad:
+ 	kfree(smd);
+ 	return ERR_PTR(r);
+ }
+-
+-struct dm_space_map *dm_sm_disk_open(struct dm_transaction_manager *tm,
+-				     void *root_le, size_t len)
+-{
+-	return dm_sm_checker_create(
+-		dm_sm_disk_open_real(tm, root_le, len));
+-}
+ EXPORT_SYMBOL_GPL(dm_sm_disk_open);
+ 
+ /*----------------------------------------------------------------*/
+--- linux-3.0-SLE11-SP3.orig/drivers/md/persistent-data/dm-transaction-manager.c
++++ linux-3.0-SLE11-SP3/drivers/md/persistent-data/dm-transaction-manager.c
+@@ -5,7 +5,6 @@
+  */
+ #include "dm-transaction-manager.h"
+ #include "dm-space-map.h"
+-#include "dm-space-map-checker.h"
+ #include "dm-space-map-disk.h"
+ #include "dm-space-map-metadata.h"
+ #include "dm-persistent-data-internal.h"
+@@ -319,15 +318,14 @@ static int dm_tm_create_internal(struct
+ 				 int create)
+ {
+ 	int r;
+-	struct dm_space_map *inner;
+ 
+-	inner = dm_sm_metadata_init();
+-	if (IS_ERR(inner))
+-		return PTR_ERR(inner);
++	*sm = dm_sm_metadata_init();
++	if (IS_ERR(*sm))
++		return PTR_ERR(*sm);
+ 
+-	*tm = dm_tm_create(bm, inner);
++	*tm = dm_tm_create(bm, *sm);
+ 	if (IS_ERR(*tm)) {
+-		dm_sm_destroy(inner);
++		dm_sm_destroy(*sm);
+ 		return PTR_ERR(*tm);
+ 	}
+ 
+@@ -339,19 +337,13 @@ static int dm_tm_create_internal(struct
+ 			goto bad1;
+ 		}
+ 
+-		r = dm_sm_metadata_create(inner, *tm, dm_bm_nr_blocks(bm),
++		r = dm_sm_metadata_create(*sm, *tm, dm_bm_nr_blocks(bm),
+ 					  sb_location);
+ 		if (r) {
+ 			DMERR("couldn't create metadata space map");
+ 			goto bad2;
+ 		}
+ 
+-		*sm = dm_sm_checker_create(inner);
+-		if (IS_ERR(*sm)) {
+-			r = PTR_ERR(*sm);
+-			goto bad2;
+-		}
+-
+ 	} else {
+ 		r = dm_bm_write_lock(dm_tm_get_bm(*tm), sb_location,
+ 				     sb_validator, sblock);
+@@ -360,19 +352,13 @@ static int dm_tm_create_internal(struct
+ 			goto bad1;
+ 		}
+ 
+-		r = dm_sm_metadata_open(inner, *tm,
++		r = dm_sm_metadata_open(*sm, *tm,
+ 					dm_block_data(*sblock) + root_offset,
+ 					root_max_len);
+ 		if (r) {
+ 			DMERR("couldn't open metadata space map");
+ 			goto bad2;
+ 		}
+-
+-		*sm = dm_sm_checker_create(inner);
+-		if (IS_ERR(*sm)) {
+-			r = PTR_ERR(*sm);
+-			goto bad2;
+-		}
+ 	}
+ 
+ 	return 0;
+@@ -381,7 +367,6 @@ bad2:
+ 	dm_tm_unlock(*tm, *sblock);
+ bad1:
+ 	dm_tm_destroy(*tm);
+-	dm_sm_destroy(inner);
+ 	return r;
+ }
+ 
