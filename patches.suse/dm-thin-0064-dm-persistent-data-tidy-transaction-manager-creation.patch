@@ -1,0 +1,230 @@
+Git-commit: 384ef0e62e409e52c80adef5b1ff83075377c19e
+From: Joe Thornber <ejt@redhat.com>
+Date: Fri, 27 Jul 2012 15:08:09 +0100
+Subject: [PATCH] dm persistent data: tidy transaction manager creation fns
+Patch-mainline: v3.6-rc1
+Reference: FATE#313903
+
+Tidy the transaction manager creation functions.
+
+They no longer lock the superblock.  Superblock locking is pulled out to
+the caller.
+
+Also export dm_bm_write_lock_zero.
+
+Signed-off-by: Joe Thornber <ejt@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Alasdair G Kergon <agk@redhat.com>
+Acked-by: NeilBrown <nfbrown@suse.com>
+
+---
+ drivers/md/dm-thin-metadata.c                       |   42 +++++++++++------
+ drivers/md/persistent-data/dm-block-manager.c       |    1 
+ drivers/md/persistent-data/dm-transaction-manager.c |   47 +++++---------------
+ drivers/md/persistent-data/dm-transaction-manager.h |   11 ++--
+ 4 files changed, 46 insertions(+), 55 deletions(-)
+
+--- linux-3.0-SLE11-SP3.orig/drivers/md/dm-thin-metadata.c
++++ linux-3.0-SLE11-SP3/drivers/md/dm-thin-metadata.c
+@@ -418,8 +418,7 @@ static int init_pmd(struct dm_pool_metad
+ 	struct dm_block *sblock;
+ 
+ 	if (create) {
+-		r = dm_tm_create_with_sm(bm, THIN_SUPERBLOCK_LOCATION,
+-					 &sb_validator, &tm, &sm, &sblock);
++		r = dm_tm_create_with_sm(bm, THIN_SUPERBLOCK_LOCATION, &tm, &sm);
+ 		if (r < 0) {
+ 			DMERR("tm_create_with_sm failed");
+ 			return r;
+@@ -428,38 +427,51 @@ static int init_pmd(struct dm_pool_metad
+ 		data_sm = dm_sm_disk_create(tm, nr_blocks);
+ 		if (IS_ERR(data_sm)) {
+ 			DMERR("sm_disk_create failed");
+-			dm_tm_unlock(tm, sblock);
+ 			r = PTR_ERR(data_sm);
+ 			goto bad;
+ 		}
++
++		/*
++		 * We cycle the superblock to let the validator do its stuff.
++		 */
++		r = dm_bm_write_lock_zero(bm, THIN_SUPERBLOCK_LOCATION, &sb_validator, &sblock);
++		if (r < 0) {
++			DMERR("couldn't lock superblock");
++			goto bad;
++		}
++
++		dm_bm_unlock(sblock);
++
+ 	} else {
+-		struct thin_disk_superblock *disk_super = NULL;
+-		size_t space_map_root_offset =
+-			offsetof(struct thin_disk_superblock, metadata_space_map_root);
++		struct thin_disk_superblock *disk_super;
++
++		r = dm_bm_read_lock(bm, THIN_SUPERBLOCK_LOCATION, &sb_validator, &sblock);
++		if (r < 0) {
++			DMERR("couldn't read superblock");
++			return r;
++		}
+ 
++		disk_super = dm_block_data(sblock);
+ 		r = dm_tm_open_with_sm(bm, THIN_SUPERBLOCK_LOCATION,
+-				       &sb_validator, space_map_root_offset,
+-				       SPACE_MAP_ROOT_SIZE, &tm, &sm, &sblock);
++				       disk_super->metadata_space_map_root,
++				       sizeof(disk_super->metadata_space_map_root),
++				       &tm, &sm);
+ 		if (r < 0) {
+ 			DMERR("tm_open_with_sm failed");
++			dm_bm_unlock(sblock);
+ 			return r;
+ 		}
+ 
+-		disk_super = dm_block_data(sblock);
+ 		data_sm = dm_sm_disk_open(tm, disk_super->data_space_map_root,
+ 					  sizeof(disk_super->data_space_map_root));
+ 		if (IS_ERR(data_sm)) {
+ 			DMERR("sm_disk_open failed");
++			dm_bm_unlock(sblock);
+ 			r = PTR_ERR(data_sm);
+ 			goto bad;
+ 		}
+-	}
+-
+ 
+-	r = dm_tm_unlock(tm, sblock);
+-	if (r < 0) {
+-		DMERR("couldn't unlock superblock");
+-		goto bad_data_sm;
++		dm_bm_unlock(sblock);
+ 	}
+ 
+ 	pmd->bm = bm;
+--- linux-3.0-SLE11-SP3.orig/drivers/md/persistent-data/dm-block-manager.c
++++ linux-3.0-SLE11-SP3/drivers/md/persistent-data/dm-block-manager.c
+@@ -565,6 +565,7 @@ int dm_bm_write_lock_zero(struct dm_bloc
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(dm_bm_write_lock_zero);
+ 
+ int dm_bm_unlock(struct dm_block *b)
+ {
+--- linux-3.0-SLE11-SP3.orig/drivers/md/persistent-data/dm-transaction-manager.c
++++ linux-3.0-SLE11-SP3/drivers/md/persistent-data/dm-transaction-manager.c
+@@ -310,12 +310,10 @@ struct dm_block_manager *dm_tm_get_bm(st
+ 
+ static int dm_tm_create_internal(struct dm_block_manager *bm,
+ 				 dm_block_t sb_location,
+-				 struct dm_block_validator *sb_validator,
+-				 size_t root_offset, size_t root_max_len,
+ 				 struct dm_transaction_manager **tm,
+ 				 struct dm_space_map **sm,
+-				 struct dm_block **sblock,
+-				 int create)
++				 int create,
++				 void *sm_root, size_t sm_len)
+ {
+ 	int r;
+ 
+@@ -330,64 +328,43 @@ static int dm_tm_create_internal(struct
+ 	}
+ 
+ 	if (create) {
+-		r = dm_bm_write_lock_zero(dm_tm_get_bm(*tm), sb_location,
+-					  sb_validator, sblock);
+-		if (r < 0) {
+-			DMERR("couldn't lock superblock");
+-			goto bad1;
+-		}
+-
+ 		r = dm_sm_metadata_create(*sm, *tm, dm_bm_nr_blocks(bm),
+ 					  sb_location);
+ 		if (r) {
+ 			DMERR("couldn't create metadata space map");
+-			goto bad2;
++			goto bad;
+ 		}
+ 
+ 	} else {
+-		r = dm_bm_write_lock(dm_tm_get_bm(*tm), sb_location,
+-				     sb_validator, sblock);
+-		if (r < 0) {
+-			DMERR("couldn't lock superblock");
+-			goto bad1;
+-		}
+-
+-		r = dm_sm_metadata_open(*sm, *tm,
+-					dm_block_data(*sblock) + root_offset,
+-					root_max_len);
++		r = dm_sm_metadata_open(*sm, *tm, sm_root, sm_len);
+ 		if (r) {
+ 			DMERR("couldn't open metadata space map");
+-			goto bad2;
++			goto bad;
+ 		}
+ 	}
+ 
+ 	return 0;
+ 
+-bad2:
+-	dm_tm_unlock(*tm, *sblock);
+-bad1:
++bad:
+ 	dm_tm_destroy(*tm);
++	dm_sm_destroy(*sm);
+ 	return r;
+ }
+ 
+ int dm_tm_create_with_sm(struct dm_block_manager *bm, dm_block_t sb_location,
+-			 struct dm_block_validator *sb_validator,
+ 			 struct dm_transaction_manager **tm,
+-			 struct dm_space_map **sm, struct dm_block **sblock)
++			 struct dm_space_map **sm)
+ {
+-	return dm_tm_create_internal(bm, sb_location, sb_validator,
+-				     0, 0, tm, sm, sblock, 1);
++	return dm_tm_create_internal(bm, sb_location, tm, sm, 1, NULL, 0);
+ }
+ EXPORT_SYMBOL_GPL(dm_tm_create_with_sm);
+ 
+ int dm_tm_open_with_sm(struct dm_block_manager *bm, dm_block_t sb_location,
+-		       struct dm_block_validator *sb_validator,
+-		       size_t root_offset, size_t root_max_len,
++		       void *sm_root, size_t root_len,
+ 		       struct dm_transaction_manager **tm,
+-		       struct dm_space_map **sm, struct dm_block **sblock)
++		       struct dm_space_map **sm)
+ {
+-	return dm_tm_create_internal(bm, sb_location, sb_validator, root_offset,
+-				     root_max_len, tm, sm, sblock, 0);
++	return dm_tm_create_internal(bm, sb_location, tm, sm, 0, sm_root, root_len);
+ }
+ EXPORT_SYMBOL_GPL(dm_tm_open_with_sm);
+ 
+--- linux-3.0-SLE11-SP3.orig/drivers/md/persistent-data/dm-transaction-manager.h
++++ linux-3.0-SLE11-SP3/drivers/md/persistent-data/dm-transaction-manager.h
+@@ -115,16 +115,17 @@ struct dm_block_manager *dm_tm_get_bm(st
+  *
+  * Returns a tm that has an open transaction to write the new disk sm.
+  * Caller should store the new sm root and commit.
++ *
++ * The superblock location is passed so the metadata space map knows it
++ * shouldn't be used.
+  */
+ int dm_tm_create_with_sm(struct dm_block_manager *bm, dm_block_t sb_location,
+-			 struct dm_block_validator *sb_validator,
+ 			 struct dm_transaction_manager **tm,
+-			 struct dm_space_map **sm, struct dm_block **sblock);
++			 struct dm_space_map **sm);
+ 
+ int dm_tm_open_with_sm(struct dm_block_manager *bm, dm_block_t sb_location,
+-		       struct dm_block_validator *sb_validator,
+-		       size_t root_offset, size_t root_max_len,
++		       void *sm_root, size_t root_len,
+ 		       struct dm_transaction_manager **tm,
+-		       struct dm_space_map **sm, struct dm_block **sblock);
++		       struct dm_space_map **sm);
+ 
+ #endif	/* _LINUX_DM_TRANSACTION_MANAGER_H */
