@@ -1,0 +1,298 @@
+Git-commit: 2dd9c257fbc243aa76ee6db0bb8371f9f74fad2d
+From: Joe Thornber <ejt@redhat.com>
+Date: Wed, 28 Mar 2012 18:41:28 +0100
+Subject: [PATCH] dm thin: support read only external snapshot origins
+Patch-mainline: v3.4-rc1
+Reference: FATE#313903
+
+Support the use of an external _read only_ device as an origin for a thin
+device.
+
+Any read to an unprovisioned area of the thin device will be passed
+through to the origin.  Writes trigger allocation of new blocks as
+usual.
+
+One possible use case for this would be VM hosts that want to run
+guests on thinly-provisioned volumes but have the base image on another
+device (possibly shared between many VMs).
+
+Signed-off-by: Joe Thornber <ejt@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Alasdair G Kergon <agk@redhat.com>
+Acked-by: NeilBrown <nfbrown@suse.com>
+
+---
+ Documentation/device-mapper/thin-provisioning.txt |   39 +++++++++-
+ drivers/md/dm-thin.c                              |   85 ++++++++++++++++++----
+ 2 files changed, 109 insertions(+), 15 deletions(-)
+
+--- linux-3.0-SLE11-SP3.orig/Documentation/device-mapper/thin-provisioning.txt
++++ linux-3.0-SLE11-SP3/Documentation/device-mapper/thin-provisioning.txt
+@@ -169,6 +169,38 @@ ii) Using an internal snapshot.
+ 
+     dmsetup create snap --table "0 2097152 thin /dev/mapper/pool 1"
+ 
++External snapshots
++------------------
++
++You can use an external _read only_ device as an origin for a
++thinly-provisioned volume.  Any read to an unprovisioned area of the
++thin device will be passed through to the origin.  Writes trigger
++the allocation of new blocks as usual.
++
++One use case for this is VM hosts that want to run guests on
++thinly-provisioned volumes but have the base image on another device
++(possibly shared between many VMs).
++
++You must not write to the origin device if you use this technique!
++Of course, you may write to the thin device and take internal snapshots
++of the thin volume.
++
++i) Creating a snapshot of an external device
++
++  This is the same as creating a thin device.
++  You don't mention the origin at this stage.
++
++    dmsetup message /dev/mapper/pool 0 "create_thin 0"
++
++ii) Using a snapshot of an external device.
++
++  Append an extra parameter to the thin target specifying the origin:
++
++    dmsetup create snap --table "0 2097152 thin /dev/mapper/pool 0 /dev/image"
++
++  N.B. All descendants (internal snapshots) of this snapshot require the
++  same extra origin parameter.
++
+ Deactivation
+ ------------
+ 
+@@ -254,7 +286,7 @@ iii) Messages
+ 
+ i) Constructor
+ 
+-    thin <pool dev> <dev id>
++    thin <pool dev> <dev id> [<external origin dev>]
+ 
+     pool dev:
+ 	the thin-pool device, e.g. /dev/mapper/my_pool or 253:0
+@@ -263,6 +295,11 @@ i) Constructor
+ 	the internal device identifier of the device to be
+ 	activated.
+ 
++    external origin dev:
++	an optional block device outside the pool to be treated as a
++	read-only snapshot origin: reads to unprovisioned areas of the
++	thin target will be mapped to this device.
++
+ The pool doesn't store any size against the thin devices.  If you
+ load a thin target that is smaller than you've been using previously,
+ then you'll have no access to blocks mapped beyond the end.  If you
+--- linux-3.0-SLE11-SP3.orig/drivers/md/dm-thin.c
++++ linux-3.0-SLE11-SP3/drivers/md/dm-thin.c
+@@ -549,6 +549,7 @@ struct pool_c {
+  */
+ struct thin_c {
+ 	struct dm_dev *pool_dev;
++	struct dm_dev *origin_dev;
+ 	dm_thin_id dev_id;
+ 
+ 	struct pool *pool;
+@@ -666,14 +667,16 @@ static void remap(struct thin_c *tc, str
+ 		(bio->bi_sector & pool->offset_mask);
+ }
+ 
+-static void remap_and_issue(struct thin_c *tc, struct bio *bio,
+-			    dm_block_t block)
++static void remap_to_origin(struct thin_c *tc, struct bio *bio)
++{
++	bio->bi_bdev = tc->origin_dev->bdev;
++}
++
++static void issue(struct thin_c *tc, struct bio *bio)
+ {
+ 	struct pool *pool = tc->pool;
+ 	unsigned long flags;
+ 
+-	remap(tc, bio, block);
+-
+ 	/*
+ 	 * Batch together any FUA/FLUSH bios we find and then issue
+ 	 * a single commit for them in process_deferred_bios().
+@@ -686,6 +689,19 @@ static void remap_and_issue(struct thin_
+ 		generic_make_request(bio);
+ }
+ 
++static void remap_to_origin_and_issue(struct thin_c *tc, struct bio *bio)
++{
++	remap_to_origin(tc, bio);
++	issue(tc, bio);
++}
++
++static void remap_and_issue(struct thin_c *tc, struct bio *bio,
++			    dm_block_t block)
++{
++	remap(tc, bio, block);
++	issue(tc, bio);
++}
++
+ /*
+  * wake_worker() is used when new work is queued and when pool_resume is
+  * ready to continue deferred IO processing.
+@@ -932,7 +948,8 @@ static struct new_mapping *get_next_mapp
+ }
+ 
+ static void schedule_copy(struct thin_c *tc, dm_block_t virt_block,
+-			  dm_block_t data_origin, dm_block_t data_dest,
++			  struct dm_dev *origin, dm_block_t data_origin,
++			  dm_block_t data_dest,
+ 			  struct cell *cell, struct bio *bio)
+ {
+ 	int r;
+@@ -964,7 +981,7 @@ static void schedule_copy(struct thin_c
+ 	} else {
+ 		struct dm_io_region from, to;
+ 
+-		from.bdev = tc->pool_dev->bdev;
++		from.bdev = origin->bdev;
+ 		from.sector = data_origin * pool->sectors_per_block;
+ 		from.count = pool->sectors_per_block;
+ 
+@@ -982,6 +999,22 @@ static void schedule_copy(struct thin_c
+ 	}
+ }
+ 
++static void schedule_internal_copy(struct thin_c *tc, dm_block_t virt_block,
++				   dm_block_t data_origin, dm_block_t data_dest,
++				   struct cell *cell, struct bio *bio)
++{
++	schedule_copy(tc, virt_block, tc->pool_dev,
++		      data_origin, data_dest, cell, bio);
++}
++
++static void schedule_external_copy(struct thin_c *tc, dm_block_t virt_block,
++				   dm_block_t data_dest,
++				   struct cell *cell, struct bio *bio)
++{
++	schedule_copy(tc, virt_block, tc->origin_dev,
++		      virt_block, data_dest, cell, bio);
++}
++
+ static void schedule_zero(struct thin_c *tc, dm_block_t virt_block,
+ 			  dm_block_t data_block, struct cell *cell,
+ 			  struct bio *bio)
+@@ -1128,8 +1161,8 @@ static void break_sharing(struct thin_c
+ 	r = alloc_data_block(tc, &data_block);
+ 	switch (r) {
+ 	case 0:
+-		schedule_copy(tc, block, lookup_result->block,
+-			      data_block, cell, bio);
++		schedule_internal_copy(tc, block, lookup_result->block,
++				       data_block, cell, bio);
+ 		break;
+ 
+ 	case -ENOSPC:
+@@ -1203,7 +1236,10 @@ static void provision_block(struct thin_
+ 	r = alloc_data_block(tc, &data_block);
+ 	switch (r) {
+ 	case 0:
+-		schedule_zero(tc, block, data_block, cell, bio);
++		if (tc->origin_dev)
++			schedule_external_copy(tc, block, data_block, cell, bio);
++		else
++			schedule_zero(tc, block, data_block, cell, bio);
+ 		break;
+ 
+ 	case -ENOSPC:
+@@ -1254,7 +1290,11 @@ static void process_bio(struct thin_c *t
+ 		break;
+ 
+ 	case -ENODATA:
+-		provision_block(tc, bio, block, cell);
++		if (bio_data_dir(bio) == READ && tc->origin_dev) {
++			cell_release_singleton(cell, bio);
++			remap_to_origin_and_issue(tc, bio);
++		} else
++			provision_block(tc, bio, block, cell);
+ 		break;
+ 
+ 	default:
+@@ -2237,6 +2277,8 @@ static void thin_dtr(struct dm_target *t
+ 	__pool_dec(tc->pool);
+ 	dm_pool_close_thin_device(tc->td);
+ 	dm_put_device(ti, tc->pool_dev);
++	if (tc->origin_dev)
++		dm_put_device(ti, tc->origin_dev);
+ 	kfree(tc);
+ 
+ 	mutex_unlock(&dm_thin_pool_table.mutex);
+@@ -2245,21 +2287,22 @@ static void thin_dtr(struct dm_target *t
+ /*
+  * Thin target parameters:
+  *
+- * <pool_dev> <dev_id>
++ * <pool_dev> <dev_id> [origin_dev]
+  *
+  * pool_dev: the path to the pool (eg, /dev/mapper/my_pool)
+  * dev_id: the internal device identifier
++ * origin_dev: a device external to the pool that should act as the origin
+  */
+ static int thin_ctr(struct dm_target *ti, unsigned argc, char **argv)
+ {
+ 	int r;
+ 	struct thin_c *tc;
+-	struct dm_dev *pool_dev;
++	struct dm_dev *pool_dev, *origin_dev;
+ 	struct mapped_device *pool_md;
+ 
+ 	mutex_lock(&dm_thin_pool_table.mutex);
+ 
+-	if (argc != 2) {
++	if (argc != 2 && argc != 3) {
+ 		ti->error = "Invalid argument count";
+ 		r = -EINVAL;
+ 		goto out_unlock;
+@@ -2272,6 +2315,15 @@ static int thin_ctr(struct dm_target *ti
+ 		goto out_unlock;
+ 	}
+ 
++	if (argc == 3) {
++		r = dm_get_device(ti, argv[2], FMODE_READ, &origin_dev);
++		if (r) {
++			ti->error = "Error opening origin device";
++			goto bad_origin_dev;
++		}
++		tc->origin_dev = origin_dev;
++	}
++
+ 	r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &pool_dev);
+ 	if (r) {
+ 		ti->error = "Error opening pool device";
+@@ -2324,6 +2376,9 @@ bad_pool_lookup:
+ bad_common:
+ 	dm_put_device(ti, tc->pool_dev);
+ bad_pool_dev:
++	if (tc->origin_dev)
++		dm_put_device(ti, tc->origin_dev);
++bad_origin_dev:
+ 	kfree(tc);
+ out_unlock:
+ 	mutex_unlock(&dm_thin_pool_table.mutex);
+@@ -2382,6 +2437,8 @@ static int thin_status(struct dm_target
+ 			DMEMIT("%s %lu",
+ 			       format_dev_t(buf, tc->pool_dev->bdev->bd_dev),
+ 			       (unsigned long) tc->dev_id);
++			if (tc->origin_dev)
++				DMEMIT(" %s", format_dev_t(buf, tc->origin_dev->bdev->bd_dev));
+ 			break;
+ 		}
+ 	}
+@@ -2419,7 +2476,7 @@ static void thin_io_hints(struct dm_targ
+ 
+ static struct target_type thin_target = {
+ 	.name = "thin",
+-	.version = {1, 0, 0},
++	.version = {1, 1, 0},
+ 	.module	= THIS_MODULE,
+ 	.ctr = thin_ctr,
+ 	.dtr = thin_dtr,
