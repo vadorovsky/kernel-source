@@ -1,0 +1,157 @@
+From: Jeremy Kerr <jeremy.kerr@canonical.com>
+Date: Thu, 11 Oct 2012 21:19:11 +0800
+Subject: [PATCH] efivarfs: Implement exclusive access for {get,set}_variable
+
+Git-commit: 8b3189616cf7fc76dde76fb3d170e8b670a14078
+Patch-mainline: v3.7-rc2? merged into efi
+References: fate#314499, fate#314509
+Target: SLE-11 SP3
+
+Currently, efivarfs does not enforce exclusion over the get_variable and
+set_variable operations. Section 7.1 of UEFI requires us to only allow a
+single processor to enter {get,set}_variable services at once.
+
+This change acquires the efivars->lock over calls to these operations
+from the efivarfs paths.
+
+Signed-off-by: Jeremy Kerr <jeremy.kerr@canonical.com>
+Signed-off-by: Matt Fleming <matt.fleming@intel.com>
+Acked-by: Lee, Chun-Yi <jlee@suse.com>
+---
+ drivers/firmware/efivars.c |   68 ++++++++++++++++++++++++++++-----------------
+ 1 file changed, 43 insertions(+), 25 deletions(-)
+
+--- a/drivers/firmware/efivars.c
++++ b/drivers/firmware/efivars.c
+@@ -690,35 +690,45 @@ static ssize_t efivarfs_file_write(struc
+ 		goto out;
+ 	}
+ 
++	/*
++	 * The lock here protects the get_variable call, the conditional
++	 * set_variable call, and removal of the variable from the efivars
++	 * list (in the case of an authenticated delete).
++	 */
++	spin_lock(&efivars->lock);
++
+ 	status = efivars->ops->set_variable(var->var.VariableName,
+ 					    &var->var.VendorGuid,
+ 					    attributes, datasize,
+ 					    data);
+ 
+-	switch (status) {
+-	case EFI_SUCCESS:
+-		break;
+-	case EFI_INVALID_PARAMETER:
+-		count = -EINVAL;
+-		goto out;
+-	case EFI_OUT_OF_RESOURCES:
+-		count = -ENOSPC;
+-		goto out;
+-	case EFI_DEVICE_ERROR:
+-		count = -EIO;
+-		goto out;
+-	case EFI_WRITE_PROTECTED:
+-		count = -EROFS;
+-		goto out;
+-	case EFI_SECURITY_VIOLATION:
+-		count = -EACCES;
+-		goto out;
+-	case EFI_NOT_FOUND:
+-		count = -ENOENT;
+-		goto out;
+-	default:
+-		count = -EINVAL;
+-		goto out;
++	if (status != EFI_SUCCESS) {
++		spin_unlock(&efivars->lock);
++		kfree(data);
++
++		switch (status) {
++		case EFI_INVALID_PARAMETER:
++			count = -EINVAL;
++			break;
++		case EFI_OUT_OF_RESOURCES:
++			count = -ENOSPC;
++			break;
++		case EFI_DEVICE_ERROR:
++			count = -EIO;
++			break;
++		case EFI_WRITE_PROTECTED:
++			count = -EROFS;
++			break;
++		case EFI_SECURITY_VIOLATION:
++			count = -EACCES;
++			break;
++		case EFI_NOT_FOUND:
++			count = -ENOENT;
++			break;
++		default:
++			count = -EINVAL;
++		}
++		return count;
+ 	}
+ 
+ 	/*
+@@ -734,12 +744,12 @@ static ssize_t efivarfs_file_write(struc
+ 					    NULL);
+ 
+ 	if (status == EFI_BUFFER_TOO_SMALL) {
++		spin_unlock(&efivars->lock);
+ 		mutex_lock(&inode->i_mutex);
+ 		i_size_write(inode, newdatasize + sizeof(attributes));
+ 		mutex_unlock(&inode->i_mutex);
+ 
+ 	} else if (status == EFI_NOT_FOUND) {
+-		spin_lock(&efivars->lock);
+ 		list_del(&var->list);
+ 		spin_unlock(&efivars->lock);
+ 		efivar_unregister(var);
+@@ -747,6 +757,7 @@ static ssize_t efivarfs_file_write(struc
+ 		dput(file->f_dentry);
+ 
+ 	} else {
++		spin_unlock(&efivars->lock);
+ 		pr_warn("efivarfs: inconsistent EFI variable implementation? "
+ 				"status = %lx\n", status);
+ 	}
+@@ -768,9 +779,11 @@ static ssize_t efivarfs_file_read(struct
+ 	void *data;
+ 	ssize_t size = 0;
+ 
++	spin_lock(&efivars->lock);
+ 	status = efivars->ops->get_variable(var->var.VariableName,
+ 					    &var->var.VendorGuid,
+ 					    &attributes, &datasize, NULL);
++	spin_unlock(&efivars->lock);
+ 
+ 	if (status != EFI_BUFFER_TOO_SMALL)
+ 		return 0;
+@@ -780,10 +793,13 @@ static ssize_t efivarfs_file_read(struct
+ 	if (!data)
+ 		return 0;
+ 
++	spin_lock(&efivars->lock);
+ 	status = efivars->ops->get_variable(var->var.VariableName,
+ 					    &var->var.VendorGuid,
+ 					    &attributes, &datasize,
+ 					    (data + 4));
++	spin_unlock(&efivars->lock);
++
+ 	if (status != EFI_SUCCESS)
+ 		goto out_free;
+ 
+@@ -1004,11 +1020,13 @@ int efivarfs_fill_super(struct super_blo
+ 		/* copied by the above to local storage in the dentry. */
+ 		kfree(name);
+ 
++		spin_lock(&efivars->lock);
+ 		efivars->ops->get_variable(entry->var.VariableName,
+ 					   &entry->var.VendorGuid,
+ 					   &entry->var.Attributes,
+ 					   &size,
+ 					   NULL);
++		spin_unlock(&efivars->lock);
+ 
+ 		mutex_lock(&inode->i_mutex);
+ 		inode->i_private = entry;
