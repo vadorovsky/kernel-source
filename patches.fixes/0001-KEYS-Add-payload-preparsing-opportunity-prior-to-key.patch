@@ -1,0 +1,475 @@
+From: David Howells <dhowells@redhat.com>
+Date: Thu, 13 Sep 2012 13:06:29 +0100
+Subject: [PATCH 01/16] KEYS: Add payload preparsing opportunity prior to key instantiate or update
+Git-commit: cf7f601c067994f371ba77721d1e45fce61a4569
+Patch-mainline: v3.7-rc1
+References: fate#314508
+Target: SLE-11 SP3
+
+Give the key type the opportunity to preparse the payload prior to the
+instantiation and update routines being called.  This is done with the
+provision of two new key type operations:
+
+	int (*preparse)(struct key_preparsed_payload *prep);
+	void (*free_preparse)(struct key_preparsed_payload *prep);
+
+If the first operation is present, then it is called before key creation (in
+the add/update case) or before the key semaphore is taken (in the update and
+instantiate cases).  The second operation is called to clean up if the first
+was called.
+
+preparse() is given the opportunity to fill in the following structure:
+
+	struct key_preparsed_payload {
+		char		*description;
+		void		*type_data[2];
+		void		*payload;
+		const void	*data;
+		size_t		datalen;
+		size_t		quotalen;
+	};
+
+Before the preparser is called, the first three fields will have been cleared,
+the payload pointer and size will be stored in data and datalen and the default
+quota size from the key_type struct will be stored into quotalen.
+
+The preparser may parse the payload in any way it likes and may store data in
+the type_data[] and payload fields for use by the instantiate() and update()
+ops.
+
+The preparser may also propose a description for the key by attaching it as a
+string to the description field.  This can be used by passing a NULL or ""
+description to the add_key() system call or the key_create_or_update()
+function.  This cannot work with request_key() as that required the description
+to tell the upcall about the key to be created.
+
+This, for example permits keys that store PGP public keys to generate their own
+name from the user ID and public key fingerprint in the key.
+
+The instantiate() and update() operations are then modified to look like this:
+
+	int (*instantiate)(struct key *key, struct key_preparsed_payload *prep);
+	int (*update)(struct key *key, struct key_preparsed_payload *prep);
+
+and the new payload data is passed in *prep, whether or not it was preparsed.
+
+Joey Lee:
+The original patch modified fs/cifs, net/ceph, net/dns_resolver and net/rxrpc because
+it changed the input parameter of user_instantiate and user_update function in
+include/keys/user-type.h. I keep the above 2 function's parameter and removed all change
+of fs/cifs, net/ceph, net/dns_resolver and net/rxrpc.
+
+I also rename the new instantiate hook to instantiate_prep that used by new asymmetric key
+type and add the hook function null check in __key_instantiate_and_link in security/keys/key.c
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+Acked-by: Lee, Chun-Yi <jlee@suse.com>
+---
+ Documentation/security/keys.txt |   50 +++++++++++++++++-
+ include/keys/user-type.h        |    2 
+ include/linux/key-type.h        |   33 +++++++++++
+ security/keys/key.c             |  111 +++++++++++++++++++++++++++++-----------
+ security/keys/keyctl.c          |   18 +++++-
+ 5 files changed, 180 insertions(+), 34 deletions(-)
+
+--- a/Documentation/security/keys.txt
++++ b/Documentation/security/keys.txt
+@@ -400,6 +400,10 @@ The main syscalls are:
+      to the keyring. In this case, an error will be generated if the process
+      does not have permission to write to the keyring.
+ 
++     If the key type supports it, if the description is NULL or an empty
++     string, the key type will try and generate a description from the content
++     of the payload.
++
+      The payload is optional, and the pointer can be NULL if not required by
+      the type. The payload is plen in size, and plen can be zero for an empty
+      payload.
+@@ -1081,12 +1085,53 @@ The structure has a number of fields, so
+      it should return 0.
+ 
+ 
+- (*) int (*instantiate)(struct key *key, const void *data, size_t datalen);
++ (*) int (*preparse)(struct key_preparsed_payload *prep);
++
++     This optional method permits the key type to attempt to parse payload
++     before a key is created (add key) or the key semaphore is taken (update or
++     instantiate key).  The structure pointed to by prep looks like:
++
++	struct key_preparsed_payload {
++		char		*description;
++		void		*type_data[2];
++		void		*payload;
++		const void	*data;
++		size_t		datalen;
++		size_t		quotalen;
++	};
++
++     Before calling the method, the caller will fill in data and datalen with
++     the payload blob parameters; quotalen will be filled in with the default
++     quota size from the key type and the rest will be cleared.
++
++     If a description can be proposed from the payload contents, that should be
++     attached as a string to the description field.  This will be used for the
++     key description if the caller of add_key() passes NULL or "".
++
++     The method can attach anything it likes to type_data[] and payload.  These
++     are merely passed along to the instantiate() or update() operations.
++
++     The method should return 0 if success ful or a negative error code
++     otherwise.
++
++     
++ (*) void (*free_preparse)(struct key_preparsed_payload *prep);
++
++     This method is only required if the preparse() method is provided,
++     otherwise it is unused.  It cleans up anything attached to the
++     description, type_data and payload fields of the key_preparsed_payload
++     struct as filled in by the preparse() method.
++
++
++ (*) int (*instantiate)(struct key *key, struct key_preparsed_payload *prep);
+ 
+      This method is called to attach a payload to a key during construction.
+      The payload attached need not bear any relation to the data passed to this
+      function.
+ 
++     The prep->data and prep->datalen fields will define the original payload
++     blob.  If preparse() was supplied then other fields may be filled in also.
++
+      If the amount of data attached to the key differs from the size in
+      keytype->def_datalen, then key_payload_reserve() should be called.
+ 
+@@ -1102,6 +1147,9 @@ The structure has a number of fields, so
+      If this type of key can be updated, then this method should be provided.
+      It is called to update a key's payload from the blob of data provided.
+ 
++     The prep->data and prep->datalen fields will define the original payload
++     blob.  If preparse() was supplied then other fields may be filled in also.
++
+      key_payload_reserve() should be called if the data length might change
+      before any changes are actually made. Note that if this succeeds, the type
+      is committed to changing the key because it's already been altered, so all
+--- a/include/keys/user-type.h
++++ b/include/keys/user-type.h
+@@ -34,6 +34,8 @@ struct user_key_payload {
+ 
+ extern struct key_type key_type_user;
+ 
++struct key_preparsed_payload;
++
+ extern int user_instantiate(struct key *key, const void *data, size_t datalen);
+ extern int user_update(struct key *key, const void *data, size_t datalen);
+ extern int user_match(const struct key *key, const void *criterion);
+--- a/include/linux/key-type.h
++++ b/include/linux/key-type.h
+@@ -25,6 +25,27 @@ struct key_construction {
+ 	struct key	*authkey;/* authorisation for key being constructed */
+ };
+ 
++/*
++ * Pre-parsed payload, used by key add, update and instantiate.
++ *
++ * This struct will be cleared and data and datalen will be set with the data
++ * and length parameters from the caller and quotalen will be set from
++ * def_datalen from the key type.  Then if the preparse() op is provided by the
++ * key type, that will be called.  Then the struct will be passed to the
++ * instantiate() or the update() op.
++ *
++ * If the preparse() op is given, the free_preparse() op will be called to
++ * clear the contents.
++ */
++struct key_preparsed_payload {
++	char		*description;	/* Proposed key description (or NULL) */
++	void		*type_data[2];	/* Private key-type data */
++	void		*payload;	/* Proposed payload */
++	const void	*data;		/* Raw data */
++	size_t		datalen;	/* Raw datalen */
++	size_t		quotalen;	/* Quota length for proposed payload */
++};
++
+ typedef int (*request_key_actor_t)(struct key_construction *key,
+ 				   const char *op, void *aux);
+ 
+@@ -44,12 +65,24 @@ struct key_type {
+ 	/* vet a description */
+ 	int (*vet_description)(const char *description);
+ 
++	/* Preparse the data blob from userspace that is to be the payload,
++	 * generating a proposed description and payload that will be handed to
++	 * the instantiate() and update() ops.
++	 */
++	int (*preparse)(struct key_preparsed_payload *prep);
++
++	/* Free a preparse data structure.
++	 */
++	void (*free_preparse)(struct key_preparsed_payload *prep);
++
+ 	/* instantiate a key of this type
+ 	 * - this method should call key_payload_reserve() to determine if the
+ 	 *   user's quota will hold the payload
+ 	 */
+ 	int (*instantiate)(struct key *key, const void *data, size_t datalen);
+ 
++	int (*instantiate_prep)(struct key *key, struct key_preparsed_payload *prep);
++
+ 	/* update a key of this type (optional)
+ 	 * - this method should call key_payload_reserve() to recalculate the
+ 	 *   quota consumption
+--- a/security/keys/key.c
++++ b/security/keys/key.c
+@@ -419,8 +419,7 @@ EXPORT_SYMBOL(key_payload_reserve);
+  * key_construction_mutex.
+  */
+ static int __key_instantiate_and_link(struct key *key,
+-				      const void *data,
+-				      size_t datalen,
++				      struct key_preparsed_payload *prep,
+ 				      struct key *keyring,
+ 				      struct key *authkey,
+ 				      unsigned long *_prealloc)
+@@ -438,7 +437,10 @@ static int __key_instantiate_and_link(st
+ 	/* can't instantiate twice */
+ 	if (!test_bit(KEY_FLAG_INSTANTIATED, &key->flags)) {
+ 		/* instantiate the key */
+-		ret = key->type->instantiate(key, data, datalen);
++		if (key->type->instantiate)
++			ret = key->type->instantiate(key, prep->data, prep->datalen);
++		else if (key->type->instantiate_prep)
++			ret = key->type->instantiate_prep(key, prep);
+ 
+ 		if (ret == 0) {
+ 			/* mark the key as being instantiated */
+@@ -489,22 +491,37 @@ int key_instantiate_and_link(struct key
+ 			     struct key *keyring,
+ 			     struct key *authkey)
+ {
++	struct key_preparsed_payload prep;
+ 	unsigned long prealloc;
+ 	int ret;
+ 
++	memset(&prep, 0, sizeof(prep));
++	prep.data = data;
++	prep.datalen = datalen;
++	prep.quotalen = key->type->def_datalen;
++	if (key->type->preparse) {
++		ret = key->type->preparse(&prep);
++		if (ret < 0)
++			goto error;
++	}
++
+ 	if (keyring) {
+ 		ret = __key_link_begin(keyring, key->type, key->description,
+ 				       &prealloc);
+ 		if (ret < 0)
+-			return ret;
++			goto error_free_preparse;
+ 	}
+ 
+-	ret = __key_instantiate_and_link(key, data, datalen, keyring, authkey,
++	ret = __key_instantiate_and_link(key, &prep, keyring, authkey,
+ 					 &prealloc);
+ 
+ 	if (keyring)
+ 		__key_link_end(keyring, key->type, prealloc);
+ 
++error_free_preparse:
++	if (key->type->preparse)
++		key->type->free_preparse(&prep);
++error:
+ 	return ret;
+ }
+ 
+@@ -826,6 +843,7 @@ key_ref_t key_create_or_update(key_ref_t
+ 			       unsigned long flags)
+ {
+ 	unsigned long prealloc;
++	struct key_preparsed_payload prep;
+ 	const struct cred *cred = current_cred();
+ 	struct key_type *ktype;
+ 	struct key *keyring, *key = NULL;
+@@ -841,8 +859,9 @@ key_ref_t key_create_or_update(key_ref_t
+ 	}
+ 
+ 	key_ref = ERR_PTR(-EINVAL);
+-	if (!ktype->match || !ktype->instantiate)
+-		goto error_2;
++	if (!ktype->match || (!ktype->instantiate && !ktype->instantiate_prep) ||
++	    (!description && !ktype->preparse))
++		goto error_put_type;
+ 
+ 	keyring = key_ref_to_ptr(keyring_ref);
+ 
+@@ -850,18 +869,37 @@ key_ref_t key_create_or_update(key_ref_t
+ 
+ 	key_ref = ERR_PTR(-ENOTDIR);
+ 	if (keyring->type != &key_type_keyring)
+-		goto error_2;
++		goto error_put_type;
++
++	memset(&prep, 0, sizeof(prep));
++	prep.data = payload;
++	prep.datalen = plen;
++	prep.quotalen = ktype->def_datalen;
++	if (ktype->preparse) {
++		ret = ktype->preparse(&prep);
++		if (ret < 0) {
++			key_ref = ERR_PTR(ret);
++			goto error_put_type;
++		}
++		if (!description)
++			description = prep.description;
++		key_ref = ERR_PTR(-EINVAL);
++		if (!description)
++			goto error_free_prep;
++	}
+ 
+ 	ret = __key_link_begin(keyring, ktype, description, &prealloc);
+-	if (ret < 0)
+-		goto error_2;
++	if (ret < 0) {
++		key_ref = ERR_PTR(ret);
++		goto error_free_prep;
++	}
+ 
+ 	/* if we're going to allocate a new key, we're going to have
+ 	 * to modify the keyring */
+ 	ret = key_permission(keyring_ref, KEY_WRITE);
+ 	if (ret < 0) {
+ 		key_ref = ERR_PTR(ret);
+-		goto error_3;
++		goto error_link_end;
+ 	}
+ 
+ 	/* if it's possible to update this type of key, search for an existing
+@@ -892,25 +930,27 @@ key_ref_t key_create_or_update(key_ref_t
+ 			perm, flags);
+ 	if (IS_ERR(key)) {
+ 		key_ref = ERR_CAST(key);
+-		goto error_3;
++		goto error_link_end;
+ 	}
+ 
+ 	/* instantiate it and link it into the target keyring */
+-	ret = __key_instantiate_and_link(key, payload, plen, keyring, NULL,
+-					 &prealloc);
++	ret = __key_instantiate_and_link(key, &prep, keyring, NULL, &prealloc);
+ 	if (ret < 0) {
+ 		key_put(key);
+ 		key_ref = ERR_PTR(ret);
+-		goto error_3;
++		goto error_link_end;
+ 	}
+ 
+ 	key_ref = make_key_ref(key, is_key_possessed(keyring_ref));
+ 
+- error_3:
++error_link_end:
+ 	__key_link_end(keyring, ktype, prealloc);
+- error_2:
++error_free_prep:
++	if (ktype->preparse)
++		ktype->free_preparse(&prep);
++error_put_type:
+ 	key_type_put(ktype);
+- error:
++error:
+ 	return key_ref;
+ 
+  found_matching_key:
+@@ -918,10 +958,9 @@ key_ref_t key_create_or_update(key_ref_t
+ 	 * - we can drop the locks first as we have the key pinned
+ 	 */
+ 	__key_link_end(keyring, ktype, prealloc);
+-	key_type_put(ktype);
+ 
+ 	key_ref = __key_update(key_ref, payload, plen);
+-	goto error;
++	goto error_free_prep;
+ }
+ EXPORT_SYMBOL(key_create_or_update);
+ 
+@@ -940,6 +979,7 @@ EXPORT_SYMBOL(key_create_or_update);
+  */
+ int key_update(key_ref_t key_ref, const void *payload, size_t plen)
+ {
++	struct key_preparsed_payload prep;
+ 	struct key *key = key_ref_to_ptr(key_ref);
+ 	int ret;
+ 
+@@ -952,18 +992,31 @@ int key_update(key_ref_t key_ref, const
+ 
+ 	/* attempt to update it if supported */
+ 	ret = -EOPNOTSUPP;
+-	if (key->type->update) {
+-		down_write(&key->sem);
+-
+-		ret = key->type->update(key, payload, plen);
+-		if (ret == 0)
+-			/* updating a negative key instantiates it */
+-			clear_bit(KEY_FLAG_NEGATIVE, &key->flags);
++	if (!key->type->update)
++		goto error;
+ 
+-		up_write(&key->sem);
++	memset(&prep, 0, sizeof(prep));
++	prep.data = payload;
++	prep.datalen = plen;
++	prep.quotalen = key->type->def_datalen;
++	if (key->type->preparse) {
++		ret = key->type->preparse(&prep);
++		if (ret < 0)
++			goto error;
+ 	}
+ 
+- error:
++	down_write(&key->sem);
++
++	ret = key->type->update(key, payload, plen);
++	if (ret == 0)
++		/* updating a negative key instantiates it */
++		clear_bit(KEY_FLAG_NEGATIVE, &key->flags);
++
++	up_write(&key->sem);
++
++	if (key->type->preparse)
++		key->type->free_preparse(&prep);
++error:
+ 	return ret;
+ }
+ EXPORT_SYMBOL(key_update);
+--- a/security/keys/keyctl.c
++++ b/security/keys/keyctl.c
+@@ -45,6 +45,9 @@ static int key_get_type_from_user(char *
+  * Extract the description of a new key from userspace and either add it as a
+  * new key to the specified keyring or update a matching key in that keyring.
+  *
++ * If the description is NULL or an empty string, the key type is asked to
++ * generate one from the payload.
++ *
+  * The keyring must be writable so that we can attach the key to it.
+  *
+  * If successful, the new key's serial number is returned, otherwise an error
+@@ -71,10 +74,17 @@ SYSCALL_DEFINE5(add_key, const char __us
+ 	if (ret < 0)
+ 		goto error;
+ 
+-	description = strndup_user(_description, PAGE_SIZE);
+-	if (IS_ERR(description)) {
+-		ret = PTR_ERR(description);
+-		goto error;
++	description = NULL;
++	if (_description) {
++		description = strndup_user(_description, PAGE_SIZE);
++		if (IS_ERR(description)) {
++			ret = PTR_ERR(description);
++			goto error;
++		}
++		if (!*description) {
++			kfree(description);
++			description = NULL;
++		}
+ 	}
+ 
+ 	/* pull the payload in if one was supplied */
