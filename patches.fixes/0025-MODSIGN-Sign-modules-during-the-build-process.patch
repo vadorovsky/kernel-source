@@ -1,0 +1,293 @@
+From: David Howells <dhowells@redhat.com>
+Date: Wed, 26 Sep 2012 10:11:06 +0100
+Subject: [PATCH 25/27] MODSIGN: Sign modules during the build process
+Git-commit: 80d65e58e93ffdabf58202653a0435bd3cf2d82e
+Patch-mainline: v3.7-rc1
+References: fate#314508
+Target: SLE-11 SP3
+
+If CONFIG_MODULE_SIG is set, then this patch will cause all modules files to
+to have signatures added.  The following steps will occur:
+
+ (1) The module will be linked to foo.ko.unsigned instead of foo.ko
+
+ (2) The module will be stripped using both "strip -x -g" and "eu-strip" to
+     ensure minimal size for inclusion in an initramfs.
+
+ (3) The signature will be generated on the stripped module.
+
+ (4) The signature will be appended to the module, along with some information
+     about the signature and a magic string that indicates the presence of the
+     signature.
+
+Step (3) requires private and public keys to be available.  By default these
+are expected to be found in files:
+
+	signing_key.priv
+	signing_key.x509
+
+in the base directory of the build.  The first is the private key in PEM form
+and the second is the X.509 certificate in DER form as can be generated from
+openssl:
+
+	openssl req \
+		-new -x509 -outform PEM -out signing_key.x509 \
+		-keyout signing_key.priv -nodes \
+		-subj "/CN=H2G2/O=Magrathea/CN=Slartibartfast"
+
+If the secret key is not found then signing will be skipped and the unsigned
+module from (1) will just be copied to foo.ko.
+
+If signing occurs, lines like the following will be seen:
+
+	LD [M]  fs/foo/foo.ko.unsigned
+	STRIP [M] fs/foo/foo.ko.stripped
+	SIGN [M] fs/foo/foo.ko
+
+will appear in the build log.  If the signature step will be skipped and the
+following will be seen:
+
+	LD [M]  fs/foo/foo.ko.unsigned
+	STRIP [M] fs/foo/foo.ko.stripped
+	NO SIGN [M] fs/foo/foo.ko
+
+NOTE!  After the signature step, the signed module _must_not_ be passed through
+strip.  The unstripped, unsigned module is still available at the name on the
+LD [M] line.  This restriction may affect packaging tools (such as rpmbuild)
+and initramfs composition tools.
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+Acked-by: Lee, Chun-Yi <jlee@suse.com>
+---
+ scripts/Makefile.modpost |   77 +++++++++++++++++++++++++++++++
+ scripts/sign-file        |  115 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 191 insertions(+), 1 deletion(-)
+ create mode 100644 scripts/sign-file
+
+--- a/scripts/Makefile.modpost
++++ b/scripts/Makefile.modpost
+@@ -14,7 +14,8 @@
+ # 3)  create one <module>.mod.c file pr. module
+ # 4)  create one Module.symvers file with CRC for all exported symbols
+ # 5) compile all <module>.mod.c files
+-# 6) final link of the module to a <module.ko> file
++# 6) final link of the module to a <module.ko> (or <module.unsigned>) file
++# 7) signs the modules to a <module.ko> file
+ 
+ # Step 3 is used to place certain information in the module's ELF
+ # section, including information such as:
+@@ -32,6 +33,8 @@
+ # Step 4 is solely used to allow module versioning in external modules,
+ # where the CRC of each module is retrieved from the Module.symvers file.
+ 
++# Step 7 is dependent on CONFIG_MODULE_SIG being enabled.
++
+ # KBUILD_MODPOST_WARN can be set to avoid error out in case of undefined
+ # symbols in the final module linking stage
+ # KBUILD_MODPOST_NOFINAL can be set to skip the final link of modules.
+@@ -120,6 +123,7 @@ $(modules:.ko=.mod.o): %.mod.o: %.mod.c
+ targets += $(modules:.ko=.mod.o)
+ 
+ # Step 6), final link of the modules
++ifneq ($(CONFIG_MODULE_SIG),y)
+ quiet_cmd_ld_ko_o = LD [M]  $@
+       cmd_ld_ko_o = $(LD) -r $(LDFLAGS)                                 \
+                              $(KBUILD_LDFLAGS_MODULE) $(LDFLAGS_MODULE) \
+@@ -129,7 +133,78 @@ $(modules): %.ko :%.o %.mod.o FORCE
+ 	$(call if_changed,ld_ko_o)
+ 
+ targets += $(modules)
++else
++quiet_cmd_ld_ko_unsigned_o = LD [M]  $@
++      cmd_ld_ko_unsigned_o =						\
++		$(LD) -r $(LDFLAGS)					\
++			 $(KBUILD_LDFLAGS_MODULE) $(LDFLAGS_MODULE)	\
++			 -o $@ $(filter-out FORCE,$^)			\
++		$(if $(AFTER_LINK),; $(AFTER_LINK))
++
++$(modules:.ko=.ko.unsigned): %.ko.unsigned :%.o %.mod.o FORCE
++	$(call if_changed,ld_ko_unsigned_o)
++
++targets += $(modules:.ko=.ko.unsigned)
++
++# Step 7), sign the modules
++MODSECKEY = ./signing_key.priv
++MODPUBKEY = ./signing_key.x509
++
++ifeq ($(wildcard $(MODSECKEY))+$(wildcard $(MODPUBKEY)),$(MODSECKEY)+$(MODPUBKEY))
++ifeq ($(KBUILD_SRC),)
++	# no O= is being used
++	SCRIPTS_DIR := scripts
++else
++	SCRIPTS_DIR := $(KBUILD_SRC)/scripts
++endif
++SIGN_MODULES := 1
++else
++SIGN_MODULES := 0
++endif
++
++# only sign if it's an in-tree module
++ifneq ($(KBUILD_EXTMOD),)
++SIGN_MODULES := 0
++endif
+ 
++# We strip the module as best we can - note that using both strip and eu-strip
++# results in a smaller module than using either alone.
++EU_STRIP = $(shell which eu-strip || echo true)
++
++quiet_cmd_sign_ko_stripped_ko_unsigned = STRIP [M] $@
++      cmd_sign_ko_stripped_ko_unsigned = \
++		cp $< $@ && \
++		strip -x -g $@ && \
++		$(EU_STRIP) $@
++
++ifeq ($(SIGN_MODULES),1)
++
++quiet_cmd_genkeyid = GENKEYID $@
++      cmd_genkeyid = \
++		perl $(SCRIPTS_DIR)/x509keyid $< $<.signer $<.keyid
++
++%.signer %.keyid: %
++	$(call if_changed,genkeyid)
++
++KEYRING_DEP := $(MODSECKEY) $(MODPUBKEY) $(MODPUBKEY).signer $(MODPUBKEY).keyid
++quiet_cmd_sign_ko_ko_stripped = SIGN [M] $@
++      cmd_sign_ko_ko_stripped = \
++		sh $(SCRIPTS_DIR)/sign-file $(MODSECKEY) $(MODPUBKEY) $< $@
++else
++KEYRING_DEP :=
++quiet_cmd_sign_ko_ko_unsigned = NO SIGN [M] $@
++      cmd_sign_ko_ko_unsigned = \
++		cp $< $@
++endif
++
++$(modules): %.ko :%.ko.stripped $(KEYRING_DEP) FORCE
++	$(call if_changed,sign_ko_ko_stripped)
++
++$(patsubst %.ko,%.ko.stripped,$(modules)): %.ko.stripped :%.ko.unsigned FORCE
++	$(call if_changed,sign_ko_stripped_ko_unsigned)
++
++targets += $(modules)
++endif
+ 
+ # Add FORCE to the prequisites of a target to force it to be always rebuilt.
+ # ---------------------------------------------------------------------------
+--- /dev/null
++++ b/scripts/sign-file
+@@ -0,0 +1,115 @@
++#!/bin/sh
++#
++# Sign a module file using the given key.
++#
++# Format: sign-file <key> <x509> <src-file> <dst-file>
++#
++
++scripts=`dirname $0`
++
++CONFIG_MODULE_SIG_SHA512=y
++if [ -r .config ]
++then
++    . ./.config
++fi
++
++key="$1"
++x509="$2"
++src="$3"
++dst="$4"
++
++if [ ! -r "$key" ]
++then
++    echo "Can't read private key" >&2
++    exit 2
++fi
++
++if [ ! -r "$x509" ]
++then
++    echo "Can't read X.509 certificate" >&2
++    exit 2
++fi
++if [ ! -r "$x509.signer" ]
++then
++    echo "Can't read Signer name" >&2
++    exit 2;
++fi
++if [ ! -r "$x509.keyid" ]
++then
++    echo "Can't read Key identifier" >&2
++    exit 2;
++fi
++
++#
++# Signature parameters
++#
++algo=1		# Public-key crypto algorithm: RSA
++hash=		# Digest algorithm
++id_type=1	# Identifier type: X.509
++
++#
++# Digest the data
++#
++dgst=
++if [ "$CONFIG_MODULE_SIG_SHA1" = "y" ]
++then
++    prologue="0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A, 0x05, 0x00, 0x04, 0x14"
++    dgst=-sha1
++    hash=2
++elif [ "$CONFIG_MODULE_SIG_SHA224" = "y" ]
++then
++    prologue="0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04, 0x05, 0x00, 0x04, 0x1C"
++    dgst=-sha224
++    hash=7
++elif [ "$CONFIG_MODULE_SIG_SHA256" = "y" ]
++then
++    prologue="0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20"
++    dgst=-sha256
++    hash=4
++elif [ "$CONFIG_MODULE_SIG_SHA384" = "y" ]
++then
++    prologue="0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30"
++    dgst=-sha384
++    hash=5
++elif [ "$CONFIG_MODULE_SIG_SHA512" = "y" ]
++then
++    prologue="0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40"
++    dgst=-sha512
++    hash=6
++else
++    echo "$0: Can't determine hash algorithm" >&2
++    exit 2
++fi
++
++(
++perl -e "binmode STDOUT; print pack(\"C*\", $prologue)" || exit $?
++openssl dgst $dgst -binary $src || exit $?
++) >$src.dig || exit $?
++
++#
++# Generate the binary signature, which will be just the integer that comprises
++# the signature with no metadata attached.
++#
++openssl rsautl -sign -inkey $key -keyform PEM -in $src.dig -out $src.sig || exit $?
++signerlen=`stat -c %s $x509.signer`
++keyidlen=`stat -c %s $x509.keyid`
++siglen=`stat -c %s $src.sig`
++
++#
++# Build the signed binary
++#
++(
++    cat $src || exit $?
++    echo '~Module signature appended~' || exit $?
++    cat $x509.signer $x509.keyid || exit $?
++
++    # Preface each signature integer with a 2-byte BE length
++    perl -e "binmode STDOUT; print pack(\"n\", $siglen)" || exit $?
++    cat $src.sig || exit $?
++
++    # Generate the information block
++    perl -e "binmode STDOUT; print pack(\"CCCCCxxxN\", $algo, $hash, $id_type, $signerlen, $keyidlen, $siglen + 2)" || exit $?
++) >$dst~ || exit $?
++
++# Permit in-place signing
++mv $dst~ $dst || exit $?
