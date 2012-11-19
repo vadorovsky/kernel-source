@@ -1,0 +1,330 @@
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+Date: Wed, 2 Nov 2011 21:52:08 -0700
+Subject: [PATCH] target: Add generic active I/O shutdown logic
+Git-commit: a17f091d1a7c570804cfc2c77701634da88f8ecf
+References: FATE#313550
+Patch-Mainline: v3.2
+
+This patch adds the initial pieces of generic active I/O shutdown logic.
+This is intended to be a 'opt-in' feature for fabric modules that
+includes the following functions to provide a mechinism for fabric
+modules to track se_cmd via se_session->sess_cmd_list:
+
+*) target_get_sess_cmd() - Add se_cmd to sess->sess_cmd_list, called
+   from fabric module incoming I/O path.
+*) target_put_sess_cmd() - Check for completion or drop se_cmd from
+   ->sess_cmd_list
+*) target_splice_sess_cmd_list() - Splice active I/O list from
+   ->sess_cmd_list to ->sess_wait_list, can called with HW fabric
+   lock held.
+*) target_wait_for_sess_cmds() - Walk ->sess_wait_list waiting on
+   individual ->cmd_wait_comp.  Optional transport_wait_for_tasks()
+   call.
+
+target_splice_sess_cmd_list() is allowed to be called under HW fabric
+lock, and performs the splice into se_sess->sess_wait_list and set
+se_cmd->cmd_wait_set.  Then target_wait_for_sess_cmds() walks the list
+waiting for individual target_put_sess_cmd() fabric callbacks to
+complete.
+
+It also adds TFO->check_release_cmd() to split the completion and memory
+release calls, where a fabric module uses target_put_sess_cmd() to check
+for I/O completion during session shutdown.  This is currently pushed out
+into fabric modules as current fabric code may sleep here waiting for
+TFO->check_stop_free() to complete in main response path, and because
+target_wait_for_sess_cmds() calling TFO->release_cmd() to free fabric
+descriptor memory directly.
+
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Roland Dreier <roland@purestorage.com>
+Signed-off-by: Nicholas A. Bellinger <nab@linux-iscsi.org>
+Acked-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/target/target_core_transport.c  |  132 +++++++++++++++++++++++++++++-
+ include/target/target_core_base.h       |    9 ++
+ include/target/target_core_fabric_ops.h |    4 +
+ include/target/target_core_transport.h  |    6 +-
+ 4 files changed, 145 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index 00acdcc..43d8a31 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -269,6 +269,9 @@ struct se_session *transport_init_session(void)
+ 	}
+ 	INIT_LIST_HEAD(&se_sess->sess_list);
+ 	INIT_LIST_HEAD(&se_sess->sess_acl_list);
++	INIT_LIST_HEAD(&se_sess->sess_cmd_list);
++	INIT_LIST_HEAD(&se_sess->sess_wait_list);
++	spin_lock_init(&se_sess->sess_cmd_lock);
+ 
+ 	return se_sess;
+ }
+@@ -1506,11 +1509,12 @@ void transport_init_se_cmd(
+ 	INIT_LIST_HEAD(&cmd->se_ordered_node);
+ 	INIT_LIST_HEAD(&cmd->se_qf_node);
+ 	INIT_LIST_HEAD(&cmd->se_queue_node);
+-
++	INIT_LIST_HEAD(&cmd->se_cmd_list);
+ 	INIT_LIST_HEAD(&cmd->t_task_list);
+ 	init_completion(&cmd->transport_lun_fe_stop_comp);
+ 	init_completion(&cmd->transport_lun_stop_comp);
+ 	init_completion(&cmd->t_transport_stop_comp);
++	init_completion(&cmd->cmd_wait_comp);
+ 	spin_lock_init(&cmd->t_state_lock);
+ 	atomic_set(&cmd->transport_dev_active, 1);
+ 
+@@ -3961,6 +3965,14 @@ void transport_release_cmd(struct se_cmd *cmd)
+ 		core_tmr_release_req(cmd->se_tmr_req);
+ 	if (cmd->t_task_cdb != cmd->__t_task_cdb)
+ 		kfree(cmd->t_task_cdb);
++	/*
++	 * Check if target_wait_for_sess_cmds() is expecting to
++	 * release se_cmd directly here..
++	 */
++	if (cmd->check_release != 0 && cmd->se_tfo->check_release_cmd)
++		if (cmd->se_tfo->check_release_cmd(cmd) != 0)
++			return;
++
+ 	cmd->se_tfo->release_cmd(cmd);
+ }
+ EXPORT_SYMBOL(transport_release_cmd);
+@@ -3988,6 +4000,114 @@ void transport_generic_free_cmd(struct se_cmd *cmd, int wait_for_tasks)
+ }
+ EXPORT_SYMBOL(transport_generic_free_cmd);
+ 
++/* target_get_sess_cmd - Add command to active ->sess_cmd_list
++ * @se_sess:	session to reference
++ * @se_cmd:	command descriptor to add
++ */
++void target_get_sess_cmd(struct se_session *se_sess, struct se_cmd *se_cmd)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
++	list_add_tail(&se_cmd->se_cmd_list, &se_sess->sess_cmd_list);
++	se_cmd->check_release = 1;
++	spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++}
++EXPORT_SYMBOL(target_get_sess_cmd);
++
++/* target_put_sess_cmd - Check for active I/O shutdown or list delete
++ * @se_sess: 	session to reference
++ * @se_cmd:	command descriptor to drop
++ */
++int target_put_sess_cmd(struct se_session *se_sess, struct se_cmd *se_cmd)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
++	if (list_empty(&se_cmd->se_cmd_list)) {
++		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++		WARN_ON(1);
++		return 0;
++	}
++
++	if (se_sess->sess_tearing_down && se_cmd->cmd_wait_set) {
++		spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++		complete(&se_cmd->cmd_wait_comp);
++		return 1;
++	}
++	list_del(&se_cmd->se_cmd_list);
++	spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++
++	return 0;
++}
++EXPORT_SYMBOL(target_put_sess_cmd);
++
++/* target_splice_sess_cmd_list - Split active cmds into sess_wait_list
++ * @se_sess:	session to split
++ */
++void target_splice_sess_cmd_list(struct se_session *se_sess)
++{
++	struct se_cmd *se_cmd;
++	unsigned long flags;
++
++	WARN_ON(!list_empty(&se_sess->sess_wait_list));
++	INIT_LIST_HEAD(&se_sess->sess_wait_list);
++
++	spin_lock_irqsave(&se_sess->sess_cmd_lock, flags);
++	se_sess->sess_tearing_down = 1;
++
++	list_splice_init(&se_sess->sess_cmd_list, &se_sess->sess_wait_list);
++
++	list_for_each_entry(se_cmd, &se_sess->sess_wait_list, se_cmd_list)
++		se_cmd->cmd_wait_set = 1;
++
++	spin_unlock_irqrestore(&se_sess->sess_cmd_lock, flags);
++}
++EXPORT_SYMBOL(target_splice_sess_cmd_list);
++
++/* target_wait_for_sess_cmds - Wait for outstanding descriptors
++ * @se_sess:    session to wait for active I/O
++ * @wait_for_tasks:	Make extra transport_wait_for_tasks call
++ */
++void target_wait_for_sess_cmds(
++	struct se_session *se_sess,
++	int wait_for_tasks)
++{
++	struct se_cmd *se_cmd, *tmp_cmd;
++	bool rc = false;
++
++	list_for_each_entry_safe(se_cmd, tmp_cmd,
++				&se_sess->sess_wait_list, se_cmd_list) {
++		list_del(&se_cmd->se_cmd_list);
++
++		pr_debug("Waiting for se_cmd: %p t_state: %d, fabric state:"
++			" %d\n", se_cmd, se_cmd->t_state,
++			se_cmd->se_tfo->get_cmd_state(se_cmd));
++
++		if (wait_for_tasks) {
++			pr_debug("Calling transport_wait_for_tasks se_cmd: %p t_state: %d,"
++				" fabric state: %d\n", se_cmd, se_cmd->t_state,
++				se_cmd->se_tfo->get_cmd_state(se_cmd));
++
++			rc = transport_wait_for_tasks(se_cmd);
++
++			pr_debug("After transport_wait_for_tasks se_cmd: %p t_state: %d,"
++				" fabric state: %d\n", se_cmd, se_cmd->t_state,
++				se_cmd->se_tfo->get_cmd_state(se_cmd));
++		}
++
++		if (!rc) {
++			wait_for_completion(&se_cmd->cmd_wait_comp);
++			pr_debug("After cmd_wait_comp: se_cmd: %p t_state: %d"
++				" fabric state: %d\n", se_cmd, se_cmd->t_state,
++				se_cmd->se_tfo->get_cmd_state(se_cmd));
++		}
++
++		se_cmd->se_tfo->release_cmd(se_cmd);
++	}
++}
++EXPORT_SYMBOL(target_wait_for_sess_cmds);
++
+ /*	transport_lun_wait_for_tasks():
+  *
+  *	Called from ConfigFS context to stop the passed struct se_cmd to allow
+@@ -4164,14 +4284,14 @@ int transport_clear_lun_from_sessions(struct se_lun *lun)
+  * Called from frontend fabric context to wait for storage engine
+  * to pause and/or release frontend generated struct se_cmd.
+  */
+-void transport_wait_for_tasks(struct se_cmd *cmd)
++bool transport_wait_for_tasks(struct se_cmd *cmd)
+ {
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&cmd->t_state_lock, flags);
+ 	if (!(cmd->se_cmd_flags & SCF_SE_LUN_CMD) && !(cmd->se_tmr_req)) {
+ 		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-		return;
++		return false;
+ 	}
+ 	/*
+ 	 * Only perform a possible wait_for_tasks if SCF_SUPPORTED_SAM_OPCODE
+@@ -4179,7 +4299,7 @@ void transport_wait_for_tasks(struct se_cmd *cmd)
+ 	 */
+ 	if (!(cmd->se_cmd_flags & SCF_SUPPORTED_SAM_OPCODE) && !cmd->se_tmr_req) {
+ 		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-		return;
++		return false;
+ 	}
+ 	/*
+ 	 * If we are already stopped due to an external event (ie: LUN shutdown)
+@@ -4222,7 +4342,7 @@ void transport_wait_for_tasks(struct se_cmd *cmd)
+ 	if (!atomic_read(&cmd->t_transport_active) ||
+ 	     atomic_read(&cmd->t_transport_aborted)) {
+ 		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-		return;
++		return false;
+ 	}
+ 
+ 	atomic_set(&cmd->t_transport_stop, 1);
+@@ -4247,6 +4367,8 @@ void transport_wait_for_tasks(struct se_cmd *cmd)
+ 		cmd->se_tfo->get_task_tag(cmd));
+ 
+ 	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
++
++	return true;
+ }
+ EXPORT_SYMBOL(transport_wait_for_tasks);
+ 
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index 9ae0079..6f6d9a5 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -426,6 +426,9 @@ struct se_cmd {
+ 	enum transport_state_table t_state;
+ 	/* Transport specific error status */
+ 	int			transport_error_status;
++	/* Used to signal cmd->se_tfo->check_release_cmd() usage per cmd */
++	int			check_release:1;
++	int			cmd_wait_set:1;
+ 	/* See se_cmd_flags_table */
+ 	u32			se_cmd_flags;
+ 	u32			se_ordered_id;
+@@ -452,6 +455,8 @@ struct se_cmd {
+ 	struct se_session	*se_sess;
+ 	struct se_tmr_req	*se_tmr_req;
+ 	struct list_head	se_queue_node;
++	struct list_head	se_cmd_list;
++	struct completion	cmd_wait_comp;
+ 	struct target_core_fabric_ops *se_tfo;
+ 	int (*transport_emulate_cdb)(struct se_cmd *);
+ 	void (*transport_complete_callback)(struct se_cmd *);
+@@ -559,12 +564,16 @@ struct se_node_acl {
+ } ____cacheline_aligned;
+ 
+ struct se_session {
++	int			sess_tearing_down:1;
+ 	u64			sess_bin_isid;
+ 	struct se_node_acl	*se_node_acl;
+ 	struct se_portal_group *se_tpg;
+ 	void			*fabric_sess_ptr;
+ 	struct list_head	sess_list;
+ 	struct list_head	sess_acl_list;
++	struct list_head	sess_cmd_list;
++	struct list_head	sess_wait_list;
++	spinlock_t		sess_cmd_lock;
+ } ____cacheline_aligned;
+ 
+ struct se_device;
+diff --git a/include/target/target_core_fabric_ops.h b/include/target/target_core_fabric_ops.h
+index 04c591d..0256825 100644
+--- a/include/target/target_core_fabric_ops.h
++++ b/include/target/target_core_fabric_ops.h
+@@ -52,6 +52,10 @@ struct target_core_fabric_ops {
+ 	 * Returning 0 will signal a descriptor has not been released.
+ 	 */
+ 	int (*check_stop_free)(struct se_cmd *);
++	/*
++	 * Optional check for active I/O shutdown
++	 */
++	int (*check_release_cmd)(struct se_cmd *);
+ 	void (*release_cmd)(struct se_cmd *);
+ 	/*
+ 	 * Called with spin_lock_bh(struct se_portal_group->session_lock held.
+diff --git a/include/target/target_core_transport.h b/include/target/target_core_transport.h
+index d1b68c9..c16e943 100644
+--- a/include/target/target_core_transport.h
++++ b/include/target/target_core_transport.h
+@@ -164,12 +164,16 @@ extern bool target_stop_task(struct se_task *task, unsigned long *flags);
+ extern int transport_generic_map_mem_to_cmd(struct se_cmd *cmd, struct scatterlist *, u32,
+ 				struct scatterlist *, u32);
+ extern int transport_clear_lun_from_sessions(struct se_lun *);
+-extern void transport_wait_for_tasks(struct se_cmd *);
++extern bool transport_wait_for_tasks(struct se_cmd *);
+ extern int transport_check_aborted_status(struct se_cmd *, int);
+ extern int transport_send_check_condition_and_sense(struct se_cmd *, u8, int);
+ extern void transport_send_task_abort(struct se_cmd *);
+ extern void transport_release_cmd(struct se_cmd *);
+ extern void transport_generic_free_cmd(struct se_cmd *, int);
++extern void target_get_sess_cmd(struct se_session *, struct se_cmd *);
++extern int target_put_sess_cmd(struct se_session *, struct se_cmd *);
++extern void target_splice_sess_cmd_list(struct se_session *);
++extern void target_wait_for_sess_cmds(struct se_session *, int);
+ extern void transport_generic_wait_for_cmds(struct se_cmd *, int);
+ extern void transport_do_task_sg_chain(struct se_cmd *);
+ extern void transport_generic_process_write(struct se_cmd *);
+-- 
+1.7.4.2
+

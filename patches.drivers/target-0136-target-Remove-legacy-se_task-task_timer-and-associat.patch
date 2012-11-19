@@ -1,0 +1,439 @@
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+Date: Sun, 23 Oct 2011 18:46:36 -0700
+Subject: [PATCH] target: Remove legacy se_task->task_timer and associated logic
+Git-commit: 2e982ab92dff057c639d4a43ccfa275be62f5e59
+References: FATE#313550
+Patch-Mainline: v3.2
+
+This patch removes the legacy usage of se_task->task_timer and associated
+infrastructure that originally was used as a way to help manage buggy backend
+SCSI LLDs that in certain cases would never return back an outstanding task.
+
+This includes the removal of target_complete_timeout_work(), timeout logic
+from transport_complete_task(), transport_task_timeout_handler(),
+transport_start_task_timer(), the per device task_timeout configfs attribute,
+and all task_timeout associated structure members and defines in
+target_core_base.h
+
+This is being removed in preparation to make transport_complete_task() run
+in lock-less mode.
+
+Cc: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Acked-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/target/target_core_configfs.c  |    4 -
+ drivers/target/target_core_device.c    |   15 ---
+ drivers/target/target_core_transport.c |  156 --------------------------------
+ include/target/target_core_base.h      |    7 +--
+ include/target/target_core_transport.h |   16 +---
+ 5 files changed, 4 insertions(+), 194 deletions(-)
+
+diff --git a/drivers/target/target_core_configfs.c b/drivers/target/target_core_configfs.c
+index 1511a2f..e0c1e8a 100644
+--- a/drivers/target/target_core_configfs.c
++++ b/drivers/target/target_core_configfs.c
+@@ -716,9 +716,6 @@ SE_DEV_ATTR_RO(hw_queue_depth);
+ DEF_DEV_ATTRIB(queue_depth);
+ SE_DEV_ATTR(queue_depth, S_IRUGO | S_IWUSR);
+ 
+-DEF_DEV_ATTRIB(task_timeout);
+-SE_DEV_ATTR(task_timeout, S_IRUGO | S_IWUSR);
+-
+ DEF_DEV_ATTRIB(max_unmap_lba_count);
+ SE_DEV_ATTR(max_unmap_lba_count, S_IRUGO | S_IWUSR);
+ 
+@@ -752,7 +749,6 @@ static struct configfs_attribute *target_core_dev_attrib_attrs[] = {
+ 	&target_core_dev_attrib_optimal_sectors.attr,
+ 	&target_core_dev_attrib_hw_queue_depth.attr,
+ 	&target_core_dev_attrib_queue_depth.attr,
+-	&target_core_dev_attrib_task_timeout.attr,
+ 	&target_core_dev_attrib_max_unmap_lba_count.attr,
+ 	&target_core_dev_attrib_max_unmap_block_desc_count.attr,
+ 	&target_core_dev_attrib_unmap_granularity.attr,
+diff --git a/drivers/target/target_core_device.c b/drivers/target/target_core_device.c
+index 81352b7..f870c3b 100644
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@ -914,21 +914,6 @@ void se_dev_set_default_attribs(
+ 	dev->se_sub_dev->se_dev_attrib.queue_depth = dev_limits->queue_depth;
+ }
+ 
+-int se_dev_set_task_timeout(struct se_device *dev, u32 task_timeout)
+-{
+-	if (task_timeout > DA_TASK_TIMEOUT_MAX) {
+-		pr_err("dev[%p]: Passed task_timeout: %u larger then"
+-			" DA_TASK_TIMEOUT_MAX\n", dev, task_timeout);
+-		return -EINVAL;
+-	} else {
+-		dev->se_sub_dev->se_dev_attrib.task_timeout = task_timeout;
+-		pr_debug("dev[%p]: Set SE Device task_timeout: %u\n",
+-			dev, task_timeout);
+-	}
+-
+-	return 0;
+-}
+-
+ int se_dev_set_max_unmap_lba_count(
+ 	struct se_device *dev,
+ 	u32 max_unmap_lba_count)
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index 51cf9bb..7ac49b6 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -75,7 +75,6 @@ static int __transport_execute_tasks(struct se_device *dev);
+ static void transport_complete_task_attr(struct se_cmd *cmd);
+ static void transport_handle_queue_full(struct se_cmd *cmd,
+ 		struct se_device *dev);
+-static void transport_direct_request_timeout(struct se_cmd *cmd);
+ static void transport_free_dev_tasks(struct se_cmd *cmd);
+ static int transport_generic_get_mem(struct se_cmd *cmd);
+ static void transport_put_cmd(struct se_cmd *cmd);
+@@ -682,26 +681,6 @@ void transport_complete_sync_cache(struct se_cmd *cmd, int good)
+ }
+ EXPORT_SYMBOL(transport_complete_sync_cache);
+ 
+-static void target_complete_timeout_work(struct work_struct *work)
+-{
+-	struct se_cmd *cmd = container_of(work, struct se_cmd, work);
+-	unsigned long flags;
+-
+-	/*
+-	 * Reset cmd->t_se_count to allow transport_put_cmd()
+-	 * to allow last call to free memory resources.
+-	 */
+-	spin_lock_irqsave(&cmd->t_state_lock, flags);
+-	if (atomic_read(&cmd->t_transport_timeout) > 1) {
+-		int tmp = (atomic_read(&cmd->t_transport_timeout) - 1);
+-
+-		atomic_sub(tmp, &cmd->t_se_count);
+-	}
+-	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-
+-	transport_put_cmd(cmd);
+-}
+-
+ static void target_complete_failure_work(struct work_struct *work)
+ {
+ 	struct se_cmd *cmd = container_of(work, struct se_cmd, work);
+@@ -726,8 +705,6 @@ void transport_complete_task(struct se_task *task, int success)
+ 	if (dev)
+ 		atomic_inc(&dev->depth_left);
+ 
+-	del_timer(&task->task_timer);
+-
+ 	spin_lock_irqsave(&cmd->t_state_lock, flags);
+ 	task->task_flags &= ~TF_ACTIVE;
+ 
+@@ -749,35 +726,11 @@ void transport_complete_task(struct se_task *task, int success)
+ 	 * to complete for an exception condition
+ 	 */
+ 	if (task->task_flags & TF_REQUEST_STOP) {
+-		/*
+-		 * Decrement cmd->t_se_count if this task had
+-		 * previously thrown its timeout exception handler.
+-		 */
+-		if (task->task_flags & TF_TIMEOUT) {
+-			atomic_dec(&cmd->t_se_count);
+-			task->task_flags &= ~TF_TIMEOUT;
+-		}
+ 		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-
+ 		complete(&task->task_stop_comp);
+ 		return;
+ 	}
+ 	/*
+-	 * If the task's timeout handler has fired, use the t_task_cdbs_timeout
+-	 * left counter to determine when the struct se_cmd is ready to be queued to
+-	 * the processing thread.
+-	 */
+-	if (task->task_flags & TF_TIMEOUT) {
+-		if (!atomic_dec_and_test(&cmd->t_task_cdbs_timeout_left)) {
+-			spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-			return;
+-		}
+-		INIT_WORK(&cmd->work, target_complete_timeout_work);
+-		goto out_queue;
+-	}
+-	atomic_dec(&cmd->t_task_cdbs_timeout_left);
+-
+-	/*
+ 	 * Decrement the outstanding t_task_cdbs_left count.  The last
+ 	 * struct se_task from struct se_cmd will complete itself into the
+ 	 * device queue depending upon int success.
+@@ -800,7 +753,6 @@ void transport_complete_task(struct se_task *task, int success)
+ 		INIT_WORK(&cmd->work, target_complete_ok_work);
+ 	}
+ 
+-out_queue:
+ 	cmd->t_state = TRANSPORT_COMPLETE;
+ 	atomic_set(&cmd->t_transport_active, 1);
+ 	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+@@ -1519,7 +1471,6 @@ transport_generic_get_task(struct se_cmd *cmd,
+ 	INIT_LIST_HEAD(&task->t_list);
+ 	INIT_LIST_HEAD(&task->t_execute_list);
+ 	INIT_LIST_HEAD(&task->t_state_list);
+-	init_timer(&task->task_timer);
+ 	init_completion(&task->task_stop_comp);
+ 	task->task_se_cmd = cmd;
+ 	task->task_data_direction = data_direction;
+@@ -1787,7 +1738,6 @@ bool target_stop_task(struct se_task *task, unsigned long *flags)
+ 		spin_unlock_irqrestore(&cmd->t_state_lock, *flags);
+ 
+ 		pr_debug("Task %p waiting to complete\n", task);
+-		del_timer_sync(&task->task_timer);
+ 		wait_for_completion(&task->task_stop_comp);
+ 		pr_debug("Task %p stopped successfully\n", task);
+ 
+@@ -1876,7 +1826,6 @@ static void transport_generic_request_failure(
+ 		transport_complete_task_attr(cmd);
+ 
+ 	if (complete) {
+-		transport_direct_request_timeout(cmd);
+ 		cmd->transport_error_status = PYX_TRANSPORT_LU_COMM_FAILURE;
+ 	}
+ 
+@@ -1979,25 +1928,6 @@ queue_full:
+ 	transport_handle_queue_full(cmd, cmd->se_dev);
+ }
+ 
+-static void transport_direct_request_timeout(struct se_cmd *cmd)
+-{
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&cmd->t_state_lock, flags);
+-	if (!atomic_read(&cmd->t_transport_timeout)) {
+-		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-		return;
+-	}
+-	if (atomic_read(&cmd->t_task_cdbs_timeout_left)) {
+-		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-		return;
+-	}
+-
+-	atomic_sub(atomic_read(&cmd->t_transport_timeout),
+-		   &cmd->t_se_count);
+-	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-}
+-
+ static inline u32 transport_lba_21(unsigned char *cdb)
+ {
+ 	return ((cdb[1] & 0x1f) << 16) | (cdb[2] << 8) | cdb[3];
+@@ -2040,80 +1970,6 @@ static void transport_set_supported_SAM_opcode(struct se_cmd *se_cmd)
+ 	spin_unlock_irqrestore(&se_cmd->t_state_lock, flags);
+ }
+ 
+-/*
+- * Called from interrupt context.
+- */
+-static void transport_task_timeout_handler(unsigned long data)
+-{
+-	struct se_task *task = (struct se_task *)data;
+-	struct se_cmd *cmd = task->task_se_cmd;
+-	unsigned long flags;
+-
+-	pr_debug("transport task timeout fired! task: %p cmd: %p\n", task, cmd);
+-
+-	spin_lock_irqsave(&cmd->t_state_lock, flags);
+-
+-	/*
+-	 * Determine if transport_complete_task() has already been called.
+-	 */
+-	if (!(task->task_flags & TF_ACTIVE)) {
+-		pr_debug("transport task: %p cmd: %p timeout !TF_ACTIVE\n",
+-			 task, cmd);
+-		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-		return;
+-	}
+-
+-	atomic_inc(&cmd->t_se_count);
+-	atomic_inc(&cmd->t_transport_timeout);
+-	cmd->t_tasks_failed = 1;
+-
+-	task->task_flags |= TF_TIMEOUT;
+-	task->task_error_status = PYX_TRANSPORT_TASK_TIMEOUT;
+-	task->task_scsi_status = 1;
+-
+-	if (task->task_flags & TF_REQUEST_STOP) {
+-		pr_debug("transport task: %p cmd: %p timeout TF_REQUEST_STOP"
+-				" == 1\n", task, cmd);
+-		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-		complete(&task->task_stop_comp);
+-		return;
+-	}
+-
+-	if (!atomic_dec_and_test(&cmd->t_task_cdbs_left)) {
+-		pr_debug("transport task: %p cmd: %p timeout non zero"
+-				" t_task_cdbs_left\n", task, cmd);
+-		spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-		return;
+-	}
+-	pr_debug("transport task: %p cmd: %p timeout ZERO t_task_cdbs_left\n",
+-			task, cmd);
+-
+-	INIT_WORK(&cmd->work, target_complete_failure_work);
+-	cmd->t_state = TRANSPORT_COMPLETE;
+-	atomic_set(&cmd->t_transport_active, 1);
+-	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-
+-	queue_work(target_completion_wq, &cmd->work);
+-}
+-
+-static void transport_start_task_timer(struct se_task *task)
+-{
+-	struct se_device *dev = task->task_se_cmd->se_dev;
+-	int timeout;
+-
+-	/*
+-	 * If the task_timeout is disabled, exit now.
+-	 */
+-	timeout = dev->se_sub_dev->se_dev_attrib.task_timeout;
+-	if (!timeout)
+-		return;
+-
+-	task->task_timer.expires = (get_jiffies_64() + timeout * HZ);
+-	task->task_timer.data = (unsigned long) task;
+-	task->task_timer.function = transport_task_timeout_handler;
+-	add_timer(&task->task_timer);
+-}
+-
+ static inline int transport_tcq_window_closed(struct se_device *dev)
+ {
+ 	if (dev->dev_tcq_window_closed++ <
+@@ -2296,7 +2152,6 @@ check_depth:
+ 	    cmd->t_task_list_num)
+ 		atomic_set(&cmd->t_transport_sent, 1);
+ 
+-	transport_start_task_timer(task);
+ 	spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+ 	/*
+ 	 * The struct se_cmd->transport_emulate_cdb() function pointer is used
+@@ -2310,7 +2165,6 @@ check_depth:
+ 			spin_lock_irqsave(&cmd->t_state_lock, flags);
+ 			task->task_flags &= ~TF_ACTIVE;
+ 			spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-			del_timer_sync(&task->task_timer);
+ 			atomic_set(&cmd->t_transport_sent, 0);
+ 			transport_stop_tasks_for_cmd(cmd);
+ 			atomic_inc(&dev->depth_left);
+@@ -2350,7 +2204,6 @@ check_depth:
+ 			spin_lock_irqsave(&cmd->t_state_lock, flags);
+ 			task->task_flags &= ~TF_ACTIVE;
+ 			spin_unlock_irqrestore(&cmd->t_state_lock, flags);
+-			del_timer_sync(&task->task_timer);
+ 			atomic_set(&cmd->t_transport_sent, 0);
+ 			transport_stop_tasks_for_cmd(cmd);
+ 			atomic_inc(&dev->depth_left);
+@@ -3553,14 +3406,6 @@ static void transport_free_dev_tasks(struct se_cmd *cmd)
+ 	while (!list_empty(&dispose_list)) {
+ 		task = list_first_entry(&dispose_list, struct se_task, t_list);
+ 
+-		/*
+-		 * We already cancelled all pending timers in
+-		 * transport_complete_task, but that was just a pure del_timer,
+-		 * so do a full del_timer_sync here to make sure any handler
+-		 * that was running at that point has finished execution.
+-		 */
+-		del_timer_sync(&task->task_timer);
+-
+ 		if (task->task_sg != cmd->t_data_sg &&
+ 		    task->task_sg != cmd->t_bidi_data_sg)
+ 			kfree(task->task_sg);
+@@ -4017,7 +3862,6 @@ int transport_generic_new_cmd(struct se_cmd *cmd)
+ 	cmd->t_task_list_num = (task_cdbs + task_cdbs_bidi);
+ 	atomic_set(&cmd->t_task_cdbs_left, cmd->t_task_list_num);
+ 	atomic_set(&cmd->t_task_cdbs_ex_left, cmd->t_task_list_num);
+-	atomic_set(&cmd->t_task_cdbs_timeout_left, cmd->t_task_list_num);
+ 
+ 	/*
+ 	 * For WRITEs, let the fabric know its buffer is ready..
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index ab95578..b6b0605 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -76,8 +76,7 @@ enum transport_tpg_type_table {
+ enum se_task_flags {
+ 	TF_ACTIVE		= (1 << 0),
+ 	TF_SENT			= (1 << 1),
+-	TF_TIMEOUT		= (1 << 2),
+-	TF_REQUEST_STOP		= (1 << 3),
++	TF_REQUEST_STOP		= (1 << 2),
+ };
+ 
+ /* Special transport agnostic struct se_cmd->t_states */
+@@ -405,7 +404,6 @@ struct se_task {
+ 	int			task_error_status;
+ 	enum dma_data_direction	task_data_direction;
+ 	atomic_t		task_state_active;
+-	struct timer_list	task_timer;
+ 	struct list_head	t_list;
+ 	struct list_head	t_execute_list;
+ 	struct list_head	t_state_list;
+@@ -470,7 +468,6 @@ struct se_cmd {
+ 	atomic_t		t_se_count;
+ 	atomic_t		t_task_cdbs_left;
+ 	atomic_t		t_task_cdbs_ex_left;
+-	atomic_t		t_task_cdbs_timeout_left;
+ 	atomic_t		t_task_cdbs_sent;
+ 	atomic_t		t_transport_aborted;
+ 	atomic_t		t_transport_active;
+@@ -478,7 +475,6 @@ struct se_cmd {
+ 	atomic_t		t_transport_queue_active;
+ 	atomic_t		t_transport_sent;
+ 	atomic_t		t_transport_stop;
+-	atomic_t		t_transport_timeout;
+ 	atomic_t		transport_dev_active;
+ 	atomic_t		transport_lun_active;
+ 	atomic_t		transport_lun_fe_stop;
+@@ -647,7 +643,6 @@ struct se_dev_attrib {
+ 	u32		optimal_sectors;
+ 	u32		hw_queue_depth;
+ 	u32		queue_depth;
+-	u32		task_timeout;
+ 	u32		max_unmap_lba_count;
+ 	u32		max_unmap_block_desc_count;
+ 	u32		unmap_granularity;
+diff --git a/include/target/target_core_transport.h b/include/target/target_core_transport.h
+index 32c5863..a037a1a 100644
+--- a/include/target/target_core_transport.h
++++ b/include/target/target_core_transport.h
+@@ -22,10 +22,9 @@
+ #define PYX_TRANSPORT_LU_COMM_FAILURE		-7
+ #define PYX_TRANSPORT_UNKNOWN_MODE_PAGE		-8
+ #define PYX_TRANSPORT_WRITE_PROTECTED		-9
+-#define PYX_TRANSPORT_TASK_TIMEOUT		-10
+-#define PYX_TRANSPORT_RESERVATION_CONFLICT	-11
+-#define PYX_TRANSPORT_ILLEGAL_REQUEST		-12
+-#define PYX_TRANSPORT_USE_SENSE_REASON		-13
++#define PYX_TRANSPORT_RESERVATION_CONFLICT	-10
++#define PYX_TRANSPORT_ILLEGAL_REQUEST		-11
++#define PYX_TRANSPORT_USE_SENSE_REASON		-12
+ 
+ #ifndef SAM_STAT_RESERVATION_CONFLICT
+ #define SAM_STAT_RESERVATION_CONFLICT		0x18
+@@ -38,13 +37,6 @@
+ #define TRANSPORT_PLUGIN_VHBA_PDEV		2
+ #define TRANSPORT_PLUGIN_VHBA_VDEV		3
+ 
+-/* For SE OBJ Plugins, in seconds */
+-#define TRANSPORT_TIMEOUT_TUR			10
+-#define TRANSPORT_TIMEOUT_TYPE_DISK		60
+-#define TRANSPORT_TIMEOUT_TYPE_ROM		120
+-#define TRANSPORT_TIMEOUT_TYPE_TAPE		600
+-#define TRANSPORT_TIMEOUT_TYPE_OTHER		300
+-
+ /*
+  * struct se_subsystem_dev->su_dev_flags
+ */
+@@ -61,8 +53,6 @@
+ #define DF_SPC2_RESERVATIONS_WITH_ISID		0x00000004
+ 
+ /* struct se_dev_attrib sanity values */
+-/* 10 Minutes */
+-#define DA_TASK_TIMEOUT_MAX			600
+ /* Default max_unmap_lba_count */
+ #define DA_MAX_UNMAP_LBA_COUNT			0
+ /* Default max_unmap_block_desc_count */
+-- 
+1.7.4.2
+
