@@ -1,0 +1,157 @@
+From: David Miller <davem@davemloft.net>
+Date: Fri, 2 Dec 2011 16:52:18 +0000
+Subject: [PATCH 15/24] cxgb3: Rework t3_l2t_get to take a dst_entry instead
+ of a neighbour.
+Git-commit: a4757123aeadf450b5b3c5f51f214660e20477f3
+Patch-mainline: v3.3-rc1
+References: bnc#784800 FATE#314296
+
+This way we consolidate the RCU locking down into the place where it
+actually matters, and also we can make the code handle
+dst_get_neighbour_noref() returning NULL properly.
+
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/infiniband/hw/cxgb3/iwch_cm.c              |   15 +----------
+ drivers/net/ethernet/chelsio/cxgb3/cxgb3_offload.c |    2 -
+ drivers/net/ethernet/chelsio/cxgb3/l2t.c           |   27 +++++++++++++++------
+ drivers/net/ethernet/chelsio/cxgb3/l2t.h           |    2 -
+ drivers/scsi/cxgbi/cxgb3i/cxgb3i.c                 |    2 -
+ 5 files changed, 25 insertions(+), 23 deletions(-)
+
+--- a/drivers/infiniband/hw/cxgb3/iwch_cm.c
++++ b/drivers/infiniband/hw/cxgb3/iwch_cm.c
+@@ -1328,7 +1328,6 @@ static int pass_accept_req(struct t3cdev
+ 	struct iwch_ep *child_ep, *parent_ep = ctx;
+ 	struct cpl_pass_accept_req *req = cplhdr(skb);
+ 	unsigned int hwtid = GET_TID(req);
+-	struct neighbour *neigh;
+ 	struct dst_entry *dst;
+ 	struct l2t_entry *l2t;
+ 	struct rtable *rt;
+@@ -1365,10 +1364,7 @@ static int pass_accept_req(struct t3cdev
+ 		goto reject;
+ 	}
+ 	dst = &rt->dst;
+-	rcu_read_lock();
+-	neigh = dst_get_neighbour(dst);
+-	l2t = t3_l2t_get(tdev, neigh, neigh->dev);
+-	rcu_read_unlock();
++	l2t = t3_l2t_get(tdev, dst, NULL);
+ 	if (!l2t) {
+ 		printk(KERN_ERR MOD "%s - failed to allocate l2t entry!\n",
+ 		       __func__);
+@@ -1879,7 +1875,6 @@ static int is_loopback_dst(struct iw_cm_
+ int iwch_connect(struct iw_cm_id *cm_id, struct iw_cm_conn_param *conn_param)
+ {
+ 	struct iwch_dev *h = to_iwch_dev(cm_id->device);
+-	struct neighbour *neigh;
+ 	struct iwch_ep *ep;
+ 	struct rtable *rt;
+ 	int err = 0;
+@@ -1937,13 +1932,7 @@ int iwch_connect(struct iw_cm_id *cm_id,
+ 		goto fail3;
+ 	}
+ 	ep->dst = &rt->dst;
+-
+-	rcu_read_lock();
+-	neigh = dst_get_neighbour(ep->dst);
+-
+-	/* get a l2t entry */
+-	ep->l2t = t3_l2t_get(ep->com.tdev, neigh, neigh->dev);
+-	rcu_read_unlock();
++	ep->l2t = t3_l2t_get(ep->com.tdev, ep->dst, NULL);
+ 	if (!ep->l2t) {
+ 		printk(KERN_ERR MOD "%s - cannot alloc l2e.\n", __func__);
+ 		err = -ENOMEM;
+--- a/drivers/net/ethernet/chelsio/cxgb3/cxgb3_offload.c
++++ b/drivers/net/ethernet/chelsio/cxgb3/cxgb3_offload.c
+@@ -1132,7 +1132,7 @@ static void cxgb_redirect(struct dst_ent
+ 	}
+ 
+ 	/* Add new L2T entry */
+-	e = t3_l2t_get(tdev, dst_get_neighbour(new), newdev);
++	e = t3_l2t_get(tdev, new, newdev);
+ 	if (!e) {
+ 		printk(KERN_ERR "%s: couldn't allocate new l2t entry!\n",
+ 		       __func__);
+--- a/drivers/net/ethernet/chelsio/cxgb3/l2t.c
++++ b/drivers/net/ethernet/chelsio/cxgb3/l2t.c
+@@ -298,18 +298,31 @@ static inline void reuse_entry(struct l2
+ 	spin_unlock(&e->lock);
+ }
+ 
+-struct l2t_entry *t3_l2t_get(struct t3cdev *cdev, struct neighbour *neigh,
++struct l2t_entry *t3_l2t_get(struct t3cdev *cdev, struct dst_entry *dst,
+ 			     struct net_device *dev)
+ {
+ 	struct l2t_entry *e = NULL;
++	struct neighbour *neigh;
++	struct port_info *p;
+ 	struct l2t_data *d;
+ 	int hash;
+-	u32 addr = *(u32 *) neigh->primary_key;
+-	int ifidx = neigh->dev->ifindex;
+-	struct port_info *p = netdev_priv(dev);
+-	int smt_idx = p->port_id;
++	u32 addr;
++	int ifidx;
++	int smt_idx;
+ 
+ 	rcu_read_lock();
++	neigh = dst_get_neighbour(dst);
++	if (!neigh)
++		goto done_rcu;
++
++	addr = *(u32 *) neigh->primary_key;
++	ifidx = neigh->dev->ifindex;
++
++	if (!dev)
++		dev = neigh->dev;
++	p = netdev_priv(dev);
++	smt_idx = p->port_id;
++
+ 	d = L2DATA(cdev);
+ 	if (!d)
+ 		goto done_rcu;
+@@ -323,7 +336,7 @@ struct l2t_entry *t3_l2t_get(struct t3cd
+ 			l2t_hold(d, e);
+ 			if (atomic_read(&e->refcnt) == 1)
+ 				reuse_entry(e, neigh);
+-			goto done;
++			goto done_unlock;
+ 		}
+ 
+ 	/* Need to allocate a new entry */
+@@ -344,7 +357,7 @@ struct l2t_entry *t3_l2t_get(struct t3cd
+ 			e->vlan = VLAN_NONE;
+ 		spin_unlock(&e->lock);
+ 	}
+-done:
++done_unlock:
+ 	write_unlock_bh(&d->lock);
+ done_rcu:
+ 	rcu_read_unlock();
+--- a/drivers/net/ethernet/chelsio/cxgb3/l2t.h
++++ b/drivers/net/ethernet/chelsio/cxgb3/l2t.h
+@@ -109,7 +109,7 @@ static inline void set_arp_failure_handl
+ 
+ void t3_l2e_free(struct l2t_data *d, struct l2t_entry *e);
+ void t3_l2t_update(struct t3cdev *dev, struct neighbour *neigh);
+-struct l2t_entry *t3_l2t_get(struct t3cdev *cdev, struct neighbour *neigh,
++struct l2t_entry *t3_l2t_get(struct t3cdev *cdev, struct dst_entry *dst,
+ 			     struct net_device *dev);
+ int t3_l2t_send_slow(struct t3cdev *dev, struct sk_buff *skb,
+ 		     struct l2t_entry *e);
+--- a/drivers/scsi/cxgbi/cxgb3i/cxgb3i.c
++++ b/drivers/scsi/cxgbi/cxgb3i/cxgb3i.c
+@@ -967,7 +967,7 @@ static int init_act_open(struct cxgbi_so
+ 		csk->saddr.sin_addr.s_addr = chba->ipv4addr;
+ 
+ 	csk->rss_qid = 0;
+-	csk->l2t = t3_l2t_get(t3dev, dst_get_neighbour(dst), ndev);
++	csk->l2t = t3_l2t_get(t3dev, dst, ndev);
+ 	if (!csk->l2t) {
+ 		pr_err("NO l2t available.\n");
+ 		return -EINVAL;
