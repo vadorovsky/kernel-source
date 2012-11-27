@@ -1,0 +1,358 @@
+From: Martin K. Petersen <martin.petersen@oracle.com>
+Date: Thu, 9 Feb 2012 13:48:53 -0500
+Subject: [PATCH] [SCSI] Handle disk devices which can not process medium access commands
+Git-commit: 18a4d0a22ed6c54b67af7718c305cd010f09ddf8
+References: FATE#313629
+Patch-Mainline: v3.4
+
+We have experienced several devices which fail in a fashion we do not
+currently handle gracefully in SCSI. After a failure these devices will
+respond to the SCSI primary command set (INQUIRY, TEST UNIT READY, etc.)
+but any command accessing the storage medium will time out.
+
+The following patch adds an callback that can be used by upper level
+drivers to inspect the results of an error handling command. This in
+turn has been used to implement additional checking in the SCSI disk
+driver.
+
+If a medium access command fails twice but TEST UNIT READY succeeds both
+times in the subsequent error handling we will offline the device. The
+maximum number of failed commands required to take a device offline can
+be tweaked in sysfs.
+
+Also add a new error flag to scsi_debug which allows this scenario to be
+easily reproduced.
+
+[jejb: fix up integer parsing to use kstrtouint]
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+Acked-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/scsi.c        |    6 ---
+ drivers/scsi/scsi_debug.c  |    4 ++
+ drivers/scsi/scsi_error.c  |   12 +++++--
+ drivers/scsi/sd.c          |   82 ++++++++++++++++++++++++++++++++++++++++++++
+ drivers/scsi/sd.h          |   35 +++++++++++++++++++
+ include/scsi/scsi_cmnd.h   |    6 +++
+ include/scsi/scsi_driver.h |    1 +
+ 7 files changed, 137 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/scsi/scsi.c b/drivers/scsi/scsi.c
+index 2aeb2e9..07322ec 100644
+--- a/drivers/scsi/scsi.c
++++ b/drivers/scsi/scsi.c
+@@ -782,12 +782,6 @@ static void scsi_done(struct scsi_cmnd *cmd)
+ 	blk_complete_request(cmd->request);
+ }
+ 
+-/* Move this to a header if it becomes more generally useful */
+-static struct scsi_driver *scsi_cmd_to_driver(struct scsi_cmnd *cmd)
+-{
+-	return *(struct scsi_driver **)cmd->request->rq_disk->private_data;
+-}
+-
+ /**
+  * scsi_finish_command - cleanup and pass command back to upper layer
+  * @cmd: the command
+diff --git a/drivers/scsi/scsi_debug.c b/drivers/scsi/scsi_debug.c
+index d2fd0efc..8917154 100644
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@ -126,6 +126,7 @@ static const char * scsi_debug_version_date = "20100324";
+ #define SCSI_DEBUG_OPT_TRANSPORT_ERR   16
+ #define SCSI_DEBUG_OPT_DIF_ERR   32
+ #define SCSI_DEBUG_OPT_DIX_ERR   64
++#define SCSI_DEBUG_OPT_MAC_TIMEOUT  128
+ /* When "every_nth" > 0 then modulo "every_nth" commands:
+  *   - a no response is simulated if SCSI_DEBUG_OPT_TIMEOUT is set
+  *   - a RECOVERED_ERROR is simulated on successful read and write
+@@ -3615,6 +3616,9 @@ int scsi_debug_queuecommand_lck(struct scsi_cmnd *SCpnt, done_funct_t done)
+ 			scsi_debug_every_nth = -1;
+ 		if (SCSI_DEBUG_OPT_TIMEOUT & scsi_debug_opts)
+ 			return 0; /* ignore command causing timeout */
++		else if (SCSI_DEBUG_OPT_MAC_TIMEOUT & scsi_debug_opts &&
++			 scsi_medium_access_command(SCpnt))
++			return 0; /* time out reads and writes */
+ 		else if (SCSI_DEBUG_OPT_RECOVERED_ERR & scsi_debug_opts)
+ 			inj_recovered = 1; /* to reads and writes below */
+ 		else if (SCSI_DEBUG_OPT_TRANSPORT_ERR & scsi_debug_opts)
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index 7c6994e..4d8ec40 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -32,6 +32,7 @@
+ #include <scsi/scsi_cmnd.h>
+ #include <scsi/scsi_dbg.h>
+ #include <scsi/scsi_device.h>
++#include <scsi/scsi_driver.h>
+ #include <scsi/scsi_eh.h>
+ #include <scsi/scsi_transport.h>
+ #include <scsi/scsi_host.h>
+@@ -147,11 +148,11 @@ enum blk_eh_timer_return scsi_times_out(struct request *req)
+ 	else if (host->hostt->eh_timed_out)
+ 		rtn = host->hostt->eh_timed_out(scmd);
+ 
++	scmd->result |= DID_TIME_OUT << 16;
++
+ 	if (unlikely(rtn == BLK_EH_NOT_HANDLED &&
+-		     !scsi_eh_scmd_add(scmd, SCSI_EH_CANCEL_CMD))) {
+-		scmd->result |= DID_TIME_OUT << 16;
++		     !scsi_eh_scmd_add(scmd, SCSI_EH_CANCEL_CMD)))
+ 		rtn = BLK_EH_HANDLED;
+-	}
+ 
+ 	return rtn;
+ }
+@@ -886,6 +887,7 @@ static int scsi_send_eh_cmnd(struct scsi_cmnd *scmd, unsigned char *cmnd,
+ 			     int cmnd_size, int timeout, unsigned sense_bytes)
+ {
+ 	struct scsi_device *sdev = scmd->device;
++	struct scsi_driver *sdrv = scsi_cmd_to_driver(scmd);
+ 	struct Scsi_Host *shost = sdev->host;
+ 	DECLARE_COMPLETION_ONSTACK(done);
+ 	unsigned long timeleft;
+@@ -940,6 +942,10 @@ static int scsi_send_eh_cmnd(struct scsi_cmnd *scmd, unsigned char *cmnd,
+ 	}
+ 
+ 	scsi_eh_restore_cmnd(scmd, &ses);
++
++	if (sdrv->eh_action)
++		rtn = sdrv->eh_action(scmd, cmnd, cmnd_size, rtn);
++
+ 	return rtn;
+ }
+ 
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index f4a980d..d4d6cfe 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -103,6 +103,7 @@ static int sd_suspend(struct device *, pm_message_t state);
+ static int sd_resume(struct device *);
+ static void sd_rescan(struct device *);
+ static int sd_done(struct scsi_cmnd *);
++static int sd_eh_action(struct scsi_cmnd *, unsigned char *, int, int);
+ static void sd_read_capacity(struct scsi_disk *sdkp, unsigned char *buffer);
+ static void scsi_disk_release(struct device *cdev);
+ static void sd_print_sense_hdr(struct scsi_disk *, struct scsi_sense_hdr *);
+@@ -342,6 +343,31 @@ sd_store_provisioning_mode(struct device *dev, struct device_attribute *attr,
+ 	return count;
+ }
+ 
++static ssize_t
++sd_show_max_medium_access_timeouts(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct scsi_disk *sdkp = to_scsi_disk(dev);
++
++	return snprintf(buf, 20, "%u\n", sdkp->max_medium_access_timeouts);
++}
++
++static ssize_t
++sd_store_max_medium_access_timeouts(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	struct scsi_disk *sdkp = to_scsi_disk(dev);
++	int err;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EACCES;
++
++	err = kstrtouint(buf, 10, &sdkp->max_medium_access_timeouts);
++
++	return err ? err : count;
++}
++
+ static struct device_attribute sd_disk_attrs[] = {
+ 	__ATTR(cache_type, S_IRUGO|S_IWUSR, sd_show_cache_type,
+ 	       sd_store_cache_type),
+@@ -356,6 +382,9 @@ static struct device_attribute sd_disk_attrs[] = {
+ 	__ATTR(thin_provisioning, S_IRUGO, sd_show_thin_provisioning, NULL),
+ 	__ATTR(provisioning_mode, S_IRUGO|S_IWUSR, sd_show_provisioning_mode,
+ 	       sd_store_provisioning_mode),
++	__ATTR(max_medium_access_timeouts, S_IRUGO|S_IWUSR,
++	       sd_show_max_medium_access_timeouts,
++	       sd_store_max_medium_access_timeouts),
+ 	__ATTR_NULL,
+ };
+ 
+@@ -378,6 +407,7 @@ static struct scsi_driver sd_template = {
+ 	},
+ 	.rescan			= sd_rescan,
+ 	.done			= sd_done,
++	.eh_action		= sd_eh_action,
+ };
+ 
+ /*
+@@ -1336,6 +1366,55 @@ static const struct block_device_operations sd_fops = {
+ 	.unlock_native_capacity	= sd_unlock_native_capacity,
+ };
+ 
++/**
++ *	sd_eh_action - error handling callback
++ *	@scmd:		sd-issued command that has failed
++ *	@eh_cmnd:	The command that was sent during error handling
++ *	@eh_cmnd_len:	Length of eh_cmnd in bytes
++ *	@eh_disp:	The recovery disposition suggested by the midlayer
++ *
++ *	This function is called by the SCSI midlayer upon completion of
++ *	an error handling command (TEST UNIT READY, START STOP UNIT,
++ *	etc.) The command sent to the device by the error handler is
++ *	stored in eh_cmnd. The result of sending the eh command is
++ *	passed in eh_disp.
++ **/
++static int sd_eh_action(struct scsi_cmnd *scmd, unsigned char *eh_cmnd,
++			int eh_cmnd_len, int eh_disp)
++{
++	struct scsi_disk *sdkp = scsi_disk(scmd->request->rq_disk);
++
++	if (!scsi_device_online(scmd->device) ||
++	    !scsi_medium_access_command(scmd))
++		return eh_disp;
++
++	/*
++	 * The device has timed out executing a medium access command.
++	 * However, the TEST UNIT READY command sent during error
++	 * handling completed successfully. Either the device is in the
++	 * process of recovering or has it suffered an internal failure
++	 * that prevents access to the storage medium.
++	 */
++	if (host_byte(scmd->result) == DID_TIME_OUT && eh_disp == SUCCESS &&
++	    eh_cmnd_len && eh_cmnd[0] == TEST_UNIT_READY)
++		sdkp->medium_access_timed_out++;
++
++	/*
++	 * If the device keeps failing read/write commands but TEST UNIT
++	 * READY always completes successfully we assume that medium
++	 * access is no longer possible and take the device offline.
++	 */
++	if (sdkp->medium_access_timed_out >= sdkp->max_medium_access_timeouts) {
++		scmd_printk(KERN_ERR, scmd,
++			    "Medium access timeout failure. Offlining disk!\n");
++		scsi_device_set_state(scmd->device, SDEV_OFFLINE);
++
++		return FAILED;
++	}
++
++	return eh_disp;
++}
++
+ static unsigned int sd_completed_bytes(struct scsi_cmnd *scmd)
+ {
+ 	u64 start_lba = blk_rq_pos(scmd->request);
+@@ -1425,6 +1504,8 @@ static int sd_done(struct scsi_cmnd *SCpnt)
+ 	    (!sense_valid || sense_deferred))
+ 		goto out;
+ 
++	sdkp->medium_access_timed_out = 0;
++
+ 	switch (sshdr.sense_key) {
+ 	case HARDWARE_ERROR:
+ 	case MEDIUM_ERROR:
+@@ -2556,6 +2637,7 @@ static void sd_probe_async(void *data, async_cookie_t cookie)
+ 	sdkp->RCD = 0;
+ 	sdkp->ATO = 0;
+ 	sdkp->first_scan = 1;
++	sdkp->max_medium_access_timeouts = SD_MAX_MEDIUM_TIMEOUTS;
+ 
+ 	sd_revalidate_disk(gd);
+ 
+diff --git a/drivers/scsi/sd.h b/drivers/scsi/sd.h
+index 4163f29..f703f48 100644
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@ -20,6 +20,7 @@
+  */
+ #define SD_MAX_RETRIES		5
+ #define SD_PASSTHROUGH_RETRIES	1
++#define SD_MAX_MEDIUM_TIMEOUTS	2
+ 
+ /*
+  * Size of the initial data buffer for mode and read capacity data
+@@ -59,6 +60,8 @@ struct scsi_disk {
+ 	u32		unmap_alignment;
+ 	u32		index;
+ 	unsigned int	physical_block_size;
++	unsigned int	max_medium_access_timeouts;
++	unsigned int	medium_access_timed_out;
+ 	u8		media_present;
+ 	u8		write_prot;
+ 	u8		protection_type;/* Data Integrity Field */
+@@ -88,6 +91,38 @@ static inline struct scsi_disk *scsi_disk(struct gendisk *disk)
+ 		    (sdsk)->disk->disk_name, ##a) :			\
+ 	sdev_printk(prefix, (sdsk)->device, fmt, ##a)
+ 
++static inline int scsi_medium_access_command(struct scsi_cmnd *scmd)
++{
++	switch (scmd->cmnd[0]) {
++	case READ_6:
++	case READ_10:
++	case READ_12:
++	case READ_16:
++	case SYNCHRONIZE_CACHE:
++	case VERIFY:
++	case VERIFY_12:
++	case VERIFY_16:
++	case WRITE_6:
++	case WRITE_10:
++	case WRITE_12:
++	case WRITE_16:
++	case WRITE_SAME:
++	case WRITE_SAME_16:
++	case UNMAP:
++		return 1;
++	case VARIABLE_LENGTH_CMD:
++		switch (scmd->cmnd[9]) {
++		case READ_32:
++		case VERIFY_32:
++		case WRITE_32:
++		case WRITE_SAME_32:
++			return 1;
++		}
++	}
++
++	return 0;
++}
++
+ /*
+  * A DIF-capable target device can be formatted with different
+  * protection schemes.  Currently 0 through 3 are defined:
+diff --git a/include/scsi/scsi_cmnd.h b/include/scsi/scsi_cmnd.h
+index a5e885a..0392641 100644
+--- a/include/scsi/scsi_cmnd.h
++++ b/include/scsi/scsi_cmnd.h
+@@ -10,6 +10,7 @@
+ 
+ struct Scsi_Host;
+ struct scsi_device;
++struct scsi_driver;
+ 
+ /*
+  * MAX_COMMAND_SIZE is:
+@@ -131,6 +132,11 @@ struct scsi_cmnd {
+ 	unsigned char tag;	/* SCSI-II queued command tag */
+ };
+ 
++static inline struct scsi_driver *scsi_cmd_to_driver(struct scsi_cmnd *cmd)
++{
++	return *(struct scsi_driver **)cmd->request->rq_disk->private_data;
++}
++
+ extern struct scsi_cmnd *scsi_get_command(struct scsi_device *, gfp_t);
+ extern struct scsi_cmnd *__scsi_get_command(struct Scsi_Host *, gfp_t);
+ extern void scsi_put_command(struct scsi_cmnd *);
+diff --git a/include/scsi/scsi_driver.h b/include/scsi/scsi_driver.h
+index 9fd6702..d443aa0 100644
+--- a/include/scsi/scsi_driver.h
++++ b/include/scsi/scsi_driver.h
+@@ -16,6 +16,7 @@ struct scsi_driver {
+ 
+ 	void (*rescan)(struct device *);
+ 	int (*done)(struct scsi_cmnd *);
++	int (*eh_action)(struct scsi_cmnd *, unsigned char *, int, int);
+ };
+ #define to_scsi_driver(drv) \
+ 	container_of((drv), struct scsi_driver, gendrv)
+-- 
+1.7.4.2
+
