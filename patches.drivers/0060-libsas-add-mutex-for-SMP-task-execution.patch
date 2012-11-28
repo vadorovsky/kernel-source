@@ -1,0 +1,153 @@
+From: Jeff Skirvin <jeffrey.d.skirvin@intel.com>
+Date: Wed, 16 Nov 2011 09:44:13 +0000
+Subject: [SCSI] libsas: add mutex for SMP task execution
+Git-commit: 89d3cf6ac3cdc4f15a82709f8c78ed169a98be5b
+References: FATE#313629
+Patch-Mainline: v3.4
+
+SAS does not tag SMP requests, and at least one lldd (isci) does not permit
+more than one in-flight request at a time.
+
+[jejb: fix sas_init_dev tab issues while we're at it]
+Signed-off-by: Jeff Skirvin <jeffrey.d.skirvin@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+Acked-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/libsas/sas_discover.c |   31 ++++++++++++++++---------------
+ drivers/scsi/libsas/sas_expander.c |   29 ++++++++++++++++-------------
+ include/scsi/libsas.h              |    2 ++
+ 3 files changed, 34 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/scsi/libsas/sas_discover.c b/drivers/scsi/libsas/sas_discover.c
+index bad5eba..c56cc64 100644
+--- a/drivers/scsi/libsas/sas_discover.c
++++ b/drivers/scsi/libsas/sas_discover.c
+@@ -37,21 +37,22 @@
+ 
+ void sas_init_dev(struct domain_device *dev)
+ {
+-        switch (dev->dev_type) {
+-        case SAS_END_DEV:
+-                break;
+-        case EDGE_DEV:
+-        case FANOUT_DEV:
+-                INIT_LIST_HEAD(&dev->ex_dev.children);
+-                break;
+-        case SATA_DEV:
+-        case SATA_PM:
+-        case SATA_PM_PORT:
+-                INIT_LIST_HEAD(&dev->sata_dev.children);
+-                break;
+-        default:
+-                break;
+-        }
++	switch (dev->dev_type) {
++	case SAS_END_DEV:
++		break;
++	case EDGE_DEV:
++	case FANOUT_DEV:
++		INIT_LIST_HEAD(&dev->ex_dev.children);
++		mutex_init(&dev->ex_dev.cmd_mutex);
++		break;
++	case SATA_DEV:
++	case SATA_PM:
++	case SATA_PM_PORT:
++		INIT_LIST_HEAD(&dev->sata_dev.children);
++		break;
++	default:
++		break;
++	}
+ }
+ 
+ /* ---------- Domain device discovery ---------- */
+diff --git a/drivers/scsi/libsas/sas_expander.c b/drivers/scsi/libsas/sas_expander.c
+index dcfab2f..d90b6c7 100644
+--- a/drivers/scsi/libsas/sas_expander.c
++++ b/drivers/scsi/libsas/sas_expander.c
+@@ -72,11 +72,13 @@ static int smp_execute_task(struct domain_device *dev, void *req, int req_size,
+ 	struct sas_internal *i =
+ 		to_sas_internal(dev->port->ha->core.shost->transportt);
+ 
++	mutex_lock(&dev->ex_dev.cmd_mutex);
+ 	for (retry = 0; retry < 3; retry++) {
+ 		task = sas_alloc_task(GFP_KERNEL);
+-		if (!task)
+-			return -ENOMEM;
+-
++		if (!task) {
++			res = -ENOMEM;
++			break;
++		}
+ 		task->dev = dev;
+ 		task->task_proto = dev->tproto;
+ 		sg_init_one(&task->smp_task.smp_req, req, req_size);
+@@ -94,7 +96,7 @@ static int smp_execute_task(struct domain_device *dev, void *req, int req_size,
+ 		if (res) {
+ 			del_timer(&task->timer);
+ 			SAS_DPRINTK("executing SMP task failed:%d\n", res);
+-			goto ex_err;
++			break;
+ 		}
+ 
+ 		wait_for_completion(&task->completion);
+@@ -104,21 +106,23 @@ static int smp_execute_task(struct domain_device *dev, void *req, int req_size,
+ 			i->dft->lldd_abort_task(task);
+ 			if (!(task->task_state_flags & SAS_TASK_STATE_DONE)) {
+ 				SAS_DPRINTK("SMP task aborted and not done\n");
+-				goto ex_err;
++				break;
+ 			}
+ 		}
+ 		if (task->task_status.resp == SAS_TASK_COMPLETE &&
+ 		    task->task_status.stat == SAM_STAT_GOOD) {
+ 			res = 0;
+ 			break;
+-		} if (task->task_status.resp == SAS_TASK_COMPLETE &&
+-		      task->task_status.stat == SAS_DATA_UNDERRUN) {
++		}
++		if (task->task_status.resp == SAS_TASK_COMPLETE &&
++		    task->task_status.stat == SAS_DATA_UNDERRUN) {
+ 			/* no error, but return the number of bytes of
+ 			 * underrun */
+ 			res = task->task_status.residual;
+ 			break;
+-		} if (task->task_status.resp == SAS_TASK_COMPLETE &&
+-		      task->task_status.stat == SAS_DATA_OVERRUN) {
++		}
++		if (task->task_status.resp == SAS_TASK_COMPLETE &&
++		    task->task_status.stat == SAS_DATA_OVERRUN) {
+ 			res = -EMSGSIZE;
+ 			break;
+ 		} else {
+@@ -131,11 +135,10 @@ static int smp_execute_task(struct domain_device *dev, void *req, int req_size,
+ 			task = NULL;
+ 		}
+ 	}
+-ex_err:
++	mutex_unlock(&dev->ex_dev.cmd_mutex);
++
+ 	BUG_ON(retry == 3 && task != NULL);
+-	if (task != NULL) {
+-		sas_free_task(task);
+-	}
++	sas_free_task(task);
+ 	return res;
+ }
+ 
+diff --git a/include/scsi/libsas.h b/include/scsi/libsas.h
+index f388ba5..18704a2e 100644
+--- a/include/scsi/libsas.h
++++ b/include/scsi/libsas.h
+@@ -153,6 +153,8 @@ struct expander_device {
+ 
+ 	struct ex_phy *ex_phy;
+ 	struct sas_port *parent_port;
++
++	struct mutex cmd_mutex;
+ };
+ 
+ /* ---------- SATA device ---------- */
+-- 
+1.7.4.2
+
