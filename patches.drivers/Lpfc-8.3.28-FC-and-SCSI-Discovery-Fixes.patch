@@ -1,0 +1,313 @@
+From: James Smart <james.smart@emulex.com>
+Date: Tue, 13 Dec 2011 13:22:17 -0500
+Subject: [SCSI] Lpfc 8.3.28: FC and SCSI Discovery Fixes
+Git-commit: df9e1b59f9e4671930a7762b9518461df4ea85f5
+References: FATE#313818
+Patch-Mainline: v3.3
+
+FC and SCSI Discovery Fixes:
+
+- Clear the virtual fabrics bit (word 1 bit 30) when sending the FLOGI
+  and FDISC. (CR 124339)
+- Return a MLQUEUE_DEVICE_BUSY if the driver detects that an I/O is being
+  retried too quickly (CR 124668)
+- Remove NDLP reference put in lpfc_cmpl_els_logo_acc for all but fabric
+  nodes (CR 123924)
+- Only retry FDISCs every second and stop retrying after devloss number
+  of retries (CR 13939)
+- Check to see if vports are unloading before adding them to the vport
+  work array. (CR 124996)
+- Fixed illegal state transition during driver unload (CR 124191)
+- Added missing protection on setting/clearing of vport->fc_flag bit (CR 126002)
+- Set NPIV flag in lpfc_mbx_process_link_up for all ports sli3 and
+  above. (CR 126094)
+- Clear FCP command bytes that are not used. (CR 126209)
+
+Signed-off-by: Alex Iannicelli <alex.iannicelli@emulex.com>
+Signed-off-by: James Smart <james.smart@emulex.com>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+Acked-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/scsi/lpfc/lpfc_els.c       |   23 ++++++++++++++++++-----
+ drivers/scsi/lpfc/lpfc_hbadisc.c   |   29 +++++++++++++++++++++++------
+ drivers/scsi/lpfc/lpfc_hw.h        |    6 ++++++
+ drivers/scsi/lpfc/lpfc_hw4.h       |    2 ++
+ drivers/scsi/lpfc/lpfc_nportdisc.c |   10 +++++++++-
+ drivers/scsi/lpfc/lpfc_scsi.c      |   13 +++++++++++--
+ drivers/scsi/lpfc/lpfc_scsi.h      |    5 +++--
+ 7 files changed, 72 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/scsi/lpfc/lpfc_els.c b/drivers/scsi/lpfc/lpfc_els.c
+index 4687694..0b662db 100644
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@ -1075,6 +1075,7 @@ lpfc_issue_els_flogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 	/* Setup CSPs accordingly for Fabric */
+ 	sp->cmn.e_d_tov = 0;
+ 	sp->cmn.w2.r_a_tov = 0;
++	sp->cmn.virtual_fabric_support = 0;
+ 	sp->cls1.classValid = 0;
+ 	sp->cls2.seqDelivery = 1;
+ 	sp->cls3.seqDelivery = 1;
+@@ -3066,17 +3067,22 @@ lpfc_els_retry(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
+ 	if (did == FDMI_DID)
+ 		retry = 1;
+ 
+-	if (((cmd == ELS_CMD_FLOGI) || (cmd == ELS_CMD_FDISC)) &&
++	if ((cmd == ELS_CMD_FLOGI) &&
+ 	    (phba->fc_topology != LPFC_TOPOLOGY_LOOP) &&
+ 	    !lpfc_error_lost_link(irsp)) {
+ 		/* FLOGI retry policy */
+ 		retry = 1;
+-		/* retry forever */
++		/* retry FLOGI forever */
+ 		maxretry = 0;
+ 		if (cmdiocb->retry >= 100)
+ 			delay = 5000;
+ 		else if (cmdiocb->retry >= 32)
+ 			delay = 1000;
++	} else if ((cmd == ELS_CMD_FDISC) && !lpfc_error_lost_link(irsp)) {
++		/* retry FDISCs every second up to devloss */
++		retry = 1;
++		maxretry = vport->cfg_devloss_tmo;
++		delay = 1000;
+ 	}
+ 
+ 	cmdiocb->retry++;
+@@ -3389,11 +3395,17 @@ lpfc_cmpl_els_logo_acc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
+ 
+ 	/*
+ 	 * The driver received a LOGO from the rport and has ACK'd it.
+-	 * At this point, the driver is done so release the IOCB and
+-	 * remove the ndlp reference.
++	 * At this point, the driver is done so release the IOCB
+ 	 */
+ 	lpfc_els_free_iocb(phba, cmdiocb);
+-	lpfc_nlp_put(ndlp);
++
++	/*
++	 * Remove the ndlp reference if it's a fabric node that has
++	 * sent us an unsolicted LOGO.
++	 */
++	if (ndlp->nlp_type & NLP_FABRIC)
++		lpfc_nlp_put(ndlp);
++
+ 	return;
+ }
+ 
+@@ -7231,6 +7243,7 @@ lpfc_issue_els_fdisc(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 	/* Setup CSPs accordingly for Fabric */
+ 	sp->cmn.e_d_tov = 0;
+ 	sp->cmn.w2.r_a_tov = 0;
++	sp->cmn.virtual_fabric_support = 0;
+ 	sp->cls1.classValid = 0;
+ 	sp->cls2.seqDelivery = 1;
+ 	sp->cls3.seqDelivery = 1;
+diff --git a/drivers/scsi/lpfc/lpfc_hbadisc.c b/drivers/scsi/lpfc/lpfc_hbadisc.c
+index 99c7667..d964985 100644
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@ -2646,9 +2646,14 @@ lpfc_init_vfi_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *mboxq)
+ {
+ 	struct lpfc_vport *vport = mboxq->vport;
+ 
+-	/* VFI not supported on interface type 0, just do the flogi */
+-	if (mboxq->u.mb.mbxStatus && (bf_get(lpfc_sli_intf_if_type,
+-	    &phba->sli4_hba.sli_intf) != LPFC_SLI_INTF_IF_TYPE_0)) {
++	/*
++	 * VFI not supported on interface type 0, just do the flogi
++	 * Also continue if the VFI is in use - just use the same one.
++	 */
++	if (mboxq->u.mb.mbxStatus &&
++	    (bf_get(lpfc_sli_intf_if_type, &phba->sli4_hba.sli_intf) !=
++			LPFC_SLI_INTF_IF_TYPE_0) &&
++	    mboxq->u.mb.mbxStatus != MBX_VFI_IN_USE) {
+ 		lpfc_printf_vlog(vport, KERN_ERR,
+ 				LOG_MBOX,
+ 				"2891 Init VFI mailbox failed 0x%x\n",
+@@ -2922,6 +2927,7 @@ lpfc_mbx_process_link_up(struct lpfc_hba *phba, struct lpfc_mbx_read_top *la)
+ {
+ 	struct lpfc_vport *vport = phba->pport;
+ 	LPFC_MBOXQ_t *sparam_mbox, *cfglink_mbox = NULL;
++	struct Scsi_Host *shost;
+ 	int i;
+ 	struct lpfc_dmabuf *mp;
+ 	int rc;
+@@ -2945,6 +2951,7 @@ lpfc_mbx_process_link_up(struct lpfc_hba *phba, struct lpfc_mbx_read_top *la)
+ 	phba->fc_topology = bf_get(lpfc_mbx_read_top_topology, la);
+ 	phba->link_flag &= ~LS_NPIV_FAB_SUPPORTED;
+ 
++	shost = lpfc_shost_from_vport(vport);
+ 	if (phba->fc_topology == LPFC_TOPOLOGY_LOOP) {
+ 		phba->sli3_options &= ~LPFC_SLI3_NPIV_ENABLED;
+ 
+@@ -2956,8 +2963,11 @@ lpfc_mbx_process_link_up(struct lpfc_hba *phba, struct lpfc_mbx_read_top *la)
+ 				"1309 Link Up Event npiv not supported in loop "
+ 				"topology\n");
+ 				/* Get Loop Map information */
+-		if (bf_get(lpfc_mbx_read_top_il, la))
++		if (bf_get(lpfc_mbx_read_top_il, la)) {
++			spin_lock_irq(shost->host_lock);
+ 			vport->fc_flag |= FC_LBIT;
++			spin_unlock_irq(shost->host_lock);
++		}
+ 
+ 		vport->fc_myDID = bf_get(lpfc_mbx_read_top_alpa_granted, la);
+ 		i = la->lilpBde64.tus.f.bdeSize;
+@@ -3002,11 +3012,13 @@ lpfc_mbx_process_link_up(struct lpfc_hba *phba, struct lpfc_mbx_read_top *la)
+ 	} else {
+ 		if (!(phba->sli3_options & LPFC_SLI3_NPIV_ENABLED)) {
+ 			if (phba->max_vpi && phba->cfg_enable_npiv &&
+-			   (phba->sli_rev == 3))
++			   (phba->sli_rev >= LPFC_SLI_REV3))
+ 				phba->sli3_options |= LPFC_SLI3_NPIV_ENABLED;
+ 		}
+ 		vport->fc_myDID = phba->fc_pref_DID;
++		spin_lock_irq(shost->host_lock);
+ 		vport->fc_flag |= FC_LBIT;
++		spin_unlock_irq(shost->host_lock);
+ 	}
+ 	spin_unlock_irq(&phba->hbalock);
+ 
+@@ -3593,6 +3605,7 @@ lpfc_mbx_cmpl_fabric_reg_login(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
+ 	MAILBOX_t *mb = &pmb->u.mb;
+ 	struct lpfc_dmabuf *mp = (struct lpfc_dmabuf *) (pmb->context1);
+ 	struct lpfc_nodelist *ndlp;
++	struct Scsi_Host *shost;
+ 
+ 	ndlp = (struct lpfc_nodelist *) pmb->context2;
+ 	pmb->context1 = NULL;
+@@ -3638,8 +3651,12 @@ lpfc_mbx_cmpl_fabric_reg_login(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
+ 		 * vport discovery */
+ 		if (!(vport->fc_flag & FC_LOGO_RCVD_DID_CHNG))
+ 			lpfc_start_fdiscs(phba);
+-		else
++		else {
++			shost = lpfc_shost_from_vport(vport);
++			spin_lock_irq(shost->host_lock);
+ 			vport->fc_flag &= ~FC_LOGO_RCVD_DID_CHNG ;
++			spin_unlock_irq(shost->host_lock);
++		}
+ 		lpfc_do_scr_ns_plogi(phba, vport);
+ 	}
+ 
+diff --git a/drivers/scsi/lpfc/lpfc_hw.h b/drivers/scsi/lpfc/lpfc_hw.h
+index db4547d..c388490 100644
+--- a/drivers/scsi/lpfc/lpfc_hw.h
++++ b/drivers/scsi/lpfc/lpfc_hw.h
+@@ -349,6 +349,12 @@ struct csp {
+  * Word 1 Bit 31 in FLOGI response is clean address bit
+  */
+ #define clean_address_bit request_multiple_Nport /* Word 1, bit 31 */
++/*
++ * Word 1 Bit 30 in common service parameter is overloaded.
++ * Word 1 Bit 30 in FLOGI request is Virtual Fabrics
++ * Word 1 Bit 30 in PLOGI request is random offset
++ */
++#define virtual_fabric_support randomOffset /* Word 1, bit 30 */
+ #ifdef __BIG_ENDIAN_BITFIELD
+ 	uint16_t request_multiple_Nport:1;	/* FC Word 1, bit 31 */
+ 	uint16_t randomOffset:1;	/* FC Word 1, bit 30 */
+diff --git a/drivers/scsi/lpfc/lpfc_hw4.h b/drivers/scsi/lpfc/lpfc_hw4.h
+index 83f7846..698310f 100644
+--- a/drivers/scsi/lpfc/lpfc_hw4.h
++++ b/drivers/scsi/lpfc/lpfc_hw4.h
+@@ -1830,6 +1830,8 @@ struct lpfc_mbx_init_vfi {
+ #define lpfc_init_vfi_hop_count_MASK	0x000000FF
+ #define lpfc_init_vfi_hop_count_WORD	word4
+ };
++#define MBX_VFI_IN_USE			0x9F02
++
+ 
+ struct lpfc_mbx_reg_vfi {
+ 	uint32_t word1;
+diff --git a/drivers/scsi/lpfc/lpfc_nportdisc.c b/drivers/scsi/lpfc/lpfc_nportdisc.c
+index 2ddd02f..e8bb005 100644
+--- a/drivers/scsi/lpfc/lpfc_nportdisc.c
++++ b/drivers/scsi/lpfc/lpfc_nportdisc.c
+@@ -783,6 +783,14 @@ lpfc_device_rm_unused_node(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ }
+ 
+ static uint32_t
++lpfc_device_recov_unused_node(struct lpfc_vport *vport,
++			struct lpfc_nodelist *ndlp,
++			   void *arg, uint32_t evt)
++{
++	return ndlp->nlp_state;
++}
++
++static uint32_t
+ lpfc_rcv_plogi_plogi_issue(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
+ 			   void *arg, uint32_t evt)
+ {
+@@ -2147,7 +2155,7 @@ static uint32_t (*lpfc_disc_action[NLP_STE_MAX_STATE * NLP_EVT_MAX_EVENT])
+ 	lpfc_disc_illegal,		/* CMPL_ADISC      */
+ 	lpfc_disc_illegal,		/* CMPL_REG_LOGIN  */
+ 	lpfc_device_rm_unused_node,	/* DEVICE_RM       */
+-	lpfc_disc_illegal,		/* DEVICE_RECOVERY */
++	lpfc_device_recov_unused_node,	/* DEVICE_RECOVERY */
+ 
+ 	lpfc_rcv_plogi_plogi_issue,	/* RCV_PLOGI   PLOGI_ISSUE    */
+ 	lpfc_rcv_prli_plogi_issue,	/* RCV_PRLI        */
+diff --git a/drivers/scsi/lpfc/lpfc_scsi.c b/drivers/scsi/lpfc/lpfc_scsi.c
+index 5335777..68afa0a 100644
+--- a/drivers/scsi/lpfc/lpfc_scsi.c
++++ b/drivers/scsi/lpfc/lpfc_scsi.c
+@@ -2912,8 +2912,8 @@ lpfc_scsi_prep_cmnd(struct lpfc_vport *vport, struct lpfc_scsi_buf *lpfc_cmd,
+ 	int_to_scsilun(lpfc_cmd->pCmd->device->lun,
+ 			&lpfc_cmd->fcp_cmnd->fcp_lun);
+ 
+-	memcpy(&fcp_cmnd->fcpCdb[0], scsi_cmnd->cmnd, 16);
+-
++	memset(&fcp_cmnd->fcpCdb[0], 0, LPFC_FCP_CDB_LEN);
++	memcpy(&fcp_cmnd->fcpCdb[0], scsi_cmnd->cmnd, scsi_cmnd->cmd_len);
+ 	if (scsi_populate_tag_msg(scsi_cmnd, tag)) {
+ 		switch (tag[0]) {
+ 		case HEAD_OF_QUEUE_TAG:
+@@ -3237,6 +3237,15 @@ lpfc_queuecommand_lck(struct scsi_cmnd *cmnd, void (*done) (struct scsi_cmnd *))
+ 		cmnd->result = err;
+ 		goto out_fail_command;
+ 	}
++	/*
++	 * Do not let the mid-layer retry I/O too fast. If an I/O is retried
++	 * without waiting a bit then indicate that the device is busy.
++	 */
++	if (cmnd->retries &&
++	    time_before(jiffies, (cmnd->jiffies_at_alloc +
++				  msecs_to_jiffies(LPFC_RETRY_PAUSE *
++						   cmnd->retries))))
++		return SCSI_MLQUEUE_DEVICE_BUSY;
+ 	ndlp = rdata->pnode;
+ 
+ 	if ((scsi_get_prot_op(cmnd) != SCSI_PROT_NORMAL) &&
+diff --git a/drivers/scsi/lpfc/lpfc_scsi.h b/drivers/scsi/lpfc/lpfc_scsi.h
+index ce645b2..9075a08 100644
+--- a/drivers/scsi/lpfc/lpfc_scsi.h
++++ b/drivers/scsi/lpfc/lpfc_scsi.h
+@@ -21,6 +21,7 @@
+ #include <asm/byteorder.h>
+ 
+ struct lpfc_hba;
++#define LPFC_FCP_CDB_LEN 16
+ 
+ #define list_remove_head(list, entry, type, member)		\
+ 	do {							\
+@@ -102,7 +103,7 @@ struct fcp_cmnd {
+ #define  WRITE_DATA      0x01	/* Bit 0 */
+ #define  READ_DATA       0x02	/* Bit 1 */
+ 
+-	uint8_t fcpCdb[16];	/* SRB cdb field is copied here */
++	uint8_t fcpCdb[LPFC_FCP_CDB_LEN]; /* SRB cdb field is copied here */
+ 	uint32_t fcpDl;		/* Total transfer length */
+ 
+ };
+@@ -153,5 +154,5 @@ struct lpfc_scsi_buf {
+ 
+ #define LPFC_SCSI_DMA_EXT_SIZE 264
+ #define LPFC_BPL_SIZE          1024
+-
++#define LPFC_RETRY_PAUSE       300
+ #define MDAC_DIRECT_CMD                  0x22
+-- 
+1.7.4.2
+
