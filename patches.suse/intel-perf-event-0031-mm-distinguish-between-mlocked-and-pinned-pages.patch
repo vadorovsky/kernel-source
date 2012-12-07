@@ -1,0 +1,188 @@
+From: Christoph Lameter <cl@linux.com>
+Subject: mm: distinguish between mlocked and pinned pages
+References: bnc#789200, fate#313753, fate#312066, fate#313762
+Patch-mainline: v3.2-rc1
+Git-commit: bc3e53f682d93df677dbd5006a404722b3adfe18
+Signed-off-by: Youquan Song <youquan.song@intel.com>
+Signed-off-by: Tony Jones <tonyj@suse.de>
+
+Some kernel components pin user space memory (infiniband and perf) (by
+increasing the page count) and account that memory as "mlocked".
+
+The difference between mlocking and pinning is:
+
+A. mlocked pages are marked with PG_mlocked and are exempt from
+   swapping. Page migration may move them around though.
+   They are kept on a special LRU list.
+
+B. Pinned pages cannot be moved because something needs to
+   directly access physical memory. They may not be on any
+   LRU list.
+
+I recently saw an mlockalled process where mm->locked_vm became
+bigger than the virtual size of the process (!) because some
+memory was accounted for twice:
+
+Once when the page was mlocked and once when the Infiniband
+layer increased the refcount because it needt to pin the RDMA
+memory.
+
+This patch introduces a separate counter for pinned pages and
+accounts them seperately.
+
+Signed-off-by: Christoph Lameter <cl@linux.com>
+Cc: Mike Marciniszyn <infinipath@qlogic.com>
+Cc: Roland Dreier <roland@kernel.org>
+Cc: Sean Hefty <sean.hefty@intel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/infiniband/core/umem.c b/drivers/infiniband/core/umem.c
+index b645e55..9155f91 100644
+--- a/drivers/infiniband/core/umem.c
++++ b/drivers/infiniband/core/umem.c
+@@ -136,7 +136,7 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+ 
+ 	down_write(&current->mm->mmap_sem);
+ 
+-	locked     = npages + current->mm->locked_vm;
++	locked     = npages + current->mm->pinned_vm;
+ 	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+ 
+ 	if ((locked > lock_limit) && !capable(CAP_IPC_LOCK)) {
+@@ -206,7 +206,7 @@ out:
+ 		__ib_umem_release(context->device, umem, 0);
+ 		kfree(umem);
+ 	} else
+-		current->mm->locked_vm = locked;
++		current->mm->pinned_vm = locked;
+ 
+ 	up_write(&current->mm->mmap_sem);
+ 	if (vma_list)
+@@ -222,7 +222,7 @@ static void ib_umem_account(struct work_struct *work)
+ 	struct ib_umem *umem = container_of(work, struct ib_umem, work);
+ 
+ 	down_write(&umem->mm->mmap_sem);
+-	umem->mm->locked_vm -= umem->diff;
++	umem->mm->pinned_vm -= umem->diff;
+ 	up_write(&umem->mm->mmap_sem);
+ 	mmput(umem->mm);
+ 	kfree(umem);
+diff --git a/drivers/infiniband/hw/ipath/ipath_user_pages.c b/drivers/infiniband/hw/ipath/ipath_user_pages.c
+index cfed539..dc66c45 100644
+--- a/drivers/infiniband/hw/ipath/ipath_user_pages.c
++++ b/drivers/infiniband/hw/ipath/ipath_user_pages.c
+@@ -79,7 +79,7 @@ static int __ipath_get_user_pages(unsigned long start_page, size_t num_pages,
+ 			goto bail_release;
+ 	}
+ 
+-	current->mm->locked_vm += num_pages;
++	current->mm->pinned_vm += num_pages;
+ 
+ 	ret = 0;
+ 	goto bail;
+@@ -178,7 +178,7 @@ void ipath_release_user_pages(struct page **p, size_t num_pages)
+ 
+ 	__ipath_release_user_pages(p, num_pages, 1);
+ 
+-	current->mm->locked_vm -= num_pages;
++	current->mm->pinned_vm -= num_pages;
+ 
+ 	up_write(&current->mm->mmap_sem);
+ }
+@@ -195,7 +195,7 @@ static void user_pages_account(struct work_struct *_work)
+ 		container_of(_work, struct ipath_user_pages_work, work);
+ 
+ 	down_write(&work->mm->mmap_sem);
+-	work->mm->locked_vm -= work->num_pages;
++	work->mm->pinned_vm -= work->num_pages;
+ 	up_write(&work->mm->mmap_sem);
+ 	mmput(work->mm);
+ 	kfree(work);
+diff --git a/drivers/infiniband/hw/qib/qib_user_pages.c b/drivers/infiniband/hw/qib/qib_user_pages.c
+index 7689e49..2bc1d2b 100644
+--- a/drivers/infiniband/hw/qib/qib_user_pages.c
++++ b/drivers/infiniband/hw/qib/qib_user_pages.c
+@@ -74,7 +74,7 @@ static int __qib_get_user_pages(unsigned long start_page, size_t num_pages,
+ 			goto bail_release;
+ 	}
+ 
+-	current->mm->locked_vm += num_pages;
++	current->mm->pinned_vm += num_pages;
+ 
+ 	ret = 0;
+ 	goto bail;
+@@ -151,7 +151,7 @@ void qib_release_user_pages(struct page **p, size_t num_pages)
+ 	__qib_release_user_pages(p, num_pages, 1);
+ 
+ 	if (current->mm) {
+-		current->mm->locked_vm -= num_pages;
++		current->mm->pinned_vm -= num_pages;
+ 		up_write(&current->mm->mmap_sem);
+ 	}
+ }
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index c7d4ee6..e418c5a 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -44,6 +44,7 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
+ 		"VmPeak:\t%8lu kB\n"
+ 		"VmSize:\t%8lu kB\n"
+ 		"VmLck:\t%8lu kB\n"
++		"VmPin:\t%8lu kB\n"
+ 		"VmHWM:\t%8lu kB\n"
+ 		"VmRSS:\t%8lu kB\n"
+ 		"VmData:\t%8lu kB\n"
+@@ -55,6 +56,7 @@ void task_mem(struct seq_file *m, struct mm_struct *mm)
+ 		hiwater_vm << (PAGE_SHIFT-10),
+ 		(total_vm - mm->reserved_vm) << (PAGE_SHIFT-10),
+ 		mm->locked_vm << (PAGE_SHIFT-10),
++		mm->pinned_vm << (PAGE_SHIFT-10),
+ 		hiwater_rss << (PAGE_SHIFT-10),
+ 		total_rss << (PAGE_SHIFT-10),
+ 		data << (PAGE_SHIFT-10),
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 6456624..f317583 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -304,7 +304,7 @@ struct mm_struct {
+ 	unsigned long hiwater_rss;	/* High-watermark of RSS usage */
+ 	unsigned long hiwater_vm;	/* High-water virtual memory usage */
+ 
+-	unsigned long total_vm, locked_vm, shared_vm, exec_vm;
++	unsigned long total_vm, locked_vm, pinned_vm, shared_vm, exec_vm;
+ 	unsigned long stack_vm, reserved_vm, def_flags, nr_ptes;
+ 	unsigned long start_code, end_code, start_data, end_data;
+ 	unsigned long start_brk, brk, start_stack;
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index d1a1bee..12a0287 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -3544,7 +3544,7 @@ static void perf_mmap_close(struct vm_area_struct *vma)
+ 		struct ring_buffer *rb = event->rb;
+ 
+ 		atomic_long_sub((size >> PAGE_SHIFT) + 1, &user->locked_vm);
+-		vma->vm_mm->locked_vm -= event->mmap_locked;
++		vma->vm_mm->pinned_vm -= event->mmap_locked;
+ 		rcu_assign_pointer(event->rb, NULL);
+ 		mutex_unlock(&event->mmap_mutex);
+ 
+@@ -3625,7 +3625,7 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
+ 
+ 	lock_limit = rlimit(RLIMIT_MEMLOCK);
+ 	lock_limit >>= PAGE_SHIFT;
+-	locked = vma->vm_mm->locked_vm + extra;
++	locked = vma->vm_mm->pinned_vm + extra;
+ 
+ 	if ((locked > lock_limit) && perf_paranoid_tracepoint_raw() &&
+ 		!capable(CAP_IPC_LOCK)) {
+@@ -3651,7 +3651,7 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
+ 	atomic_long_add(user_extra, &user->locked_vm);
+ 	event->mmap_locked = extra;
+ 	event->mmap_user = get_current_user();
+-	vma->vm_mm->locked_vm += event->mmap_locked;
++	vma->vm_mm->pinned_vm += event->mmap_locked;
+ 
+ unlock:
+ 	if (!ret)
