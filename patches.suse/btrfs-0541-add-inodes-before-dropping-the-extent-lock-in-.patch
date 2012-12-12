@@ -1,0 +1,158 @@
+From: Jan Schmidt <list.btrfs@jan-o-sch.net>
+Date: Wed, 30 May 2012 18:05:21 +0200
+Patch-mainline: 3.5
+Git-commit: 3301958b7c1dae8f0f5ded63aa881e0b71e78464
+Subject: [PATCH] Btrfs: add inodes before dropping the extent lock in
+ find_all_leafs
+
+We must build up the inode list with the extent lock held after following
+indirect refs.
+
+This also requires an extension to ulists, which allows to modify the stored
+aux value in case a key already exists in the list.
+
+Signed-off-by: Jan Schmidt <list.btrfs@jan-o-sch.net>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/backref.c |   36 +++++++++++++++++++++++++++++++-----
+ fs/btrfs/ulist.c   |   11 ++++++++++-
+ fs/btrfs/ulist.h   |    2 ++
+ 3 files changed, 43 insertions(+), 6 deletions(-)
+
+--- a/fs/btrfs/backref.c
++++ b/fs/btrfs/backref.c
+@@ -106,6 +106,7 @@ struct __prelim_ref {
+ 	struct btrfs_key key_for_search;
+ 	int level;
+ 	int count;
++	struct extent_inode_elem *inode_list;
+ 	u64 parent;
+ 	u64 wanted_disk_byte;
+ };
+@@ -166,6 +167,7 @@ static int __add_prelim_ref(struct list_
+ 	else
+ 		memset(&ref->key_for_search, 0, sizeof(ref->key_for_search));
+ 
++	ref->inode_list = NULL;
+ 	ref->level = level;
+ 	ref->count = count;
+ 	ref->parent = parent;
+@@ -181,14 +183,21 @@ static int add_all_parents(struct btrfs_
+ 				const u64 *extent_item_pos)
+ {
+ 	int ret;
+-	int slot;
++	int slot = path->slots[level];
+ 	struct extent_buffer *eb = path->nodes[level];
+ 	struct btrfs_file_extent_item *fi;
++	struct extent_inode_elem *eie = NULL;
+ 	u64 disk_byte;
+ 	u64 wanted_objectid = key->objectid;
+ 
+ add_parent:
+-	ret = ulist_add(parents, eb->start, 0, GFP_NOFS);
++	if (level == 0 && extent_item_pos) {
++		fi = btrfs_item_ptr(eb, slot, struct btrfs_file_extent_item);
++		ret = check_extent_in_eb(key, eb, fi, *extent_item_pos, &eie);
++		if (ret < 0)
++			return ret;
++	}
++	ret = ulist_add(parents, eb->start, (unsigned long)eie, GFP_NOFS);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -202,6 +211,7 @@ add_parent:
+ 	 * repeat this until we don't find any additional EXTENT_DATA items.
+ 	 */
+ 	while (1) {
++		eie = NULL;
+ 		ret = btrfs_next_leaf(root, path);
+ 		if (ret < 0)
+ 			return ret;
+@@ -346,6 +356,8 @@ static int __resolve_indirect_refs(struc
+ 		ULIST_ITER_INIT(&uiter);
+ 		node = ulist_next(parents, &uiter);
+ 		ref->parent = node ? node->val : 0;
++		ref->inode_list =
++			node ? (struct extent_inode_elem *)node->aux : 0;
+ 
+ 		/* additional parents require new refs being added here */
+ 		while ((node = ulist_next(parents, &uiter))) {
+@@ -356,6 +368,8 @@ static int __resolve_indirect_refs(struc
+ 			}
+ 			memcpy(new_ref, ref, sizeof(*ref));
+ 			new_ref->parent = node->val;
++			new_ref->inode_list =
++					(struct extent_inode_elem *)node->aux;
+ 			list_add(&new_ref->list, &ref->list);
+ 		}
+ 		ulist_reinit(parents);
+@@ -879,7 +893,7 @@ again:
+ 		}
+ 		if (ref->count && ref->parent) {
+ 			struct extent_inode_elem *eie = NULL;
+-			if (extent_item_pos) {
++			if (extent_item_pos && !ref->inode_list) {
+ 				u32 bsz;
+ 				struct extent_buffer *eb;
+ 				bsz = btrfs_level_size(fs_info->extent_root,
+@@ -889,10 +903,22 @@ again:
+ 				BUG_ON(!eb);
+ 				ret = find_extent_in_eb(eb, bytenr,
+ 							*extent_item_pos, &eie);
++				ref->inode_list = eie;
+ 				free_extent_buffer(eb);
+ 			}
+-			ret = ulist_add(refs, ref->parent,
+-					(unsigned long)eie, GFP_NOFS);
++			ret = ulist_add_merge(refs, ref->parent,
++					      (unsigned long)ref->inode_list,
++					      (unsigned long *)&eie, GFP_NOFS);
++			if (!ret && extent_item_pos) {
++				/*
++				 * we've recorded that parent, so we must extend
++				 * its inode list here
++				 */
++				BUG_ON(!eie);
++				while (eie->next)
++					eie = eie->next;
++				eie->next = ref->inode_list;
++			}
+ 			BUG_ON(ret < 0);
+ 		}
+ 		kfree(ref);
+--- a/fs/btrfs/ulist.c
++++ b/fs/btrfs/ulist.c
+@@ -146,11 +146,20 @@ EXPORT_SYMBOL(ulist_free);
+ int ulist_add(struct ulist *ulist, u64 val, unsigned long aux,
+ 	      gfp_t gfp_mask)
+ {
++	return ulist_add_merge(ulist, val, aux, NULL, gfp_mask);
++}
++
++int ulist_add_merge(struct ulist *ulist, u64 val, unsigned long aux,
++		    unsigned long *old_aux, gfp_t gfp_mask)
++{
+ 	int i;
+ 
+ 	for (i = 0; i < ulist->nnodes; ++i) {
+-		if (ulist->nodes[i].val == val)
++		if (ulist->nodes[i].val == val) {
++			if (old_aux)
++				*old_aux = ulist->nodes[i].aux;
+ 			return 0;
++		}
+ 	}
+ 
+ 	if (ulist->nnodes >= ulist->nodes_alloced) {
+--- a/fs/btrfs/ulist.h
++++ b/fs/btrfs/ulist.h
+@@ -66,6 +66,8 @@ void ulist_reinit(struct ulist *ulist);
+ struct ulist *ulist_alloc(gfp_t gfp_mask);
+ void ulist_free(struct ulist *ulist);
+ int ulist_add(struct ulist *ulist, u64 val, unsigned long aux, gfp_t gfp_mask);
++int ulist_add_merge(struct ulist *ulist, u64 val, unsigned long aux,
++		    unsigned long *old_aux, gfp_t gfp_mask);
+ struct ulist_node *ulist_next(struct ulist *ulist,
+ 			      struct ulist_iterator *uiter);
+ #define ULIST_ITER_INIT(uiter) ((uiter)->i = 0)
