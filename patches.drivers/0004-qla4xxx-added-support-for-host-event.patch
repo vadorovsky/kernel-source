@@ -1,0 +1,216 @@
+From: Vikas Chaudhary <vikas.chaudhary@qlogic.com>
+Date: Mon, 13 Feb 2012 19:14:49 +0530
+Subject: [PATCH 04/63] qla4xxx: added support for host event
+Git-commit: ff884430801c08bd909fd95f6cb1a0446afd30db
+Patch-mainline: v3.4-rc1
+References: FATE#313902
+
+Added support to post kernel host event to application using
+netlink interface.
+
+Signed-off-by: Vikas Chaudhary <vikas.chaudhary@qlogic.com>
+Reviewed-by: Mike Christie <michaelc@cs.wisc.edu>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/scsi/qla4xxx/ql4_def.h  | 18 +++++++++
+ drivers/scsi/qla4xxx/ql4_glbl.h |  2 +
+ drivers/scsi/qla4xxx/ql4_isr.c  |  6 +++
+ drivers/scsi/qla4xxx/ql4_os.c   | 85 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 111 insertions(+)
+
+diff --git a/drivers/scsi/qla4xxx/ql4_def.h b/drivers/scsi/qla4xxx/ql4_def.h
+index 1218cdb..cab1005 100644
+--- a/drivers/scsi/qla4xxx/ql4_def.h
++++ b/drivers/scsi/qla4xxx/ql4_def.h
+@@ -301,7 +301,21 @@ struct ql4_tuple_ddb {
+ #define DF_ISNS_DISCOVERED	2	/* Device was discovered via iSNS */
+ #define DF_FO_MASKED		3
+ 
++enum qla4_work_type {
++	QLA4_EVENT_AEN,
++};
+ 
++struct qla4_work_evt {
++	struct list_head list;
++	enum qla4_work_type type;
++	union {
++		struct {
++			enum iscsi_host_event_code code;
++			uint32_t data_size;
++			uint8_t data[0];
++		} aen;
++	} u;
++};
+ 
+ struct ql82xx_hw_data {
+ 	/* Offsets for flash/nvram access (set to ~0 if not used). */
+@@ -672,6 +686,10 @@ struct scsi_qla_host {
+ 	struct completion disable_acb_comp;
+ 	int is_reset;
+ 	uint16_t temperature;
++
++	/* event work list */
++	struct list_head work_list;
++	spinlock_t work_lock;
+ };
+ 
+ struct ql4_task_data {
+diff --git a/drivers/scsi/qla4xxx/ql4_glbl.h b/drivers/scsi/qla4xxx/ql4_glbl.h
+index d0dd4b3..34cf851 100644
+--- a/drivers/scsi/qla4xxx/ql4_glbl.h
++++ b/drivers/scsi/qla4xxx/ql4_glbl.h
+@@ -181,6 +181,8 @@ int qla4xxx_flash_ddb_change(struct scsi_qla_host *ha, uint32_t fw_ddb_index,
+ int qla4xxx_ddb_change(struct scsi_qla_host *ha, uint32_t fw_ddb_index,
+ 		       struct ddb_entry *ddb_entry, uint32_t state);
+ void qla4xxx_build_ddb_list(struct scsi_qla_host *ha, int is_reset);
++int qla4xxx_post_aen_work(struct scsi_qla_host *ha, uint32_t aen_code,
++			  uint32_t data_size, uint8_t *data);
+ 
+ /* BSG Functions */
+ int qla4xxx_bsg_request(struct bsg_job *bsg_job);
+diff --git a/drivers/scsi/qla4xxx/ql4_isr.c b/drivers/scsi/qla4xxx/ql4_isr.c
+index 962535d..65a34a2 100644
+--- a/drivers/scsi/qla4xxx/ql4_isr.c
++++ b/drivers/scsi/qla4xxx/ql4_isr.c
+@@ -576,6 +576,9 @@ static void qla4xxx_isr_decode_mailbox(struct scsi_qla_host * ha,
+ 				set_bit(DPC_LINK_CHANGED, &ha->dpc_flags);
+ 
+ 			ql4_printk(KERN_INFO, ha, "%s: LINK UP\n", __func__);
++			qla4xxx_post_aen_work(ha, ISCSI_EVENT_LINKUP,
++					      sizeof(mbox_sts),
++					      (uint8_t *) mbox_sts);
+ 			break;
+ 
+ 		case MBOX_ASTS_LINK_DOWN:
+@@ -584,6 +587,9 @@ static void qla4xxx_isr_decode_mailbox(struct scsi_qla_host * ha,
+ 				set_bit(DPC_LINK_CHANGED, &ha->dpc_flags);
+ 
+ 			ql4_printk(KERN_INFO, ha, "%s: LINK DOWN\n", __func__);
++			qla4xxx_post_aen_work(ha, ISCSI_EVENT_LINKDOWN,
++					      sizeof(mbox_sts),
++					      (uint8_t *) mbox_sts);
+ 			break;
+ 
+ 		case MBOX_ASTS_HEARTBEAT:
+diff --git a/drivers/scsi/qla4xxx/ql4_os.c b/drivers/scsi/qla4xxx/ql4_os.c
+index ff62c4e..35b31fd9 100644
+--- a/drivers/scsi/qla4xxx/ql4_os.c
++++ b/drivers/scsi/qla4xxx/ql4_os.c
+@@ -2230,6 +2230,10 @@ static void qla4xxx_timer(struct scsi_qla_host *ha)
+ 		}
+ 	}
+ 
++	/* Process any deferred work. */
++	if (!list_empty(&ha->work_list))
++		start_dpc++;
++
+ 	/* Wakeup the dpc routine for this adapter, if needed. */
+ 	if (start_dpc ||
+ 	     test_bit(DPC_RESET_HA, &ha->dpc_flags) ||
+@@ -2795,6 +2799,81 @@ void qla4xxx_wake_dpc(struct scsi_qla_host *ha)
+ 		queue_work(ha->dpc_thread, &ha->dpc_work);
+ }
+ 
++static struct qla4_work_evt *
++qla4xxx_alloc_work(struct scsi_qla_host *ha, uint32_t data_size,
++		   enum qla4_work_type type)
++{
++	struct qla4_work_evt *e;
++	uint32_t size = sizeof(struct qla4_work_evt) + data_size;
++
++	e = kzalloc(size, GFP_ATOMIC);
++	if (!e)
++		return NULL;
++
++	INIT_LIST_HEAD(&e->list);
++	e->type = type;
++	return e;
++}
++
++static void qla4xxx_post_work(struct scsi_qla_host *ha,
++			     struct qla4_work_evt *e)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&ha->work_lock, flags);
++	list_add_tail(&e->list, &ha->work_list);
++	spin_unlock_irqrestore(&ha->work_lock, flags);
++	qla4xxx_wake_dpc(ha);
++}
++
++int qla4xxx_post_aen_work(struct scsi_qla_host *ha,
++			  enum iscsi_host_event_code aen_code,
++			  uint32_t data_size, uint8_t *data)
++{
++	struct qla4_work_evt *e;
++
++	e = qla4xxx_alloc_work(ha, data_size, QLA4_EVENT_AEN);
++	if (!e)
++		return QLA_ERROR;
++
++	e->u.aen.code = aen_code;
++	e->u.aen.data_size = data_size;
++	memcpy(e->u.aen.data, data, data_size);
++
++	qla4xxx_post_work(ha, e);
++
++	return QLA_SUCCESS;
++}
++
++void qla4xxx_do_work(struct scsi_qla_host *ha)
++{
++	struct qla4_work_evt *e, *tmp;
++	unsigned long flags;
++	LIST_HEAD(work);
++
++	spin_lock_irqsave(&ha->work_lock, flags);
++	list_splice_init(&ha->work_list, &work);
++	spin_unlock_irqrestore(&ha->work_lock, flags);
++
++	list_for_each_entry_safe(e, tmp, &work, list) {
++		list_del_init(&e->list);
++
++		switch (e->type) {
++		case QLA4_EVENT_AEN:
++			iscsi_post_host_event(ha->host_no,
++					      &qla4xxx_iscsi_transport,
++					      e->u.aen.code,
++					      e->u.aen.data_size,
++					      e->u.aen.data);
++			break;
++		default:
++			ql4_printk(KERN_WARNING, ha, "event type: 0x%x not "
++				   "supported", e->type);
++		}
++		kfree(e);
++	}
++}
++
+ /**
+  * qla4xxx_do_dpc - dpc routine
+  * @data: in our case pointer to adapter structure
+@@ -2826,6 +2905,9 @@ static void qla4xxx_do_dpc(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	/* post events to application */
++	qla4xxx_do_work(ha);
++
+ 	if (is_qla8022(ha)) {
+ 		if (test_bit(DPC_HA_UNRECOVERABLE, &ha->dpc_flags)) {
+ 			qla4_8xxx_idc_lock(ha);
+@@ -4398,6 +4480,9 @@ static int __devinit qla4xxx_probe_adapter(struct pci_dev *pdev,
+ 
+ 	spin_lock_init(&ha->hardware_lock);
+ 
++	/* Initialize work list */
++	INIT_LIST_HEAD(&ha->work_list);
++
+ 	/* Allocate dma buffers */
+ 	if (qla4xxx_mem_alloc(ha)) {
+ 		ql4_printk(KERN_WARNING, ha,
+-- 
+1.8.0
+
+
