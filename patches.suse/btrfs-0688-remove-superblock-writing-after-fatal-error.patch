@@ -1,0 +1,145 @@
+From: Stefan Behrens <sbehrens@giantdisaster.de>
+Date: Wed, 1 Aug 2012 05:45:52 -0600
+Patch-mainline: 3.6
+Git-commit: 68ce9682a4bb95d6be5529cb57214bf2a1b7d20e
+References: FATE#312888
+Subject: [PATCH] Btrfs: remove superblock writing after fatal error
+
+With commit acce952b0, btrfs was changed to flag the filesystem with
+BTRFS_SUPER_FLAG_ERROR and switch to read-only mode after a fatal
+error happened like a write I/O errors of all mirrors.
+In such situations, on unmount, the superblock is written in
+btrfs_error_commit_super(). This is done with the intention to be able
+to evaluate the error flag on the next mount. A warning is printed
+in this case during the next mount and the log tree is ignored.
+
+The issue is that it is possible that the superblock points to a root
+that was not written (due to write I/O errors).
+The result is that the filesystem cannot be mounted. btrfsck also does
+not start and all the other btrfs-progs tools fail to start as well.
+However, mount -o recovery is working well and does the right things
+to recover the filesystem (i.e., don't use the log root, clear the
+free space cache and use the next mountable root that is stored in the
+root backup array).
+
+This patch removes the writing of the superblock when
+BTRFS_SUPER_FLAG_ERROR is set, and removes the handling of the error
+flag in the mount function.
+
+These lines can be used to reproduce the issue (using /dev/sdm):
+SCRATCH_DEV=/dev/sdm
+SCRATCH_MNT=/mnt
+echo 0 25165824 linear $SCRATCH_DEV 0 | dmsetup create foo
+ls -alLF /dev/mapper/foo
+mkfs.btrfs /dev/mapper/foo
+mount /dev/mapper/foo $SCRATCH_MNT
+echo bar > $SCRATCH_MNT/foo
+sync
+echo 0 25165824 error | dmsetup reload foo
+dmsetup resume foo
+ls -alF $SCRATCH_MNT
+touch $SCRATCH_MNT/1
+ls -alF $SCRATCH_MNT
+sleep 35
+echo 0 25165824 linear $SCRATCH_DEV 0 | dmsetup reload foo
+dmsetup resume foo
+sleep 1
+umount $SCRATCH_MNT
+btrfsck /dev/mapper/foo
+dmsetup remove foo
+
+Signed-off-by: Stefan Behrens <sbehrens@giantdisaster.de>
+Signed-off-by: Jan Schmidt <list.btrfs@jan-o-sch.net>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/disk-io.c |   36 ++++--------------------------------
+ fs/btrfs/disk-io.h |    2 +-
+ 2 files changed, 5 insertions(+), 33 deletions(-)
+
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -2536,8 +2536,7 @@ retry_root_backup:
+ 		goto fail_trans_kthread;
+ 
+ 	/* do not make disk changes in broken FS */
+-	if (btrfs_super_log_root(disk_super) != 0 &&
+-	    !(fs_info->fs_state & BTRFS_SUPER_FLAG_ERROR)) {
++	if (btrfs_super_log_root(disk_super) != 0) {
+ 		u64 bytenr = btrfs_super_log_root(disk_super);
+ 
+ 		if (fs_devices->rw_devices == 0) {
+@@ -3199,30 +3198,14 @@ int close_ctree(struct btrfs_root *root)
+ 	/* clear out the rbtree of defraggable inodes */
+ 	btrfs_run_defrag_inodes(fs_info);
+ 
+-	/*
+-	 * Here come 2 situations when btrfs is broken to flip readonly:
+-	 *
+-	 * 1. when btrfs flips readonly somewhere else before
+-	 * btrfs_commit_super, sb->s_flags has MS_RDONLY flag,
+-	 * and btrfs will skip to write sb directly to keep
+-	 * ERROR state on disk.
+-	 *
+-	 * 2. when btrfs flips readonly just in btrfs_commit_super,
+-	 * and in such case, btrfs cannot write sb via btrfs_commit_super,
+-	 * and since fs_state has been set BTRFS_SUPER_FLAG_ERROR flag,
+-	 * btrfs will cleanup all FS resources first and write sb then.
+-	 */
+ 	if (!(fs_info->sb->s_flags & MS_RDONLY)) {
+ 		ret = btrfs_commit_super(root);
+ 		if (ret)
+ 			printk(KERN_ERR "btrfs: commit super ret %d\n", ret);
+ 	}
+ 
+-	if (fs_info->fs_state & BTRFS_SUPER_FLAG_ERROR) {
+-		ret = btrfs_error_commit_super(root);
+-		if (ret)
+-			printk(KERN_ERR "btrfs: commit super ret %d\n", ret);
+-	}
++	if (fs_info->fs_state & BTRFS_SUPER_FLAG_ERROR)
++		btrfs_error_commit_super(root);
+ 
+ 	btrfs_put_block_group_cache(fs_info);
+ 
+@@ -3444,18 +3427,11 @@ static int btrfs_check_super_valid(struc
+ 	if (read_only)
+ 		return 0;
+ 
+-	if (fs_info->fs_state & BTRFS_SUPER_FLAG_ERROR) {
+-		printk(KERN_WARNING "warning: mount fs with errors, "
+-		       "running btrfsck is recommended\n");
+-	}
+-
+ 	return 0;
+ }
+ 
+-int btrfs_error_commit_super(struct btrfs_root *root)
++void btrfs_error_commit_super(struct btrfs_root *root)
+ {
+-	int ret;
+-
+ 	mutex_lock(&root->fs_info->cleaner_mutex);
+ 	btrfs_run_delayed_iputs(root);
+ 	mutex_unlock(&root->fs_info->cleaner_mutex);
+@@ -3465,10 +3441,6 @@ int btrfs_error_commit_super(struct btrf
+ 
+ 	/* cleanup FS via transaction */
+ 	btrfs_cleanup_transaction(root);
+-
+-	ret = write_ctree_super(NULL, root, 0);
+-
+-	return ret;
+ }
+ 
+ static void btrfs_destroy_ordered_operations(struct btrfs_root *root)
+--- a/fs/btrfs/disk-io.h
++++ b/fs/btrfs/disk-io.h
+@@ -54,7 +54,7 @@ int write_ctree_super(struct btrfs_trans
+ 		      struct btrfs_root *root, int max_mirrors);
+ struct buffer_head *btrfs_read_dev_super(struct block_device *bdev);
+ int btrfs_commit_super(struct btrfs_root *root);
+-int btrfs_error_commit_super(struct btrfs_root *root);
++void btrfs_error_commit_super(struct btrfs_root *root);
+ struct extent_buffer *btrfs_find_tree_block(struct btrfs_root *root,
+ 					    u64 bytenr, u32 blocksize);
+ struct btrfs_root *btrfs_read_fs_root_no_radix(struct btrfs_root *tree_root,

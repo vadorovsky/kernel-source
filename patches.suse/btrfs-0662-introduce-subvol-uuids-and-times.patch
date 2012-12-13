@@ -1,0 +1,610 @@
+From: Alexander Block <ablock84@googlemail.com>
+Date: Wed, 25 Jul 2012 17:35:53 +0200
+Patch-mainline: 3.6
+Git-commit: 8ea05e3a4262b9e6871c349fa3486bcfc72ffd1a
+References: FATE#312888
+Subject: [PATCH] Btrfs: introduce subvol uuids and times
+
+This patch introduces uuids for subvolumes. Each
+subvolume has it's own uuid. In case it was snapshotted,
+it also contains parent_uuid. In case it was received,
+it also contains received_uuid.
+
+It also introduces subvolume ctime/otime/stime/rtime. The
+first two are comparable to the times found in inodes. otime
+is the origin/creation time and ctime is the change time.
+stime/rtime are only valid on received subvolumes.
+stime is the time of the subvolume when it was
+sent. rtime is the time of the subvolume when it was
+received.
+
+Additionally to the times, we have a transid for each
+time. They are updated at the same place as the times.
+
+btrfs receive uses stransid and rtransid to find out
+if a received subvolume changed in the meantime.
+
+If an older kernel mounts a filesystem with the
+extented fields, all fields become invalid. The next
+mount with a new kernel will detect this and reset the
+fields.
+
+Signed-off-by: Alexander Block <ablock84@googlemail.com>
+Reviewed-by: David Sterba <dave@jikos.cz>
+Reviewed-by: Arne Jansen <sensille@gmx.net>
+Reviewed-by: Jan Schmidt <list.btrfs@jan-o-sch.net>
+Reviewed-by: Alex Lyakas <alex.bolshoy.btrfs@gmail.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/check-integrity.c |    7 +-
+ fs/btrfs/ctree.h           |   47 +++++++++++++++++++
+ fs/btrfs/disk-io.c         |    7 +-
+ fs/btrfs/inode.c           |    4 +
+ fs/btrfs/ioctl.c           |  100 ++++++++++++++++++++++++++++++++++++++++--
+ fs/btrfs/ioctl.h           |   17 +++++++
+ fs/btrfs/root-tree.c       |  107 ++++++++++++++++++++++++++++++++++++++++++---
+ fs/btrfs/transaction.c     |   17 +++++++
+ 8 files changed, 291 insertions(+), 15 deletions(-)
+
+--- a/fs/btrfs/check-integrity.c
++++ b/fs/btrfs/check-integrity.c
+@@ -1033,6 +1033,7 @@ continue_with_current_leaf_stack_frame:
+ 			struct btrfs_disk_key *disk_key;
+ 			u8 type;
+ 			u32 item_offset;
++			u32 item_size;
+ 
+ 			if (disk_item_offset + sizeof(struct btrfs_item) >
+ 			    sf->block_ctx->len) {
+@@ -1048,6 +1049,7 @@ leaf_item_out_of_bounce_error:
+ 						     disk_item_offset,
+ 						     sizeof(struct btrfs_item));
+ 			item_offset = le32_to_cpu(disk_item.offset);
++			item_size = le32_to_cpu(disk_item.size);
+ 			disk_key = &disk_item.key;
+ 			type = disk_key->type;
+ 
+@@ -1058,14 +1060,13 @@ leaf_item_out_of_bounce_error:
+ 
+ 				root_item_offset = item_offset +
+ 					offsetof(struct btrfs_leaf, items);
+-				if (root_item_offset +
+-				    sizeof(struct btrfs_root_item) >
++				if (root_item_offset + item_size >
+ 				    sf->block_ctx->len)
+ 					goto leaf_item_out_of_bounce_error;
+ 				btrfsic_read_from_block_data(
+ 					sf->block_ctx, &root_item,
+ 					root_item_offset,
+-					sizeof(struct btrfs_root_item));
++					item_size);
+ 				next_bytenr = le64_to_cpu(root_item.bytenr);
+ 
+ 				sf->error =
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -712,6 +712,36 @@ struct btrfs_root_item {
+ 	struct btrfs_disk_key drop_progress;
+ 	u8 drop_level;
+ 	u8 level;
++
++	/*
++	 * The following fields appear after subvol_uuids+subvol_times
++	 * were introduced.
++	 */
++
++	/*
++	 * This generation number is used to test if the new fields are valid
++	 * and up to date while reading the root item. Everytime the root item
++	 * is written out, the "generation" field is copied into this field. If
++	 * anyone ever mounted the fs with an older kernel, we will have
++	 * mismatching generation values here and thus must invalidate the
++	 * new fields. See btrfs_update_root and btrfs_find_last_root for
++	 * details.
++	 * the offset of generation_v2 is also used as the start for the memset
++	 * when invalidating the fields.
++	 */
++	__le64 generation_v2;
++	u8 uuid[BTRFS_UUID_SIZE];
++	u8 parent_uuid[BTRFS_UUID_SIZE];
++	u8 received_uuid[BTRFS_UUID_SIZE];
++	__le64 ctransid; /* updated when an inode changes */
++	__le64 otransid; /* trans when created */
++	__le64 stransid; /* trans when sent. non-zero for received subvol */
++	__le64 rtransid; /* trans when received. non-zero for received subvol */
++	struct btrfs_timespec ctime;
++	struct btrfs_timespec otime;
++	struct btrfs_timespec stime;
++	struct btrfs_timespec rtime;
++	__le64 reserved[8]; /* for future */
+ } __attribute__ ((__packed__));
+ 
+ /*
+@@ -1521,6 +1551,8 @@ struct btrfs_root {
+ 	struct super_block anon_super;
+ 
+ 	int force_cow;
++
++	spinlock_t root_times_lock;
+ };
+ 
+ struct btrfs_ioctl_defrag_range_args {
+@@ -2359,6 +2391,16 @@ BTRFS_SETGET_STACK_FUNCS(root_used, stru
+ BTRFS_SETGET_STACK_FUNCS(root_limit, struct btrfs_root_item, byte_limit, 64);
+ BTRFS_SETGET_STACK_FUNCS(root_last_snapshot, struct btrfs_root_item,
+ 			 last_snapshot, 64);
++BTRFS_SETGET_STACK_FUNCS(root_generation_v2, struct btrfs_root_item,
++			 generation_v2, 64);
++BTRFS_SETGET_STACK_FUNCS(root_ctransid, struct btrfs_root_item,
++			 ctransid, 64);
++BTRFS_SETGET_STACK_FUNCS(root_otransid, struct btrfs_root_item,
++			 otransid, 64);
++BTRFS_SETGET_STACK_FUNCS(root_stransid, struct btrfs_root_item,
++			 stransid, 64);
++BTRFS_SETGET_STACK_FUNCS(root_rtransid, struct btrfs_root_item,
++			 rtransid, 64);
+ 
+ static inline bool btrfs_root_readonly(struct btrfs_root *root)
+ {
+@@ -3047,6 +3089,9 @@ int __must_check btrfs_update_root(struc
+ 				   struct btrfs_root *root,
+ 				   struct btrfs_key *key,
+ 				   struct btrfs_root_item *item);
++void btrfs_read_root_item(struct btrfs_root *root,
++			 struct extent_buffer *eb, int slot,
++			 struct btrfs_root_item *item);
+ int btrfs_find_last_root(struct btrfs_root *root, u64 objectid, struct
+ 			 btrfs_root_item *item, struct btrfs_key *key);
+ int btrfs_find_dead_roots(struct btrfs_root *root, u64 objectid);
+@@ -3054,6 +3099,8 @@ int btrfs_find_orphan_roots(struct btrfs
+ void btrfs_set_root_node(struct btrfs_root_item *item,
+ 			 struct extent_buffer *node);
+ void btrfs_check_and_init_root_item(struct btrfs_root_item *item);
++void btrfs_update_root_times(struct btrfs_trans_handle *trans,
++			     struct btrfs_root *root);
+ 
+ /* dir-item.c */
+ int btrfs_insert_dir_item(struct btrfs_trans_handle *trans,
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -1188,6 +1188,7 @@ static void __setup_root(u32 nodesize, u
+ 	INIT_LIST_HEAD(&root->anon_super.s_instances);
+ 	init_rwsem(&root->anon_super.s_umount);
+ 
++	spin_lock_init(&root->root_times_lock);
+ }
+ 
+ static int __must_check find_and_setup_root(struct btrfs_root *tree_root,
+@@ -1408,6 +1409,7 @@ struct btrfs_root *btrfs_read_fs_root_no
+ 	u64 generation;
+ 	u32 blocksize;
+ 	int ret = 0;
++	int slot;
+ 
+ 	root = btrfs_alloc_root(fs_info);
+ 	if (!root)
+@@ -1434,9 +1436,8 @@ struct btrfs_root *btrfs_read_fs_root_no
+ 	ret = btrfs_search_slot(NULL, tree_root, location, path, 0, 0);
+ 	if (ret == 0) {
+ 		l = path->nodes[0];
+-		read_extent_buffer(l, &root->root_item,
+-				btrfs_item_ptr_offset(l, path->slots[0]),
+-				sizeof(root->root_item));
++		slot = path->slots[0];
++		btrfs_read_root_item(tree_root, l, slot, &root->root_item);
+ 		memcpy(&root->root_key, location, sizeof(*location));
+ 	}
+ 	btrfs_free_path(path);
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -2734,6 +2734,8 @@ noinline int btrfs_update_inode(struct b
+ 	 */
+ 	if (!btrfs_is_free_space_inode(inode)
+ 	    && root->root_key.objectid != BTRFS_DATA_RELOC_TREE_OBJECTID) {
++		btrfs_update_root_times(trans, root);
++
+ 		ret = btrfs_delayed_update_inode(trans, root, inode);
+ 		if (!ret)
+ 			btrfs_set_inode_last_trans(trans, inode);
+@@ -4730,6 +4732,8 @@ static struct inode *btrfs_new_inode(str
+ 	trace_btrfs_inode_new(inode);
+ 	btrfs_set_inode_last_trans(trans, inode);
+ 
++	btrfs_update_root_times(trans, root);
++
+ 	return inode;
+ fail:
+ 	if (dir)
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -41,6 +41,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/slab.h>
+ #include <linux/blkdev.h>
++#include <linux/uuid.h>
+ #include "compat.h"
+ #include "ctree.h"
+ #include "disk-io.h"
+@@ -348,11 +349,13 @@ static noinline int create_subvol(struct
+ 	struct dentry *parent = dentry->d_parent;
+ 	struct inode *dir;
+ 	struct inode *inode;
++	struct timespec cur_time = CURRENT_TIME;
+ 	int ret;
+ 	int err;
+ 	u64 objectid;
+ 	u64 new_dirid = BTRFS_FIRST_FREE_OBJECTID;
+ 	u64 index = 0;
++	uuid_le new_uuid;
+ 
+ 	ret = btrfs_find_free_objectid(root->fs_info->tree_root, &objectid);
+ 	if (ret)
+@@ -396,8 +399,9 @@ static noinline int create_subvol(struct
+ 			    BTRFS_UUID_SIZE);
+ 	btrfs_mark_buffer_dirty(leaf);
+ 
++	memset(&root_item, 0, sizeof(root_item));
++
+ 	inode_item = &root_item.inode;
+-	memset(inode_item, 0, sizeof(*inode_item));
+ 	inode_item->generation = cpu_to_le64(1);
+ 	inode_item->size = cpu_to_le64(3);
+ 	inode_item->nlink = cpu_to_le32(1);
+@@ -415,8 +419,15 @@ static noinline int create_subvol(struct
+ 	btrfs_set_root_used(&root_item, leaf->len);
+ 	btrfs_set_root_last_snapshot(&root_item, 0);
+ 
+-	memset(&root_item.drop_progress, 0, sizeof(root_item.drop_progress));
+-	root_item.drop_level = 0;
++	btrfs_set_root_generation_v2(&root_item,
++			btrfs_root_generation(&root_item));
++	uuid_le_gen(&new_uuid);
++	memcpy(root_item.uuid, new_uuid.b, BTRFS_UUID_SIZE);
++	root_item.otime.sec = cpu_to_le64(cur_time.tv_sec);
++	root_item.otime.nsec = cpu_to_le64(cur_time.tv_nsec);
++	root_item.ctime = root_item.otime;
++	btrfs_set_root_ctransid(&root_item, trans->transid);
++	btrfs_set_root_otransid(&root_item, trans->transid);
+ 
+ 	btrfs_tree_unlock(leaf);
+ 	free_extent_buffer(leaf);
+@@ -3604,6 +3615,87 @@ out:
+ 	return ret;
+ }
+ 
++static long btrfs_ioctl_set_received_subvol(struct file *file,
++					    void __user *arg)
++{
++	struct btrfs_ioctl_received_subvol_args *sa = NULL;
++	struct inode *inode = fdentry(file)->d_inode;
++	struct btrfs_root *root = BTRFS_I(inode)->root;
++	struct btrfs_root_item *root_item = &root->root_item;
++	struct btrfs_trans_handle *trans;
++	struct timespec ct = CURRENT_TIME;
++	int ret = 0;
++
++	ret = mnt_want_write_file(file);
++	if (ret < 0)
++		return ret;
++
++	down_write(&root->fs_info->subvol_sem);
++
++	if (btrfs_ino(inode) != BTRFS_FIRST_FREE_OBJECTID) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (btrfs_root_readonly(root)) {
++		ret = -EROFS;
++		goto out;
++	}
++
++	if (!inode_owner_or_capable(inode)) {
++		ret = -EACCES;
++		goto out;
++	}
++
++	sa = memdup_user(arg, sizeof(*sa));
++	if (IS_ERR(sa)) {
++		ret = PTR_ERR(sa);
++		sa = NULL;
++		goto out;
++	}
++
++	trans = btrfs_start_transaction(root, 1);
++	if (IS_ERR(trans)) {
++		ret = PTR_ERR(trans);
++		trans = NULL;
++		goto out;
++	}
++
++	sa->rtransid = trans->transid;
++	sa->rtime.sec = ct.tv_sec;
++	sa->rtime.nsec = ct.tv_nsec;
++
++	memcpy(root_item->received_uuid, sa->uuid, BTRFS_UUID_SIZE);
++	btrfs_set_root_stransid(root_item, sa->stransid);
++	btrfs_set_root_rtransid(root_item, sa->rtransid);
++	root_item->stime.sec = cpu_to_le64(sa->stime.sec);
++	root_item->stime.nsec = cpu_to_le32(sa->stime.nsec);
++	root_item->rtime.sec = cpu_to_le64(sa->rtime.sec);
++	root_item->rtime.nsec = cpu_to_le32(sa->rtime.nsec);
++
++	ret = btrfs_update_root(trans, root->fs_info->tree_root,
++				&root->root_key, &root->root_item);
++	if (ret < 0) {
++		btrfs_end_transaction(trans, root);
++		trans = NULL;
++		goto out;
++	} else {
++		ret = btrfs_commit_transaction(trans, root);
++		if (ret < 0)
++			goto out;
++	}
++
++	ret = copy_to_user(arg, sa, sizeof(*sa));
++	if (ret)
++		ret = -EFAULT;
++
++out:
++	kfree(sa);
++	up_write(&root->fs_info->subvol_sem);
++	mnt_drop_write_file(file);
++	return ret;
++}
++
+ long btrfs_ioctl(struct file *file, unsigned int
+ 		cmd, unsigned long arg)
+ {
+@@ -3688,6 +3780,8 @@ long btrfs_ioctl(struct file *file, unsi
+ 		return btrfs_ioctl_balance_ctl(root, arg);
+ 	case BTRFS_IOC_BALANCE_PROGRESS:
+ 		return btrfs_ioctl_balance_progress(root, argp);
++	case BTRFS_IOC_SET_RECEIVED_SUBVOL:
++		return btrfs_ioctl_set_received_subvol(file, argp);
+ 	case BTRFS_IOC_GET_DEV_STATS:
+ 		return btrfs_ioctl_get_dev_stats(root, argp);
+ 	case BTRFS_IOC_QUOTA_CTL:
+--- a/fs/btrfs/ioctl.h
++++ b/fs/btrfs/ioctl.h
+@@ -349,6 +349,21 @@ struct btrfs_ioctl_qgroup_create_args {
+ 	__u64 qgroupid;
+ };
+ 
++struct btrfs_ioctl_timespec {
++	__u64 sec;
++	__u32 nsec;
++};
++
++struct btrfs_ioctl_received_subvol_args {
++	char	uuid[BTRFS_UUID_SIZE];	/* in */
++	__u64	stransid;		/* in */
++	__u64	rtransid;		/* out */
++	struct btrfs_ioctl_timespec stime; /* in */
++	struct btrfs_ioctl_timespec rtime; /* out */
++	__u64	flags;			/* in */
++	__u64	reserved[16];		/* in */
++};
++
+ #define BTRFS_IOC_SNAP_CREATE _IOW(BTRFS_IOCTL_MAGIC, 1, \
+ 				   struct btrfs_ioctl_vol_args)
+ #define BTRFS_IOC_DEFRAG _IOW(BTRFS_IOCTL_MAGIC, 2, \
+@@ -415,6 +430,8 @@ struct btrfs_ioctl_qgroup_create_args {
+ 					struct btrfs_ioctl_ino_path_args)
+ #define BTRFS_IOC_LOGICAL_INO _IOWR(BTRFS_IOCTL_MAGIC, 36, \
+ 					struct btrfs_ioctl_ino_path_args)
++#define BTRFS_IOC_SET_RECEIVED_SUBVOL _IOWR(BTRFS_IOCTL_MAGIC, 37, \
++				struct btrfs_ioctl_received_subvol_args)
+ #define BTRFS_IOC_DEVICES_READY _IOR(BTRFS_IOCTL_MAGIC, 39, \
+ 				     struct btrfs_ioctl_vol_args)
+ #define BTRFS_IOC_QUOTA_CTL _IOWR(BTRFS_IOCTL_MAGIC, 40, \
+--- a/fs/btrfs/root-tree.c
++++ b/fs/btrfs/root-tree.c
+@@ -16,12 +16,55 @@
+  * Boston, MA 021110-1307, USA.
+  */
+ 
++#include <linux/uuid.h>
+ #include "ctree.h"
+ #include "transaction.h"
+ #include "disk-io.h"
+ #include "print-tree.h"
+ 
+ /*
++ * Read a root item from the tree. In case we detect a root item smaller then
++ * sizeof(root_item), we know it's an old version of the root structure and
++ * initialize all new fields to zero. The same happens if we detect mismatching
++ * generation numbers as then we know the root was once mounted with an older
++ * kernel that was not aware of the root item structure change.
++ */
++void btrfs_read_root_item(struct btrfs_root *root,
++			 struct extent_buffer *eb, int slot,
++			 struct btrfs_root_item *item)
++{
++	uuid_le uuid;
++	int len;
++	int need_reset = 0;
++
++	len = btrfs_item_size_nr(eb, slot);
++	read_extent_buffer(eb, item, btrfs_item_ptr_offset(eb, slot),
++			min_t(int, len, (int)sizeof(*item)));
++	if (len < sizeof(*item))
++		need_reset = 1;
++	if (!need_reset && btrfs_root_generation(item)
++		!= btrfs_root_generation_v2(item)) {
++		if (btrfs_root_generation_v2(item) != 0) {
++			printk(KERN_WARNING "btrfs: mismatching "
++					"generation and generation_v2 "
++					"found in root item. This root "
++					"was probably mounted with an "
++					"older kernel. Resetting all "
++					"new fields.\n");
++		}
++		need_reset = 1;
++	}
++	if (need_reset) {
++		memset(&item->generation_v2, 0,
++			sizeof(*item) - offsetof(struct btrfs_root_item,
++					generation_v2));
++
++		uuid_le_gen(&uuid);
++		memcpy(item->uuid, uuid.b, BTRFS_UUID_SIZE);
++	}
++}
++
++/*
+  * lookup the root with the highest offset for a given objectid.  The key we do
+  * find is copied into 'key'.  If we find something return 0, otherwise 1, < 0
+  * on error.
+@@ -61,10 +104,10 @@ int btrfs_find_last_root(struct btrfs_ro
+ 		goto out;
+ 	}
+ 	if (item)
+-		read_extent_buffer(l, item, btrfs_item_ptr_offset(l, slot),
+-				   sizeof(*item));
++		btrfs_read_root_item(root, l, slot, item);
+ 	if (key)
+ 		memcpy(key, &found_key, sizeof(found_key));
++
+ 	ret = 0;
+ out:
+ 	btrfs_free_path(path);
+@@ -91,16 +134,15 @@ int btrfs_update_root(struct btrfs_trans
+ 	int ret;
+ 	int slot;
+ 	unsigned long ptr;
++	int old_len;
+ 
+ 	path = btrfs_alloc_path();
+ 	if (!path)
+ 		return -ENOMEM;
+ 
+ 	ret = btrfs_search_slot(trans, root, key, path, 0, 1);
+-	if (ret < 0) {
+-		btrfs_abort_transaction(trans, root, ret);
+-		goto out;
+-	}
++	if (ret < 0)
++		goto out_abort;
+ 
+ 	if (ret != 0) {
+ 		btrfs_print_leaf(root, path->nodes[0]);
+@@ -113,16 +155,56 @@ int btrfs_update_root(struct btrfs_trans
+ 	l = path->nodes[0];
+ 	slot = path->slots[0];
+ 	ptr = btrfs_item_ptr_offset(l, slot);
++	old_len = btrfs_item_size_nr(l, slot);
++
++	/*
++	 * If this is the first time we update the root item which originated
++	 * from an older kernel, we need to enlarge the item size to make room
++	 * for the added fields.
++	 */
++	if (old_len < sizeof(*item)) {
++		btrfs_release_path(path);
++		ret = btrfs_search_slot(trans, root, key, path,
++				-1, 1);
++		if (ret < 0)
++			goto out_abort;
++		ret = btrfs_del_item(trans, root, path);
++		if (ret < 0)
++			goto out_abort;
++		btrfs_release_path(path);
++		ret = btrfs_insert_empty_item(trans, root, path,
++				key, sizeof(*item));
++		if (ret < 0)
++			goto out_abort;
++		l = path->nodes[0];
++		slot = path->slots[0];
++		ptr = btrfs_item_ptr_offset(l, slot);
++	}
++
++	/*
++	 * Update generation_v2 so at the next mount we know the new root
++	 * fields are valid.
++	 */
++	btrfs_set_root_generation_v2(item, btrfs_root_generation(item));
++
+ 	write_extent_buffer(l, item, ptr, sizeof(*item));
+ 	btrfs_mark_buffer_dirty(path->nodes[0]);
+ out:
+ 	btrfs_free_path(path);
+ 	return ret;
++
++out_abort:
++	btrfs_abort_transaction(trans, root, ret);
++	goto out;
+ }
+ 
+ int btrfs_insert_root(struct btrfs_trans_handle *trans, struct btrfs_root *root,
+ 		      struct btrfs_key *key, struct btrfs_root_item *item)
+ {
++	/*
++	 * Make sure generation v1 and v2 match. See update_root for details.
++	 */
++	btrfs_set_root_generation_v2(item, btrfs_root_generation(item));
+ 	return btrfs_insert_item(trans, root, key, item, sizeof(*item));
+ }
+ 
+@@ -454,3 +536,16 @@ void btrfs_check_and_init_root_item(stru
+ 		root_item->byte_limit = 0;
+ 	}
+ }
++
++void btrfs_update_root_times(struct btrfs_trans_handle *trans,
++			     struct btrfs_root *root)
++{
++	struct btrfs_root_item *item = &root->root_item;
++	struct timespec ct = CURRENT_TIME;
++
++	spin_lock(&root->root_times_lock);
++	item->ctransid = trans->transid;
++	item->ctime.sec = cpu_to_le64(ct.tv_sec);
++	item->ctime.nsec = cpu_to_le64(ct.tv_nsec);
++	spin_unlock(&root->root_times_lock);
++}
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -22,6 +22,7 @@
+ #include <linux/writeback.h>
+ #include <linux/pagemap.h>
+ #include <linux/blkdev.h>
++#include <linux/uuid.h>
+ #include "ctree.h"
+ #include "disk-io.h"
+ #include "transaction.h"
+@@ -951,11 +952,13 @@ static noinline int create_pending_snaps
+ 	struct dentry *dentry;
+ 	struct extent_buffer *tmp;
+ 	struct extent_buffer *old;
++	struct timespec cur_time = CURRENT_TIME;
+ 	int ret;
+ 	u64 to_reserve = 0;
+ 	u64 index = 0;
+ 	u64 objectid;
+ 	u64 root_flags;
++	uuid_le new_uuid;
+ 
+ 	rsv = trans->block_rsv;
+ 
+@@ -1049,6 +1052,20 @@ static noinline int create_pending_snaps
+ 		root_flags &= ~BTRFS_ROOT_SUBVOL_RDONLY;
+ 	btrfs_set_root_flags(new_root_item, root_flags);
+ 
++	btrfs_set_root_generation_v2(new_root_item,
++			trans->transid);
++	uuid_le_gen(&new_uuid);
++	memcpy(new_root_item->uuid, new_uuid.b, BTRFS_UUID_SIZE);
++	memcpy(new_root_item->parent_uuid, root->root_item.uuid,
++			BTRFS_UUID_SIZE);
++	new_root_item->otime.sec = cpu_to_le64(cur_time.tv_sec);
++	new_root_item->otime.nsec = cpu_to_le64(cur_time.tv_nsec);
++	btrfs_set_root_otransid(new_root_item, trans->transid);
++	memset(&new_root_item->stime, 0, sizeof(new_root_item->stime));
++	memset(&new_root_item->rtime, 0, sizeof(new_root_item->rtime));
++	btrfs_set_root_stransid(new_root_item, 0);
++	btrfs_set_root_rtransid(new_root_item, 0);
++
+ 	old = btrfs_lock_root_node(root);
+ 	ret = btrfs_cow_block(trans, root, old, NULL, 0, &old);
+ 	if (ret) {
