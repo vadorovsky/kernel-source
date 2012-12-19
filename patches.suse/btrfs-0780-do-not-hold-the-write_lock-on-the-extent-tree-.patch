@@ -1,0 +1,110 @@
+From: Josef Bacik <jbacik@fusionio.com>
+Date: Fri, 14 Sep 2012 12:59:20 -0400
+Patch-mainline: 3.7
+Git-commit: ff44c6e36dc9dcc02652a1105b120bdf08cea9f7
+References: FATE#312888
+Subject: [PATCH] Btrfs: do not hold the write_lock on the extent tree
+ while logging
+
+Dave Sterba pointed out a sleeping while atomic bug while doing fsync.  This
+is because I'm an idiot and didn't realize that rwlock's were spin locks, so
+we've been holding this thing while doing allocations and such which is not
+good.  This patch fixes this by dropping the write lock before we do
+anything heavy and re-acquire it when it is done.  We also need to take a
+ref on the em's in case their corresponding pages are evicted and mark them
+as being logged so that releasepage does not remove them and doesn't remove
+them from our local list.  Thanks,
+
+Reported-by: Dave Sterba <dave@jikos.cz>
+Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/extent_map.c |    3 ++-
+ fs/btrfs/extent_map.h |    1 +
+ fs/btrfs/tree-log.c   |   21 +++++++++++++++++----
+ 3 files changed, 20 insertions(+), 5 deletions(-)
+
+--- a/fs/btrfs/extent_map.c
++++ b/fs/btrfs/extent_map.c
+@@ -407,7 +407,8 @@ int remove_extent_mapping(struct extent_
+ 
+ 	WARN_ON(test_bit(EXTENT_FLAG_PINNED, &em->flags));
+ 	rb_erase(&em->rb_node, &tree->map);
+-	list_del_init(&em->list);
++	if (!test_bit(EXTENT_FLAG_LOGGING, &em->flags))
++		list_del_init(&em->list);
+ 	em->in_tree = 0;
+ 	return ret;
+ }
+--- a/fs/btrfs/extent_map.h
++++ b/fs/btrfs/extent_map.h
+@@ -13,6 +13,7 @@
+ #define EXTENT_FLAG_COMPRESSED 1
+ #define EXTENT_FLAG_VACANCY 2 /* no file extent item found */
+ #define EXTENT_FLAG_PREALLOC 3 /* pre-allocated extent */
++#define EXTENT_FLAG_LOGGING 4 /* Logging this extent */
+ 
+ struct extent_map {
+ 	struct rb_node rb_node;
+--- a/fs/btrfs/tree-log.c
++++ b/fs/btrfs/tree-log.c
+@@ -2945,6 +2945,9 @@ static int btrfs_log_changed_extents(str
+ 		list_del_init(&em->list);
+ 		if (em->generation <= test_gen)
+ 			continue;
++		/* Need a ref to keep it from getting evicted from cache */
++		atomic_inc(&em->refs);
++		set_bit(EXTENT_FLAG_LOGGING, &em->flags);
+ 		list_add_tail(&em->list, &extents);
+ 	}
+ 
+@@ -2954,13 +2957,18 @@ static int btrfs_log_changed_extents(str
+ 		em = list_entry(extents.next, struct extent_map, list);
+ 
+ 		list_del_init(&em->list);
++		clear_bit(EXTENT_FLAG_LOGGING, &em->flags);
+ 
+ 		/*
+ 		 * If we had an error we just need to delete everybody from our
+ 		 * private list.
+ 		 */
+-		if (ret)
++		if (ret) {
++			free_extent_map(em);
+ 			continue;
++		}
++
++		write_unlock(&tree->lock);
+ 
+ 		/*
+ 		 * If the previous EM and the last extent we left off on aren't
+@@ -2971,21 +2979,26 @@ static int btrfs_log_changed_extents(str
+ 			ret = copy_items(trans, inode, dst_path, args.src,
+ 					 args.start_slot, args.nr,
+ 					 LOG_INODE_ALL);
+-			if (ret)
++			if (ret) {
++				free_extent_map(em);
++				write_lock(&tree->lock);
+ 				continue;
++			}
+ 			btrfs_release_path(path);
+ 			args.nr = 0;
+ 		}
+ 
+ 		ret = log_one_extent(trans, inode, root, em, path, dst_path, &args);
++		free_extent_map(em);
++		write_lock(&tree->lock);
+ 	}
++	WARN_ON(!list_empty(&extents));
++	write_unlock(&tree->lock);
+ 
+ 	if (!ret && args.nr)
+ 		ret = copy_items(trans, inode, dst_path, args.src,
+ 				 args.start_slot, args.nr, LOG_INODE_ALL);
+ 	btrfs_release_path(path);
+-	WARN_ON(!list_empty(&extents));
+-	write_unlock(&tree->lock);
+ 	return ret;
+ }
+ 

@@ -1,0 +1,151 @@
+From: Josef Bacik <jbacik@fusionio.com>
+Date: Mon, 27 Aug 2012 17:48:15 -0400
+Patch-mainline: 3.7
+Git-commit: ca7e70f59078046db28501519308c2061b0e7a6f
+References: FATE#312888
+Subject: [PATCH] Btrfs: do not needlessly restart the transaction for
+ enospc
+
+We will stop and restart a transaction every time we move to a different leaf
+when truncating a file.  This is for enospc reasons, but really we could
+probably get away with doing this a little better by actually working until we
+hit an ENOSPC.  So add a ->failfast flag to the block_rsv and set it when we do
+truncates which will fail as soon as the block rsv runs out of space, and then
+at that point we can stop and restart the transaction and refill the block rsv
+and carry on.  This will make rm'ing of a file with lots of extents a bit
+faster.  Thanks,
+
+Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/ctree.h       |    1 
+ fs/btrfs/extent-tree.c |    2 -
+ fs/btrfs/inode.c       |   53 ++++++++++++++++---------------------------------
+ 3 files changed, 20 insertions(+), 36 deletions(-)
+
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -1034,6 +1034,7 @@ struct btrfs_block_rsv {
+ 	struct btrfs_space_info *space_info;
+ 	spinlock_t lock;
+ 	unsigned int full;
++	unsigned int failfast;
+ };
+ 
+ /*
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -6310,7 +6310,7 @@ use_block_rsv(struct btrfs_trans_handle
+ 	ret = block_rsv_use_bytes(block_rsv, blocksize);
+ 	if (!ret)
+ 		return block_rsv;
+-	if (ret) {
++	if (ret && !block_rsv->failfast) {
+ 		static DEFINE_RATELIMIT_STATE(_rs,
+ 				DEFAULT_RATELIMIT_INTERVAL,
+ 				/*DEFAULT_RATELIMIT_BURST*/ 2);
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -3447,12 +3447,6 @@ delete:
+ 
+ 		if (path->slots[0] == 0 ||
+ 		    path->slots[0] != pending_del_slot) {
+-			if (root->ref_cows &&
+-			    BTRFS_I(inode)->location.objectid !=
+-						BTRFS_FREE_INO_OBJECTID) {
+-				err = -EAGAIN;
+-				goto out;
+-			}
+ 			if (pending_del_nr) {
+ 				ret = btrfs_del_items(trans, root, path,
+ 						pending_del_slot,
+@@ -3825,6 +3819,7 @@ void btrfs_evict_inode(struct inode *ino
+ 		goto no_delete;
+ 	}
+ 	rsv->size = min_size;
++	rsv->failfast = 1;
+ 	global_rsv = &root->fs_info->global_block_rsv;
+ 
+ 	btrfs_i_size_write(inode, 0);
+@@ -3869,7 +3864,7 @@ void btrfs_evict_inode(struct inode *ino
+ 		trans->block_rsv = rsv;
+ 
+ 		ret = btrfs_truncate_inode_items(trans, root, inode, 0, 0);
+-		if (ret != -EAGAIN)
++		if (ret != -ENOSPC)
+ 			break;
+ 
+ 		nr = trans->blocks_used;
+@@ -6855,6 +6850,7 @@ static int btrfs_truncate(struct inode *
+ 	if (!rsv)
+ 		return -ENOMEM;
+ 	rsv->size = min_size;
++	rsv->failfast = 1;
+ 
+ 	/*
+ 	 * 1 for the truncate slack space
+@@ -6908,37 +6904,13 @@ static int btrfs_truncate(struct inode *
+ 	 * safe.
+ 	 */
+ 	set_bit(BTRFS_INODE_NEEDS_FULL_SYNC, &BTRFS_I(inode)->runtime_flags);
++	trans->block_rsv = rsv;
+ 
+ 	while (1) {
+-		ret = btrfs_block_rsv_refill(root, rsv, min_size);
+-		if (ret) {
+-			/*
+-			 * This can only happen with the original transaction we
+-			 * started above, every other time we shouldn't have a
+-			 * transaction started yet.
+-			 */
+-			if (ret == -EAGAIN)
+-				goto end_trans;
+-			err = ret;
+-			break;
+-		}
+-
+-		if (!trans) {
+-			/* Just need the 1 for updating the inode */
+-			trans = btrfs_start_transaction(root, 1);
+-			if (IS_ERR(trans)) {
+-				ret = err = PTR_ERR(trans);
+-				trans = NULL;
+-				break;
+-			}
+-		}
+-
+-		trans->block_rsv = rsv;
+-
+ 		ret = btrfs_truncate_inode_items(trans, root, inode,
+ 						 inode->i_size,
+ 						 BTRFS_EXTENT_DATA_KEY);
+-		if (ret != -EAGAIN) {
++		if (ret != -ENOSPC) {
+ 			err = ret;
+ 			break;
+ 		}
+@@ -6949,11 +6921,22 @@ static int btrfs_truncate(struct inode *
+ 			err = ret;
+ 			break;
+ 		}
+-end_trans:
++
+ 		nr = trans->blocks_used;
+ 		btrfs_end_transaction(trans, root);
+-		trans = NULL;
+ 		btrfs_btree_balance_dirty(root, nr);
++
++		trans = btrfs_start_transaction(root, 2);
++		if (IS_ERR(trans)) {
++			ret = err = PTR_ERR(trans);
++			trans = NULL;
++			break;
++		}
++
++		ret = btrfs_block_rsv_migrate(&root->fs_info->trans_block_rsv,
++					      rsv, min_size);
++		BUG_ON(ret);	/* shouldn't happen */
++		trans->block_rsv = rsv;
+ 	}
+ 
+ 	if (ret == 0 && inode->i_nlink > 0) {
