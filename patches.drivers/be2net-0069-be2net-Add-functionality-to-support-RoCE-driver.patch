@@ -1,0 +1,587 @@
+From: Parav Pandit <parav.pandit@emulex.com>
+Date: Mon, 26 Mar 2012 14:27:13 +0000
+Subject: [PATCH 069/143] be2net: Add functionality to support RoCE driver
+Patch-mainline: v3.5-rc1
+Git-commit: 045508a8a36f9a82b63d1f6362bd323085638588
+References: bnc#777565 FATE#313819
+
+- Increase MSI-X vectors by 5 for RoCE traffic.
+- Add macro to check roce support on a device.
+- Add device-specific doorbell and MSI-X vector fields shared with NIC
+  functionality.
+- Provide RoCE driver registration and deregistration functions.
+- Add support functions which will be invoked on adapter add/remove
+  and port up/down events.
+- Traverse through the list of adapters to invoke callback functions.
+
+Signed-off-by: Parav Pandit <parav.pandit@emulex.com>
+Acked-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/emulex/benet/Makefile  |    2 
+ drivers/net/ethernet/emulex/benet/be.h      |   38 +++++
+ drivers/net/ethernet/emulex/benet/be_cmds.h |    1 
+ drivers/net/ethernet/emulex/benet/be_hw.h   |    4 
+ drivers/net/ethernet/emulex/benet/be_main.c |   88 +++++++++++--
+ drivers/net/ethernet/emulex/benet/be_roce.c |  182 ++++++++++++++++++++++++++++
+ drivers/net/ethernet/emulex/benet/be_roce.h |   75 +++++++++++
+ 7 files changed, 375 insertions(+), 15 deletions(-)
+ create mode 100644 drivers/net/ethernet/emulex/benet/be_roce.c
+ create mode 100644 drivers/net/ethernet/emulex/benet/be_roce.h
+
+--- a/drivers/net/ethernet/emulex/benet/Makefile
++++ b/drivers/net/ethernet/emulex/benet/Makefile
+@@ -4,4 +4,4 @@
+ 
+ obj-$(CONFIG_BE2NET) += be2net.o
+ 
+-be2net-y :=  be_main.o be_cmds.o be_ethtool.o
++be2net-y :=  be_main.o be_cmds.o be_ethtool.o be_roce.o
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@ -32,6 +32,7 @@
+ #include <linux/u64_stats_sync.h>
+ 
+ #include "be_hw.h"
++#include "be_roce.h"
+ 
+ #define DRV_VER			"4.1.227u"
+ #define DRV_NAME		"be2net"
+@@ -102,7 +103,8 @@ static inline char *nic_name(struct pci_
+ #define MAX_RX_QS		(MAX_RSS_QS + 1) /* RSS qs + 1 def Rx */
+ 
+ #define MAX_TX_QS		8
+-#define MAX_MSIX_VECTORS	MAX_RSS_QS
++#define MAX_ROCE_EQS		5
++#define MAX_MSIX_VECTORS	(MAX_RSS_QS + MAX_ROCE_EQS) /* RSS qs + RoCE */
+ #define BE_TX_BUDGET		256
+ #define BE_NAPI_WEIGHT		64
+ #define MAX_RX_POST		BE_NAPI_WEIGHT /* Frags posted at a time */
+@@ -400,6 +402,17 @@ struct be_adapter {
+ 	u32 tx_fc;		/* Tx flow control */
+ 	bool stats_cmd_sent;
+ 	u8 generation;		/* BladeEngine ASIC generation */
++	u32 if_type;
++	struct {
++		u8 __iomem *base;	/* Door Bell */
++		u32 size;
++		u32 total_size;
++		u64 io_addr;
++	} roce_db;
++	u32 num_msix_roce_vec;
++	struct ocrdma_dev *ocrdma_dev;
++	struct list_head entry;
++
+ 	u32 flash_status;
+ 	struct completion flash_compl;
+ 
+@@ -432,6 +445,10 @@ struct be_adapter {
+ #define lancer_chip(adapter)	((adapter->pdev->device == OC_DEVICE_ID3) || \
+ 				 (adapter->pdev->device == OC_DEVICE_ID4))
+ 
++#define be_roce_supported(adapter) ((adapter->if_type == SLI_INTF_TYPE_3 || \
++				adapter->sli_family == SKYHAWK_SLI_FAMILY) && \
++				(adapter->function_mode & RDMA_ENABLED))
++
+ extern const struct ethtool_ops be_ethtool_ops;
+ 
+ #define msix_enabled(adapter)		(adapter->num_msix_vec > 0)
+@@ -596,6 +613,12 @@ static inline bool be_is_wol_excluded(st
+ 	}
+ }
+ 
++static inline bool be_type_2_3(struct be_adapter *adapter)
++{
++	return (adapter->if_type == SLI_INTF_TYPE_2 ||
++		adapter->if_type == SLI_INTF_TYPE_3) ? true : false;
++}
++
+ extern void be_cq_notify(struct be_adapter *adapter, u16 qid, bool arm,
+ 		u16 num_popped);
+ extern void be_link_status_update(struct be_adapter *adapter, u8 link_status);
+@@ -603,4 +626,17 @@ extern void be_parse_stats(struct be_ada
+ extern int be_load_fw(struct be_adapter *adapter, u8 *func);
+ extern bool be_is_wol_supported(struct be_adapter *adapter);
+ extern bool be_pause_supported(struct be_adapter *adapter);
++
++/*
++ * internal function to initialize-cleanup roce device.
++ */
++extern void be_roce_dev_add(struct be_adapter *);
++extern void be_roce_dev_remove(struct be_adapter *);
++
++/*
++ * internal function to open-close roce device during ifup-ifdown.
++ */
++extern void be_roce_dev_open(struct be_adapter *);
++extern void be_roce_dev_close(struct be_adapter *);
++
+ #endif				/* BE_H */
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.h
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.h
+@@ -1060,6 +1060,7 @@ struct be_cmd_resp_modify_eq_delay {
+ /* The HW can come up in either of the following multi-channel modes
+  * based on the skew/IPL.
+  */
++#define RDMA_ENABLED				0x4
+ #define FLEX10_MODE				0x400
+ #define VNIC_MODE				0x20000
+ #define UMC_ENABLED				0x1000000
+--- a/drivers/net/ethernet/emulex/benet/be_hw.h
++++ b/drivers/net/ethernet/emulex/benet/be_hw.h
+@@ -98,11 +98,13 @@
+ #define SLI_INTF_REV_SHIFT			4
+ #define SLI_INTF_FT_MASK			0x00000001
+ 
++#define SLI_INTF_TYPE_2		2
++#define SLI_INTF_TYPE_3		3
+ 
+ /* SLI family */
+ #define BE_SLI_FAMILY		0x0
+ #define LANCER_A0_SLI_FAMILY	0xA
+-
++#define SKYHAWK_SLI_FAMILY      0x2
+ 
+ /********* ISR0 Register offset **********/
+ #define CEV_ISR0_OFFSET 			0xC18
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@ -2112,10 +2112,17 @@ static uint be_num_rss_want(struct be_ad
+ static void be_msix_enable(struct be_adapter *adapter)
+ {
+ #define BE_MIN_MSIX_VECTORS		1
+-	int i, status, num_vec;
++	int i, status, num_vec, num_roce_vec = 0;
+ 
+ 	/* If RSS queues are not used, need a vec for default RX Q */
+ 	num_vec = min(be_num_rss_want(adapter), num_online_cpus());
++	if (be_roce_supported(adapter)) {
++		num_roce_vec = min_t(u32, MAX_ROCE_MSIX_VECTORS,
++					(num_online_cpus() + 1));
++		num_roce_vec = min(num_roce_vec, MAX_ROCE_EQS);
++		num_vec += num_roce_vec;
++		num_vec = min(num_vec, MAX_MSIX_VECTORS);
++	}
+ 	num_vec = max(num_vec, BE_MIN_MSIX_VECTORS);
+ 
+ 	for (i = 0; i < num_vec; i++)
+@@ -2132,7 +2139,17 @@ static void be_msix_enable(struct be_ada
+ 	}
+ 	return;
+ done:
+-	adapter->num_msix_vec = num_vec;
++	if (be_roce_supported(adapter)) {
++		if (num_vec > num_roce_vec) {
++			adapter->num_msix_vec = num_vec - num_roce_vec;
++			adapter->num_msix_roce_vec =
++				num_vec - adapter->num_msix_vec;
++		} else {
++			adapter->num_msix_vec = num_vec;
++			adapter->num_msix_roce_vec = 0;
++		}
++	} else
++		adapter->num_msix_vec = num_vec;
+ 	return;
+ }
+ 
+@@ -2291,6 +2308,8 @@ static int be_close(struct net_device *n
+ 	struct be_eq_obj *eqo;
+ 	int i;
+ 
++	be_roce_dev_close(adapter);
++
+ 	be_async_mcc_disable(adapter);
+ 
+ 	if (!lancer_chip(adapter))
+@@ -2399,6 +2418,7 @@ static int be_open(struct net_device *ne
+ 	if (!status)
+ 		be_link_status_update(adapter, link_status);
+ 
++	be_roce_dev_open(adapter);
+ 	return 0;
+ err:
+ 	be_close(adapter->netdev);
+@@ -3179,6 +3199,24 @@ static void be_unmap_pci_bars(struct be_
+ 		iounmap(adapter->csr);
+ 	if (adapter->db)
+ 		iounmap(adapter->db);
++	if (adapter->roce_db.base)
++		pci_iounmap(adapter->pdev, adapter->roce_db.base);
++}
++
++static int lancer_roce_map_pci_bars(struct be_adapter *adapter)
++{
++	struct pci_dev *pdev = adapter->pdev;
++	u8 __iomem *addr;
++
++	addr = pci_iomap(pdev, 2, 0);
++	if (addr == NULL)
++		return -ENOMEM;
++
++	adapter->roce_db.base = addr;
++	adapter->roce_db.io_addr = pci_resource_start(pdev, 2);
++	adapter->roce_db.size = 8192;
++	adapter->roce_db.total_size = pci_resource_len(pdev, 2);
++	return 0;
+ }
+ 
+ static int be_map_pci_bars(struct be_adapter *adapter)
+@@ -3187,11 +3225,18 @@ static int be_map_pci_bars(struct be_ada
+ 	int db_reg;
+ 
+ 	if (lancer_chip(adapter)) {
+-		addr = ioremap_nocache(pci_resource_start(adapter->pdev, 0),
+-			pci_resource_len(adapter->pdev, 0));
+-		if (addr == NULL)
+-			return -ENOMEM;
+-		adapter->db = addr;
++		if (be_type_2_3(adapter)) {
++			addr = ioremap_nocache(
++					pci_resource_start(adapter->pdev, 0),
++					pci_resource_len(adapter->pdev, 0));
++			if (addr == NULL)
++				return -ENOMEM;
++			adapter->db = addr;
++		}
++		if (adapter->if_type == SLI_INTF_TYPE_3) {
++			if (lancer_roce_map_pci_bars(adapter))
++				goto pci_map_err;
++		}
+ 		return 0;
+ 	}
+ 
+@@ -3216,14 +3261,19 @@ static int be_map_pci_bars(struct be_ada
+ 	if (addr == NULL)
+ 		goto pci_map_err;
+ 	adapter->db = addr;
+-
++	if (adapter->sli_family == SKYHAWK_SLI_FAMILY) {
++		adapter->roce_db.size = 4096;
++		adapter->roce_db.io_addr =
++				pci_resource_start(adapter->pdev, db_reg);
++		adapter->roce_db.total_size =
++				pci_resource_len(adapter->pdev, db_reg);
++	}
+ 	return 0;
+ pci_map_err:
+ 	be_unmap_pci_bars(adapter);
+ 	return -ENOMEM;
+ }
+ 
+-
+ static void be_ctrl_cleanup(struct be_adapter *adapter)
+ {
+ 	struct be_dma_mem *mem = &adapter->mbox_mem_alloced;
+@@ -3329,6 +3379,8 @@ static void __devexit be_remove(struct p
+ 	if (!adapter)
+ 		return;
+ 
++	be_roce_dev_remove(adapter);
++
+ 	unregister_netdev(adapter->netdev);
+ 
+ 	be_clear(adapter);
+@@ -3407,17 +3459,27 @@ static int be_dev_family_check(struct be
+ 		break;
+ 	case BE_DEVICE_ID2:
+ 	case OC_DEVICE_ID2:
+-	case OC_DEVICE_ID5:
+ 		adapter->generation = BE_GEN3;
+ 		break;
+ 	case OC_DEVICE_ID3:
+ 	case OC_DEVICE_ID4:
+ 		pci_read_config_dword(pdev, SLI_INTF_REG_OFFSET, &sli_intf);
++		adapter->if_type = (sli_intf & SLI_INTF_IF_TYPE_MASK) >>
++						SLI_INTF_IF_TYPE_SHIFT;
+ 		if_type = (sli_intf & SLI_INTF_IF_TYPE_MASK) >>
+ 						SLI_INTF_IF_TYPE_SHIFT;
+-
+ 		if (((sli_intf & SLI_INTF_VALID_MASK) != SLI_INTF_VALID) ||
+-			if_type != 0x02) {
++			!be_type_2_3(adapter)) {
++			dev_err(&pdev->dev, "SLI_INTF reg val is not valid\n");
++			return -EINVAL;
++		}
++		adapter->sli_family = ((sli_intf & SLI_INTF_FAMILY_MASK) >>
++					 SLI_INTF_FAMILY_SHIFT);
++		adapter->generation = BE_GEN3;
++		break;
++	case OC_DEVICE_ID5:
++		pci_read_config_dword(pdev, SLI_INTF_REG_OFFSET, &sli_intf);
++		if ((sli_intf & SLI_INTF_VALID_MASK) != SLI_INTF_VALID) {
+ 			dev_err(&pdev->dev, "SLI_INTF reg val is not valid\n");
+ 			return -EINVAL;
+ 		}
+@@ -3677,6 +3739,8 @@ static int __devinit be_probe(struct pci
+ 	if (status != 0)
+ 		goto unsetup;
+ 
++	be_roce_dev_add(adapter);
++
+ 	dev_info(&pdev->dev, "%s: %s port %d\n", netdev->name, nic_name(pdev),
+ 		adapter->port_num);
+ 
+--- /dev/null
++++ b/drivers/net/ethernet/emulex/benet/be_roce.c
+@@ -0,0 +1,182 @@
++/*
++ * Copyright (C) 2005 - 2011 Emulex
++ * All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation. The full GNU General
++ * Public License is included in this distribution in the file called COPYING.
++ *
++ * Contact Information:
++ * linux-drivers@emulex.com
++ *
++ * Emulex
++ * 3333 Susan Street
++ * Costa Mesa, CA 92626
++ */
++
++#include <linux/mutex.h>
++#include <linux/list.h>
++#include <linux/netdevice.h>
++#include <linux/module.h>
++
++#include "be.h"
++#include "be_cmds.h"
++
++static struct ocrdma_driver *ocrdma_drv;
++static LIST_HEAD(be_adapter_list);
++static DEFINE_MUTEX(be_adapter_list_lock);
++
++static void _be_roce_dev_add(struct be_adapter *adapter)
++{
++	struct be_dev_info dev_info;
++	int i, num_vec;
++	struct pci_dev *pdev = adapter->pdev;
++
++	if (!ocrdma_drv)
++		return;
++	if (pdev->device == OC_DEVICE_ID5) {
++		/* only msix is supported on these devices */
++		if (!msix_enabled(adapter))
++			return;
++		/* DPP region address and length */
++		dev_info.dpp_unmapped_addr = pci_resource_start(pdev, 2);
++		dev_info.dpp_unmapped_len = pci_resource_len(pdev, 2);
++	} else {
++		dev_info.dpp_unmapped_addr = 0;
++		dev_info.dpp_unmapped_len = 0;
++	}
++	dev_info.pdev = adapter->pdev;
++	if (adapter->sli_family == SKYHAWK_SLI_FAMILY)
++		dev_info.db = adapter->db;
++	else
++		dev_info.db = adapter->roce_db.base;
++	dev_info.unmapped_db = adapter->roce_db.io_addr;
++	dev_info.db_page_size = adapter->roce_db.size;
++	dev_info.db_total_size = adapter->roce_db.total_size;
++	dev_info.netdev = adapter->netdev;
++	memcpy(dev_info.mac_addr, adapter->netdev->dev_addr, ETH_ALEN);
++	dev_info.dev_family = adapter->sli_family;
++	if (msix_enabled(adapter)) {
++		/* provide all the vectors, so that EQ creation response
++		 * can decide which one to use.
++		 */
++		num_vec = adapter->num_msix_vec + adapter->num_msix_roce_vec;
++		dev_info.intr_mode = BE_INTERRUPT_MODE_MSIX;
++		dev_info.msix.num_vectors = min(num_vec, MAX_ROCE_MSIX_VECTORS);
++		/* provide start index of the vector,
++		 * so in case of linear usage,
++		 * it can use the base as starting point.
++		 */
++		dev_info.msix.start_vector = adapter->num_evt_qs;
++		for (i = 0; i < dev_info.msix.num_vectors; i++) {
++			dev_info.msix.vector_list[i] =
++			    adapter->msix_entries[i].vector;
++		}
++	} else {
++		dev_info.msix.num_vectors = 0;
++		dev_info.intr_mode = BE_INTERRUPT_MODE_INTX;
++	}
++	adapter->ocrdma_dev = ocrdma_drv->add(&dev_info);
++}
++
++void be_roce_dev_add(struct be_adapter *adapter)
++{
++	if (be_roce_supported(adapter)) {
++		INIT_LIST_HEAD(&adapter->entry);
++		mutex_lock(&be_adapter_list_lock);
++		list_add_tail(&adapter->entry, &be_adapter_list);
++
++		/* invoke add() routine of roce driver only if
++		 * valid driver registered with add method and add() is not yet
++		 * invoked on a given adapter.
++		 */
++		_be_roce_dev_add(adapter);
++		mutex_unlock(&be_adapter_list_lock);
++	}
++}
++
++void _be_roce_dev_remove(struct be_adapter *adapter)
++{
++	if (ocrdma_drv && ocrdma_drv->remove && adapter->ocrdma_dev)
++		ocrdma_drv->remove(adapter->ocrdma_dev);
++	adapter->ocrdma_dev = NULL;
++}
++
++void be_roce_dev_remove(struct be_adapter *adapter)
++{
++	if (be_roce_supported(adapter)) {
++		mutex_lock(&be_adapter_list_lock);
++		_be_roce_dev_remove(adapter);
++		list_del(&adapter->entry);
++		mutex_unlock(&be_adapter_list_lock);
++	}
++}
++
++void _be_roce_dev_open(struct be_adapter *adapter)
++{
++	if (ocrdma_drv && adapter->ocrdma_dev &&
++	    ocrdma_drv->state_change_handler)
++		ocrdma_drv->state_change_handler(adapter->ocrdma_dev, 0);
++}
++
++void be_roce_dev_open(struct be_adapter *adapter)
++{
++	if (be_roce_supported(adapter)) {
++		mutex_lock(&be_adapter_list_lock);
++		_be_roce_dev_open(adapter);
++		mutex_unlock(&be_adapter_list_lock);
++	}
++}
++
++void _be_roce_dev_close(struct be_adapter *adapter)
++{
++	if (ocrdma_drv && adapter->ocrdma_dev &&
++	    ocrdma_drv->state_change_handler)
++		ocrdma_drv->state_change_handler(adapter->ocrdma_dev, 1);
++}
++
++void be_roce_dev_close(struct be_adapter *adapter)
++{
++	if (be_roce_supported(adapter)) {
++		mutex_lock(&be_adapter_list_lock);
++		_be_roce_dev_close(adapter);
++		mutex_unlock(&be_adapter_list_lock);
++	}
++}
++
++int be_roce_register_driver(struct ocrdma_driver *drv)
++{
++	struct be_adapter *dev;
++
++	mutex_lock(&be_adapter_list_lock);
++	if (ocrdma_drv) {
++		mutex_unlock(&be_adapter_list_lock);
++		return -EINVAL;
++	}
++	ocrdma_drv = drv;
++	list_for_each_entry(dev, &be_adapter_list, entry) {
++		struct net_device *netdev;
++		_be_roce_dev_add(dev);
++		netdev = dev->netdev;
++		if (netif_running(netdev) && netif_oper_up(netdev))
++			_be_roce_dev_open(dev);
++	}
++	mutex_unlock(&be_adapter_list_lock);
++	return 0;
++}
++EXPORT_SYMBOL(be_roce_register_driver);
++
++void be_roce_unregister_driver(struct ocrdma_driver *drv)
++{
++	struct be_adapter *dev;
++
++	mutex_lock(&be_adapter_list_lock);
++	list_for_each_entry(dev, &be_adapter_list, entry) {
++		if (dev->ocrdma_dev)
++			_be_roce_dev_remove(dev);
++	}
++	ocrdma_drv = NULL;
++	mutex_unlock(&be_adapter_list_lock);
++}
++EXPORT_SYMBOL(be_roce_unregister_driver);
+--- /dev/null
++++ b/drivers/net/ethernet/emulex/benet/be_roce.h
+@@ -0,0 +1,75 @@
++/*
++ * Copyright (C) 2005 - 2011 Emulex
++ * All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation. The full GNU General
++ * Public License is included in this distribution in the file called COPYING.
++ *
++ * Contact Information:
++ * linux-drivers@emulex.com
++ *
++ * Emulex
++ * 3333 Susan Street
++ * Costa Mesa, CA 92626
++ */
++
++#ifndef BE_ROCE_H
++#define BE_ROCE_H
++
++#include <linux/pci.h>
++#include <linux/netdevice.h>
++
++struct ocrdma_dev;
++
++enum be_interrupt_mode {
++	BE_INTERRUPT_MODE_MSIX	= 0,
++	BE_INTERRUPT_MODE_INTX	= 1,
++	BE_INTERRUPT_MODE_MSI	= 2,
++};
++
++#define MAX_ROCE_MSIX_VECTORS   16
++struct be_dev_info {
++	u8 __iomem *db;
++	u64 unmapped_db;
++	u32 db_page_size;
++	u32 db_total_size;
++	u64 dpp_unmapped_addr;
++	u32 dpp_unmapped_len;
++	struct pci_dev *pdev;
++	struct net_device *netdev;
++	u8 mac_addr[ETH_ALEN];
++	u32 dev_family;
++	enum be_interrupt_mode intr_mode;
++	struct {
++		int num_vectors;
++		int start_vector;
++		u32 vector_list[MAX_ROCE_MSIX_VECTORS];
++	} msix;
++};
++
++/* ocrdma driver register's the callback functions with nic driver. */
++struct ocrdma_driver {
++	unsigned char name[32];
++	struct ocrdma_dev *(*add) (struct be_dev_info *dev_info);
++	void (*remove) (struct ocrdma_dev *);
++	void (*state_change_handler) (struct ocrdma_dev *, u32 new_state);
++};
++
++enum {
++	BE_DEV_UP	= 0,
++	BE_DEV_DOWN	= 1
++};
++
++/* APIs for RoCE driver to register callback handlers,
++ * which will be invoked when device is added, removed, ifup, ifdown
++ */
++int be_roce_register_driver(struct ocrdma_driver *drv);
++void be_roce_unregister_driver(struct ocrdma_driver *drv);
++
++/* API for RoCE driver to issue mailbox commands */
++int be_roce_mcc_cmd(void *netdev_handle, void *wrb_payload,
++		    int wrb_payload_size, u16 *cmd_status, u16 *ext_status);
++
++#endif /* BE_ROCE_H */
