@@ -1,0 +1,442 @@
+From: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Subject: s390/scm_block: force cluster writes
+Patch-mainline: v3.7-rc1
+Git-commit: 0d804b20735d974534abb422f723d404b779433a
+References: bnc#792703,FATE#314095
+
+s390/scm_block: force cluster writes
+
+Force writes to Storage Class Memory (SCM) to be in done in clusters.
+
+Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/block/Kconfig           |    7 +
+ drivers/s390/block/Makefile          |    3 
+ drivers/s390/block/scm_blk.c         |   37 +++++
+ drivers/s390/block/scm_blk.h         |   38 +++++
+ drivers/s390/block/scm_blk_cluster.c |  228 +++++++++++++++++++++++++++++++++++
+ 5 files changed, 310 insertions(+), 3 deletions(-)
+
+--- a/drivers/s390/block/Kconfig
++++ b/drivers/s390/block/Kconfig
+@@ -81,3 +81,10 @@ config SCM_BLOCK
+ 
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called scm_block.
++
++config SCM_BLOCK_CLUSTER_WRITE
++	def_bool y
++	prompt "SCM force cluster writes"
++	depends on SCM_BLOCK
++	help
++	  Force writes to Storage Class Memory (SCM) to be in done in clusters.
+--- a/drivers/s390/block/Makefile
++++ b/drivers/s390/block/Makefile
+@@ -19,4 +19,7 @@ obj-$(CONFIG_BLK_DEV_XPRAM) += xpram.o
+ obj-$(CONFIG_DCSSBLK) += dcssblk.o
+ 
+ scm_block-objs := scm_drv.o scm_blk.o
++ifdef CONFIG_SCM_BLOCK_CLUSTER_WRITE
++scm_block-objs += scm_blk_cluster.o
++endif
+ obj-$(CONFIG_SCM_BLOCK) += scm_block.o
+--- a/drivers/s390/block/scm_blk.c
++++ b/drivers/s390/block/scm_blk.c
+@@ -37,6 +37,7 @@ static void __scm_free_rq(struct scm_req
+ 
+ 	free_page((unsigned long) scmrq->aob);
+ 	free_page((unsigned long) scmrq->aidaw);
++	__scm_free_rq_cluster(scmrq);
+ 	kfree(aobrq);
+ }
+ 
+@@ -70,6 +71,12 @@ static int __scm_alloc_rq(void)
+ 		__scm_free_rq(scmrq);
+ 		return -ENOMEM;
+ 	}
++
++	if (__scm_alloc_rq_cluster(scmrq)) {
++		__scm_free_rq(scmrq);
++		return -ENOMEM;
++	}
++
+ 	INIT_LIST_HEAD(&scmrq->list);
+ 	spin_lock_irq(&list_lock);
+ 	list_add(&scmrq->list, &inactive_requests);
+@@ -170,6 +177,7 @@ static inline void scm_request_init(stru
+ 	scmrq->bdev = bdev;
+ 	scmrq->retries = 4;
+ 	scmrq->error = 0;
++	scm_request_cluster_init(scmrq);
+ }
+ 
+ static void scm_ensure_queue_restart(struct scm_blk_dev *bdev)
+@@ -181,17 +189,19 @@ static void scm_ensure_queue_restart(str
+ 	blk_delay_queue(bdev->rq, SCM_QUEUE_DELAY);
+ }
+ 
+-static void scm_request_requeue(struct scm_request *scmrq)
++void scm_request_requeue(struct scm_request *scmrq)
+ {
+ 	struct scm_blk_dev *bdev = scmrq->bdev;
+ 
++	scm_release_cluster(scmrq);
+ 	blk_requeue_request(bdev->rq, scmrq->request);
+ 	scm_request_done(scmrq);
+ 	scm_ensure_queue_restart(bdev);
+ }
+ 
+-static void scm_request_finish(struct scm_request *scmrq)
++void scm_request_finish(struct scm_request *scmrq)
+ {
++	scm_release_cluster(scmrq);
+ 	blk_end_request_all(scmrq->request, scmrq->error);
+ 	scm_request_done(scmrq);
+ }
+@@ -215,6 +225,16 @@ static void scm_blk_request(struct reque
+ 			return;
+ 		}
+ 		scm_request_init(bdev, scmrq, req);
++		if (!scm_reserve_cluster(scmrq)) {
++			SCM_LOG(5, "cluster busy");
++			scm_request_done(scmrq);
++			return;
++		}
++		if (scm_need_cluster_request(scmrq)) {
++			blk_start_request(req);
++			scm_initiate_cluster_request(scmrq);
++			return;
++		}
+ 		scm_request_prepare(scmrq);
+ 		blk_start_request(req);
+ 
+@@ -282,6 +302,13 @@ static void scm_blk_tasklet(struct scm_b
+ 			spin_lock_irqsave(&bdev->lock, flags);
+ 			continue;
+ 		}
++
++		if (scm_test_cluster_request(scmrq)) {
++			scm_cluster_request_irq(scmrq);
++			spin_lock_irqsave(&bdev->lock, flags);
++			continue;
++		}
++
+ 		scm_request_finish(scmrq);
+ 		atomic_dec(&bdev->queued_reqs);
+ 		spin_lock_irqsave(&bdev->lock, flags);
+@@ -325,6 +352,7 @@ int scm_blk_dev_setup(struct scm_blk_dev
+ 	blk_queue_max_hw_sectors(rq, nr_max_blk << 3); /* 8 * 512 = blk_size */
+ 	blk_queue_max_segments(rq, nr_max_blk);
+ 	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, rq);
++	scm_blk_dev_cluster_setup(bdev);
+ 
+ 	bdev->gendisk = alloc_disk(SCM_NR_PARTS);
+ 	if (!bdev->gendisk)
+@@ -370,7 +398,10 @@ void scm_blk_dev_cleanup(struct scm_blk_
+ 
+ static int __init scm_blk_init(void)
+ {
+-	int ret;
++	int ret = -EINVAL;
++
++	if (!scm_cluster_size_valid())
++		goto out;
+ 
+ 	ret = register_blkdev(0, "scm");
+ 	if (ret < 0)
+--- a/drivers/s390/block/scm_blk.h
++++ b/drivers/s390/block/scm_blk.h
+@@ -22,6 +22,9 @@ struct scm_blk_dev {
+ 	spinlock_t lock;	/* guard the rest of the blockdev */
+ 	atomic_t queued_reqs;
+ 	struct list_head finished_requests;
++#ifdef CONFIG_SCM_BLOCK_CLUSTER_WRITE
++	struct list_head cluster_list;
++#endif
+ };
+ 
+ struct scm_request {
+@@ -32,6 +35,13 @@ struct scm_request {
+ 	struct list_head list;
+ 	u8 retries;
+ 	int error;
++#ifdef CONFIG_SCM_BLOCK_CLUSTER_WRITE
++	struct {
++		enum {CLUSTER_NONE, CLUSTER_READ, CLUSTER_WRITE} state;
++		struct list_head list;
++		void **buf;
++	} cluster;
++#endif
+ };
+ 
+ #define to_aobrq(rq) container_of((void *) rq, struct aob_rq_header, data)
+@@ -40,9 +50,37 @@ int scm_blk_dev_setup(struct scm_blk_dev
+ void scm_blk_dev_cleanup(struct scm_blk_dev *);
+ void scm_blk_irq(struct scm_device *, void *, int);
+ 
++void scm_request_finish(struct scm_request *);
++void scm_request_requeue(struct scm_request *);
++
+ int scm_drv_init(void);
+ void scm_drv_cleanup(void);
+ 
++#ifdef CONFIG_SCM_BLOCK_CLUSTER_WRITE
++void __scm_free_rq_cluster(struct scm_request *);
++int __scm_alloc_rq_cluster(struct scm_request *);
++void scm_request_cluster_init(struct scm_request *);
++bool scm_reserve_cluster(struct scm_request *);
++void scm_release_cluster(struct scm_request *);
++void scm_blk_dev_cluster_setup(struct scm_blk_dev *);
++bool scm_need_cluster_request(struct scm_request *);
++void scm_initiate_cluster_request(struct scm_request *);
++void scm_cluster_request_irq(struct scm_request *);
++bool scm_test_cluster_request(struct scm_request *);
++bool scm_cluster_size_valid(void);
++#else
++#define __scm_free_rq_cluster(scmrq) {}
++#define __scm_alloc_rq_cluster(scmrq) 0
++#define scm_request_cluster_init(scmrq) {}
++#define scm_reserve_cluster(scmrq) true
++#define scm_release_cluster(scmrq) {}
++#define scm_blk_dev_cluster_setup(bdev) {}
++#define scm_need_cluster_request(scmrq) false
++#define scm_initiate_cluster_request(scmrq) {}
++#define scm_cluster_request_irq(scmrq) {}
++#define scm_test_cluster_request(scmrq) false
++#define scm_cluster_size_valid() true
++#endif
+ 
+ extern debug_info_t *scm_debug;
+ 
+--- /dev/null
++++ b/drivers/s390/block/scm_blk_cluster.c
+@@ -0,0 +1,228 @@
++/*
++ * Block driver for s390 storage class memory.
++ *
++ * Copyright IBM Corp. 2012
++ * Author(s): Sebastian Ott <sebott@linux.vnet.ibm.com>
++ */
++
++#include <linux/spinlock.h>
++#include <linux/module.h>
++#include <linux/blkdev.h>
++#include <linux/genhd.h>
++#include <linux/slab.h>
++#include <linux/list.h>
++#include <asm/eadm.h>
++#include "scm_blk.h"
++
++static unsigned int write_cluster_size = 64;
++module_param(write_cluster_size, uint, S_IRUGO);
++MODULE_PARM_DESC(write_cluster_size,
++		 "Number of pages used for contiguous writes.");
++
++#define CLUSTER_SIZE (write_cluster_size * PAGE_SIZE)
++
++void __scm_free_rq_cluster(struct scm_request *scmrq)
++{
++	int i;
++
++	if (!scmrq->cluster.buf)
++		return;
++
++	for (i = 0; i < 2 * write_cluster_size; i++)
++		free_page((unsigned long) scmrq->cluster.buf[i]);
++
++	kfree(scmrq->cluster.buf);
++}
++
++int __scm_alloc_rq_cluster(struct scm_request *scmrq)
++{
++	int i;
++
++	scmrq->cluster.buf = kzalloc(sizeof(void *) * 2 * write_cluster_size,
++				 GFP_KERNEL);
++	if (!scmrq->cluster.buf)
++		return -ENOMEM;
++
++	for (i = 0; i < 2 * write_cluster_size; i++) {
++		scmrq->cluster.buf[i] = (void *) get_zeroed_page(GFP_DMA);
++		if (!scmrq->cluster.buf[i])
++			return -ENOMEM;
++	}
++	INIT_LIST_HEAD(&scmrq->cluster.list);
++	return 0;
++}
++
++void scm_request_cluster_init(struct scm_request *scmrq)
++{
++	scmrq->cluster.state = CLUSTER_NONE;
++}
++
++static bool clusters_intersect(struct scm_request *A, struct scm_request *B)
++{
++	unsigned long firstA, lastA, firstB, lastB;
++
++	firstA = ((u64) blk_rq_pos(A->request) << 9) / CLUSTER_SIZE;
++	lastA = (((u64) blk_rq_pos(A->request) << 9) +
++		    blk_rq_bytes(A->request) - 1) / CLUSTER_SIZE;
++
++	firstB = ((u64) blk_rq_pos(B->request) << 9) / CLUSTER_SIZE;
++	lastB = (((u64) blk_rq_pos(B->request) << 9) +
++		    blk_rq_bytes(B->request) - 1) / CLUSTER_SIZE;
++
++	return (firstB <= lastA && firstA <= lastB);
++}
++
++bool scm_reserve_cluster(struct scm_request *scmrq)
++{
++	struct scm_blk_dev *bdev = scmrq->bdev;
++	struct scm_request *iter;
++
++	if (write_cluster_size == 0)
++		return true;
++
++	spin_lock(&bdev->lock);
++	list_for_each_entry(iter, &bdev->cluster_list, cluster.list) {
++		if (clusters_intersect(scmrq, iter) &&
++		    (rq_data_dir(scmrq->request) == WRITE ||
++		     rq_data_dir(iter->request) == WRITE)) {
++			spin_unlock(&bdev->lock);
++			return false;
++		}
++	}
++	list_add(&scmrq->cluster.list, &bdev->cluster_list);
++	spin_unlock(&bdev->lock);
++
++	return true;
++}
++
++void scm_release_cluster(struct scm_request *scmrq)
++{
++	struct scm_blk_dev *bdev = scmrq->bdev;
++	unsigned long flags;
++
++	if (write_cluster_size == 0)
++		return;
++
++	spin_lock_irqsave(&bdev->lock, flags);
++	list_del(&scmrq->cluster.list);
++	spin_unlock_irqrestore(&bdev->lock, flags);
++}
++
++void scm_blk_dev_cluster_setup(struct scm_blk_dev *bdev)
++{
++	INIT_LIST_HEAD(&bdev->cluster_list);
++	blk_queue_io_opt(bdev->rq, CLUSTER_SIZE);
++}
++
++static void scm_prepare_cluster_request(struct scm_request *scmrq)
++{
++	struct scm_blk_dev *bdev = scmrq->bdev;
++	struct scm_device *scmdev = bdev->gendisk->private_data;
++	struct request *req = scmrq->request;
++	struct aidaw *aidaw = scmrq->aidaw;
++	struct msb *msb = &scmrq->aob->msb[0];
++	struct req_iterator iter;
++	struct bio_vec *bv;
++	int i = 0;
++	u64 addr;
++
++	switch (scmrq->cluster.state) {
++	case CLUSTER_NONE:
++		scmrq->cluster.state = CLUSTER_READ;
++		/* fall through */
++	case CLUSTER_READ:
++		scmrq->aob->request.msb_count = 1;
++		msb->bs = MSB_BS_4K;
++		msb->oc = MSB_OC_READ;
++		msb->flags = MSB_FLAG_IDA;
++		msb->data_addr = (u64) aidaw;
++		msb->blk_count = write_cluster_size;
++
++		addr = scmdev->address + ((u64) blk_rq_pos(req) << 9);
++		msb->scm_addr = round_down(addr, CLUSTER_SIZE);
++
++		if (msb->scm_addr !=
++		    round_down(addr + (u64) blk_rq_bytes(req) - 1,
++			       CLUSTER_SIZE))
++			msb->blk_count = 2 * write_cluster_size;
++
++		for (i = 0; i < msb->blk_count; i++) {
++			aidaw->data_addr = (u64) scmrq->cluster.buf[i];
++			aidaw++;
++		}
++
++		break;
++	case CLUSTER_WRITE:
++		msb->oc = MSB_OC_WRITE;
++
++		for (addr = msb->scm_addr;
++		     addr < scmdev->address + ((u64) blk_rq_pos(req) << 9);
++		     addr += PAGE_SIZE) {
++			aidaw->data_addr = (u64) scmrq->cluster.buf[i];
++			aidaw++;
++			i++;
++		}
++		rq_for_each_segment(bv, req, iter) {
++			aidaw->data_addr = (u64) page_address(bv->bv_page);
++			aidaw++;
++			i++;
++		}
++		for (; i < msb->blk_count; i++) {
++			aidaw->data_addr = (u64) scmrq->cluster.buf[i];
++			aidaw++;
++		}
++		break;
++	}
++}
++
++bool scm_need_cluster_request(struct scm_request *scmrq)
++{
++	if (rq_data_dir(scmrq->request) == READ)
++		return false;
++
++	return blk_rq_bytes(scmrq->request) < CLUSTER_SIZE;
++}
++
++/* Called with queue lock held. */
++void scm_initiate_cluster_request(struct scm_request *scmrq)
++{
++	scm_prepare_cluster_request(scmrq);
++	if (scm_start_aob(scmrq->aob))
++		scm_request_requeue(scmrq);
++}
++
++bool scm_test_cluster_request(struct scm_request *scmrq)
++{
++	return scmrq->cluster.state != CLUSTER_NONE;
++}
++
++void scm_cluster_request_irq(struct scm_request *scmrq)
++{
++	struct scm_blk_dev *bdev = scmrq->bdev;
++	unsigned long flags;
++
++	switch (scmrq->cluster.state) {
++	case CLUSTER_NONE:
++		BUG();
++		break;
++	case CLUSTER_READ:
++		if (scmrq->error) {
++			scm_request_finish(scmrq);
++			break;
++		}
++		scmrq->cluster.state = CLUSTER_WRITE;
++		spin_lock_irqsave(&bdev->rq_lock, flags);
++		scm_initiate_cluster_request(scmrq);
++		spin_unlock_irqrestore(&bdev->rq_lock, flags);
++		break;
++	case CLUSTER_WRITE:
++		scm_request_finish(scmrq);
++		break;
++	}
++}
++
++bool scm_cluster_size_valid(void)
++{
++	return write_cluster_size == 0 || write_cluster_size == 32 ||
++		write_cluster_size == 64 || write_cluster_size == 128;
++}
