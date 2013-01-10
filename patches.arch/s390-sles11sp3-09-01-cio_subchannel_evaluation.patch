@@ -1,0 +1,172 @@
+From: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Subject: hibernate: directly trigger subchannel evaluation
+Patch-mainline: v3.2-rc5
+Git-commit: 817e5000ebc4d448ca514db49b55073a724f8552
+References: bnc#792703,FATE#314095
+
+hibernate: directly trigger subchannel evaluation
+
+Using the generic css_schedule_eval to evaluate subchannels
+while resuming from hibernation is very slow when used with
+many devices. Provide a new evaluation trigger which exploits
+css_sched_sch_todo and use this in the resume callback for
+ccw devices.
+
+Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/cio/cio.h    |    5 ++
+ drivers/s390/cio/css.c    |  104 ++++++++++++++++++++++++++--------------------
+ drivers/s390/cio/device.c |    4 -
+ 3 files changed, 66 insertions(+), 47 deletions(-)
+
+--- a/drivers/s390/cio/cio.h
++++ b/drivers/s390/cio/cio.h
+@@ -68,8 +68,13 @@ struct schib {
+ 	__u8 mda[4];		 /* model dependent area */
+ } __attribute__ ((packed,aligned(4)));
+ 
++/*
++ * When rescheduled, todo's with higher values will overwrite those
++ * with lower values.
++ */
+ enum sch_todo {
+ 	SCH_TODO_NOTHING,
++	SCH_TODO_EVAL,
+ 	SCH_TODO_UNREG,
+ };
+ 
+--- a/drivers/s390/cio/css.c
++++ b/drivers/s390/cio/css.c
+@@ -195,51 +195,6 @@ void css_sch_device_unregister(struct su
+ }
+ EXPORT_SYMBOL_GPL(css_sch_device_unregister);
+ 
+-static void css_sch_todo(struct work_struct *work)
+-{
+-	struct subchannel *sch;
+-	enum sch_todo todo;
+-
+-	sch = container_of(work, struct subchannel, todo_work);
+-	/* Find out todo. */
+-	spin_lock_irq(sch->lock);
+-	todo = sch->todo;
+-	CIO_MSG_EVENT(4, "sch_todo: sch=0.%x.%04x, todo=%d\n", sch->schid.ssid,
+-		      sch->schid.sch_no, todo);
+-	sch->todo = SCH_TODO_NOTHING;
+-	spin_unlock_irq(sch->lock);
+-	/* Perform todo. */
+-	if (todo == SCH_TODO_UNREG)
+-		css_sch_device_unregister(sch);
+-	/* Release workqueue ref. */
+-	put_device(&sch->dev);
+-}
+-
+-/**
+- * css_sched_sch_todo - schedule a subchannel operation
+- * @sch: subchannel
+- * @todo: todo
+- *
+- * Schedule the operation identified by @todo to be performed on the slow path
+- * workqueue. Do nothing if another operation with higher priority is already
+- * scheduled. Needs to be called with subchannel lock held.
+- */
+-void css_sched_sch_todo(struct subchannel *sch, enum sch_todo todo)
+-{
+-	CIO_MSG_EVENT(4, "sch_todo: sched sch=0.%x.%04x todo=%d\n",
+-		      sch->schid.ssid, sch->schid.sch_no, todo);
+-	if (sch->todo >= todo)
+-		return;
+-	/* Get workqueue ref. */
+-	if (!get_device(&sch->dev))
+-		return;
+-	sch->todo = todo;
+-	if (!queue_work(cio_work_q, &sch->todo_work)) {
+-		/* Already queued, release workqueue ref. */
+-		put_device(&sch->dev);
+-	}
+-}
+-
+ static void ssd_from_pmcw(struct chsc_ssd_info *ssd, struct pmcw *pmcw)
+ {
+ 	int i;
+@@ -466,6 +421,65 @@ static void css_evaluate_subchannel(stru
+ 		css_schedule_eval(schid);
+ }
+ 
++/**
++ * css_sched_sch_todo - schedule a subchannel operation
++ * @sch: subchannel
++ * @todo: todo
++ *
++ * Schedule the operation identified by @todo to be performed on the slow path
++ * workqueue. Do nothing if another operation with higher priority is already
++ * scheduled. Needs to be called with subchannel lock held.
++ */
++void css_sched_sch_todo(struct subchannel *sch, enum sch_todo todo)
++{
++	CIO_MSG_EVENT(4, "sch_todo: sched sch=0.%x.%04x todo=%d\n",
++		      sch->schid.ssid, sch->schid.sch_no, todo);
++	if (sch->todo >= todo)
++		return;
++	/* Get workqueue ref. */
++	if (!get_device(&sch->dev))
++		return;
++	sch->todo = todo;
++	if (!queue_work(cio_work_q, &sch->todo_work)) {
++		/* Already queued, release workqueue ref. */
++		put_device(&sch->dev);
++	}
++}
++
++static void css_sch_todo(struct work_struct *work)
++{
++	struct subchannel *sch;
++	enum sch_todo todo;
++	int ret;
++
++	sch = container_of(work, struct subchannel, todo_work);
++	/* Find out todo. */
++	spin_lock_irq(sch->lock);
++	todo = sch->todo;
++	CIO_MSG_EVENT(4, "sch_todo: sch=0.%x.%04x, todo=%d\n", sch->schid.ssid,
++		      sch->schid.sch_no, todo);
++	sch->todo = SCH_TODO_NOTHING;
++	spin_unlock_irq(sch->lock);
++	/* Perform todo. */
++	switch (todo) {
++	case SCH_TODO_NOTHING:
++		break;
++	case SCH_TODO_EVAL:
++		ret = css_evaluate_known_subchannel(sch, 1);
++		if (ret == -EAGAIN) {
++			spin_lock_irq(sch->lock);
++			css_sched_sch_todo(sch, todo);
++			spin_unlock_irq(sch->lock);
++		}
++		break;
++	case SCH_TODO_UNREG:
++		css_sch_device_unregister(sch);
++		break;
++	}
++	/* Release workqueue ref. */
++	put_device(&sch->dev);
++}
++
+ static struct idset *slow_subchannel_set;
+ static spinlock_t slow_subchannel_lock;
+ static wait_queue_head_t css_eval_wq;
+--- a/drivers/s390/cio/device.c
++++ b/drivers/s390/cio/device.c
+@@ -1879,9 +1879,9 @@ static void __ccw_device_pm_restore(stru
+ 	 */
+ 	cdev->private->flags.resuming = 1;
+ 	cdev->private->path_new_mask = LPM_ANYPATH;
+-	css_schedule_eval(sch->schid);
++	css_sched_sch_todo(sch, SCH_TODO_EVAL);
+ 	spin_unlock_irq(sch->lock);
+-	css_complete_work();
++	css_wait_for_slow_path();
+ 
+ 	/* cdev may have been moved to a different subchannel. */
+ 	sch = to_subchannel(cdev->dev.parent);
