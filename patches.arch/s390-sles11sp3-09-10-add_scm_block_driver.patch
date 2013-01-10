@@ -1,0 +1,639 @@
+From: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Subject: s390: add scm block driver
+Patch-mainline: v3.7-rc1
+Git-commit: f30664e2c85c7804f07c636bbe99f35e0b2d4c76
+References: bnc#792703,FATE#314095
+
+s390: add scm block driver
+
+Block device driver for Storage Class Memory (SCM). This driver
+provides a block device interface for each available SCM increment.
+
+Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/block/Kconfig   |   11 +
+ drivers/s390/block/Makefile  |    3 
+ drivers/s390/block/scm_blk.c |  414 +++++++++++++++++++++++++++++++++++++++++++
+ drivers/s390/block/scm_blk.h |   79 ++++++++
+ drivers/s390/block/scm_drv.c |   90 +++++++++
+ 5 files changed, 597 insertions(+)
+
+--- a/drivers/s390/block/Kconfig
++++ b/drivers/s390/block/Kconfig
+@@ -70,3 +70,14 @@ config DASD_EER
+ 	  This driver provides a character device interface to the
+ 	  DASD extended error reporting. This is only needed if you want to
+ 	  use applications written for the EER facility.
++
++config SCM_BLOCK
++	def_tristate m
++	prompt "Support for Storage Class Memory"
++	depends on S390 && BLOCK && EADM_SCH && SCM_BUS
++	help
++	  Block device driver for Storage Class Memory (SCM). This driver
++	  provides a block device interface for each available SCM increment.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called scm_block.
+--- a/drivers/s390/block/Makefile
++++ b/drivers/s390/block/Makefile
+@@ -17,3 +17,6 @@ obj-$(CONFIG_DASD_ECKD) += dasd_eckd_mod
+ obj-$(CONFIG_DASD_FBA)  += dasd_fba_mod.o
+ obj-$(CONFIG_BLK_DEV_XPRAM) += xpram.o
+ obj-$(CONFIG_DCSSBLK) += dcssblk.o
++
++scm_block-objs := scm_drv.o scm_blk.o
++obj-$(CONFIG_SCM_BLOCK) += scm_block.o
+--- /dev/null
++++ b/drivers/s390/block/scm_blk.c
+@@ -0,0 +1,414 @@
++/*
++ * Block driver for s390 storage class memory.
++ *
++ * Copyright IBM Corp. 2012
++ * Author(s): Sebastian Ott <sebott@linux.vnet.ibm.com>
++ */
++
++#define KMSG_COMPONENT "scm_block"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <linux/interrupt.h>
++#include <linux/spinlock.h>
++#include <linux/module.h>
++#include <linux/blkdev.h>
++#include <linux/genhd.h>
++#include <linux/slab.h>
++#include <linux/list.h>
++#include <asm/eadm.h>
++#include "scm_blk.h"
++
++debug_info_t *scm_debug;
++static int scm_major;
++static DEFINE_SPINLOCK(list_lock);
++static LIST_HEAD(inactive_requests);
++static unsigned int nr_requests = 64;
++static atomic_t nr_devices = ATOMIC_INIT(0);
++module_param(nr_requests, uint, S_IRUGO);
++MODULE_PARM_DESC(nr_requests, "Number of parallel requests.");
++
++MODULE_DESCRIPTION("Block driver for s390 storage class memory.");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("scm:scmdev*");
++
++static void __scm_free_rq(struct scm_request *scmrq)
++{
++	struct aob_rq_header *aobrq = to_aobrq(scmrq);
++
++	free_page((unsigned long) scmrq->aob);
++	free_page((unsigned long) scmrq->aidaw);
++	kfree(aobrq);
++}
++
++static void scm_free_rqs(void)
++{
++	struct list_head *iter, *safe;
++	struct scm_request *scmrq;
++
++	spin_lock_irq(&list_lock);
++	list_for_each_safe(iter, safe, &inactive_requests) {
++		scmrq = list_entry(iter, struct scm_request, list);
++		list_del(&scmrq->list);
++		__scm_free_rq(scmrq);
++	}
++	spin_unlock_irq(&list_lock);
++}
++
++static int __scm_alloc_rq(void)
++{
++	struct aob_rq_header *aobrq;
++	struct scm_request *scmrq;
++
++	aobrq = kzalloc(sizeof(*aobrq) + sizeof(*scmrq), GFP_KERNEL);
++	if (!aobrq)
++		return -ENOMEM;
++
++	scmrq = (void *) aobrq->data;
++	scmrq->aidaw = (void *) get_zeroed_page(GFP_DMA);
++	scmrq->aob = (void *) get_zeroed_page(GFP_DMA);
++	if (!scmrq->aob || !scmrq->aidaw) {
++		__scm_free_rq(scmrq);
++		return -ENOMEM;
++	}
++	INIT_LIST_HEAD(&scmrq->list);
++	spin_lock_irq(&list_lock);
++	list_add(&scmrq->list, &inactive_requests);
++	spin_unlock_irq(&list_lock);
++
++	return 0;
++}
++
++static int scm_alloc_rqs(unsigned int nrqs)
++{
++	int ret = 0;
++
++	while (nrqs-- && !ret)
++		ret = __scm_alloc_rq();
++
++	return ret;
++}
++
++static struct scm_request *scm_request_fetch(void)
++{
++	struct scm_request *scmrq = NULL;
++
++	spin_lock(&list_lock);
++	if (list_empty(&inactive_requests))
++		goto out;
++	scmrq = list_first_entry(&inactive_requests, struct scm_request, list);
++	list_del(&scmrq->list);
++out:
++	spin_unlock(&list_lock);
++	return scmrq;
++}
++
++static void scm_request_done(struct scm_request *scmrq)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&list_lock, flags);
++	list_add(&scmrq->list, &inactive_requests);
++	spin_unlock_irqrestore(&list_lock, flags);
++}
++
++static int scm_open(struct block_device *blkdev, fmode_t mode)
++{
++	return scm_get_ref();
++}
++
++static int scm_release(struct gendisk *gendisk, fmode_t mode)
++{
++	scm_put_ref();
++	return 0;
++}
++
++static const struct block_device_operations scm_blk_devops = {
++	.owner = THIS_MODULE,
++	.open = scm_open,
++	.release = scm_release,
++};
++
++static void scm_request_prepare(struct scm_request *scmrq)
++{
++	struct scm_blk_dev *bdev = scmrq->bdev;
++	struct scm_device *scmdev = bdev->gendisk->private_data;
++	struct aidaw *aidaw = scmrq->aidaw;
++	struct msb *msb = &scmrq->aob->msb[0];
++	struct req_iterator iter;
++	struct bio_vec *bv;
++
++	msb->bs = MSB_BS_4K;
++	scmrq->aob->request.msb_count = 1;
++	msb->scm_addr = scmdev->address +
++		((u64) blk_rq_pos(scmrq->request) << 9);
++	msb->oc = (rq_data_dir(scmrq->request) == READ) ?
++		MSB_OC_READ : MSB_OC_WRITE;
++	msb->flags |= MSB_FLAG_IDA;
++	msb->data_addr = (u64) aidaw;
++
++	rq_for_each_segment(bv, scmrq->request, iter) {
++		WARN_ON(bv->bv_offset);
++		msb->blk_count += bv->bv_len >> 12;
++		aidaw->data_addr = (u64) page_address(bv->bv_page);
++		aidaw++;
++	}
++}
++
++static inline void scm_request_init(struct scm_blk_dev *bdev,
++				    struct scm_request *scmrq,
++				    struct request *req)
++{
++	struct aob_rq_header *aobrq = to_aobrq(scmrq);
++	struct aob *aob = scmrq->aob;
++
++	memset(aob, 0, sizeof(*aob));
++	memset(scmrq->aidaw, 0, PAGE_SIZE);
++	aobrq->scmdev = bdev->scmdev;
++	aob->request.cmd_code = ARQB_CMD_MOVE;
++	aob->request.data = (u64) aobrq;
++	scmrq->request = req;
++	scmrq->bdev = bdev;
++	scmrq->retries = 4;
++	scmrq->error = 0;
++}
++
++static void scm_ensure_queue_restart(struct scm_blk_dev *bdev)
++{
++	if (atomic_read(&bdev->queued_reqs)) {
++		/* Queue restart is triggered by the next interrupt. */
++		return;
++	}
++	blk_delay_queue(bdev->rq, SCM_QUEUE_DELAY);
++}
++
++static void scm_request_requeue(struct scm_request *scmrq)
++{
++	struct scm_blk_dev *bdev = scmrq->bdev;
++
++	blk_requeue_request(bdev->rq, scmrq->request);
++	scm_request_done(scmrq);
++	scm_ensure_queue_restart(bdev);
++}
++
++static void scm_request_finish(struct scm_request *scmrq)
++{
++	blk_end_request_all(scmrq->request, scmrq->error);
++	scm_request_done(scmrq);
++}
++
++static void scm_blk_request(struct request_queue *rq)
++{
++	struct scm_device *scmdev = rq->queuedata;
++	struct scm_blk_dev *bdev = dev_get_drvdata(&scmdev->dev);
++	struct scm_request *scmrq;
++	struct request *req;
++	int ret;
++
++	while ((req = blk_peek_request(rq))) {
++		if (req->cmd_type != REQ_TYPE_FS)
++			continue;
++
++		scmrq = scm_request_fetch();
++		if (!scmrq) {
++			SCM_LOG(5, "no request");
++			scm_ensure_queue_restart(bdev);
++			return;
++		}
++		scm_request_init(bdev, scmrq, req);
++		scm_request_prepare(scmrq);
++		blk_start_request(req);
++
++		ret = scm_start_aob(scmrq->aob);
++		if (ret) {
++			SCM_LOG(5, "no subchannel");
++			scm_request_requeue(scmrq);
++			return;
++		}
++		atomic_inc(&bdev->queued_reqs);
++	}
++}
++
++static void __scmrq_log_error(struct scm_request *scmrq)
++{
++	struct aob *aob = scmrq->aob;
++
++	if (scmrq->error == -ETIMEDOUT)
++		SCM_LOG(1, "Request timeout");
++	else {
++		SCM_LOG(1, "Request error");
++		SCM_LOG_HEX(1, &aob->response, sizeof(aob->response));
++	}
++	if (scmrq->retries)
++		SCM_LOG(1, "Retry request");
++	else
++		pr_err("An I/O operation to SCM failed with rc=%d\n",
++		       scmrq->error);
++}
++
++void scm_blk_irq(struct scm_device *scmdev, void *data, int error)
++{
++	struct scm_request *scmrq = data;
++	struct scm_blk_dev *bdev = scmrq->bdev;
++
++	scmrq->error = error;
++	if (error)
++		__scmrq_log_error(scmrq);
++
++	spin_lock(&bdev->lock);
++	list_add_tail(&scmrq->list, &bdev->finished_requests);
++	spin_unlock(&bdev->lock);
++	tasklet_hi_schedule(&bdev->tasklet);
++}
++
++static void scm_blk_tasklet(struct scm_blk_dev *bdev)
++{
++	struct scm_request *scmrq;
++	unsigned long flags;
++
++	spin_lock_irqsave(&bdev->lock, flags);
++	while (!list_empty(&bdev->finished_requests)) {
++		scmrq = list_first_entry(&bdev->finished_requests,
++					 struct scm_request, list);
++		list_del(&scmrq->list);
++		spin_unlock_irqrestore(&bdev->lock, flags);
++
++		if (scmrq->error && scmrq->retries-- > 0) {
++			if (scm_start_aob(scmrq->aob)) {
++				spin_lock_irqsave(&bdev->rq_lock, flags);
++				scm_request_requeue(scmrq);
++				spin_unlock_irqrestore(&bdev->rq_lock, flags);
++			}
++			/* Request restarted or requeued, handle next. */
++			spin_lock_irqsave(&bdev->lock, flags);
++			continue;
++		}
++		scm_request_finish(scmrq);
++		atomic_dec(&bdev->queued_reqs);
++		spin_lock_irqsave(&bdev->lock, flags);
++	}
++	spin_unlock_irqrestore(&bdev->lock, flags);
++	/* Look out for more requests. */
++	blk_run_queue(bdev->rq);
++}
++
++int scm_blk_dev_setup(struct scm_blk_dev *bdev, struct scm_device *scmdev)
++{
++	struct request_queue *rq;
++	int len, ret = -ENOMEM;
++	unsigned int devindex, nr_max_blk;
++
++	devindex = atomic_inc_return(&nr_devices) - 1;
++	/* scma..scmz + scmaa..scmzz */
++	if (devindex > 701) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	bdev->scmdev = scmdev;
++	spin_lock_init(&bdev->rq_lock);
++	spin_lock_init(&bdev->lock);
++	INIT_LIST_HEAD(&bdev->finished_requests);
++	atomic_set(&bdev->queued_reqs, 0);
++	tasklet_init(&bdev->tasklet,
++		     (void (*)(unsigned long)) scm_blk_tasklet,
++		     (unsigned long) bdev);
++
++	rq = blk_init_queue(scm_blk_request, &bdev->rq_lock);
++	if (!rq)
++		goto out;
++
++	bdev->rq = rq;
++	nr_max_blk = min(scmdev->nr_max_block,
++			 (unsigned int) (PAGE_SIZE / sizeof(struct aidaw)));
++
++	blk_queue_logical_block_size(rq, 1 << 12);
++	blk_queue_max_hw_sectors(rq, nr_max_blk << 3); /* 8 * 512 = blk_size */
++	blk_queue_max_segments(rq, nr_max_blk);
++	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, rq);
++
++	bdev->gendisk = alloc_disk(SCM_NR_PARTS);
++	if (!bdev->gendisk)
++		goto out_queue;
++
++	rq->queuedata = scmdev;
++	bdev->gendisk->driverfs_dev = &scmdev->dev;
++	bdev->gendisk->private_data = scmdev;
++	bdev->gendisk->fops = &scm_blk_devops;
++	bdev->gendisk->queue = rq;
++	bdev->gendisk->major = scm_major;
++	bdev->gendisk->first_minor = devindex * SCM_NR_PARTS;
++
++	len = snprintf(bdev->gendisk->disk_name, DISK_NAME_LEN, "scm");
++	if (devindex > 25) {
++		len += snprintf(bdev->gendisk->disk_name + len,
++				DISK_NAME_LEN - len, "%c",
++				'a' + (devindex / 26) - 1);
++		devindex = devindex % 26;
++	}
++	snprintf(bdev->gendisk->disk_name + len, DISK_NAME_LEN - len, "%c",
++		 'a' + devindex);
++
++	/* 512 byte sectors */
++	set_capacity(bdev->gendisk, scmdev->size >> 9);
++	add_disk(bdev->gendisk);
++	return 0;
++
++out_queue:
++	blk_cleanup_queue(rq);
++out:
++	atomic_dec(&nr_devices);
++	return ret;
++}
++
++void scm_blk_dev_cleanup(struct scm_blk_dev *bdev)
++{
++	tasklet_kill(&bdev->tasklet);
++	del_gendisk(bdev->gendisk);
++	blk_cleanup_queue(bdev->gendisk->queue);
++	put_disk(bdev->gendisk);
++}
++
++static int __init scm_blk_init(void)
++{
++	int ret;
++
++	ret = register_blkdev(0, "scm");
++	if (ret < 0)
++		goto out;
++
++	scm_major = ret;
++	if (scm_alloc_rqs(nr_requests))
++		goto out_unreg;
++
++	scm_debug = debug_register("scm_log", 16, 1, 16);
++	if (!scm_debug)
++		goto out_free;
++
++	debug_register_view(scm_debug, &debug_hex_ascii_view);
++	debug_set_level(scm_debug, 2);
++
++	ret = scm_drv_init();
++	if (ret)
++		goto out_dbf;
++
++	return ret;
++
++out_dbf:
++	debug_unregister(scm_debug);
++out_free:
++	scm_free_rqs();
++out_unreg:
++	unregister_blkdev(scm_major, "scm");
++out:
++	return ret;
++}
++module_init(scm_blk_init);
++
++static void __exit scm_blk_cleanup(void)
++{
++	scm_drv_cleanup();
++	debug_unregister(scm_debug);
++	scm_free_rqs();
++	unregister_blkdev(scm_major, "scm");
++}
++module_exit(scm_blk_cleanup);
+--- /dev/null
++++ b/drivers/s390/block/scm_blk.h
+@@ -0,0 +1,79 @@
++#ifndef SCM_BLK_H
++#define SCM_BLK_H
++
++#include <linux/interrupt.h>
++#include <linux/spinlock.h>
++#include <linux/blkdev.h>
++#include <linux/genhd.h>
++#include <linux/list.h>
++
++#include <asm/debug.h>
++#include <asm/eadm.h>
++
++#define SCM_NR_PARTS 8
++#define SCM_QUEUE_DELAY 5
++
++struct scm_blk_dev {
++	struct tasklet_struct tasklet;
++	struct request_queue *rq;
++	struct gendisk *gendisk;
++	struct scm_device *scmdev;
++	spinlock_t rq_lock;	/* guard the request queue */
++	spinlock_t lock;	/* guard the rest of the blockdev */
++	atomic_t queued_reqs;
++	struct list_head finished_requests;
++};
++
++struct scm_request {
++	struct scm_blk_dev *bdev;
++	struct request *request;
++	struct aidaw *aidaw;
++	struct aob *aob;
++	struct list_head list;
++	u8 retries;
++	int error;
++};
++
++#define to_aobrq(rq) container_of((void *) rq, struct aob_rq_header, data)
++
++int scm_blk_dev_setup(struct scm_blk_dev *, struct scm_device *);
++void scm_blk_dev_cleanup(struct scm_blk_dev *);
++void scm_blk_irq(struct scm_device *, void *, int);
++
++int scm_drv_init(void);
++void scm_drv_cleanup(void);
++
++
++extern debug_info_t *scm_debug;
++
++#define SCM_LOG(imp, txt) do {					\
++		debug_text_event(scm_debug, imp, txt);		\
++	} while (0)
++
++static inline void SCM_LOG_HEX(int level, void *data, int length)
++{
++	if (level > scm_debug->level)
++		return;
++	while (length > 0) {
++		debug_event(scm_debug, level, data, length);
++		length -= scm_debug->buf_size;
++		data += scm_debug->buf_size;
++	}
++}
++
++static inline void SCM_LOG_STATE(int level, struct scm_device *scmdev)
++{
++	struct {
++		u64 address;
++		u8 oper_state;
++		u8 rank;
++	} __packed data = {
++		.address = scmdev->address,
++		.oper_state = scmdev->attrs.oper_state,
++		.rank = scmdev->attrs.rank,
++	};
++
++	SCM_LOG_HEX(level, &data, sizeof(data));
++}
++
++#endif /* SCM_BLK_H */
+--- /dev/null
++++ b/drivers/s390/block/scm_drv.c
+@@ -0,0 +1,90 @@
++/*
++ * Device driver for s390 storage class memory.
++ *
++ * Copyright IBM Corp. 2012
++ * Author(s): Sebastian Ott <sebott@linux.vnet.ibm.com>
++ */
++
++#define KMSG_COMPONENT "scm_block"
++#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
++
++#include <linux/module.h>
++#include <linux/spinlock.h>
++#include <linux/slab.h>
++#include <asm/eadm.h>
++#include "scm_blk.h"
++
++static void notify(struct scm_device *scmdev)
++{
++	pr_info("%lu: The capabilities of the SCM increment changed\n",
++		(unsigned long) scmdev->address);
++	SCM_LOG(2, "State changed");
++	SCM_LOG_STATE(2, scmdev);
++}
++
++static int scm_probe(struct scm_device *scmdev)
++{
++	struct scm_blk_dev *bdev;
++	int ret;
++
++	SCM_LOG(2, "probe");
++	SCM_LOG_STATE(2, scmdev);
++
++	if (scmdev->attrs.oper_state != OP_STATE_GOOD)
++		return -EINVAL;
++
++	bdev = kzalloc(sizeof(*bdev), GFP_KERNEL);
++	if (!bdev)
++		return -ENOMEM;
++
++	spin_lock_irq(&scmdev->lock);
++	dev_set_drvdata(&scmdev->dev, bdev);
++	spin_unlock_irq(&scmdev->lock);
++
++	ret = scm_blk_dev_setup(bdev, scmdev);
++	if (ret) {
++		spin_lock_irq(&scmdev->lock);
++		dev_set_drvdata(&scmdev->dev, NULL);
++		spin_unlock_irq(&scmdev->lock);
++		kfree(bdev);
++		goto out;
++	}
++
++out:
++	return ret;
++}
++
++static int scm_remove(struct scm_device *scmdev)
++{
++	struct scm_blk_dev *bdev;
++
++	spin_lock_irq(&scmdev->lock);
++	bdev = dev_get_drvdata(&scmdev->dev);
++	dev_set_drvdata(&scmdev->dev, NULL);
++	spin_unlock_irq(&scmdev->lock);
++	scm_blk_dev_cleanup(bdev);
++	kfree(bdev);
++
++	return 0;
++}
++
++static struct scm_driver scm_drv = {
++	.drv = {
++		.name = "scm_block",
++		.owner = THIS_MODULE,
++	},
++	.notify = notify,
++	.probe = scm_probe,
++	.remove = scm_remove,
++	.handler = scm_blk_irq,
++};
++
++int __init scm_drv_init(void)
++{
++	return scm_driver_register(&scm_drv);
++}
++
++void scm_drv_cleanup(void)
++{
++	scm_driver_unregister(&scm_drv);
++}
