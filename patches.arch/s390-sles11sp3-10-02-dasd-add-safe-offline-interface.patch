@@ -1,0 +1,245 @@
+From: Stefan Haberland <stefan.haberland@de.ibm.com>
+Subject: dasd: add safe offline interface
+Patch-mainline: v3.8-rc1
+Git-Commit: d07dc5d8ab6f15353c866e2768c389abdc1faba6
+References: bnc#792956,FATE#314555
+
+Summary:     dasd: add safe offline interface
+Description: The regular behavior of the DASD device driver when setting a
+             device offline is to return all outstanding I/O as failed. This
+             behavior is different from that of other System z operating
+             systems and may lead to unexpected data loss. Adding an explicit
+             'safe' offline function will allow customers to use DASDs in the 
+             way they expect them to work.
+
+Signed-off-by: Stefan Haberland <stefan.haberland@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/block/dasd.c        |   97 ++++++++++++++++++++++++++++++++-------
+ drivers/s390/block/dasd_devmap.c |   34 +++++++++++++
+ drivers/s390/block/dasd_int.h    |    2 
+ 3 files changed, 116 insertions(+), 17 deletions(-)
+
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -351,6 +351,16 @@ static int dasd_state_basic_to_ready(str
+ 	return rc;
+ }
+ 
++static inline
++int _wait_for_empty_queues(struct dasd_device *device)
++{
++	if (device->block)
++		return list_empty(&device->ccw_queue) &&
++			list_empty(&device->block->ccw_queue);
++	else
++		return list_empty(&device->ccw_queue);
++}
++
+ /*
+  * Remove device from block device layer. Destroy dirty buffers.
+  * Forget format information. Check if the target level is basic
+@@ -1843,6 +1853,13 @@ static void __dasd_device_check_expire(s
+ 	cqr = list_entry(device->ccw_queue.next, struct dasd_ccw_req, devlist);
+ 	if ((cqr->status == DASD_CQR_IN_IO && cqr->expires != 0) &&
+ 	    (time_after_eq(jiffies, cqr->expires + cqr->starttime))) {
++		if (test_bit(DASD_FLAG_SAFE_OFFLINE_RUNNING, &device->flags)) {
++			/*
++			 * IO in safe offline processing should not
++			 * run out of retries
++			 */
++			cqr->retries++;
++		}
+ 		if (device->discipline->term_IO(cqr) != 0) {
+ 			/* Hmpf, try again in 5 sec */
+ 			dev_err(&device->cdev->dev,
+@@ -3120,11 +3137,11 @@ void dasd_generic_remove(struct ccw_devi
+ 
+ 	cdev->handler = NULL;
+ 
+-	dasd_remove_sysfs_files(cdev);
+ 	device = dasd_device_from_cdev(cdev);
+ 	if (IS_ERR(device))
+ 		return;
+-	if (test_and_set_bit(DASD_FLAG_OFFLINE, &device->flags)) {
++	if (test_and_set_bit(DASD_FLAG_OFFLINE, &device->flags) &&
++	    !test_bit(DASD_FLAG_SAFE_OFFLINE_RUNNING, &device->flags)) {
+ 		/* Already doing offline processing */
+ 		dasd_put_device(device);
+ 		return;
+@@ -3144,6 +3161,8 @@ void dasd_generic_remove(struct ccw_devi
+ 	 */
+ 	if (block)
+ 		dasd_free_block(block);
++
++	dasd_remove_sysfs_files(cdev);
+ }
+ 
+ /*
+@@ -3222,16 +3241,13 @@ int dasd_generic_set_offline(struct ccw_
+ {
+ 	struct dasd_device *device;
+ 	struct dasd_block *block;
+-	int max_count, open_count;
++	int max_count, open_count, rc;
+ 
++	rc = 0;
+ 	device = dasd_device_from_cdev(cdev);
+ 	if (IS_ERR(device))
+ 		return PTR_ERR(device);
+-	if (test_and_set_bit(DASD_FLAG_OFFLINE, &device->flags)) {
+-		/* Already doing offline processing */
+-		dasd_put_device(device);
+-		return 0;
+-	}
++
+ 	/*
+ 	 * We must make sure that this device is currently not in use.
+ 	 * The open_count is increased for every opener, that includes
+@@ -3255,6 +3271,54 @@ int dasd_generic_set_offline(struct ccw_
+ 			return -EBUSY;
+ 		}
+ 	}
++
++	if (test_bit(DASD_FLAG_SAFE_OFFLINE_RUNNING, &device->flags)) {
++		/*
++		 * safe offline allready running
++		 * could only be called by normal offline so safe_offline flag
++		 * needs to be removed to run normal offline and kill all I/O
++		 */
++		if (test_and_set_bit(DASD_FLAG_OFFLINE, &device->flags)) {
++			/* Already doing normal offline processing */
++			dasd_put_device(device);
++			return -EBUSY;
++		} else
++			clear_bit(DASD_FLAG_SAFE_OFFLINE, &device->flags);
++
++	} else
++		if (test_bit(DASD_FLAG_OFFLINE, &device->flags)) {
++			/* Already doing offline processing */
++			dasd_put_device(device);
++			return -EBUSY;
++		}
++
++	/*
++	 * if safe_offline called set safe_offline_running flag and
++	 * clear safe_offline so that a call to normal offline
++	 * can overrun safe_offline processing
++	 */
++	if (test_and_clear_bit(DASD_FLAG_SAFE_OFFLINE, &device->flags) &&
++	    !test_and_set_bit(DASD_FLAG_SAFE_OFFLINE_RUNNING, &device->flags)) {
++		/*
++		 * If we want to set the device safe offline all IO operations
++		 * should be finished before continuing the offline process
++		 * so sync bdev first and then wait for our queues to become
++		 * empty
++		 */
++		/* sync blockdev and partitions */
++		rc = fsync_bdev(device->block->bdev);
++		if (rc != 0)
++			goto interrupted;
++
++		/* schedule device tasklet and wait for completion */
++		dasd_schedule_device_bh(device);
++		rc = wait_event_interruptible(shutdown_waitq,
++					      _wait_for_empty_queues(device));
++		if (rc != 0)
++			goto interrupted;
++	}
++
++	set_bit(DASD_FLAG_OFFLINE, &device->flags);
+ 	dasd_set_target_state(device, DASD_STATE_NEW);
+ 	/* dasd_delete_device destroys the device reference. */
+ 	block = device->block;
+@@ -3266,6 +3330,14 @@ int dasd_generic_set_offline(struct ccw_
+ 	if (block)
+ 		dasd_free_block(block);
+ 	return 0;
++
++interrupted:
++	/* interrupted by signal */
++	clear_bit(DASD_FLAG_SAFE_OFFLINE, &device->flags);
++	clear_bit(DASD_FLAG_SAFE_OFFLINE_RUNNING, &device->flags);
++	clear_bit(DASD_FLAG_OFFLINE, &device->flags);
++	dasd_put_device(device);
++	return rc;
+ }
+ 
+ int dasd_generic_last_path_gone(struct dasd_device *device)
+@@ -3585,15 +3657,6 @@ char *dasd_get_sense(struct irb *irb)
+ }
+ EXPORT_SYMBOL_GPL(dasd_get_sense);
+ 
+-static inline int _wait_for_empty_queues(struct dasd_device *device)
+-{
+-	if (device->block)
+-		return list_empty(&device->ccw_queue) &&
+-			list_empty(&device->block->ccw_queue);
+-	else
+-		return list_empty(&device->ccw_queue);
+-}
+-
+ void dasd_generic_shutdown(struct ccw_device *cdev)
+ {
+ 	struct dasd_device *device;
+--- a/drivers/s390/block/dasd_devmap.c
++++ b/drivers/s390/block/dasd_devmap.c
+@@ -953,6 +953,39 @@ static DEVICE_ATTR(raw_track_access, 064
+ 		   dasd_use_raw_store);
+ 
+ static ssize_t
++dasd_safe_offline_store(struct device *dev, struct device_attribute *attr,
++			const char *buf, size_t count)
++{
++	struct ccw_device *cdev = to_ccwdev(dev);
++	struct dasd_device *device;
++	int rc;
++
++	device = dasd_device_from_cdev(cdev);
++	if (IS_ERR(device)) {
++		rc = PTR_ERR(device);
++		goto out;
++	}
++
++	if (test_bit(DASD_FLAG_OFFLINE, &device->flags) ||
++	    test_bit(DASD_FLAG_SAFE_OFFLINE_RUNNING, &device->flags)) {
++		/* Already doing offline processing */
++		dasd_put_device(device);
++		rc = -EBUSY;
++		goto out;
++	}
++
++	set_bit(DASD_FLAG_SAFE_OFFLINE, &device->flags);
++	dasd_put_device(device);
++
++	rc = ccw_device_set_offline(cdev);
++
++out:
++	return rc ? rc : count;
++}
++
++static DEVICE_ATTR(safe_offline, 0200, NULL, dasd_safe_offline_store);
++
++static ssize_t
+ dasd_discipline_show(struct device *dev, struct device_attribute *attr,
+ 		     char *buf)
+ {
+@@ -1457,6 +1490,7 @@ static struct attribute * dasd_attrs[] =
+ 	&dev_attr_timeout.attr,
+ 	&dev_attr_reservation_policy.attr,
+ 	&dev_attr_last_known_reservation_state.attr,
++	&dev_attr_safe_offline.attr,
+ 	NULL,
+ };
+ 
+--- a/drivers/s390/block/dasd_int.h
++++ b/drivers/s390/block/dasd_int.h
+@@ -524,6 +524,8 @@ struct dasd_block {
+ #define DASD_FLAG_IS_RESERVED	7	/* The device is reserved */
+ #define DASD_FLAG_LOCK_STOLEN	8	/* The device lock was stolen */
+ #define DASD_FLAG_SUSPENDED	9	/* The device was suspended */
++#define DASD_FLAG_SAFE_OFFLINE	10	/* safe offline processing requested*/
++#define DASD_FLAG_SAFE_OFFLINE_RUNNING	11	/* safe offline running */
+ #define DASD_FLAG_TIMEOUT	12	/* Timeout, abort noretry requests */
+ 
+ 
