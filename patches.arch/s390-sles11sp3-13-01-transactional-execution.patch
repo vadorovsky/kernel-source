@@ -1,0 +1,712 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: kernel: add support for transactional execution
+Patch-mainline: v3.7-rc1
+Git-Commit: d35339a42dd1f53b0bb86cf75418a9b7cf5f0f30
+References: bnc#794527,FATE#314142
+
+Summary:     kernel: add support for transactional execution
+Description: Allow user-space processes to use transactional execution (TX).
+             If the TX facility is available user space programs can use
+             transactions for fine-grained serialization based on the data
+             objects that are referenced during a transaction. This is
+             useful for lockless data structures and speculative compiler
+             optimizations.
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ arch/s390/include/asm/elf.h       |    1 
+ arch/s390/include/asm/lowcore.h   |    6 +
+ arch/s390/include/asm/processor.h |    6 +
+ arch/s390/include/asm/ptrace.h    |   16 ++-
+ arch/s390/include/asm/setup.h     |    3 
+ arch/s390/kernel/asm-offsets.c    |    2 
+ arch/s390/kernel/dis.c            |   12 ++
+ arch/s390/kernel/early.c          |    3 
+ arch/s390/kernel/entry64.S        |   10 ++
+ arch/s390/kernel/processor.c      |    6 -
+ arch/s390/kernel/ptrace.c         |   66 ++++++++++++++++
+ arch/s390/kernel/setup.c          |    8 +
+ arch/s390/kernel/traps.c          |  153 ++++++++++++++++----------------------
+ include/linux/elf.h               |    1 
+ 14 files changed, 197 insertions(+), 96 deletions(-)
+
+--- a/arch/s390/include/asm/elf.h
++++ b/arch/s390/include/asm/elf.h
+@@ -103,6 +103,7 @@
+ #define HWCAP_S390_HPAGE	128
+ #define HWCAP_S390_ETF3EH	256
+ #define HWCAP_S390_HIGH_GPRS	512
++#define HWCAP_S390_TE		1024
+ 
+ /*
+  * These are used to set parameters in the core dumps.
+--- a/arch/s390/include/asm/lowcore.h
++++ b/arch/s390/include/asm/lowcore.h
+@@ -322,9 +322,13 @@ struct _lowcore {
+ 	__u8	pad_0x1338[0x1340-0x1338];	/* 0x1338 */
+ 	__u32	access_regs_save_area[16];	/* 0x1340 */
+ 	__u64	cregs_save_area[16];		/* 0x1380 */
++	__u8	pad_0x1400[0x1800-0x1400];	/* 0x1400 */
++
++	/* Transaction abort diagnostic block */
++	__u8	pgm_tdb[256];			/* 0x1800 */
+ 
+ 	/* align to the top of the prefix area */
+-	__u8	pad_0x1400[0x2000-0x1400];	/* 0x1400 */
++	__u8	pad_0x1900[0x2000-0x1900];	/* 0x1900 */
+ } __packed;
+ 
+ #endif /* CONFIG_32BIT */
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -82,11 +82,17 @@ struct thread_struct {
+         unsigned int trap_no;
+ 	struct per_regs per_user;	/* User specified PER registers */
+ 	struct per_event per_event;	/* Cause of the last PER trap */
++	unsigned long per_flags;	/* Flags to control debug behavior */
+         /* pfault_wait is used to block the process on a pfault event */
+ 	unsigned long pfault_wait;
+ 	struct list_head list;
++#ifdef CONFIG_64BIT
++	unsigned char trap_tdb[256];	/* Transaction abort diagnose block */
++#endif
+ };
+ 
++#define PER_FLAG_NO_TE		1UL	/* Flag to disable transactions. */
++
+ typedef struct thread_struct thread_struct;
+ 
+ /*
+--- a/arch/s390/include/asm/ptrace.h
++++ b/arch/s390/include/asm/ptrace.h
+@@ -365,17 +365,19 @@ struct per_struct_kernel {
+ 	unsigned char access_id;	/* PER trap access identification */
+ };
+ 
+-#define PER_EVENT_MASK			0xE9000000UL
++#define PER_EVENT_MASK			0xEB000000UL
+ 
+ #define PER_EVENT_BRANCH		0x80000000UL
+ #define PER_EVENT_IFETCH		0x40000000UL
+ #define PER_EVENT_STORE			0x20000000UL
+ #define PER_EVENT_STORE_REAL		0x08000000UL
++#define PER_EVENT_TRANSACTION_END	0x02000000UL
+ #define PER_EVENT_NULLIFICATION		0x01000000UL
+ 
+-#define PER_CONTROL_MASK		0x00a00000UL
++#define PER_CONTROL_MASK		0x00e00000UL
+ 
+ #define PER_CONTROL_BRANCH_ADDRESS	0x00800000UL
++#define PER_CONTROL_SUSPENSION		0x00400000UL
+ #define PER_CONTROL_ALTERATION		0x00200000UL
+ 
+ #endif
+@@ -391,7 +393,7 @@ typedef struct
+ 	unsigned long cr[NUM_CR_WORDS];
+ } per_cr_words;
+ 
+-#define PER_EM_MASK 0xE8000000UL
++#define PER_EM_MASK 0xEB000000UL
+ 
+ typedef	struct
+ {
+@@ -407,9 +409,11 @@ typedef	struct
+ 	unsigned em_storage_alteration : 1;
+ 	unsigned em_gpr_alt_unused     : 1;
+ 	unsigned em_store_real_address : 1;
+-	unsigned                       : 3;
+-	unsigned branch_addr_ctl       : 1;
+ 	unsigned                       : 1;
++	unsigned em_transaction_end    : 1;
++	unsigned em_nullification      : 1;
++	unsigned branch_addr_ctl       : 1;
++	unsigned suspension_ctl        : 1;
+ 	unsigned storage_alt_space_ctl : 1;
+ 	unsigned                       : 21;
+ 	unsigned long starting_addr;
+@@ -487,6 +491,8 @@ typedef struct
+ #define PTRACE_POKETEXT_AREA	      0x5004
+ #define PTRACE_POKEDATA_AREA 	      0x5005
+ #define PTRACE_GET_LAST_BREAK	      0x5006
++#define PTRACE_ENABLE_TE	      0x5009
++#define PTRACE_DISABLE_TE	      0x5010
+ 
+ /*
+  * PT_PROT definition is loosely based on hppa bsd definition in
+--- a/arch/s390/include/asm/setup.h
++++ b/arch/s390/include/asm/setup.h
+@@ -82,6 +82,7 @@ extern unsigned int user_mode;
+ #define MACHINE_FLAG_LPAR	(1UL << 12)
+ #define MACHINE_FLAG_SPP	(1UL << 13)
+ #define MACHINE_FLAG_TOPOLOGY	(1UL << 14)
++#define MACHINE_FLAG_TE		(1UL << 15)
+ 
+ #define MACHINE_IS_VM		(S390_lowcore.machine_flags & MACHINE_FLAG_VM)
+ #define MACHINE_IS_KVM		(S390_lowcore.machine_flags & MACHINE_FLAG_KVM)
+@@ -100,6 +101,7 @@ extern unsigned int user_mode;
+ #define MACHINE_HAS_PFMF	(0)
+ #define MACHINE_HAS_SPP		(0)
+ #define MACHINE_HAS_TOPOLOGY	(0)
++#define MACHINE_HAS_TE		(0)
+ #else /* __s390x__ */
+ #define MACHINE_HAS_IEEE	(1)
+ #define MACHINE_HAS_CSP		(1)
+@@ -111,6 +113,7 @@ extern unsigned int user_mode;
+ #define MACHINE_HAS_PFMF	(S390_lowcore.machine_flags & MACHINE_FLAG_PFMF)
+ #define MACHINE_HAS_SPP		(S390_lowcore.machine_flags & MACHINE_FLAG_SPP)
+ #define MACHINE_HAS_TOPOLOGY	(S390_lowcore.machine_flags & MACHINE_FLAG_TOPOLOGY)
++#define MACHINE_HAS_TE		(S390_lowcore.machine_flags & MACHINE_FLAG_TE)
+ #endif /* __s390x__ */
+ 
+ #define ZFCPDUMP_HSA_SIZE	(32UL<<20)
+--- a/arch/s390/kernel/asm-offsets.c
++++ b/arch/s390/kernel/asm-offsets.c
+@@ -153,6 +153,8 @@ int main(void)
+ 	DEFINE(__LC_VDSO_PER_CPU, offsetof(struct _lowcore, vdso_per_cpu_data));
+ 	DEFINE(__LC_SIE_HOOK, offsetof(struct _lowcore, sie_hook));
+ 	DEFINE(__LC_CMF_HPP, offsetof(struct _lowcore, cmf_hpp));
++	DEFINE(__LC_PGM_TDB, offsetof(struct _lowcore, pgm_tdb));
++	DEFINE(__THREAD_trap_tdb, offsetof(struct task_struct, thread.trap_tdb));
+ #endif /* CONFIG_32BIT */
+ 	return 0;
+ }
+--- a/arch/s390/kernel/dis.c
++++ b/arch/s390/kernel/dis.c
+@@ -318,6 +318,9 @@ enum {
+ 	LONG_INSN_POPCNT,
+ 	LONG_INSN_RISBHG,
+ 	LONG_INSN_RISBLG,
++	LONG_INSN_TABORT,
++	LONG_INSN_TBEGIN,
++	LONG_INSN_TBEGINC,
+ };
+ 
+ static char *long_insn_name[] = {
+@@ -333,6 +336,9 @@ static char *long_insn_name[] = {
+ 	[LONG_INSN_POPCNT] = "popcnt",
+ 	[LONG_INSN_RISBHG] = "risbhg",
+ 	[LONG_INSN_RISBLG] = "risblk",
++	[LONG_INSN_TABORT] = "tabort",
++	[LONG_INSN_TBEGIN] = "tbegin",
++	[LONG_INSN_TBEGINC] = "tbeginc",
+ };
+ 
+ static struct insn opcode[] = {
+@@ -597,6 +603,9 @@ static struct insn opcode_b2[] = {
+ 	{ "lpswe", 0xb2, INSTR_S_RD },
+ 	{ "srnmt", 0xb9, INSTR_S_RD },
+ 	{ "lfas", 0xbd, INSTR_S_RD },
++	{ "etndg", 0xec, INSTR_RRE_R0 },
++	{ { 0, LONG_INSN_TABORT }, 0xfc, INSTR_S_RD },
++	{ "tend", 0xf8, INSTR_S_RD },
+ #endif
+ 	{ "stidp", 0x02, INSTR_S_RD },
+ 	{ "sck", 0x04, INSTR_S_RD },
+@@ -1152,6 +1161,7 @@ static struct insn opcode_e3[] = {
+ 	{ "stfh", 0xcb, INSTR_RXY_RRRD },
+ 	{ "chf", 0xcd, INSTR_RXY_RRRD },
+ 	{ "clhf", 0xcf, INSTR_RXY_RRRD },
++	{ "ntstg", 0x25, INSTR_RXY_RRRD },
+ #endif
+ 	{ "lrv", 0x1e, INSTR_RXY_RRRD },
+ 	{ "lrvh", 0x1f, INSTR_RXY_RRRD },
+@@ -1175,6 +1185,8 @@ static struct insn opcode_e5[] = {
+ 	{ "mvhhi", 0x44, INSTR_SIL_RDI },
+ 	{ "mvhi", 0x4c, INSTR_SIL_RDI },
+ 	{ "mvghi", 0x48, INSTR_SIL_RDI },
++	{ { 0, LONG_INSN_TBEGIN }, 0x60, INSTR_SIL_RDU },
++	{ { 0, LONG_INSN_TBEGINC }, 0x61, INSTR_SIL_RDU },
+ #endif
+ 	{ "lasp", 0x00, INSTR_SSE_RDRD },
+ 	{ "tprot", 0x01, INSTR_SSE_RDRD },
+--- a/arch/s390/kernel/early.c
++++ b/arch/s390/kernel/early.c
+@@ -374,6 +374,8 @@ static __init void detect_machine_facili
+ 		S390_lowcore.machine_flags |= MACHINE_FLAG_MVCOS;
+ 	if (test_facility(40))
+ 		S390_lowcore.machine_flags |= MACHINE_FLAG_SPP;
++	if (test_facility(50) && test_facility(73))
++		S390_lowcore.machine_flags |= MACHINE_FLAG_TE;
+ #endif
+ }
+ 
+@@ -439,7 +441,6 @@ static void __init setup_boot_command_li
+ 	append_to_cmdline(append_ipl_scpdata);
+ }
+ 
+-
+ /*
+  * Save ipl parameters, clear bss memory, initialize storage keys
+  * and create a kernel NSS at startup if the SAVESYS= parm is defined
+--- a/arch/s390/kernel/entry64.S
++++ b/arch/s390/kernel/entry64.S
+@@ -471,6 +471,11 @@ pgm_check_handler:
+ 	UPDATE_VTIME __LC_LAST_UPDATE_TIMER,__LC_EXIT_TIMER,__LC_SYSTEM_TIMER
+ 	mvc	__LC_LAST_UPDATE_TIMER(8),__LC_SYNC_ENTER_TIMER
+ 	LAST_BREAK
++	lg	%r14,__TI_task(%r12)
++	lghi	%r13,__LC_PGM_TDB
++	tm	__LC_PGM_ILC+2,0x02	# check for transaction abort
++	jz	pgm_no_vtime
++	mvc	__THREAD_trap_tdb(256,%r14),0(%r13)
+ pgm_no_vtime:
+ 	HANDLE_SIE_INTERCEPT
+ 	stg	%r11,SP_ARGS(%r15)
+@@ -513,6 +518,11 @@ pgm_per_std:
+ 	UPDATE_VTIME __LC_LAST_UPDATE_TIMER,__LC_EXIT_TIMER,__LC_SYSTEM_TIMER
+ 	mvc	__LC_LAST_UPDATE_TIMER(8),__LC_SYNC_ENTER_TIMER
+ 	LAST_BREAK
++	lg	%r14,__TI_task(%r12)
++	lghi	%r13,__LC_PGM_TDB
++	tm	__LC_PGM_ILC+2,0x02	# check for transaction abort
++	jz	pgm_no_vtime2
++	mvc	__THREAD_trap_tdb(256,%r14),0(%r13)
+ pgm_no_vtime2:
+ 	HANDLE_SIE_INTERCEPT
+ 	lg	%r1,__TI_task(%r12)
+--- a/arch/s390/kernel/processor.c
++++ b/arch/s390/kernel/processor.c
+@@ -41,9 +41,9 @@ void __cpuinit cpu_init(void)
+  */
+ static int show_cpuinfo(struct seq_file *m, void *v)
+ {
+-	static const char *hwcap_str[10] = {
++	static const char *hwcap_str[11] = {
+ 		"esan3", "zarch", "stfle", "msa", "ldisp", "eimm", "dfp",
+-		"edat", "etf3eh", "highgprs"
++		"edat", "etf3eh", "highgprs", "te"
+ 	};
+ 	unsigned long n = (unsigned long) v - 1;
+ 	int i;
+@@ -56,7 +56,7 @@ static int show_cpuinfo(struct seq_file
+ 			   num_online_cpus(), loops_per_jiffy/(500000/HZ),
+ 			   (loops_per_jiffy/(5000/HZ))%100);
+ 		seq_puts(m, "features\t: ");
+-		for (i = 0; i < 10; i++)
++		for (i = 0; i < 11; i++)
+ 			if (hwcap_str[i] && (elf_hwcap & (1UL << i)))
+ 				seq_printf(m, "%s ", hwcap_str[i]);
+ 		seq_puts(m, "\n");
+--- a/arch/s390/kernel/ptrace.c
++++ b/arch/s390/kernel/ptrace.c
+@@ -42,6 +42,7 @@ enum s390_regset {
+ 	REGSET_GENERAL,
+ 	REGSET_FP,
+ 	REGSET_LAST_BREAK,
++	REGSET_TDB,
+ 	REGSET_GENERAL_EXTENDED,
+ };
+ 
+@@ -51,6 +52,21 @@ void update_per_regs(struct task_struct
+ 	struct thread_struct *thread = &task->thread;
+ 	struct per_regs old, new;
+ 
++	/* Take care of the enable/disable of transactional execution. */
++	if (MACHINE_HAS_TE) {
++		unsigned long cr0, cr0_new;
++
++		__ctl_store(cr0, 0, 0);
++		/* set or clear transaction execution bits 8 and 9. */
++		if (task->thread.per_flags & PER_FLAG_NO_TE)
++			cr0_new = cr0 & ~(3UL << 54);
++		else
++			cr0_new = cr0 | (3UL << 54);
++		/* Only load control register 0 if necessary. */
++		if (cr0 != cr0_new)
++			__ctl_load(cr0_new, 0, 0);
++	}
++
+ 	/* Copy user specified PER registers */
+ 	new.control = thread->per_user.control;
+ 	new.start = thread->per_user.start;
+@@ -59,6 +75,10 @@ void update_per_regs(struct task_struct
+ 	/* merge TIF_SINGLE_STEP into user specified PER registers. */
+ 	if (test_tsk_thread_flag(task, TIF_SINGLE_STEP)) {
+ 		new.control |= PER_EVENT_IFETCH;
++#ifdef CONFIG_64BIT
++		new.control |= PER_CONTROL_SUSPENSION;
++		new.control |= PER_EVENT_TRANSACTION_END;
++#endif
+ 		new.start = 0;
+ 		new.end = PSW_ADDR_INSN;
+ 	}
+@@ -99,6 +119,7 @@ void ptrace_disable(struct task_struct *
+ 	memset(&task->thread.per_event, 0, sizeof(task->thread.per_event));
+ 	clear_tsk_thread_flag(task, TIF_SINGLE_STEP);
+ 	clear_tsk_thread_flag(task, TIF_PER_TRAP);
++	task->thread.per_flags = 0;
+ }
+ 
+ #ifndef CONFIG_64BIT
+@@ -423,6 +444,16 @@ long arch_ptrace(struct task_struct *chi
+ 		put_user(task_thread_info(child)->last_break,
+ 			 (unsigned long __user *) data);
+ 		return 0;
++	case PTRACE_ENABLE_TE:
++		if (!MACHINE_HAS_TE)
++			return -ENOSYS;
++		child->thread.per_flags &= ~PER_FLAG_NO_TE;
++		return 0;
++	case PTRACE_DISABLE_TE:
++		if (!MACHINE_HAS_TE)
++			return -ENOSYS;
++		child->thread.per_flags |= PER_FLAG_NO_TE;
++		return 0;
+ 	default:
+ 		/* Removing high order bit from addr (only for 31 bit). */
+ 		addr &= PSW_ADDR_INSN;
+@@ -905,6 +936,25 @@ static int s390_last_break_set(struct ta
+ 	return 0;
+ }
+ 
++static int s390_tdb_get(struct task_struct *target,
++			const struct user_regset *regset,
++			unsigned int pos, unsigned int count,
++			void *kbuf, void __user *ubuf)
++{
++	unsigned char *data;
++
++	data = target->thread.trap_tdb;
++	return user_regset_copyout(&pos, &count, &kbuf, &ubuf, data, 0, 256);
++}
++
++static int s390_tdb_set(struct task_struct *target,
++			const struct user_regset *regset,
++			unsigned int pos, unsigned int count,
++			const void *kbuf, const void __user *ubuf)
++{
++	return 0;
++}
++
+ #endif
+ 
+ static const struct user_regset s390_regsets[] = {
+@@ -933,6 +983,14 @@ static const struct user_regset s390_reg
+ 		.get = s390_last_break_get,
+ 		.set = s390_last_break_set,
+ 	},
++	[REGSET_TDB] = {
++		.core_note_type = NT_S390_TDB,
++		.n = 1,
++		.size = 256,
++		.align = 1,
++		.get = s390_tdb_get,
++		.set = s390_tdb_set,
++	},
+ #endif
+ };
+ 
+@@ -1122,6 +1180,14 @@ static const struct user_regset s390_com
+ 		.get = s390_compat_last_break_get,
+ 		.set = s390_compat_last_break_set,
+ 	},
++	[REGSET_TDB] = {
++		.core_note_type = NT_S390_TDB,
++		.n = 1,
++		.size = 256,
++		.align = 1,
++		.get = s390_tdb_get,
++		.set = s390_tdb_set,
++	},
+ 	[REGSET_GENERAL_EXTENDED] = {
+ 		.core_note_type = NT_S390_HIGH_GPRS,
+ 		.n = sizeof(s390_compat_regs_high) / sizeof(compat_long_t),
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -945,6 +945,14 @@ static void __init setup_hwcaps(void)
+ 	 */
+ 	elf_hwcap |= HWCAP_S390_HIGH_GPRS;
+ 
++#if defined(CONFIG_64BIT)
++	/*
++	 * Transactional execution support HWCAP_S390_TE is bit 10.
++	 */
++	if (MACHINE_HAS_TE)
++		elf_hwcap |= HWCAP_S390_TE;
++#endif
++
+ 	get_cpu_id(&cpu_id);
+ 	switch (cpu_id.machine) {
+ 	case 0x9672:
+--- a/arch/s390/kernel/traps.c
++++ b/arch/s390/kernel/traps.c
+@@ -64,6 +64,23 @@ static int kstack_depth_to_print = 12;
+ static int kstack_depth_to_print = 20;
+ #endif /* CONFIG_64BIT */
+ 
++static inline void __user *get_trap_ip(struct pt_regs *regs, long int_code)
++{
++#ifdef CONFIG_64BIT
++	unsigned long address;
++
++	if (int_code & 0x200)
++		address = *(unsigned long *)(current->thread.trap_tdb + 24);
++	else
++		address = regs->psw.addr;
++	return (void __user *)
++		((address - (int_code >> 16)) & PSW_ADDR_INSN);
++#else
++	return (void __user *)
++		((regs->psw.addr - (int_code >> 16)) & PSW_ADDR_INSN);
++#endif
++}
++
+ /*
+  * For show_trace we have tree different stack to consider:
+  *   - the panic stack which is used if the kernel stack has overflown
+@@ -293,19 +310,25 @@ int is_valid_bugaddr(unsigned long addr)
+ 	return 1;
+ }
+ 
+-static inline void __kprobes do_trap(long pgm_int_code, int signr, char *str,
+-				     struct pt_regs *regs, siginfo_t *info)
++static void __kprobes inline do_trap(struct pt_regs *regs, long int_code,
++				     int si_signo, int si_code, char *str)
+ {
+-	if (notify_die(DIE_TRAP, str, regs, pgm_int_code,
+-		       pgm_int_code, signr) == NOTIFY_STOP)
++	siginfo_t info;
++
++	if (notify_die(DIE_TRAP, str, regs, 0,
++				int_code, si_signo) == NOTIFY_STOP)
+ 		return;
+ 
+         if (regs->psw.mask & PSW_MASK_PSTATE) {
+                 struct task_struct *tsk = current;
+ 
+-		tsk->thread.trap_no = pgm_int_code & 0xffff;
+-		force_sig_info(signr, info, tsk);
+-		report_user_fault(regs, pgm_int_code, signr);
++		tsk->thread.trap_no = int_code & 0xffff;
++		info.si_signo = si_signo;
++		info.si_errno = 0;
++		info.si_code = si_code;
++		info.si_addr = get_trap_ip(regs, int_code);
++		force_sig_info(si_signo, &info, tsk);
++		report_user_fault(regs, int_code, si_signo);
+         } else {
+                 const struct exception_table_entry *fixup;
+                 fixup = search_exception_tables(regs->psw.addr & PSW_ADDR_INSN);
+@@ -317,18 +340,11 @@ static inline void __kprobes do_trap(lon
+ 			btt = report_bug(regs->psw.addr & PSW_ADDR_INSN, regs);
+ 			if (btt == BUG_TRAP_TYPE_WARN)
+ 				return;
+-			die(str, regs, pgm_int_code);
++			die(str, regs, int_code);
+ 		}
+         }
+ }
+ 
+-static inline void __user *get_psw_address(struct pt_regs *regs,
+-					   long pgm_int_code)
+-{
+-	return (void __user *)
+-		((regs->psw.addr - (pgm_int_code >> 16)) & PSW_ADDR_INSN);
+-}
+-
+ void __kprobes do_per_trap(struct pt_regs *regs)
+ {
+ 	if (notify_die(DIE_SSTEP, "sstep", regs, 0, 0, SIGTRAP) == NOTIFY_STOP)
+@@ -351,12 +367,7 @@ static void default_trap_handler(struct
+ static void name(struct pt_regs *regs, long pgm_int_code, \
+ 		 unsigned long trans_exc_code) \
+ { \
+-        siginfo_t info; \
+-        info.si_signo = signr; \
+-        info.si_errno = 0; \
+-        info.si_code = sicode; \
+-	info.si_addr = get_psw_address(regs, pgm_int_code); \
+-	do_trap(pgm_int_code, signr, str, regs, &info);	    \
++        do_trap(regs, pgm_int_code, signr, sicode, str); \
+ }
+ 
+ DO_ERROR_INFO(addressing_exception, SIGILL, ILL_ILLADR,
+@@ -386,42 +397,40 @@ DO_ERROR_INFO(special_op_exception, SIGI
+ DO_ERROR_INFO(translation_exception, SIGILL, ILL_ILLOPN,
+ 	      "translation exception")
+ 
+-static inline void do_fp_trap(struct pt_regs *regs, void __user *location,
+-			      int fpc, long pgm_int_code)
+-{
+-	siginfo_t si;
++#ifdef CONFIG_64BIT
++DO_ERROR_INFO(transaction_exception, SIGILL, ILL_ILLOPN,
++	      "transaction constraint exception")
++#endif
+ 
+-	si.si_signo = SIGFPE;
+-	si.si_errno = 0;
+-	si.si_addr = location;
+-	si.si_code = 0;
++static inline void do_fp_trap(struct pt_regs *regs, int fpc, long pgm_int_code)
++{
++	int si_code = 0;
+ 	/* FPC[2] is Data Exception Code */
+ 	if ((fpc & 0x00000300) == 0) {
+ 		/* bits 6 and 7 of DXC are 0 iff IEEE exception */
+ 		if (fpc & 0x8000) /* invalid fp operation */
+-			si.si_code = FPE_FLTINV;
++			si_code = FPE_FLTINV;
+ 		else if (fpc & 0x4000) /* div by 0 */
+-			si.si_code = FPE_FLTDIV;
++			si_code = FPE_FLTDIV;
+ 		else if (fpc & 0x2000) /* overflow */
+-			si.si_code = FPE_FLTOVF;
++			si_code = FPE_FLTOVF;
+ 		else if (fpc & 0x1000) /* underflow */
+-			si.si_code = FPE_FLTUND;
++			si_code = FPE_FLTUND;
+ 		else if (fpc & 0x0800) /* inexact */
+-			si.si_code = FPE_FLTRES;
++			si_code = FPE_FLTRES;
+ 	}
+-	do_trap(pgm_int_code, SIGFPE,
+-		"floating point exception", regs, &si);
++	do_trap(regs, pgm_int_code, SIGFPE, si_code,
++		"floating point exception");
+ }
+ 
+ static void __kprobes illegal_op(struct pt_regs *regs, long pgm_int_code,
+ 				 unsigned long trans_exc_code)
+ {
+-	siginfo_t info;
+         __u8 opcode[6];
+ 	__u16 __user *location;
+ 	int signal = 0;
+ 
+-	location = get_psw_address(regs, pgm_int_code);
++	location = get_trap_ip(regs, pgm_int_code);
+ 
+ 	if (regs->psw.mask & PSW_MASK_PSTATE) {
+ 		if (get_user(*((__u16 *) opcode), (__u16 __user *) location))
+@@ -468,25 +477,15 @@ static void __kprobes illegal_op(struct
+ 
+ #ifdef CONFIG_MATHEMU
+         if (signal == SIGFPE)
+-		do_fp_trap(regs, location,
+-			   current->thread.fp_regs.fpc, pgm_int_code);
+-        else if (signal == SIGSEGV) {
+-		info.si_signo = signal;
+-		info.si_errno = 0;
+-		info.si_code = SEGV_MAPERR;
+-		info.si_addr = (void __user *) location;
+-		do_trap(pgm_int_code, signal,
+-			"user address fault", regs, &info);
+-	} else
++		do_fp_trap(regs, current->thread.fp_regs.fpc, pgm_int_code);
++        else if (signal == SIGSEGV)
++		do_trap(regs, pgm_int_code, signal, SEGV_MAPERR,
++			"user address fault");
++	else
+ #endif
+-        if (signal) {
+-		info.si_signo = signal;
+-		info.si_errno = 0;
+-		info.si_code = ILL_ILLOPC;
+-		info.si_addr = (void __user *) location;
+-		do_trap(pgm_int_code, signal,
+-			"illegal operation", regs, &info);
+-	}
++        if (signal)
++		do_trap(regs, pgm_int_code, signal, ILL_ILLOPC,
++			"illegal operation");
+ }
+ 
+ 
+@@ -499,7 +498,7 @@ asmlinkage void specification_exception(
+ 	__u16 __user *location = NULL;
+ 	int signal = 0;
+ 
+-	location = (__u16 __user *) get_psw_address(regs, pgm_int_code);
++	location = (__u16 __user *) get_trap_ip(regs, pgm_int_code);
+ 
+         if (regs->psw.mask & PSW_MASK_PSTATE) {
+ 		get_user(*((__u16 *) opcode), location);
+@@ -534,17 +533,10 @@ asmlinkage void specification_exception(
+ 		signal = SIGILL;
+ 
+         if (signal == SIGFPE)
+-		do_fp_trap(regs, location,
+-			   current->thread.fp_regs.fpc, pgm_int_code);
+-        else if (signal) {
+-		siginfo_t info;
+-		info.si_signo = signal;
+-		info.si_errno = 0;
+-		info.si_code = ILL_ILLOPN;
+-		info.si_addr = location;
+-		do_trap(pgm_int_code, signal,
+-			"specification exception", regs, &info);
+-	}
++		do_fp_trap(regs, current->thread.fp_regs.fpc, pgm_int_code);
++        else if (signal)
++		do_trap(regs, pgm_int_code, signal, ILL_ILLOPN,
++			"specification exception");
+ }
+ #else
+ DO_ERROR_INFO(specification_exception, SIGILL, ILL_ILLOPN,
+@@ -557,7 +549,7 @@ static void data_exception(struct pt_reg
+ 	__u16 __user *location;
+ 	int signal = 0;
+ 
+-	location = get_psw_address(regs, pgm_int_code);
++	location = get_trap_ip(regs, pgm_int_code);
+ 
+ 	if (MACHINE_HAS_IEEE)
+ 		asm volatile("stfpc %0" : "=m" (current->thread.fp_regs.fpc));
+@@ -622,32 +614,20 @@ static void data_exception(struct pt_reg
+ 	else
+ 		signal = SIGILL;
+         if (signal == SIGFPE)
+-		do_fp_trap(regs, location,
+-			   current->thread.fp_regs.fpc, pgm_int_code);
+-        else if (signal) {
+-		siginfo_t info;
+-		info.si_signo = signal;
+-		info.si_errno = 0;
+-		info.si_code = ILL_ILLOPN;
+-		info.si_addr = location;
+-		do_trap(pgm_int_code, signal, "data exception", regs, &info);
+-	}
++		do_fp_trap(regs, current->thread.fp_regs.fpc, pgm_int_code);
++        else if (signal)
++		do_trap(regs, pgm_int_code, signal, ILL_ILLOPN,
++			"data exception");
+ }
+ 
+ static void space_switch_exception(struct pt_regs *regs, long pgm_int_code,
+ 				   unsigned long trans_exc_code)
+ {
+-        siginfo_t info;
+-
+ 	/* Set user psw back to home space mode. */
+ 	if (regs->psw.mask & PSW_MASK_PSTATE)
+ 		regs->psw.mask |= PSW_ASC_HOME;
+ 	/* Send SIGILL. */
+-        info.si_signo = SIGILL;
+-        info.si_errno = 0;
+-        info.si_code = ILL_PRVOPC;
+-	info.si_addr = get_psw_address(regs, pgm_int_code);
+-	do_trap(pgm_int_code, SIGILL, "space switch event", regs, &info);
++	do_trap(regs, pgm_int_code, SIGILL, ILL_PRVOPC, "space switch event");
+ }
+ 
+ asmlinkage void __kprobes kernel_stack_overflow(struct pt_regs * regs)
+@@ -687,6 +667,7 @@ void __init trap_init(void)
+         pgm_check_table[0x12] = &translation_exception;
+         pgm_check_table[0x13] = &special_op_exception;
+ #ifdef CONFIG_64BIT
++	pgm_check_table[0x18] = &transaction_exception;
+ 	pgm_check_table[0x38] = &do_asce_exception;
+ 	pgm_check_table[0x39] = &do_dat_exception;
+ 	pgm_check_table[0x3A] = &do_dat_exception;
+--- a/include/linux/elf.h
++++ b/include/linux/elf.h
+@@ -395,6 +395,7 @@ typedef struct elf64_shdr {
+ #define NT_S390_CTRS	0x304		/* s390 control registers */
+ #define NT_S390_PREFIX	0x305		/* s390 prefix register */
+ #define NT_S390_LAST_BREAK	0x306	/* s390 breaking event address */
++#define NT_S390_TDB	0x308		/* s390 transaction diagnostic block */
+ #define NT_ARM_VFP	0x400		/* ARM VFP/NEON registers */
+ 
+ 
