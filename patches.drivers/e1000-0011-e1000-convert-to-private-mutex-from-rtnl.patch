@@ -1,0 +1,167 @@
+From: Jesse Brandeburg <jesse.brandeburg@intel.com>
+Date: Wed, 5 Oct 2011 07:24:51 +0000
+Subject: [PATCH 11/51] e1000: convert to private mutex from rtnl
+Patch-mainline: v3.2-rc1
+Git-commit: 0ef4eedc2e98edd51cd106e1f6a27178622b7e57
+References: bnc#795304 FATE#313649
+
+The e1000 driver when running with lockdep could run into
+some possible deadlocks between the work items acquiring
+rtnl and the rtnl lock being acquired before work items
+were cancelled.
+
+Use a private mutex to make sure lock ordering isn't violated.
+The private mutex is only used to protect areas not generally
+covered by the rtnl lock already.
+
+Signed-off-by: Jesse Brandeburg <jesse.brandeburg@intel.com>
+CC: Thomas Gleixner <tglx@linutronix.de>
+CC: Tushar Dave <tushar.n.dave@intel.com>
+Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Acked-by: John Ronciak <john.ronciak@intel.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/intel/e1000/e1000.h      |    2 +
+ drivers/net/ethernet/intel/e1000/e1000_main.c |   38 +++++++++++++++++++-------
+ 2 files changed, 31 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/intel/e1000/e1000.h
++++ b/drivers/net/ethernet/intel/e1000/e1000.h
+@@ -310,6 +310,8 @@ struct e1000_adapter {
+ 	struct delayed_work watchdog_task;
+ 	struct delayed_work fifo_stall_task;
+ 	struct delayed_work phy_info_task;
++
++	struct mutex mutex;
+ };
+ 
+ enum e1000_state_t {
+--- a/drivers/net/ethernet/intel/e1000/e1000_main.c
++++ b/drivers/net/ethernet/intel/e1000/e1000_main.c
+@@ -553,10 +553,10 @@ static void e1000_reinit_safe(struct e10
+ {
+ 	while (test_and_set_bit(__E1000_RESETTING, &adapter->flags))
+ 		msleep(1);
+-	rtnl_lock();
++	mutex_lock(&adapter->mutex);
+ 	e1000_down(adapter);
+ 	e1000_up(adapter);
+-	rtnl_unlock();
++	mutex_unlock(&adapter->mutex);
+ 	clear_bit(__E1000_RESETTING, &adapter->flags);
+ }
+ 
+@@ -1322,6 +1322,7 @@ static int __devinit e1000_sw_init(struc
+ 	e1000_irq_disable(adapter);
+ 
+ 	spin_lock_init(&adapter->stats_lock);
++	mutex_init(&adapter->mutex);
+ 
+ 	set_bit(__E1000_DOWN, &adapter->flags);
+ 
+@@ -2336,9 +2337,11 @@ static void e1000_update_phy_info_task(s
+ 	struct e1000_adapter *adapter = container_of(work,
+ 						     struct e1000_adapter,
+ 						     phy_info_task.work);
+-	rtnl_lock();
++	if (test_bit(__E1000_DOWN, &adapter->flags))
++		return;
++	mutex_lock(&adapter->mutex);
+ 	e1000_phy_get_info(&adapter->hw, &adapter->phy_info);
+-	rtnl_unlock();
++	mutex_unlock(&adapter->mutex);
+ }
+ 
+ /**
+@@ -2354,7 +2357,9 @@ static void e1000_82547_tx_fifo_stall_ta
+ 	struct net_device *netdev = adapter->netdev;
+ 	u32 tctl;
+ 
+-	rtnl_lock();
++	if (test_bit(__E1000_DOWN, &adapter->flags))
++		return;
++	mutex_lock(&adapter->mutex);
+ 	if (atomic_read(&adapter->tx_fifo_stall)) {
+ 		if ((er32(TDT) == er32(TDH)) &&
+ 		   (er32(TDFT) == er32(TDFH)) &&
+@@ -2375,7 +2380,7 @@ static void e1000_82547_tx_fifo_stall_ta
+ 			schedule_delayed_work(&adapter->fifo_stall_task, 1);
+ 		}
+ 	}
+-	rtnl_unlock();
++	mutex_unlock(&adapter->mutex);
+ }
+ 
+ bool e1000_has_link(struct e1000_adapter *adapter)
+@@ -2429,6 +2434,10 @@ static void e1000_watchdog(struct work_s
+ 	struct e1000_tx_ring *txdr = adapter->tx_ring;
+ 	u32 link, tctl;
+ 
++	if (test_bit(__E1000_DOWN, &adapter->flags))
++		return;
++
++	mutex_lock(&adapter->mutex);
+ 	link = e1000_has_link(adapter);
+ 	if ((netif_carrier_ok(netdev)) && link)
+ 		goto link_up;
+@@ -2517,8 +2526,8 @@ link_up:
+ 			 * (Do the reset outside of interrupt context). */
+ 			adapter->tx_timeout_count++;
+ 			schedule_work(&adapter->reset_task);
+-			/* return immediately since reset is imminent */
+-			return;
++			/* exit immediately since reset is imminent */
++			goto unlock;
+ 		}
+ 	}
+ 
+@@ -2547,6 +2556,9 @@ link_up:
+ 	/* Reschedule the task */
+ 	if (!test_bit(__E1000_DOWN, &adapter->flags))
+ 		schedule_delayed_work(&adapter->watchdog_task, 2 * HZ);
++
++unlock:
++	mutex_unlock(&adapter->mutex);
+ }
+ 
+ enum latency_range {
+@@ -3253,6 +3265,8 @@ static void e1000_reset_task(struct work
+ 	struct e1000_adapter *adapter =
+ 		container_of(work, struct e1000_adapter, reset_task);
+ 
++	if (test_bit(__E1000_DOWN, &adapter->flags))
++		return;
+ 	e1000_reinit_safe(adapter);
+ }
+ 
+@@ -4707,6 +4721,8 @@ static int __e1000_shutdown(struct pci_d
+ 
+ 	netif_device_detach(netdev);
+ 
++	mutex_lock(&adapter->mutex);
++
+ 	if (netif_running(netdev)) {
+ 		WARN_ON(test_bit(__E1000_RESETTING, &adapter->flags));
+ 		e1000_down(adapter);
+@@ -4714,8 +4730,10 @@ static int __e1000_shutdown(struct pci_d
+ 
+ #ifdef CONFIG_PM
+ 	retval = pci_save_state(pdev);
+-	if (retval)
++	if (retval) {
++		mutex_unlock(&adapter->mutex);
+ 		return retval;
++	}
+ #endif
+ 
+ 	status = er32(STATUS);
+@@ -4770,6 +4788,8 @@ static int __e1000_shutdown(struct pci_d
+ 	if (netif_running(netdev))
+ 		e1000_free_irq(adapter);
+ 
++	mutex_unlock(&adapter->mutex);
++
+ 	pci_disable_device(pdev);
+ 
+ 	return 0;

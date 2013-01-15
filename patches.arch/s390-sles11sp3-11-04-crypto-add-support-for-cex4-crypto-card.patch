@@ -1,0 +1,329 @@
+From: Holger Dengler <hd@linux.vnet.ibm.com>
+Subject: zcrypt: Add support for CEX4 crypto card
+Patch-mainline: v3.7-rc1
+Git-Commit: 1e2076f4527b5b0854d0ebe60102b6710a9ba64c
+References: bnc#793683,FATE#314097
+
+Summary:     zcrypt: Add support for CEX4 crypto card
+Description: New zcrypt module supports IBM CryptoExpress 4 cards.
+
+Signed-off-by: Holger Dengler <hd@linux.vnet.ibm.com>
+Signed-off-by: Ingo Tuchscherer <ingo.tuchscherer@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/crypto/Makefile      |    4 
+ drivers/s390/crypto/ap_bus.c      |   21 +----
+ drivers/s390/crypto/ap_bus.h      |    1 
+ drivers/s390/crypto/zcrypt_cex4.c |  153 ++++++++++++++++++++++++++++++++++++++
+ drivers/s390/crypto/zcrypt_cex4.h |   12 ++
+ drivers/s390/crypto/zcrypt_mono.c |   24 +++++
+ 6 files changed, 197 insertions(+), 18 deletions(-)
+
+--- a/drivers/s390/crypto/Makefile
++++ b/drivers/s390/crypto/Makefile
+@@ -6,13 +6,13 @@ ifdef CONFIG_ZCRYPT_MONOLITHIC
+ 
+ z90crypt-objs := zcrypt_mono.o ap_bus.o zcrypt_api.o \
+ 		zcrypt_pcica.o zcrypt_pcicc.o zcrypt_pcixcc.o zcrypt_cex2a.o \
+-		zcrypt_msgtype6.o zcrypt_msgtype50.o
++		zcrypt_msgtype6.o zcrypt_msgtype50.o zcrypt_cex4.o
+ obj-$(CONFIG_ZCRYPT) += z90crypt.o
+ 
+ else
+ 
+ ap-objs := ap_bus.o
+ obj-$(CONFIG_ZCRYPT) += ap.o zcrypt_api.o zcrypt_pcicc.o zcrypt_pcixcc.o
+-obj-$(CONFIG_ZCRYPT) += zcrypt_pcica.o zcrypt_cex2a.o
++obj-$(CONFIG_ZCRYPT) += zcrypt_pcica.o zcrypt_cex2a.o zcrypt_cex4.o
+ obj-$(CONFIG_ZCRYPT) += zcrypt_msgtype6.o zcrypt_msgtype50.o
+ endif
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@ -1343,29 +1343,22 @@ static void ap_scan_bus(struct work_stru
+ 			    (unsigned long) ap_dev);
+ 		switch (device_type) {
+ 		case 0:
++			/* device type probing for old cards */
+ 			if (ap_probe_device_type(ap_dev)) {
+ 				kfree(ap_dev);
+ 				continue;
+ 			}
+ 			break;
+-		case 10:
+-			if (ap_query_functions(qid, &device_functions)) {
+-				kfree(ap_dev);
+-				continue;
+-			}
+-			if (ap_test_bit(&device_functions, 3))
+-				ap_dev->device_type = AP_DEVICE_TYPE_CEX3C;
+-			else if (ap_test_bit(&device_functions, 4))
+-				ap_dev->device_type = AP_DEVICE_TYPE_CEX3A;
+-			else {
+-				kfree(ap_dev);
+-				continue;
+-			}
+-			break;
+ 		default:
+ 			ap_dev->device_type = device_type;
+ 		}
+ 
++		rc = ap_query_functions(qid, &device_functions);
++		if (!rc)
++			ap_dev->functions = device_functions;
++		else
++			ap_dev->functions = 0u;
++
+ 		ap_dev->device.bus = &ap_bus_type;
+ 		ap_dev->device.parent = ap_root_device;
+ 		if (dev_set_name(&ap_dev->device, "card%02x",
+--- a/drivers/s390/crypto/ap_bus.h
++++ b/drivers/s390/crypto/ap_bus.h
+@@ -118,6 +118,7 @@ static inline int ap_test_bit(unsigned i
+ #define AP_DEVICE_TYPE_CEX2C	7
+ #define AP_DEVICE_TYPE_CEX3A	8
+ #define AP_DEVICE_TYPE_CEX3C	9
++#define AP_DEVICE_TYPE_CEX4	10
+ 
+ /*
+  * Known function facilities
+--- /dev/null
++++ b/drivers/s390/crypto/zcrypt_cex4.c
+@@ -0,0 +1,153 @@
++/*
++ *  Copyright IBM Corp. 2012
++ *  Author(s): Holger Dengler <hd@linux.vnet.ibm.com>
++ */
++
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/init.h>
++#include <linux/err.h>
++#include <linux/atomic.h>
++#include <linux/uaccess.h>
++
++#include "ap_bus.h"
++#include "zcrypt_api.h"
++#include "zcrypt_msgtype6.h"
++#include "zcrypt_msgtype50.h"
++#include "zcrypt_error.h"
++#include "zcrypt_cex4.h"
++
++#define CEX4A_MIN_MOD_SIZE	  1	/*    8 bits	*/
++#define CEX4A_MAX_MOD_SIZE_2K	256	/* 2048 bits	*/
++#define CEX4A_MAX_MOD_SIZE_4K	512	/* 4096 bits	*/
++
++#define CEX4C_MIN_MOD_SIZE	 16	/*  256 bits	*/
++#define CEX4C_MAX_MOD_SIZE	512	/* 4096 bits	*/
++
++#define CEX4A_SPEED_RATING	900	 /* TODO new card, new speed rating */
++#define CEX4C_SPEED_RATING	6500	 /* TODO new card, new speed rating */
++
++#define CEX4A_MAX_MESSAGE_SIZE	MSGTYPE50_CRB3_MAX_MSG_SIZE
++#define CEX4C_MAX_MESSAGE_SIZE	MSGTYPE06_MAX_MSG_SIZE
++
++#define CEX4_CLEANUP_TIME	(15*HZ)
++
++static struct ap_device_id zcrypt_cex4_ids[] = {
++	{ AP_DEVICE(AP_DEVICE_TYPE_CEX4)  },
++	{ /* end of list */ },
++};
++
++MODULE_DEVICE_TABLE(ap, zcrypt_cex4_ids);
++MODULE_AUTHOR("IBM Corporation");
++MODULE_DESCRIPTION("CEX4 Cryptographic Card device driver, " \
++		   "Copyright IBM Corp. 2012");
++MODULE_LICENSE("GPL");
++
++static int zcrypt_cex4_probe(struct ap_device *ap_dev);
++static void zcrypt_cex4_remove(struct ap_device *ap_dev);
++
++static struct ap_driver zcrypt_cex4_driver = {
++	.probe = zcrypt_cex4_probe,
++	.remove = zcrypt_cex4_remove,
++	.ids = zcrypt_cex4_ids,
++	.request_timeout = CEX4_CLEANUP_TIME,
++};
++
++/**
++ * Probe function for CEX4 cards. It always accepts the AP device
++ * since the bus_match already checked the hardware type.
++ * @ap_dev: pointer to the AP device.
++ */
++static int zcrypt_cex4_probe(struct ap_device *ap_dev)
++{
++	struct zcrypt_device *zdev = NULL;
++	int rc = 0;
++	switch (ap_dev->device_type) {
++	case AP_DEVICE_TYPE_CEX4:
++		if (ap_test_bit(&ap_dev->functions, AP_FUNC_ACCEL)) {
++			zdev = zcrypt_device_alloc(CEX4A_MAX_MESSAGE_SIZE);
++			if (!zdev)
++				return -ENOMEM;
++			zdev->type_string = "CEX4A";
++			zdev->user_space_type = ZCRYPT_CEX3A;
++			zdev->min_mod_size = CEX4A_MIN_MOD_SIZE;
++			if (ap_test_bit(&ap_dev->functions, AP_FUNC_MEX4K) &&
++			    ap_test_bit(&ap_dev->functions, AP_FUNC_CRT4K)) {
++				zdev->max_mod_size =
++					CEX4A_MAX_MOD_SIZE_4K;
++				zdev->max_exp_bit_length =
++					CEX4A_MAX_MOD_SIZE_4K;
++			} else {
++				zdev->max_mod_size =
++					CEX4A_MAX_MOD_SIZE_2K;
++				zdev->max_exp_bit_length =
++					CEX4A_MAX_MOD_SIZE_2K;
++			}
++			zdev->short_crt = 1;
++			zdev->speed_rating = CEX4A_SPEED_RATING;
++			//zdev->ops = &zcrypt_msgtype50_ops;
++			zdev->ops = zcrypt_msgtype_request(MSGTYPE50_NAME,
++							   MSGTYPE50_VARIANT_DEFAULT);
++		} else if (ap_test_bit(&ap_dev->functions, AP_FUNC_COPRO)) {
++			zdev = zcrypt_device_alloc(CEX4C_MAX_MESSAGE_SIZE);
++			if (!zdev)
++				return -ENOMEM;
++			zdev->type_string = "CEX4C";
++			zdev->user_space_type = ZCRYPT_CEX3C;
++			zdev->min_mod_size = CEX4C_MIN_MOD_SIZE;
++			zdev->max_mod_size = CEX4C_MAX_MOD_SIZE;
++			zdev->max_exp_bit_length = CEX4C_MAX_MOD_SIZE;
++			zdev->short_crt = 0;
++			zdev->speed_rating = CEX4C_SPEED_RATING;
++			//zdev->ops = &zcrypt_msgtype6_ops;
++			zdev->ops = zcrypt_msgtype_request(MSGTYPE06_NAME,
++							   MSGTYPE06_VARIANT_DEFAULT);
++		}
++		break;
++	}
++	if (!zdev) {
++		return -ENODEV;
++	}
++	zdev->ap_dev = ap_dev;
++	zdev->online = 1;
++	ap_dev->reply = &zdev->reply;
++	ap_dev->private = zdev;
++	rc = zcrypt_device_register(zdev);
++	if (rc) {
++		zcrypt_msgtype_release(zdev->ops);
++		ap_dev->private = NULL;
++		zcrypt_device_free(zdev);
++	}
++	return rc;
++}
++
++/**
++ * This is called to remove the extended CEX4 driver information
++ * if an AP device is removed.
++ */
++static void zcrypt_cex4_remove(struct ap_device *ap_dev)
++{
++	struct zcrypt_device *zdev = ap_dev->private;
++	struct zcrypt_ops *zops;
++
++	if (zdev) {
++		zops = zdev->ops;
++		zcrypt_device_unregister(zdev);
++		zcrypt_msgtype_release(zops);
++	}
++}
++
++int __init zcrypt_cex4_init(void)
++{
++	return ap_driver_register(&zcrypt_cex4_driver, THIS_MODULE, "cex4");
++}
++
++void zcrypt_cex4_exit(void)
++{
++	ap_driver_unregister(&zcrypt_cex4_driver);
++}
++
++#ifndef CONFIG_ZCRYPT_MONOLITHIC
++module_init(zcrypt_cex4_init);
++module_exit(zcrypt_cex4_exit);
++#endif
+--- /dev/null
++++ b/drivers/s390/crypto/zcrypt_cex4.h
+@@ -0,0 +1,12 @@
++/*
++ *  Copyright IBM Corp. 2012
++ *  Author(s): Holger Dengler <hd@linux.vnet.ibm.com>
++ */
++
++#ifndef _ZCRYPT_CEX4_H_
++#define _ZCRYPT_CEX4_H_
++
++int zcrypt_cex4_init(void);
++void zcrypt_cex4_exit(void);
++
++#endif /* _ZCRYPT_CEX4_H_ */
+--- a/drivers/s390/crypto/zcrypt_mono.c
++++ b/drivers/s390/crypto/zcrypt_mono.c
+@@ -41,6 +41,9 @@
+ #include "zcrypt_pcicc.h"
+ #include "zcrypt_pcixcc.h"
+ #include "zcrypt_cex2a.h"
++#include "zcrypt_cex4.h"
++#include "zcrypt_msgtype50.h"
++#include "zcrypt_msgtype6.h"
+ 
+ /**
+  * The module initialization code.
+@@ -48,16 +51,21 @@
+ static int __init zcrypt_init(void)
+ {
+ 	int rc;
+-
+ 	rc = ap_module_init();
+ 	if (rc)
+ 		goto out;
+ 	rc = zcrypt_api_init();
+ 	if (rc)
+ 		goto out_ap;
++        rc = zcrypt_msgtype50_init();
++        if (rc)
++                goto out_api;
++        rc = zcrypt_msgtype6_init();
++        if (rc)
++                goto out_msgtype50;
+ 	rc = zcrypt_pcica_init();
+ 	if (rc)
+-		goto out_api;
++		goto out_msgtype6;
+ 	rc = zcrypt_pcicc_init();
+ 	if (rc)
+ 		goto out_pcica;
+@@ -67,14 +75,23 @@ static int __init zcrypt_init(void)
+ 	rc = zcrypt_cex2a_init();
+ 	if (rc)
+ 		goto out_pcixcc;
++	rc = zcrypt_cex4_init();
++        if (rc)
++                goto out_cex2a;
+ 	return 0;
+ 
++out_cex2a:
++	zcrypt_cex2a_exit();
+ out_pcixcc:
+ 	zcrypt_pcixcc_exit();
+ out_pcicc:
+ 	zcrypt_pcicc_exit();
+ out_pcica:
+ 	zcrypt_pcica_exit();
++out_msgtype6:
++	zcrypt_msgtype6_exit();
++out_msgtype50:
++	zcrypt_msgtype50_exit();
+ out_api:
+ 	zcrypt_api_exit();
+ out_ap:
+@@ -88,6 +105,9 @@ out:
+  */
+ static void __exit zcrypt_exit(void)
+ {
++	zcrypt_msgtype6_exit();
++	zcrypt_msgtype50_exit();
++	zcrypt_cex4_exit();
+ 	zcrypt_cex2a_exit();
+ 	zcrypt_pcixcc_exit();
+ 	zcrypt_pcicc_exit();
