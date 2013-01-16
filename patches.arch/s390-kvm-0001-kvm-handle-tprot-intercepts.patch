@@ -1,0 +1,133 @@
+From 928fe53c5a7efa5542cedb4056b105ff4a267000 Mon Sep 17 00:00:00 2001
+From: Christian Borntraeger <borntraeger@de.ibm.com>
+Date: Sun, 24 Jul 2011 10:48:17 +0200
+Subject: [PATCH 01/42] kvm: handle tprot intercepts
+Git-commit: 928fe53c5a7efa5542cedb4056b105ff4a267000
+References: FATE#314101,FATE#310914
+Patch-mainline: Merged into kvm
+
+When running a kvm guest we can get intercepts for tprot, if the host
+page table is read-only or not populated. This patch implements the
+most common case (linux memory detection).
+This also allows host copy on write for guest memory on newer systems.
+
+Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Signed-off-by: Alexander Graf <agraf@suse.de>
+
+---
+ arch/s390/include/asm/kvm_host.h |    1 +
+ arch/s390/kvm/intercept.c        |    1 +
+ arch/s390/kvm/kvm-s390.c         |    1 +
+ arch/s390/kvm/kvm-s390.h         |    1 +
+ arch/s390/kvm/priv.c             |   49 ++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 53 insertions(+), 0 deletions(-)
+
+diff --git a/arch/s390/include/asm/kvm_host.h b/arch/s390/include/asm/kvm_host.h
+index cef7dbf..e9bcdca 100644
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -138,6 +138,7 @@ struct kvm_vcpu_stat {
+ 	u32 instruction_chsc;
+ 	u32 instruction_stsi;
+ 	u32 instruction_stfl;
++	u32 instruction_tprot;
+ 	u32 instruction_sigp_sense;
+ 	u32 instruction_sigp_emergency;
+ 	u32 instruction_sigp_stop;
+diff --git a/arch/s390/kvm/intercept.c b/arch/s390/kvm/intercept.c
+index f7b6df4..b531205 100644
+--- a/arch/s390/kvm/intercept.c
++++ b/arch/s390/kvm/intercept.c
+@@ -105,6 +105,7 @@ static intercept_handler_t instruction_handlers[256] = {
+ 	[0xae] = kvm_s390_handle_sigp,
+ 	[0xb2] = kvm_s390_handle_b2,
+ 	[0xb7] = handle_lctl,
++	[0xe5] = kvm_s390_handle_e5,
+ 	[0xeb] = handle_lctlg,
+ };
+ 
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index 2ada634..afc75b6 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -62,6 +62,7 @@ struct kvm_stats_debugfs_item debugfs_entries[] = {
+ 	{ "instruction_chsc", VCPU_STAT(instruction_chsc) },
+ 	{ "instruction_stsi", VCPU_STAT(instruction_stsi) },
+ 	{ "instruction_stfl", VCPU_STAT(instruction_stfl) },
++	{ "instruction_tprot", VCPU_STAT(instruction_tprot) },
+ 	{ "instruction_sigp_sense", VCPU_STAT(instruction_sigp_sense) },
+ 	{ "instruction_sigp_emergency", VCPU_STAT(instruction_sigp_emergency) },
+ 	{ "instruction_sigp_stop", VCPU_STAT(instruction_sigp_stop) },
+diff --git a/arch/s390/kvm/kvm-s390.h b/arch/s390/kvm/kvm-s390.h
+index a7b7586..65e2201 100644
+--- a/arch/s390/kvm/kvm-s390.h
++++ b/arch/s390/kvm/kvm-s390.h
+@@ -87,6 +87,7 @@ static inline void kvm_s390_vcpu_set_mem(struct kvm_vcpu *vcpu)
+ 
+ /* implemented in priv.c */
+ int kvm_s390_handle_b2(struct kvm_vcpu *vcpu);
++int kvm_s390_handle_e5(struct kvm_vcpu *vcpu);
+ 
+ /* implemented in sigp.c */
+ int kvm_s390_handle_sigp(struct kvm_vcpu *vcpu);
+diff --git a/arch/s390/kvm/priv.c b/arch/s390/kvm/priv.c
+index 73c47bd..3916263 100644
+--- a/arch/s390/kvm/priv.c
++++ b/arch/s390/kvm/priv.c
+@@ -326,3 +326,52 @@ int kvm_s390_handle_b2(struct kvm_vcpu *vcpu)
+ 	}
+ 	return -EOPNOTSUPP;
+ }
++
++static int handle_tprot(struct kvm_vcpu *vcpu)
++{
++	int base1 = (vcpu->arch.sie_block->ipb & 0xf0000000) >> 28;
++	int disp1 = (vcpu->arch.sie_block->ipb & 0x0fff0000) >> 16;
++	int base2 = (vcpu->arch.sie_block->ipb & 0xf000) >> 12;
++	int disp2 = vcpu->arch.sie_block->ipb & 0x0fff;
++	u64 address1 = disp1 + base1 ? vcpu->arch.guest_gprs[base1] : 0;
++	u64 address2 = disp2 + base2 ? vcpu->arch.guest_gprs[base2] : 0;
++	struct vm_area_struct *vma;
++
++	vcpu->stat.instruction_tprot++;
++
++	/* we only handle the Linux memory detection case:
++	 * access key == 0
++	 * guest DAT == off
++	 * everything else goes to userspace. */
++	if (address2 & 0xf0)
++		return -EOPNOTSUPP;
++	if (vcpu->arch.sie_block->gpsw.mask & PSW_MASK_DAT)
++		return -EOPNOTSUPP;
++
++
++	down_read(&current->mm->mmap_sem);
++	vma = find_vma(current->mm,
++			(unsigned long) __guestaddr_to_user(vcpu, address1));
++	if (!vma) {
++		up_read(&current->mm->mmap_sem);
++		return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
++	}
++
++	vcpu->arch.sie_block->gpsw.mask &= ~(3ul << 44);
++	if (!(vma->vm_flags & VM_WRITE) && (vma->vm_flags & VM_READ))
++		vcpu->arch.sie_block->gpsw.mask |= (1ul << 44);
++	if (!(vma->vm_flags & VM_WRITE) && !(vma->vm_flags & VM_READ))
++		vcpu->arch.sie_block->gpsw.mask |= (2ul << 44);
++
++	up_read(&current->mm->mmap_sem);
++	return 0;
++}
++
++int kvm_s390_handle_e5(struct kvm_vcpu *vcpu)
++{
++	/* For e5xx... instructions we only handle TPROT */
++	if ((vcpu->arch.sie_block->ipa & 0x00ff) == 0x01)
++		return handle_tprot(vcpu);
++	return -EOPNOTSUPP;
++}
++
+-- 
+1.6.0.2
+
