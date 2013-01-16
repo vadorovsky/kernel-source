@@ -1,0 +1,499 @@
+From 85f8fcf30c2f409a9c37bbf6d242f76e0ffd2f9e Mon Sep 17 00:00:00 2001
+From: Cornelia Huck <cornelia.huck@de.ibm.com>
+Date: Thu, 20 Dec 2012 15:32:09 +0100
+Subject: [PATCH 39/42] KVM: s390: Add support for machine checks.
+Git-commit: 85f8fcf30c2f409a9c37bbf6d242f76e0ffd2f9e
+References: FATE#314101,FATE#310914
+Patch-mainline: Merged into kvm
+
+Add support for injecting machine checks (only repressible
+conditions for now).
+
+This is a bit more involved than I/O interrupts, for these reasons:
+
+- Machine checks come in both floating and cpu varieties.
+- We don't have a bit for machine checks enabling, but have to use
+  a roundabout approach with trapping PSW changing instructions and
+  watching for opened machine checks.
+
+Reviewed-by: Alexander Graf <agraf@suse.de>
+Reviewed-by: Marcelo Tosatti <mtosatti@redhat.com>
+Signed-off-by: Cornelia Huck <cornelia.huck@de.ibm.com>
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Signed-off-by: Alexander Graf <agraf@suse.de>
+
+---
+ arch/s390/include/asm/compat.h   |    1 +
+ arch/s390/include/asm/kvm_host.h |    8 ++
+ arch/s390/include/asm/ptrace.h   |    6 ++
+ arch/s390/kvm/intercept.c        |    2 +
+ arch/s390/kvm/interrupt.c        |  111 ++++++++++++++++++++++++++++++-
+ arch/s390/kvm/kvm-s390.h         |    3 +
+ arch/s390/kvm/priv.c             |  135 ++++++++++++++++++++++++++++++++++++++
+ include/linux/kvm.h              |    1 +
+ 8 files changed, 265 insertions(+), 2 deletions(-)
+
+Index: linux-3.0-SLE11-SP3/arch/s390/include/asm/compat.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/include/asm/compat.h
++++ linux-3.0-SLE11-SP3/arch/s390/include/asm/compat.h
+@@ -12,6 +12,7 @@
+ #define PSW32_MASK_IO		0x02000000UL
+ #define PSW32_MASK_EXT		0x01000000UL
+ #define PSW32_MASK_KEY		0x00F00000UL
++#define PSW32_MASK_BASE		0x00080000UL    /* Always one */
+ #define PSW32_MASK_MCHECK	0x00040000UL
+ #define PSW32_MASK_WAIT		0x00020000UL
+ #define PSW32_MASK_PSTATE	0x00010000UL
+Index: linux-3.0-SLE11-SP3/arch/s390/include/asm/kvm_host.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/include/asm/kvm_host.h
++++ linux-3.0-SLE11-SP3/arch/s390/include/asm/kvm_host.h
+@@ -77,8 +77,10 @@ struct kvm_s390_sie_block {
+ 	__u8	reserved40[4];		/* 0x0040 */
+ #define LCTL_CR0	0x8000
+ #define LCTL_CR6	0x0200
++#define LCTL_CR14	0x0002
+ 	__u16   lctl;			/* 0x0044 */
+ 	__s16	icpua;			/* 0x0046 */
++#define ICTL_LPSW 0x00400000
+ 	__u32	ictl;			/* 0x0048 */
+ 	__u32	eca;			/* 0x004c */
+ 	__u8	icptcode;		/* 0x0050 */
+@@ -190,6 +192,11 @@ struct kvm_s390_emerg_info {
+ 	__u16 code;
+ };
+ 
++struct kvm_s390_mchk_info {
++	__u64 cr14;
++	__u64 mcic;
++};
++
+ struct kvm_s390_interrupt_info {
+ 	struct list_head list;
+ 	u64	type;
+@@ -200,6 +207,7 @@ struct kvm_s390_interrupt_info {
+ 		struct kvm_s390_emerg_info emerg;
+ 		struct kvm_s390_extcall_info extcall;
+ 		struct kvm_s390_prefix_info prefix;
++		struct kvm_s390_mchk_info mchk;
+ 	};
+ };
+ 
+Index: linux-3.0-SLE11-SP3/arch/s390/include/asm/ptrace.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/include/asm/ptrace.h
++++ linux-3.0-SLE11-SP3/arch/s390/include/asm/ptrace.h
+@@ -237,6 +237,8 @@ typedef struct
+ #define PSW_MASK_CC		0x00003000UL
+ #define PSW_MASK_PM		0x00000F00UL
+ #define PSW_MASK_RI		0x00000000UL
++#define PSW_MASK_EA		0x00000000UL
++#define PSW_MASK_BA		0x00000000UL
+ 
+ #define PSW_ADDR_AMODE		0x80000000UL
+ #define PSW_ADDR_INSN		0x7FFFFFFFUL
+@@ -263,6 +265,8 @@ typedef struct
+ #define PSW_MASK_CC		0x0000300000000000UL
+ #define PSW_MASK_PM		0x00000F0000000000UL
+ #define PSW_MASK_RI		0x0000008000000000UL
++#define PSW_MASK_EA		0x0000000100000000UL
++#define PSW_MASK_BA		0x0000000080000000UL
+ 
+ #define PSW_ADDR_AMODE		0x0000000000000000UL
+ #define PSW_ADDR_INSN		0xFFFFFFFFFFFFFFFFUL
+Index: linux-3.0-SLE11-SP3/arch/s390/kvm/intercept.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/kvm/intercept.c
++++ linux-3.0-SLE11-SP3/arch/s390/kvm/intercept.c
+@@ -93,10 +93,12 @@ static int handle_lctl(struct kvm_vcpu *
+ 
+ static const intercept_handler_t instruction_handlers[256] = {
+ 	[0x01] = kvm_s390_handle_01,
++	[0x82] = kvm_s390_handle_lpsw,
+ 	[0x83] = kvm_s390_handle_diag,
+ 	[0xae] = kvm_s390_handle_sigp,
+ 	[0xb2] = kvm_s390_handle_b2,
+ 	[0xb7] = handle_lctl,
++	[0xb9] = kvm_s390_handle_b9,
+ 	[0xe5] = kvm_s390_handle_e5,
+ 	[0xeb] = handle_lctlg,
+ };
+Index: linux-3.0-SLE11-SP3/arch/s390/kvm/interrupt.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/kvm/interrupt.c
++++ linux-3.0-SLE11-SP3/arch/s390/kvm/interrupt.c
+@@ -40,6 +40,11 @@ static int psw_ioint_disabled(struct kvm
+ 	return !(vcpu->arch.sie_block->gpsw.mask & PSW_MASK_IO);
+ }
+ 
++static int psw_mchk_disabled(struct kvm_vcpu *vcpu)
++{
++	return !(vcpu->arch.sie_block->gpsw.mask & PSW_MASK_MCHECK);
++}
++
+ static int psw_interrupts_disabled(struct kvm_vcpu *vcpu)
+ {
+ 	if ((vcpu->arch.sie_block->gpsw.mask & PSW_MASK_PER) ||
+@@ -81,6 +86,12 @@ static int __interrupt_is_deliverable(st
+ 	case KVM_S390_SIGP_SET_PREFIX:
+ 	case KVM_S390_RESTART:
+ 		return 1;
++	case KVM_S390_MCHK:
++		if (psw_mchk_disabled(vcpu))
++			return 0;
++		if (vcpu->arch.sie_block->gcr[14] & inti->mchk.cr14)
++			return 1;
++		return 0;
+ 	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+ 		if (psw_ioint_disabled(vcpu))
+ 			return 0;
+@@ -115,6 +126,7 @@ static void __reset_intercept_indicators
+ 		CPUSTAT_IO_INT | CPUSTAT_EXT_INT | CPUSTAT_STOP_INT,
+ 		&vcpu->arch.sie_block->cpuflags);
+ 	vcpu->arch.sie_block->lctl = 0x0000;
++	vcpu->arch.sie_block->ictl &= ~ICTL_LPSW;
+ }
+ 
+ static void __set_cpuflag(struct kvm_vcpu *vcpu, u32 flag)
+@@ -138,6 +150,12 @@ static void __set_intercept_indicator(st
+ 	case KVM_S390_SIGP_STOP:
+ 		__set_cpuflag(vcpu, CPUSTAT_STOP_INT);
+ 		break;
++	case KVM_S390_MCHK:
++		if (psw_mchk_disabled(vcpu))
++			vcpu->arch.sie_block->ictl |= ICTL_LPSW;
++		else
++			vcpu->arch.sie_block->lctl |= LCTL_CR14;
++		break;
+ 	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+ 		if (psw_ioint_disabled(vcpu))
+ 			__set_cpuflag(vcpu, CPUSTAT_IO_INT);
+@@ -308,6 +326,29 @@ static void __do_deliver_interrupt(struc
+ 			exception = 1;
+ 		break;
+ 
++	case KVM_S390_MCHK:
++		VCPU_EVENT(vcpu, 4, "interrupt: machine check mcic=%llx",
++			   inti->mchk.mcic);
++		rc = kvm_s390_vcpu_store_status(vcpu,
++						KVM_S390_STORE_STATUS_PREFIXED);
++		if (rc == -EFAULT)
++			exception = 1;
++
++		rc = put_guest_u64(vcpu, __LC_MCCK_CODE, inti->mchk.mcic);
++		if (rc == -EFAULT)
++			exception = 1;
++
++		rc = copy_to_guest(vcpu, __LC_MCK_OLD_PSW,
++				   &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
++		if (rc == -EFAULT)
++			exception = 1;
++
++		rc = copy_from_guest(vcpu, &vcpu->arch.sie_block->gpsw,
++				     __LC_MCK_NEW_PSW, sizeof(psw_t));
++		if (rc == -EFAULT)
++			exception = 1;
++		break;
++
+ 	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+ 	{
+ 		__u32 param0 = ((__u32)inti->io.subchannel_id << 16) |
+@@ -316,8 +357,6 @@ static void __do_deliver_interrupt(struc
+ 			inti->io.io_int_word;
+ 		VCPU_EVENT(vcpu, 4, "interrupt: I/O %llx", inti->type);
+ 		vcpu->stat.deliver_io_int++;
+-		trace_kvm_s390_deliver_interrupt(vcpu->vcpu_id, inti->type,
+-						 param0, param1);
+ 		rc = put_guest_u16(vcpu, __LC_SUBCHANNEL_ID,
+ 				   inti->io.subchannel_id);
+ 		if (rc == -EFAULT)
+@@ -570,6 +609,61 @@ void kvm_s390_deliver_pending_interrupts
+ 	}
+ }
+ 
++void kvm_s390_deliver_pending_machine_checks(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
++	struct kvm_s390_float_interrupt *fi = vcpu->arch.local_int.float_int;
++	struct kvm_s390_interrupt_info  *n, *inti = NULL;
++	int deliver;
++
++	__reset_intercept_indicators(vcpu);
++	if (atomic_read(&li->active)) {
++		do {
++			deliver = 0;
++			spin_lock_bh(&li->lock);
++			list_for_each_entry_safe(inti, n, &li->list, list) {
++				if ((inti->type == KVM_S390_MCHK) &&
++				    __interrupt_is_deliverable(vcpu, inti)) {
++					list_del(&inti->list);
++					deliver = 1;
++					break;
++				}
++				__set_intercept_indicator(vcpu, inti);
++			}
++			if (list_empty(&li->list))
++				atomic_set(&li->active, 0);
++			spin_unlock_bh(&li->lock);
++			if (deliver) {
++				__do_deliver_interrupt(vcpu, inti);
++				kfree(inti);
++			}
++		} while (deliver);
++	}
++
++	if (atomic_read(&fi->active)) {
++		do {
++			deliver = 0;
++			spin_lock(&fi->lock);
++			list_for_each_entry_safe(inti, n, &fi->list, list) {
++				if ((inti->type == KVM_S390_MCHK) &&
++				    __interrupt_is_deliverable(vcpu, inti)) {
++					list_del(&inti->list);
++					deliver = 1;
++					break;
++				}
++				__set_intercept_indicator(vcpu, inti);
++			}
++			if (list_empty(&fi->list))
++				atomic_set(&fi->active, 0);
++			spin_unlock(&fi->lock);
++			if (deliver) {
++				__do_deliver_interrupt(vcpu, inti);
++				kfree(inti);
++			}
++		} while (deliver);
++	}
++}
++
+ int kvm_s390_inject_program_int(struct kvm_vcpu *vcpu, u16 code)
+ {
+ 	struct kvm_s390_local_interrupt *li = &vcpu->arch.local_int;
+@@ -622,6 +716,13 @@ int kvm_s390_inject_vm(struct kvm *kvm,
+ 	case KVM_S390_INT_EMERGENCY:
+ 		kfree(inti);
+ 		return -EINVAL;
++	case KVM_S390_MCHK:
++		VM_EVENT(kvm, 5, "inject: machine check parm64:%llx",
++			 s390int->parm64);
++		inti->type = s390int->type;
++		inti->mchk.cr14 = s390int->parm; /* upper bits are not used */
++		inti->mchk.mcic = s390int->parm64;
++		break;
+ 	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+ 		if (s390int->type & IOINT_AI_MASK)
+ 			VM_EVENT(kvm, 5, "%s", "inject: I/O (AI)");
+@@ -728,6 +829,12 @@ int kvm_s390_inject_vcpu(struct kvm_vcpu
+ 		inti->type = s390int->type;
+ 		inti->emerg.code = s390int->parm;
+ 		break;
++	case KVM_S390_MCHK:
++		VCPU_EVENT(vcpu, 5, "inject: machine check parm64:%llx",
++			   s390int->parm64);
++		inti->type = s390int->type;
++		inti->mchk.mcic = s390int->parm64;
++		break;
+ 	case KVM_S390_INT_VIRTIO:
+ 	case KVM_S390_INT_SERVICE:
+ 	case KVM_S390_INT_IO_MIN...KVM_S390_INT_IO_MAX:
+Index: linux-3.0-SLE11-SP3/arch/s390/kvm/kvm-s390.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/kvm/kvm-s390.h
++++ linux-3.0-SLE11-SP3/arch/s390/kvm/kvm-s390.h
+@@ -94,6 +94,7 @@ int kvm_s390_handle_wait(struct kvm_vcpu
+ enum hrtimer_restart kvm_s390_idle_wakeup(struct hrtimer *timer);
+ void kvm_s390_tasklet(unsigned long parm);
+ void kvm_s390_deliver_pending_interrupts(struct kvm_vcpu *vcpu);
++void kvm_s390_deliver_pending_machine_checks(struct kvm_vcpu *vcpu);
+ int kvm_s390_inject_vm(struct kvm *kvm,
+ 		struct kvm_s390_interrupt *s390int);
+ int kvm_s390_inject_vcpu(struct kvm_vcpu *vcpu,
+@@ -132,6 +133,8 @@ static inline void kvm_s390_vcpu_set_mem
+ int kvm_s390_handle_b2(struct kvm_vcpu *vcpu);
+ int kvm_s390_handle_e5(struct kvm_vcpu *vcpu);
+ int kvm_s390_handle_01(struct kvm_vcpu *vcpu);
++int kvm_s390_handle_b9(struct kvm_vcpu *vcpu);
++int kvm_s390_handle_lpsw(struct kvm_vcpu *vcpu);
+ 
+ /* implemented in sigp.c */
+ int kvm_s390_handle_sigp(struct kvm_vcpu *vcpu);
+Index: linux-3.0-SLE11-SP3/arch/s390/kvm/priv.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/kvm/priv.c
++++ linux-3.0-SLE11-SP3/arch/s390/kvm/priv.c
+@@ -18,6 +18,8 @@
+ #include <asm/debug.h>
+ #include <asm/ebcdic.h>
+ #include <asm/sysinfo.h>
++#include <asm/ptrace.h>
++#include <asm/compat.h>
+ #include "gaccess.h"
+ #include "kvm-s390.h"
+ 
+@@ -160,6 +162,99 @@ static int handle_stfl(struct kvm_vcpu *
+ 	return 0;
+ }
+ 
++static void handle_new_psw(struct kvm_vcpu *vcpu)
++{
++	/* Check whether the new psw is enabled for machine checks. */
++	if (vcpu->arch.sie_block->gpsw.mask & PSW_MASK_MCHECK)
++		kvm_s390_deliver_pending_machine_checks(vcpu);
++}
++
++#define PSW_MASK_ADDR_MODE (PSW_MASK_EA | PSW_MASK_BA)
++#define PSW_MASK_UNASSIGNED 0xb80800fe7fffffffUL
++#define PSW_ADDR_24 0x00000000000fffffUL
++#define PSW_ADDR_31 0x000000007fffffffUL
++
++int kvm_s390_handle_lpsw(struct kvm_vcpu *vcpu)
++{
++	u64 addr;
++	psw_compat_t new_psw;
++
++	if (vcpu->arch.sie_block->gpsw.mask & PSW_MASK_PSTATE)
++		return kvm_s390_inject_program_int(vcpu,
++						   PGM_PRIVILEGED_OPERATION);
++
++	addr = kvm_s390_get_base_disp_s(vcpu);
++
++	if (addr & 7) {
++		kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
++		goto out;
++	}
++
++	if (copy_from_guest(vcpu, &new_psw, addr, sizeof(new_psw))) {
++		kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
++		goto out;
++	}
++
++	if (!(new_psw.mask & PSW32_MASK_BASE)) {
++		kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
++		goto out;
++	}
++
++	vcpu->arch.sie_block->gpsw.mask =
++		(new_psw.mask & ~PSW32_MASK_BASE) << 32;
++	vcpu->arch.sie_block->gpsw.addr = new_psw.addr;
++
++	if ((vcpu->arch.sie_block->gpsw.mask & PSW_MASK_UNASSIGNED) ||
++	    (!(vcpu->arch.sie_block->gpsw.mask & PSW_MASK_ADDR_MODE) &&
++	     (vcpu->arch.sie_block->gpsw.addr & ~PSW_ADDR_24)) ||
++	    ((vcpu->arch.sie_block->gpsw.mask & PSW_MASK_ADDR_MODE) ==
++	     PSW_MASK_EA)) {
++		kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
++		goto out;
++	}
++
++	handle_new_psw(vcpu);
++out:
++	return 0;
++}
++
++static int handle_lpswe(struct kvm_vcpu *vcpu)
++{
++	u64 addr;
++	psw_t new_psw;
++
++	addr = kvm_s390_get_base_disp_s(vcpu);
++
++	if (addr & 7) {
++		kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
++		goto out;
++	}
++
++	if (copy_from_guest(vcpu, &new_psw, addr, sizeof(new_psw))) {
++		kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
++		goto out;
++	}
++
++	vcpu->arch.sie_block->gpsw.mask = new_psw.mask;
++	vcpu->arch.sie_block->gpsw.addr = new_psw.addr;
++
++	if ((vcpu->arch.sie_block->gpsw.mask & PSW_MASK_UNASSIGNED) ||
++	    (((vcpu->arch.sie_block->gpsw.mask & PSW_MASK_ADDR_MODE) ==
++	      PSW_MASK_BA) &&
++	     (vcpu->arch.sie_block->gpsw.addr & ~PSW_ADDR_31)) ||
++	    (!(vcpu->arch.sie_block->gpsw.mask & PSW_MASK_ADDR_MODE) &&
++	     (vcpu->arch.sie_block->gpsw.addr & ~PSW_ADDR_24)) ||
++	    ((vcpu->arch.sie_block->gpsw.mask & PSW_MASK_ADDR_MODE) ==
++	     PSW_MASK_EA)) {
++		kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
++		goto out;
++	}
++
++	handle_new_psw(vcpu);
++out:
++	return 0;
++}
++
+ static int handle_stidp(struct kvm_vcpu *vcpu)
+ {
+ 	u64 operand2;
+@@ -285,6 +380,7 @@ static const intercept_handler_t priv_ha
+ 	[0x5f] = handle_chsc,
+ 	[0x7d] = handle_stsi,
+ 	[0xb1] = handle_stfl,
++	[0xb2] = handle_lpswe,
+ };
+ 
+ int kvm_s390_handle_b2(struct kvm_vcpu *vcpu)
+@@ -304,6 +400,45 @@ int kvm_s390_handle_b2(struct kvm_vcpu *
+ 			return kvm_s390_inject_program_int(vcpu,
+ 						   PGM_PRIVILEGED_OPERATION);
+ 		else
++			return handler(vcpu);
++	}
++	return -EOPNOTSUPP;
++}
++
++static int handle_epsw(struct kvm_vcpu *vcpu)
++{
++	int reg1, reg2;
++
++	reg1 = (vcpu->arch.sie_block->ipb & 0x00f00000) >> 24;
++	reg2 = (vcpu->arch.sie_block->ipb & 0x000f0000) >> 16;
++
++	/* This basically extracts the mask half of the psw. */
++	vcpu->run->s.regs.gprs[reg1] &= 0xffffffff00000000;
++	vcpu->run->s.regs.gprs[reg1] |= vcpu->arch.sie_block->gpsw.mask >> 32;
++	if (reg2) {
++		vcpu->run->s.regs.gprs[reg2] &= 0xffffffff00000000;
++		vcpu->run->s.regs.gprs[reg2] |=
++			vcpu->arch.sie_block->gpsw.mask & 0x00000000ffffffff;
++	}
++	return 0;
++}
++
++static const intercept_handler_t b9_handlers[256] = {
++	[0x8d] = handle_epsw,
++};
++
++int kvm_s390_handle_b9(struct kvm_vcpu *vcpu)
++{
++	intercept_handler_t handler;
++
++	/* This is handled just as for the B2 instructions. */
++	handler = b9_handlers[vcpu->arch.sie_block->ipa & 0x00ff];
++	if (handler) {
++		if ((handler != handle_epsw) &&
++		    (vcpu->arch.sie_block->gpsw.mask & PSW_MASK_PSTATE))
++			return kvm_s390_inject_program_int(vcpu,
++						   PGM_PRIVILEGED_OPERATION);
++		else
+ 			return handler(vcpu);
+ 	}
+ 	return -EOPNOTSUPP;
+Index: linux-3.0-SLE11-SP3/include/linux/kvm.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/include/linux/kvm.h
++++ linux-3.0-SLE11-SP3/include/linux/kvm.h
+@@ -376,6 +376,7 @@ struct kvm_s390_psw {
+ #define KVM_S390_PROGRAM_INT		0xfffe0001u
+ #define KVM_S390_SIGP_SET_PREFIX	0xfffe0002u
+ #define KVM_S390_RESTART		0xfffe0003u
++#define KVM_S390_MCHK			0xfffe1000u
+ #define KVM_S390_INT_VIRTIO		0xffff2603u
+ #define KVM_S390_INT_SERVICE		0xffff2401u
+ #define KVM_S390_INT_EMERGENCY		0xffff1201u
