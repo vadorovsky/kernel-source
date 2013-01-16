@@ -1,0 +1,353 @@
+From 771f8a8adbf1cb690b0bd50d37a23ae587c462e7 Mon Sep 17 00:00:00 2001
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Date: Sun, 24 Jul 2011 10:48:18 +0200
+Subject: [PATCH 05/42] move sie code to entry.S
+Git-commit: 771f8a8adbf1cb690b0bd50d37a23ae587c462e7
+References: FATE#314101,FATE#310914
+Patch-mainline: Merged into kvm
+
+The entry to / exit from sie has subtle dependencies to the first level
+interrupt handler. Move the sie assembler code to entry64.S and replace
+the SIE_HOOK callback with a test and the new _TIF_SIE bit.
+In addition this patch fixes several problems in regard to the check for
+the_TIF_EXIT_SIE bits. The old code checked the TIF bits before executing
+the interrupt handler and it only modified the instruction address if it
+pointed directly to the sie instruction. In both cases it could miss
+a TIF bit that normally would cause an exit from the guest and would
+reenter the guest context.
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Signed-off-by: Alexander Graf <agraf@suse.de>
+
+---
+ arch/s390/include/asm/thread_info.h |    2 +
+ arch/s390/kernel/entry64.S          |   80 +++++++++++++++++++++++++---
+ arch/s390/kernel/s390_ksyms.c       |    4 ++
+ arch/s390/kvm/Makefile              |    2 +-
+ arch/s390/kvm/sie64a.S              |   98 -----------------------------------
+ 5 files changed, 79 insertions(+), 107 deletions(-)
+ delete mode 100644 arch/s390/kvm/sie64a.S
+
+Index: linux-3.0-SLE11-SP3/arch/s390/include/asm/thread_info.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/include/asm/thread_info.h
++++ linux-3.0-SLE11-SP3/arch/s390/include/asm/thread_info.h
+@@ -94,6 +94,7 @@ static inline struct thread_info *curren
+ #define TIF_SYSCALL_AUDIT	9	/* syscall auditing active */
+ #define TIF_SECCOMP		10	/* secure computing */
+ #define TIF_SYSCALL_TRACEPOINT	11	/* syscall tracepoint instrumentation */
++#define TIF_SIE			12	/* guest execution active */
+ #define TIF_POLLING_NRFLAG	16	/* true if poll_idle() is polling
+ 					   TIF_NEED_RESCHED */
+ #define TIF_31BIT		17	/* 32bit process */
+@@ -113,6 +114,7 @@ static inline struct thread_info *curren
+ #define _TIF_SYSCALL_AUDIT	(1<<TIF_SYSCALL_AUDIT)
+ #define _TIF_SECCOMP		(1<<TIF_SECCOMP)
+ #define _TIF_SYSCALL_TRACEPOINT	(1<<TIF_SYSCALL_TRACEPOINT)
++#define _TIF_SIE		(1<<TIF_SIE)
+ #define _TIF_POLLING_NRFLAG	(1<<TIF_POLLING_NRFLAG)
+ #define _TIF_31BIT		(1<<TIF_31BIT)
+ #define _TIF_SINGLE_STEP	(1<<TIF_FREEZE)
+Index: linux-3.0-SLE11-SP3/arch/s390/kernel/entry64.S
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/kernel/entry64.S
++++ linux-3.0-SLE11-SP3/arch/s390/kernel/entry64.S
+@@ -56,15 +56,28 @@ _TIF_WORK_INT = (_TIF_SIGPENDING | _TIF_
+ 		 _TIF_MCCK_PENDING)
+ _TIF_SYSCALL = (_TIF_SYSCALL_TRACE>>8 | _TIF_SYSCALL_AUDIT>>8 | \
+ 		_TIF_SECCOMP>>8 | _TIF_SYSCALL_TRACEPOINT>>8)
++_TIF_EXIT_SIE = (_TIF_SIGPENDING | _TIF_NEED_RESCHED | _TIF_MCCK_PENDING)
+ 
+ #define BASED(name) name-system_call(%r13)
+ 
++	.macro SPP newpp
++#if defined(CONFIG_KVM) || defined(CONFIG_KVM_MODULE)
++	tm	__LC_MACHINE_FLAGS+6,0x20	# MACHINE_FLAG_SPP
++	jz	.+8
++	.insn	s,0xb2800000,\newpp
++#endif
++	.endm
++
+ 	.macro	HANDLE_SIE_INTERCEPT
+ #if defined(CONFIG_KVM) || defined(CONFIG_KVM_MODULE)
+-	lg	%r3,__LC_SIE_HOOK
+-	ltgr	%r3,%r3
++	tm	__TI_flags+6(%r12),_TIF_SIE>>8
+ 	jz	0f
+-	basr	%r14,%r3
++	SPP	__LC_CMF_HPP			# set host id
++	clc	SP_PSW+8(8,%r15),BASED(.Lsie_loop)
++	jl	0f
++	clc	SP_PSW+8(8,%r15),BASED(.Lsie_done)
++	jhe	0f
++	mvc	SP_PSW+8(8,%r15),BASED(.Lsie_loop)
+ 0:
+ #endif
+ 	.endm
+@@ -465,6 +478,7 @@ pgm_check_handler:
+ 	xc	SP_ILC(4,%r15),SP_ILC(%r15)
+ 	mvc	SP_PSW(16,%r15),__LC_PGM_OLD_PSW
+ 	lg	%r12,__LC_THREAD_INFO	# load pointer to thread_info struct
++	HANDLE_SIE_INTERCEPT
+ 	tm	SP_PSW+1(%r15),0x01	# interrupting from user ?
+ 	jz	pgm_no_vtime
+ 	UPDATE_VTIME __LC_EXIT_TIMER,__LC_SYNC_ENTER_TIMER,__LC_USER_TIMER
+@@ -477,7 +491,6 @@ pgm_check_handler:
+ 	jz	pgm_no_vtime
+ 	mvc	__THREAD_trap_tdb(256,%r14),0(%r13)
+ pgm_no_vtime:
+-	HANDLE_SIE_INTERCEPT
+ 	stg	%r11,SP_ARGS(%r15)
+ 	lgf	%r3,__LC_PGM_ILC	# load program interruption code
+ 	lg	%r4,__LC_TRANS_EXC_CODE
+@@ -512,6 +525,7 @@ pgm_per_std:
+ 	CREATE_STACK_FRAME __LC_SAVE_AREA
+ 	mvc	SP_PSW(16,%r15),__LC_PGM_OLD_PSW
+ 	lg	%r12,__LC_THREAD_INFO	# load pointer to thread_info struct
++	HANDLE_SIE_INTERCEPT
+ 	tm	SP_PSW+1(%r15),0x01	# interrupting from user ?
+ 	jz	pgm_no_vtime2
+ 	UPDATE_VTIME __LC_EXIT_TIMER,__LC_SYNC_ENTER_TIMER,__LC_USER_TIMER
+@@ -524,7 +538,6 @@ pgm_per_std:
+ 	jz	pgm_no_vtime2
+ 	mvc	__THREAD_trap_tdb(256,%r14),0(%r13)
+ pgm_no_vtime2:
+-	HANDLE_SIE_INTERCEPT
+ 	lg	%r1,__TI_task(%r12)
+ 	tm	SP_PSW+1(%r15),0x01	# kernel per event ?
+ 	jz	kernel_per
+@@ -589,6 +602,7 @@ io_int_handler:
+ 	CREATE_STACK_FRAME __LC_SAVE_AREA+40
+ 	mvc	SP_PSW(16,%r15),0(%r12)	# move user PSW to stack
+ 	lg	%r12,__LC_THREAD_INFO	# load pointer to thread_info struct
++	HANDLE_SIE_INTERCEPT
+ 	tm	SP_PSW+1(%r15),0x01	# interrupting from user ?
+ 	jz	io_no_vtime
+ 	UPDATE_VTIME __LC_EXIT_TIMER,__LC_ASYNC_ENTER_TIMER,__LC_USER_TIMER
+@@ -596,7 +610,6 @@ io_int_handler:
+ 	mvc	__LC_LAST_UPDATE_TIMER(8),__LC_ASYNC_ENTER_TIMER
+ 	LAST_BREAK
+ io_no_vtime:
+-	HANDLE_SIE_INTERCEPT
+ 	TRACE_IRQS_OFF
+ 	la	%r2,SP_PTREGS(%r15)	# address of register-save area
+ 	brasl	%r14,do_IRQ		# call standard irq handler
+@@ -724,6 +737,7 @@ ext_int_handler:
+ 	CREATE_STACK_FRAME __LC_SAVE_AREA+40
+ 	mvc	SP_PSW(16,%r15),0(%r12)	# move user PSW to stack
+ 	lg	%r12,__LC_THREAD_INFO	# load pointer to thread_info struct
++	HANDLE_SIE_INTERCEPT
+ 	tm	SP_PSW+1(%r15),0x01	# interrupting from user ?
+ 	jz	ext_no_vtime
+ 	UPDATE_VTIME __LC_EXIT_TIMER,__LC_ASYNC_ENTER_TIMER,__LC_USER_TIMER
+@@ -731,7 +745,6 @@ ext_int_handler:
+ 	mvc	__LC_LAST_UPDATE_TIMER(8),__LC_ASYNC_ENTER_TIMER
+ 	LAST_BREAK
+ ext_no_vtime:
+-	HANDLE_SIE_INTERCEPT
+ 	TRACE_IRQS_OFF
+ 	xc	__SF_BACKCHAIN(8,%r15),__SF_BACKCHAIN(%r15)
+ 	lghi	%r1,4096
+@@ -796,6 +809,7 @@ mcck_int_main:
+ 	lg	%r12,__LC_THREAD_INFO	# load pointer to thread_info struct
+ 	tm	__LC_MCCK_CODE+2,0x08	# mwp of old psw valid?
+ 	jno	mcck_no_vtime		# no -> no timer update
++	HANDLE_SIE_INTERCEPT
+ 	tm	SP_PSW+1(%r15),0x01	# interrupting from user ?
+ 	jz	mcck_no_vtime
+ 	UPDATE_VTIME __LC_EXIT_TIMER,__LC_MCCK_ENTER_TIMER,__LC_USER_TIMER
+@@ -815,7 +829,6 @@ mcck_no_vtime:
+ 	stosm	__SF_EMPTY(%r15),0x04	# turn dat on
+ 	tm	__TI_flags+7(%r12),_TIF_MCCK_PENDING
+ 	jno	mcck_return
+-	HANDLE_SIE_INTERCEPT
+ 	TRACE_IRQS_OFF
+ 	brasl	%r14,s390_handle_mcck
+ 	TRACE_IRQS_ON
+@@ -1067,6 +1080,57 @@ cleanup_io_restore_insn:
+ .Lcritical_end:
+ 		.quad	__critical_end
+ 
++#if defined(CONFIG_KVM) || defined(CONFIG_KVM_MODULE)
++/*
++ * sie64a calling convention:
++ * %r2 pointer to sie control block
++ * %r3 guest register save area
++ */
++	.globl	sie64a
++sie64a:
++	stmg	%r6,%r14,__SF_GPRS(%r15)	# save kernel registers
++	stg	%r2,__SF_EMPTY(%r15)		# save control block pointer
++	stg	%r3,__SF_EMPTY+8(%r15)		# save guest register save area
++	lmg	%r0,%r13,0(%r3)			# load guest gprs 0-13
++	lg	%r14,__LC_THREAD_INFO		# pointer thread_info struct
++	oi	__TI_flags+6(%r14),_TIF_SIE>>8
++sie_loop:
++	lg	%r14,__LC_THREAD_INFO		# pointer thread_info struct
++	tm	__TI_flags+7(%r14),_TIF_EXIT_SIE
++	jnz	sie_exit
++	lg	%r14,__SF_EMPTY(%r15)		# get control block pointer
++	SPP	__SF_EMPTY(%r15)		# set guest id
++	sie	0(%r14)
++sie_done:
++	SPP	__LC_CMF_HPP			# set host id
++	lg	%r14,__LC_THREAD_INFO		# pointer thread_info struct
++sie_exit:
++	ni	__TI_flags+6(%r14),255-(_TIF_SIE>>8)
++	lg	%r14,__SF_EMPTY+8(%r15)		# load guest register save area
++	stmg	%r0,%r13,0(%r14)		# save guest gprs 0-13
++	lmg	%r6,%r14,__SF_GPRS(%r15)	# restore kernel registers
++	lghi	%r2,0
++	br	%r14
++sie_fault:
++	lg	%r14,__LC_THREAD_INFO		# pointer thread_info struct
++	ni	__TI_flags+6(%r14),255-(_TIF_SIE>>8)
++	lg	%r14,__SF_EMPTY+8(%r15)		# load guest register save area
++	stmg	%r0,%r13,0(%r14)		# save guest gprs 0-13
++	lmg	%r6,%r14,__SF_GPRS(%r15)	# restore kernel registers
++	lghi	%r2,-EFAULT
++	br	%r14
++
++	.align	8
++.Lsie_loop:
++	.quad	sie_loop
++.Lsie_done:
++	.quad	sie_done
++
++	.section __ex_table,"a"
++	.quad	sie_loop,sie_fault
++	.previous
++#endif
++
+ 		.section .rodata, "a"
+ #define SYSCALL(esa,esame,emu)	.long esame
+ 	.globl	sys_call_table
+Index: linux-3.0-SLE11-SP3/arch/s390/kernel/s390_ksyms.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/kernel/s390_ksyms.c
++++ linux-3.0-SLE11-SP3/arch/s390/kernel/s390_ksyms.c
+@@ -1,6 +1,10 @@
+ #include <linux/module.h>
++#include <linux/kvm_host.h>
+ #include <asm/ftrace.h>
+ 
+ #ifdef CONFIG_FUNCTION_TRACER
+ EXPORT_SYMBOL(_mcount);
+ #endif
++#if defined(CONFIG_KVM) || defined(CONFIG_KVM_MODULE)
++EXPORT_SYMBOL(sie64a);
++#endif
+Index: linux-3.0-SLE11-SP3/arch/s390/kvm/Makefile
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/kvm/Makefile
++++ linux-3.0-SLE11-SP3/arch/s390/kvm/Makefile
+@@ -10,5 +10,5 @@ common-objs = $(addprefix ../../../virt/
+ 
+ ccflags-y := -Ivirt/kvm -Iarch/s390/kvm
+ 
+-kvm-objs := $(common-objs) kvm-s390.o sie64a.o intercept.o interrupt.o priv.o sigp.o diag.o
++kvm-objs := $(common-objs) kvm-s390.o intercept.o interrupt.o priv.o sigp.o diag.o
+ obj-$(CONFIG_KVM) += kvm.o
+Index: linux-3.0-SLE11-SP3/arch/s390/kvm/sie64a.S
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/arch/s390/kvm/sie64a.S
++++ /dev/null
+@@ -1,98 +0,0 @@
+-/*
+- * sie64a.S - low level sie call
+- *
+- * Copyright IBM Corp. 2008,2010
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License (version 2 only)
+- * as published by the Free Software Foundation.
+- *
+- *    Author(s): Heiko Carstens <heiko.carstens@de.ibm.com>
+- *		 Christian Ehrhardt <ehrhardt@linux.vnet.ibm.com>
+- */
+-
+-#include <linux/errno.h>
+-#include <asm/asm-offsets.h>
+-#include <asm/setup.h>
+-#include <asm/asm-offsets.h>
+-#include <asm/ptrace.h>
+-#include <asm/thread_info.h>
+-
+-_TIF_EXIT_SIE = (_TIF_SIGPENDING | _TIF_NEED_RESCHED | _TIF_MCCK_PENDING)
+-
+-/*
+- * offsets into stackframe
+- * SP_	= offsets into stack sie64 is called with
+- * SPI_ = offsets into irq stack
+- */
+-SP_GREGS = __SF_EMPTY
+-SP_HOOK  = __SF_EMPTY+8
+-SP_GPP	 = __SF_EMPTY+16
+-SPI_PSW  = STACK_FRAME_OVERHEAD + __PT_PSW
+-
+-
+-	.macro SPP newpp
+-	tm	__LC_MACHINE_FLAGS+6,0x20	# MACHINE_FLAG_SPP
+-	jz	0f
+-	.insn	s,0xb2800000,\newpp
+-0:
+-	.endm
+-
+-sie_irq_handler:
+-	SPP	__LC_CMF_HPP			# set host id
+-	larl	%r2,sie_inst
+-	clg	%r2,SPI_PSW+8(0,%r15)		# intercepted sie
+-	jne	1f
+-	xc	__LC_SIE_HOOK(8),__LC_SIE_HOOK
+-	lg	%r2,__LC_THREAD_INFO		# pointer thread_info struct
+-	tm	__TI_flags+7(%r2),_TIF_EXIT_SIE
+-	jz	0f
+-	larl	%r2,sie_exit			# work pending, leave sie
+-	stg	%r2,SPI_PSW+8(0,%r15)
+-	br	%r14
+-0:	larl	%r2,sie_reenter			# re-enter with guest id
+-	stg	%r2,SPI_PSW+8(0,%r15)
+-1:	br	%r14
+-
+-/*
+- * sie64a calling convention:
+- * %r2 pointer to sie control block
+- * %r3 guest register save area
+- */
+-	.globl	sie64a
+-sie64a:
+-	stg	%r3,SP_GREGS(%r15)		# save guest register save area
+-	stmg	%r6,%r14,__SF_GPRS(%r15)	# save registers on entry
+-	lgr	%r14,%r2			# pointer to sie control block
+-	larl	%r5,sie_irq_handler
+-	stg	%r2,SP_GPP(%r15)
+-	stg	%r5,SP_HOOK(%r15)		# save hook target
+-	lmg	%r0,%r13,0(%r3)			# load guest gprs 0-13
+-sie_reenter:
+-	mvc	__LC_SIE_HOOK(8),SP_HOOK(%r15)
+-	SPP	SP_GPP(%r15)			# set guest id
+-sie_inst:
+-	sie	0(%r14)
+-	xc	__LC_SIE_HOOK(8),__LC_SIE_HOOK
+-	SPP	__LC_CMF_HPP			# set host id
+-sie_exit:
+-	lg	%r14,SP_GREGS(%r15)
+-	stmg	%r0,%r13,0(%r14)		# save guest gprs 0-13
+-	lghi	%r2,0
+-	lmg	%r6,%r14,__SF_GPRS(%r15)
+-	br	%r14
+-
+-sie_err:
+-	xc	__LC_SIE_HOOK(8),__LC_SIE_HOOK
+-	SPP	__LC_CMF_HPP			# set host id
+-	lg	%r14,SP_GREGS(%r15)
+-	stmg	%r0,%r13,0(%r14)		# save guest gprs 0-13
+-	lghi	%r2,-EFAULT
+-	lmg	%r6,%r14,__SF_GPRS(%r15)
+-	br	%r14
+-
+-	.section __ex_table,"a"
+-	.quad	sie_inst,sie_err
+-	.quad	sie_exit,sie_err
+-	.quad	sie_reenter,sie_err
+-	.previous
