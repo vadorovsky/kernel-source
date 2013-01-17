@@ -1,0 +1,220 @@
+From: Ben Hutchings <bhutchings@solarflare.com>
+Date: Thu, 8 Dec 2011 19:51:47 +0000
+Subject: sfc: Correct interrupt timer quantum for Siena (normal and turbo
+ mode)
+Patch-mainline: v3.4-rc1
+Git-commit: cc180b69c009ec52f67a56d96b9073b9f774b323
+References: bnc#786035 FATE#314299
+
+We currently assume that the timer quantum for Siena is 5 us, the same
+as for Falcon.  This is not correct; timer ticks are generated on a
+rota which takes a minimum of 768 cycles (each event delivery or other
+timer change will delay it by 3 cycles).  The timer quantum should be
+6.144 or 3.072 us depending on whether turbo mode is active.
+
+Replace EFX_IRQ_MOD_RESOLUTION with a timer_quantum_ns field in struct
+efx_nic, initialised by the efx_nic_type::probe function.
+
+While we're at it, replace EFX_IRQ_MOD_MAX with a timer_period_max
+field in struct efx_nic_type.
+
+Signed-off-by: Ben Hutchings <bhutchings@solarflare.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/sfc/efx.c        |   31 ++++++++++++++++++++++---------
+ drivers/net/ethernet/sfc/falcon.c     |    6 ++++--
+ drivers/net/ethernet/sfc/net_driver.h |    4 ++++
+ drivers/net/ethernet/sfc/nic.h        |    3 ---
+ drivers/net/ethernet/sfc/siena.c      |   13 ++++++++++---
+ 5 files changed, 40 insertions(+), 17 deletions(-)
+
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -1517,13 +1517,13 @@ static void efx_remove_all(struct efx_ni
+  *
+  **************************************************************************/
+ 
+-static unsigned int irq_mod_ticks(unsigned int usecs, unsigned int resolution)
++static unsigned int irq_mod_ticks(unsigned int usecs, unsigned int quantum_ns)
+ {
+ 	if (usecs == 0)
+ 		return 0;
+-	if (usecs < resolution)
++	if (usecs * 1000 < quantum_ns)
+ 		return 1; /* never round down to 0 */
+-	return usecs / resolution;
++	return usecs * 1000 / quantum_ns;
+ }
+ 
+ /* Set interrupt moderation parameters */
+@@ -1532,14 +1532,20 @@ int efx_init_irq_moderation(struct efx_n
+ 			    bool rx_may_override_tx)
+ {
+ 	struct efx_channel *channel;
+-	unsigned tx_ticks = irq_mod_ticks(tx_usecs, EFX_IRQ_MOD_RESOLUTION);
+-	unsigned rx_ticks = irq_mod_ticks(rx_usecs, EFX_IRQ_MOD_RESOLUTION);
++	unsigned int irq_mod_max = DIV_ROUND_UP(efx->type->timer_period_max *
++						efx->timer_quantum_ns,
++						1000);
++	unsigned int tx_ticks;
++	unsigned int rx_ticks;
+ 
+ 	EFX_ASSERT_RESET_SERIALISED(efx);
+ 
+-	if (tx_ticks > EFX_IRQ_MOD_MAX || rx_ticks > EFX_IRQ_MOD_MAX)
++	if (tx_usecs > irq_mod_max || rx_usecs > irq_mod_max)
+ 		return -EINVAL;
+ 
++	tx_ticks = irq_mod_ticks(tx_usecs, efx->timer_quantum_ns);
++	rx_ticks = irq_mod_ticks(rx_usecs, efx->timer_quantum_ns);
++
+ 	if (tx_ticks != rx_ticks && efx->tx_channel_offset == 0 &&
+ 	    !rx_may_override_tx) {
+ 		netif_err(efx, drv, efx->net_dev, "Channels are shared. "
+@@ -1562,8 +1568,14 @@ int efx_init_irq_moderation(struct efx_n
+ void efx_get_irq_moderation(struct efx_nic *efx, unsigned int *tx_usecs,
+ 			    unsigned int *rx_usecs, bool *rx_adaptive)
+ {
++	/* We must round up when converting ticks to microseconds
++	 * because we round down when converting the other way.
++	 */
++
+ 	*rx_adaptive = efx->irq_rx_adaptive;
+-	*rx_usecs = efx->irq_rx_moderation * EFX_IRQ_MOD_RESOLUTION;
++	*rx_usecs = DIV_ROUND_UP(efx->irq_rx_moderation *
++				 efx->timer_quantum_ns,
++				 1000);
+ 
+ 	/* If channels are shared between RX and TX, so is IRQ
+ 	 * moderation.  Otherwise, IRQ moderation is the same for all
+@@ -1572,9 +1584,10 @@ void efx_get_irq_moderation(struct efx_n
+ 	if (efx->tx_channel_offset == 0)
+ 		*tx_usecs = *rx_usecs;
+ 	else
+-		*tx_usecs =
++		*tx_usecs = DIV_ROUND_UP(
+ 			efx->channel[efx->tx_channel_offset]->irq_moderation *
+-			EFX_IRQ_MOD_RESOLUTION;
++			efx->timer_quantum_ns,
++			1000);
+ }
+ 
+ /**************************************************************************
+--- a/drivers/net/ethernet/sfc/falcon.c
++++ b/drivers/net/ethernet/sfc/falcon.c
+@@ -103,8 +103,6 @@ static void falcon_push_irq_moderation(s
+ 	efx_dword_t timer_cmd;
+ 	struct efx_nic *efx = channel->efx;
+ 
+-	BUILD_BUG_ON(EFX_IRQ_MOD_MAX > (1 << FRF_AB_TC_TIMER_VAL_WIDTH));
+-
+ 	/* Set timer register */
+ 	if (channel->irq_moderation) {
+ 		EFX_POPULATE_DWORD_2(timer_cmd,
+@@ -1470,6 +1468,8 @@ static int falcon_probe_nic(struct efx_n
+ 		goto fail5;
+ 	}
+ 
++	efx->timer_quantum_ns = 4968; /* 621 cycles */
++
+ 	/* Initialise I2C adapter */
+ 	board = falcon_board(efx);
+ 	board->i2c_adap.owner = THIS_MODULE;
+@@ -1784,6 +1784,7 @@ const struct efx_nic_type falcon_a1_nic_
+ 	.rx_buffer_padding = 0x24,
+ 	.max_interrupt_mode = EFX_INT_MODE_MSI,
+ 	.phys_addr_channels = 4,
++	.timer_period_max =  1 << FRF_AB_TC_TIMER_VAL_WIDTH,
+ 	.tx_dc_base = 0x130000,
+ 	.rx_dc_base = 0x100000,
+ 	.offload_features = NETIF_F_IP_CSUM,
+@@ -1835,6 +1836,7 @@ const struct efx_nic_type falcon_b0_nic_
+ 	.phys_addr_channels = 32, /* Hardware limit is 64, but the legacy
+ 				   * interrupt handler only supports 32
+ 				   * channels */
++	.timer_period_max =  1 << FRF_AB_TC_TIMER_VAL_WIDTH,
+ 	.tx_dc_base = 0x130000,
+ 	.rx_dc_base = 0x100000,
+ 	.offload_features = NETIF_F_IP_CSUM | NETIF_F_RXHASH | NETIF_F_NTUPLE,
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -624,6 +624,7 @@ struct efx_filter_state;
+  * @membase_phys: Memory BAR value as physical address
+  * @membase: Memory BAR value
+  * @interrupt_mode: Interrupt mode
++ * @timer_quantum_ns: Interrupt timer quantum, in nanoseconds
+  * @irq_rx_adaptive: Adaptive IRQ moderation enabled for RX event queues
+  * @irq_rx_moderation: IRQ moderation time for RX event queues
+  * @msg_enable: Log message enable flags
+@@ -706,6 +707,7 @@ struct efx_nic {
+ 	void __iomem *membase;
+ 
+ 	enum efx_int_mode interrupt_mode;
++	unsigned int timer_quantum_ns;
+ 	bool irq_rx_adaptive;
+ 	unsigned int irq_rx_moderation;
+ 	u32 msg_enable;
+@@ -845,6 +847,7 @@ static inline unsigned int efx_port_num(
+  *	from &enum efx_init_mode.
+  * @phys_addr_channels: Number of channels with physically addressed
+  *	descriptors
++ * @timer_period_max: Maximum period of interrupt timer (in ticks)
+  * @tx_dc_base: Base address in SRAM of TX queue descriptor caches
+  * @rx_dc_base: Base address in SRAM of RX queue descriptor caches
+  * @offload_features: net_device feature flags for protocol offload
+@@ -889,6 +892,7 @@ struct efx_nic_type {
+ 	unsigned int rx_buffer_padding;
+ 	unsigned int max_interrupt_mode;
+ 	unsigned int phys_addr_channels;
++	unsigned int timer_period_max;
+ 	unsigned int tx_dc_base;
+ 	unsigned int rx_dc_base;
+ 	u32 offload_features;
+--- a/drivers/net/ethernet/sfc/nic.h
++++ b/drivers/net/ethernet/sfc/nic.h
+@@ -210,9 +210,6 @@ extern irqreturn_t efx_nic_fatal_interru
+ extern irqreturn_t falcon_legacy_interrupt_a1(int irq, void *dev_id);
+ extern void falcon_irq_ack_a1(struct efx_nic *efx);
+ 
+-#define EFX_IRQ_MOD_RESOLUTION	5
+-#define EFX_IRQ_MOD_MAX		0x1000
+-
+ /* Global Resources */
+ extern int efx_nic_flush_queues(struct efx_nic *efx);
+ extern void falcon_start_nic_stats(struct efx_nic *efx);
+--- a/drivers/net/ethernet/sfc/siena.c
++++ b/drivers/net/ethernet/sfc/siena.c
+@@ -35,8 +35,6 @@ static void siena_push_irq_moderation(st
+ {
+ 	efx_dword_t timer_cmd;
+ 
+-	BUILD_BUG_ON(EFX_IRQ_MOD_MAX > (1 << FRF_CZ_TC_TIMER_VAL_WIDTH));
+-
+ 	if (channel->irq_moderation)
+ 		EFX_POPULATE_DWORD_2(timer_cmd,
+ 				     FRF_CZ_TC_TIMER_MODE,
+@@ -216,7 +214,15 @@ static int siena_reset_hw(struct efx_nic
+ 
+ static int siena_probe_nvconfig(struct efx_nic *efx)
+ {
+-	return efx_mcdi_get_board_cfg(efx, efx->net_dev->perm_addr, NULL, NULL);
++	u32 caps = 0;
++	int rc;
++
++	rc = efx_mcdi_get_board_cfg(efx, efx->net_dev->perm_addr, NULL, &caps);
++
++	efx->timer_quantum_ns =
++		(caps & (1 << MC_CMD_CAPABILITIES_TURBO_ACTIVE_LBN)) ?
++		3072 : 6144; /* 768 cycles */
++	return rc;
+ }
+ 
+ static int siena_probe_nic(struct efx_nic *efx)
+@@ -644,6 +650,7 @@ const struct efx_nic_type siena_a0_nic_t
+ 	.phys_addr_channels = 32, /* Hardware limit is 64, but the legacy
+ 				   * interrupt handler only supports 32
+ 				   * channels */
++	.timer_period_max = 1 << FRF_CZ_TC_TIMER_VAL_WIDTH,
+ 	.tx_dc_base = 0x88000,
+ 	.rx_dc_base = 0x68000,
+ 	.offload_features = (NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM |
