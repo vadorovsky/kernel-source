@@ -1,0 +1,199 @@
+From: Ben Hutchings <bhutchings@solarflare.com>
+Date: Tue, 28 Feb 2012 23:40:21 +0000
+Subject: sfc: Run event/IRQ self-test asynchronously when interface is
+ brought up
+Patch-mainline: v3.4-rc1
+Git-commit: dd40781e3a4e9d3177a548c389232ee9496dae8e
+References: bnc#786035 FATE#314299
+
+Generate a test event on each event queue whenever the interface is
+brought up, then after 1 second check that we have either handled a
+test event or handled another IRQ for each event queue.
+
+Signed-off-by: Ben Hutchings <bhutchings@solarflare.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/sfc/efx.c        |    6 ++++-
+ drivers/net/ethernet/sfc/efx.h        |    2 -
+ drivers/net/ethernet/sfc/net_driver.h |    6 +++--
+ drivers/net/ethernet/sfc/nic.c        |    4 +--
+ drivers/net/ethernet/sfc/nic.h        |    2 -
+ drivers/net/ethernet/sfc/selftest.c   |   35 ++++++++++++++++++++++++++++++++++
+ drivers/net/ethernet/sfc/selftest.h   |    3 ++
+ 7 files changed, 51 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -25,6 +25,7 @@
+ #include "net_driver.h"
+ #include "efx.h"
+ #include "nic.h"
++#include "selftest.h"
+ 
+ #include "mcdi.h"
+ #include "workarounds.h"
+@@ -1568,8 +1569,9 @@ static void efx_start_all(struct efx_nic
+  * since we're holding the rtnl_lock at this point. */
+ static void efx_flush_all(struct efx_nic *efx)
+ {
+-	/* Make sure the hardware monitor is stopped */
++	/* Make sure the hardware monitor and event self-test are stopped */
+ 	cancel_delayed_work_sync(&efx->monitor_work);
++	efx_selftest_async_cancel(efx);
+ 	/* Stop scheduled port reconfigurations */
+ 	cancel_work_sync(&efx->mac_work);
+ }
+@@ -1829,6 +1831,7 @@ static int efx_net_open(struct net_devic
+ 	efx_link_status_changed(efx);
+ 
+ 	efx_start_all(efx);
++	efx_selftest_async_start(efx);
+ 	return 0;
+ }
+ 
+@@ -2377,6 +2380,7 @@ static int efx_init_struct(struct efx_ni
+ #endif
+ 	INIT_WORK(&efx->reset_work, efx_reset_work);
+ 	INIT_DELAYED_WORK(&efx->monitor_work, efx_monitor);
++	INIT_DELAYED_WORK(&efx->selftest_work, efx_selftest_async_work);
+ 	efx->pci_dev = pci_dev;
+ 	efx->msg_enable = debug;
+ 	efx->state = STATE_INIT;
+--- a/drivers/net/ethernet/sfc/efx.h
++++ b/drivers/net/ethernet/sfc/efx.h
+@@ -162,7 +162,7 @@ static inline void efx_schedule_channel(
+ 
+ static inline void efx_schedule_channel_irq(struct efx_channel *channel)
+ {
+-	channel->last_irq_cpu = raw_smp_processor_id();
++	channel->event_test_cpu = raw_smp_processor_id();
+ 	efx_schedule_channel(channel);
+ }
+ 
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -325,7 +325,7 @@ enum efx_rx_alloc_method {
+  * @eventq_mask: Event queue pointer mask
+  * @eventq_read_ptr: Event queue read pointer
+  * @last_eventq_read_ptr: Last event queue read pointer value.
+- * @last_irq_cpu: Last CPU to handle interrupt for this channel
++ * @event_test_cpu: Last CPU to handle interrupt or test event for this channel
+  * @irq_count: Number of IRQs since last adaptive moderation decision
+  * @irq_mod_score: IRQ moderation score
+  * @rx_alloc_level: Watermark based heuristic counter for pushing descriptors
+@@ -356,8 +356,8 @@ struct efx_channel {
+ 	unsigned int eventq_mask;
+ 	unsigned int eventq_read_ptr;
+ 	unsigned int last_eventq_read_ptr;
++	int event_test_cpu;
+ 
+-	int last_irq_cpu;
+ 	unsigned int irq_count;
+ 	unsigned int irq_mod_score;
+ #ifdef CONFIG_RFS_ACCEL
+@@ -678,6 +678,7 @@ struct vfdi_status;
+  * @irq_status: Interrupt status buffer
+  * @irq_zero_count: Number of legacy IRQs seen with queue flags == 0
+  * @irq_level: IRQ level/index for IRQs not triggered by an event queue
++ * @selftest_work: Work item for asynchronous self-test
+  * @mtd_list: List of MTDs attached to the NIC
+  * @nic_data: Hardware dependent state
+  * @mac_lock: MAC access lock. Protects @port_enabled, @phy_mode,
+@@ -791,6 +792,7 @@ struct efx_nic {
+ 	struct efx_buffer irq_status;
+ 	unsigned irq_zero_count;
+ 	unsigned irq_level;
++	struct delayed_work selftest_work;
+ 
+ #ifdef CONFIG_SFC_MTD
+ 	struct list_head mtd_list;
+--- a/drivers/net/ethernet/sfc/nic.c
++++ b/drivers/net/ethernet/sfc/nic.c
+@@ -1091,7 +1091,7 @@ efx_handle_generated_event(struct efx_ch
+ 	code = _EFX_CHANNEL_MAGIC_CODE(magic);
+ 
+ 	if (magic == EFX_CHANNEL_MAGIC_TEST(channel)) {
+-		/* ignore */
++		channel->event_test_cpu = raw_smp_processor_id();
+ 	} else if (rx_queue && magic == EFX_CHANNEL_MAGIC_FILL(rx_queue)) {
+ 		/* The queue must be empty, so we won't receive any rx
+ 		 * events, so efx_process_channel() won't refill the
+@@ -1342,7 +1342,7 @@ void efx_nic_remove_eventq(struct efx_ch
+ 
+ void efx_nic_event_test_start(struct efx_channel *channel)
+ {
+-	channel->last_irq_cpu = -1;
++	channel->event_test_cpu = -1;
+ 	smp_wmb();
+ 	efx_magic_event(channel, EFX_CHANNEL_MAGIC_TEST(channel));
+ }
+--- a/drivers/net/ethernet/sfc/nic.h
++++ b/drivers/net/ethernet/sfc/nic.h
+@@ -311,7 +311,7 @@ extern void falcon_irq_ack_a1(struct efx
+ 
+ static inline int efx_nic_event_test_irq_cpu(struct efx_channel *channel)
+ {
+-	return ACCESS_ONCE(channel->last_irq_cpu);
++	return ACCESS_ONCE(channel->event_test_cpu);
+ }
+ static inline int efx_nic_irq_test_irq_cpu(struct efx_nic *efx)
+ {
+--- a/drivers/net/ethernet/sfc/selftest.c
++++ b/drivers/net/ethernet/sfc/selftest.c
+@@ -702,6 +702,8 @@ int efx_selftest(struct efx_nic *efx, st
+ 	enum reset_type reset_method = RESET_TYPE_INVISIBLE;
+ 	int rc_test = 0, rc_reset = 0, rc;
+ 
++	efx_selftest_async_cancel(efx);
++
+ 	/* Online (i.e. non-disruptive) testing
+ 	 * This checks interrupt generation, event delivery and PHY presence. */
+ 
+@@ -794,3 +796,36 @@ int efx_selftest(struct efx_nic *efx, st
+ 	return rc_test;
+ }
+ 
++void efx_selftest_async_start(struct efx_nic *efx)
++{
++	struct efx_channel *channel;
++
++	efx_for_each_channel(channel, efx)
++		efx_nic_event_test_start(channel);
++	schedule_delayed_work(&efx->selftest_work, IRQ_TIMEOUT);
++}
++
++void efx_selftest_async_cancel(struct efx_nic *efx)
++{
++	cancel_delayed_work_sync(&efx->selftest_work);
++}
++
++void efx_selftest_async_work(struct work_struct *data)
++{
++	struct efx_nic *efx = container_of(data, struct efx_nic,
++					   selftest_work.work);
++	struct efx_channel *channel;
++	int cpu;
++
++	efx_for_each_channel(channel, efx) {
++		cpu = efx_nic_event_test_irq_cpu(channel);
++		if (cpu < 0)
++			netif_err(efx, ifup, efx->net_dev,
++				  "channel %d failed to trigger an interrupt\n",
++				  channel->channel);
++		else
++			netif_dbg(efx, ifup, efx->net_dev,
++				  "channel %d triggered interrupt on CPU %d\n",
++				  channel->channel, cpu);
++	}
++}
+--- a/drivers/net/ethernet/sfc/selftest.h
++++ b/drivers/net/ethernet/sfc/selftest.h
+@@ -48,5 +48,8 @@ extern void efx_loopback_rx_packet(struc
+ extern int efx_selftest(struct efx_nic *efx,
+ 			struct efx_self_tests *tests,
+ 			unsigned flags);
++extern void efx_selftest_async_start(struct efx_nic *efx);
++extern void efx_selftest_async_cancel(struct efx_nic *efx);
++extern void efx_selftest_async_work(struct work_struct *data);
+ 
+ #endif /* EFX_SELFTEST_H */

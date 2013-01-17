@@ -1,0 +1,347 @@
+From a3e06bbe8445f57eb949e6474c5a9b30f24d2057 Mon Sep 17 00:00:00 2001
+From: "Liu, Jinsong" <jinsong.liu@intel.com>
+Date: Thu, 22 Sep 2011 16:55:52 +0800
+Subject: KVM: emulate lapic tsc deadline timer for guest
+Patch-mainline: v3.2
+Git-commit: a3e06bbe8445f57eb949e6474c5a9b30f24d2057
+References: fate313642
+
+This patch emulate lapic tsc deadline timer for guest:
+Enumerate tsc deadline timer capability by CPUID;
+Enable tsc deadline timer mode by lapic MMIO;
+Start tsc deadline timer by WRMSR;
+
+[jan: use do_div()]
+[avi: fix for !irqchip_in_kernel()]
+[marcelo: another fix for !irqchip_in_kernel()]
+
+Signed-off-by: Liu, Jinsong <jinsong.liu@intel.com>
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Signed-off-by: Avi Kivity <avi@redhat.com>
+Acked-by: Bruce Rogers <brogers@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |    2 
+ arch/x86/kvm/kvm_timer.h        |    2 
+ arch/x86/kvm/lapic.c            |  141 ++++++++++++++++++++++++++++++++--------
+ arch/x86/kvm/lapic.h            |    3 
+ arch/x86/kvm/x86.c              |   21 +++++
+ 5 files changed, 140 insertions(+), 29 deletions(-)
+
+Index: b/arch/x86/include/asm/kvm_host.h
+===================================================================
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -666,6 +666,8 @@ u8 kvm_get_guest_memory_type(struct kvm_
+ 
+ extern bool tdp_enabled;
+ 
++u64 vcpu_tsc_khz(struct kvm_vcpu *vcpu);
++
+ /* control of guest tsc rate supported? */
+ extern bool kvm_has_tsc_control;
+ /* minimum supported tsc_khz for guests */
+Index: b/arch/x86/kvm/kvm_timer.h
+===================================================================
+--- a/arch/x86/kvm/kvm_timer.h
++++ b/arch/x86/kvm/kvm_timer.h
+@@ -2,6 +2,8 @@
+ struct kvm_timer {
+ 	struct hrtimer timer;
+ 	s64 period; 				/* unit: ns */
++	u32 timer_mode_mask;
++	u64 tscdeadline;
+ 	atomic_t pending;			/* accumulated triggered timers */
+ 	bool reinject;
+ 	struct kvm_timer_ops *t_ops;
+Index: b/arch/x86/kvm/lapic.c
+===================================================================
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -138,9 +138,23 @@ static inline int apic_lvt_vector(struct
+ 	return apic_get_reg(apic, lvt_type) & APIC_VECTOR_MASK;
+ }
+ 
++static inline int apic_lvtt_oneshot(struct kvm_lapic *apic)
++{
++	return ((apic_get_reg(apic, APIC_LVTT) &
++		apic->lapic_timer.timer_mode_mask) == APIC_LVT_TIMER_ONESHOT);
++}
++
+ static inline int apic_lvtt_period(struct kvm_lapic *apic)
+ {
+-	return apic_get_reg(apic, APIC_LVTT) & APIC_LVT_TIMER_PERIODIC;
++	return ((apic_get_reg(apic, APIC_LVTT) &
++		apic->lapic_timer.timer_mode_mask) == APIC_LVT_TIMER_PERIODIC);
++}
++
++static inline int apic_lvtt_tscdeadline(struct kvm_lapic *apic)
++{
++	return ((apic_get_reg(apic, APIC_LVTT) &
++		apic->lapic_timer.timer_mode_mask) ==
++			APIC_LVT_TIMER_TSCDEADLINE);
+ }
+ 
+ static inline int apic_lvt_nmi_mode(u32 lvt_val)
+@@ -169,7 +183,7 @@ static inline int apic_x2apic_mode(struc
+ }
+ 
+ static unsigned int apic_lvt_mask[APIC_LVT_NUM] = {
+-	LVT_MASK | APIC_LVT_TIMER_PERIODIC,	/* LVTT */
++	LVT_MASK ,      /* part LVTT mask, timer mode mask added at runtime */
+ 	LVT_MASK | APIC_MODE_MASK,	/* LVTTHMR */
+ 	LVT_MASK | APIC_MODE_MASK,	/* LVTPC */
+ 	LINT_MASK, LINT_MASK,	/* LVT0-1 */
+@@ -573,6 +587,9 @@ static u32 __apic_read(struct kvm_lapic
+ 		break;
+ 
+ 	case APIC_TMCCT:	/* Timer CCR */
++		if (apic_lvtt_tscdeadline(apic))
++			return 0;
++
+ 		val = apic_get_tmcct(apic);
+ 		break;
+ 
+@@ -667,37 +684,41 @@ static void update_divide_count(struct k
+ 
+ static void start_apic_timer(struct kvm_lapic *apic)
+ {
+-	ktime_t now = apic->lapic_timer.timer.base->get_time();
+-
+-	apic->lapic_timer.period = (u64)apic_get_reg(apic, APIC_TMICT) *
+-		    APIC_BUS_CYCLE_NS * apic->divide_count;
++	ktime_t now;
+ 	atomic_set(&apic->lapic_timer.pending, 0);
+ 
+-	if (!apic->lapic_timer.period)
+-		return;
+-	/*
+-	 * Do not allow the guest to program periodic timers with small
+-	 * interval, since the hrtimers are not throttled by the host
+-	 * scheduler.
+-	 */
+-	if (apic_lvtt_period(apic)) {
+-		s64 min_period = min_timer_period_us * 1000LL;
++	if (apic_lvtt_period(apic) || apic_lvtt_oneshot(apic)) {
++		/* lapic timer in oneshot or peroidic mode */
++		now = apic->lapic_timer.timer.base->get_time();
++		apic->lapic_timer.period = (u64)apic_get_reg(apic, APIC_TMICT)
++			    * APIC_BUS_CYCLE_NS * apic->divide_count;
+ 
+-		if (apic->lapic_timer.period < min_period) {
+-			pr_info_ratelimited(
+-				"kvm: vcpu %i: requested %lld ns "
+-				"lapic timer period limited to %lld ns\n",
+-				apic->vcpu->vcpu_id, apic->lapic_timer.period,
+-				min_period);
+-			apic->lapic_timer.period = min_period;
++		if (!apic->lapic_timer.period)
++			return;
++		/*
++		 * Do not allow the guest to program periodic timers with small
++		 * interval, since the hrtimers are not throttled by the host
++		 * scheduler.
++		 */
++		if (apic_lvtt_period(apic)) {
++			s64 min_period = min_timer_period_us * 1000LL;
++
++			if (apic->lapic_timer.period < min_period) {
++				if (printk_ratelimit()) {
++				    printk(KERN_INFO "kvm: vcpu %i: requested %lld ns "
++				    "lapic timer period limited to %lld ns\n",
++				    apic->vcpu->vcpu_id,
++				    apic->lapic_timer.period, min_period);
++				}
++				apic->lapic_timer.period = min_period;
++			}
+ 		}
+-	}
+ 
+-	hrtimer_start(&apic->lapic_timer.timer,
+-		      ktime_add_ns(now, apic->lapic_timer.period),
+-		      HRTIMER_MODE_ABS);
++		hrtimer_start(&apic->lapic_timer.timer,
++			      ktime_add_ns(now, apic->lapic_timer.period),
++			      HRTIMER_MODE_ABS);
+ 
+-	apic_debug("%s: bus cycle is %" PRId64 "ns, now 0x%016"
++		apic_debug("%s: bus cycle is %" PRId64 "ns, now 0x%016"
+ 			   PRIx64 ", "
+ 			   "timer initial count 0x%x, period %lldns, "
+ 			   "expire @ 0x%016" PRIx64 ".\n", __func__,
+@@ -706,6 +727,30 @@ static void start_apic_timer(struct kvm_
+ 			   apic->lapic_timer.period,
+ 			   ktime_to_ns(ktime_add_ns(now,
+ 					apic->lapic_timer.period)));
++	} else if (apic_lvtt_tscdeadline(apic)) {
++		/* lapic timer in tsc deadline mode */
++		u64 guest_tsc, tscdeadline = apic->lapic_timer.tscdeadline;
++		u64 ns = 0;
++		struct kvm_vcpu *vcpu = apic->vcpu;
++		unsigned long this_tsc_khz = vcpu_tsc_khz(vcpu);
++		unsigned long flags;
++
++		if (unlikely(!tscdeadline || !this_tsc_khz))
++			return;
++
++		local_irq_save(flags);
++
++		now = apic->lapic_timer.timer.base->get_time();
++		guest_tsc = kvm_x86_ops->read_l1_tsc(vcpu);
++		if (likely(tscdeadline > guest_tsc)) {
++			ns = (tscdeadline - guest_tsc) * 1000000ULL;
++			do_div(ns, this_tsc_khz);
++		}
++		hrtimer_start(&apic->lapic_timer.timer,
++			ktime_add_ns(now, ns), HRTIMER_MODE_ABS);
++
++		local_irq_restore(flags);
++	}
+ }
+ 
+ static void apic_manage_nmi_watchdog(struct kvm_lapic *apic, u32 lvt0_val)
+@@ -793,7 +838,6 @@ static int apic_reg_write(struct kvm_lap
+ 
+ 	case APIC_LVT0:
+ 		apic_manage_nmi_watchdog(apic, val);
+-	case APIC_LVTT:
+ 	case APIC_LVTTHMR:
+ 	case APIC_LVTPC:
+ 	case APIC_LVT1:
+@@ -807,7 +851,22 @@ static int apic_reg_write(struct kvm_lap
+ 
+ 		break;
+ 
++	case APIC_LVTT:
++		if ((apic_get_reg(apic, APIC_LVTT) &
++		    apic->lapic_timer.timer_mode_mask) !=
++		   (val & apic->lapic_timer.timer_mode_mask))
++			hrtimer_cancel(&apic->lapic_timer.timer);
++
++		if (!apic_sw_enabled(apic))
++			val |= APIC_LVT_MASKED;
++		val &= (apic_lvt_mask[0] | apic->lapic_timer.timer_mode_mask);
++		apic_set_reg(apic, APIC_LVTT, val);
++		break;
++
+ 	case APIC_TMICT:
++		if (apic_lvtt_tscdeadline(apic))
++			break;
++
+ 		hrtimer_cancel(&apic->lapic_timer.timer);
+ 		apic_set_reg(apic, APIC_TMICT, val);
+ 		start_apic_timer(apic);
+@@ -894,6 +953,32 @@ void kvm_free_lapic(struct kvm_vcpu *vcp
+  *----------------------------------------------------------------------
+  */
+ 
++u64 kvm_get_lapic_tscdeadline_msr(struct kvm_vcpu *vcpu)
++{
++	struct kvm_lapic *apic = vcpu->arch.apic;
++	if (!apic)
++		return 0;
++
++	if (apic_lvtt_oneshot(apic) || apic_lvtt_period(apic))
++		return 0;
++
++	return apic->lapic_timer.tscdeadline;
++}
++
++void kvm_set_lapic_tscdeadline_msr(struct kvm_vcpu *vcpu, u64 data)
++{
++	struct kvm_lapic *apic = vcpu->arch.apic;
++	if (!apic)
++		return;
++
++	if (apic_lvtt_oneshot(apic) || apic_lvtt_period(apic))
++		return;
++
++	hrtimer_cancel(&apic->lapic_timer.timer);
++	apic->lapic_timer.tscdeadline = data;
++	start_apic_timer(apic);
++}
++
+ void kvm_lapic_set_tpr(struct kvm_vcpu *vcpu, unsigned long cr8)
+ {
+ 	struct kvm_lapic *apic = vcpu->arch.apic;
+Index: b/arch/x86/kvm/lapic.h
+===================================================================
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -41,6 +41,9 @@ int kvm_lapic_enabled(struct kvm_vcpu *v
+ bool kvm_apic_present(struct kvm_vcpu *vcpu);
+ int kvm_lapic_find_highest_irr(struct kvm_vcpu *vcpu);
+ 
++u64 kvm_get_lapic_tscdeadline_msr(struct kvm_vcpu *vcpu);
++void kvm_set_lapic_tscdeadline_msr(struct kvm_vcpu *vcpu, u64 data);
++
+ void kvm_lapic_set_vapic_addr(struct kvm_vcpu *vcpu, gpa_t vapic_addr);
+ void kvm_lapic_sync_from_vapic(struct kvm_vcpu *vcpu);
+ void kvm_lapic_sync_to_vapic(struct kvm_vcpu *vcpu);
+Index: b/arch/x86/kvm/x86.c
+===================================================================
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -613,6 +613,8 @@ static inline bool guest_cpuid_has_pcid(
+ static void update_cpuid(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_cpuid_entry2 *best;
++	struct kvm_lapic *apic = vcpu->arch.apic;
++	u32 timer_mode_mask;
+ 
+ 	best = kvm_find_cpuid_entry(vcpu, 1, 0);
+ 	if (!best)
+@@ -624,6 +626,16 @@ static void update_cpuid(struct kvm_vcpu
+ 		if (kvm_read_cr4_bits(vcpu, X86_CR4_OSXSAVE))
+ 			best->ecx |= bit(X86_FEATURE_OSXSAVE);
+ 	}
++
++	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL &&
++		best->function == 0x1) {
++		best->ecx |= bit(X86_FEATURE_TSC_DEADLINE_TIMER);
++		timer_mode_mask = 3 << 17;
++	} else
++		timer_mode_mask = 1 << 17;
++
++	if (apic)
++		apic->lapic_timer.timer_mode_mask = timer_mode_mask;
+ }
+ 
+ int kvm_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
+@@ -850,6 +862,7 @@ static u32 msrs_to_save[] = {
+ static unsigned num_msrs_to_save;
+ 
+ static u32 emulated_msrs[] = {
++	MSR_IA32_TSCDEADLINE,
+ 	MSR_IA32_MISC_ENABLE,
+ 	MSR_IA32_MCG_STATUS,
+ 	MSR_IA32_MCG_CTL,
+@@ -1029,7 +1042,7 @@ static inline int kvm_tsc_changes_freq(v
+ 	return ret;
+ }
+ 
+-static u64 vcpu_tsc_khz(struct kvm_vcpu *vcpu)
++u64 vcpu_tsc_khz(struct kvm_vcpu *vcpu)
+ {
+ 	if (vcpu->arch.virtual_tsc_khz)
+ 		return vcpu->arch.virtual_tsc_khz;
+@@ -1565,6 +1578,9 @@ int kvm_set_msr_common(struct kvm_vcpu *
+ 		break;
+ 	case APIC_BASE_MSR ... APIC_BASE_MSR + 0x3ff:
+ 		return kvm_x2apic_msr_write(vcpu, msr, data);
++	case MSR_IA32_TSCDEADLINE:
++		kvm_set_lapic_tscdeadline_msr(vcpu, data);
++		break;
+ 	case MSR_IA32_MISC_ENABLE:
+ 		vcpu->arch.ia32_misc_enable_msr = data;
+ 		break;
+@@ -1873,6 +1889,9 @@ int kvm_get_msr_common(struct kvm_vcpu *
+ 	case APIC_BASE_MSR ... APIC_BASE_MSR + 0x3ff:
+ 		return kvm_x2apic_msr_read(vcpu, msr, pdata);
+ 		break;
++	case MSR_IA32_TSCDEADLINE:
++		data = kvm_get_lapic_tscdeadline_msr(vcpu);
++		break;
+ 	case MSR_IA32_MISC_ENABLE:
+ 		data = vcpu->arch.ia32_misc_enable_msr;
+ 		break;
