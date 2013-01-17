@@ -1,0 +1,198 @@
+From: Ben Hutchings <bhutchings@solarflare.com>
+Date: Fri, 24 Jun 2011 20:46:31 +0100
+Subject: sfc: Allow resets to be upgraded; use atomic ops for safety
+Patch-mainline: v3.1-rc1
+Git-commit: a7d529ae2158b5300e4aa16c21f1828bc864449b
+References: bnc#786035 FATE#314299
+
+Currently an attempt to schedule any reset is ignored if a reset
+is already pending.  This ignores the relative scopes - if the
+requested reset is greater in scope then the scheduled reset should
+be upgraded accordingly.
+
+There are also some race conditions which could lead to a reset
+request being lost.  Deal with them by using atomic operations on a
+bitmask.  This also makes tests on reset_pending easier to get right.
+
+Signed-off-by: Ben Hutchings <bhutchings@solarflare.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/sfc/efx.c        |   38 +++++++++++++++++---------------------
+ drivers/net/sfc/enum.h       |    3 ++-
+ drivers/net/sfc/falcon.c     |    2 +-
+ drivers/net/sfc/net_driver.h |    4 ++--
+ 4 files changed, 22 insertions(+), 25 deletions(-)
+
+--- a/drivers/net/sfc/efx.c
++++ b/drivers/net/sfc/efx.c
+@@ -229,8 +229,7 @@ static int efx_process_channel(struct ef
+ 	struct efx_nic *efx = channel->efx;
+ 	int spent;
+ 
+-	if (unlikely(efx->reset_pending != RESET_TYPE_NONE ||
+-		     !channel->enabled))
++	if (unlikely(efx->reset_pending || !channel->enabled))
+ 		return 0;
+ 
+ 	spent = efx_nic_process_eventq(channel, budget);
+@@ -1452,7 +1451,7 @@ static void efx_start_all(struct efx_nic
+ 	 * reset_pending [modified from an atomic context], we instead guarantee
+ 	 * that efx_mcdi_mode_poll() isn't reverted erroneously */
+ 	efx_mcdi_mode_event(efx);
+-	if (efx->reset_pending != RESET_TYPE_NONE)
++	if (efx->reset_pending)
+ 		efx_mcdi_mode_poll(efx);
+ 
+ 	/* Start the hardware monitor if there is one. Otherwise (we're link
+@@ -2110,8 +2109,10 @@ int efx_reset(struct efx_nic *efx, enum
+ 		goto out;
+ 	}
+ 
+-	/* Allow resets to be rescheduled. */
+-	efx->reset_pending = RESET_TYPE_NONE;
++	/* Clear flags for the scopes we covered.  We assume the NIC and
++	 * driver are now quiescent so that there is no race here.
++	 */
++	efx->reset_pending &= -(1 << (method + 1));
+ 
+ 	/* Reinitialise bus-mastering, which may have been turned off before
+ 	 * the reset was scheduled. This is still appropriate, even in the
+@@ -2146,12 +2147,13 @@ out:
+ static void efx_reset_work(struct work_struct *data)
+ {
+ 	struct efx_nic *efx = container_of(data, struct efx_nic, reset_work);
++	unsigned long pending = ACCESS_ONCE(efx->reset_pending);
+ 
+-	if (efx->reset_pending == RESET_TYPE_NONE)
++	if (!pending)
+ 		return;
+ 
+ 	/* If we're not RUNNING then don't reset. Leave the reset_pending
+-	 * flag set so that efx_pci_probe_main will be retried */
++	 * flags set so that efx_pci_probe_main will be retried */
+ 	if (efx->state != STATE_RUNNING) {
+ 		netif_info(efx, drv, efx->net_dev,
+ 			   "scheduled reset quenched. NIC not RUNNING\n");
+@@ -2159,7 +2161,7 @@ static void efx_reset_work(struct work_s
+ 	}
+ 
+ 	rtnl_lock();
+-	(void)efx_reset(efx, efx->reset_pending);
++	(void)efx_reset(efx, fls(pending) - 1);
+ 	rtnl_unlock();
+ }
+ 
+@@ -2167,12 +2169,6 @@ void efx_schedule_reset(struct efx_nic *
+ {
+ 	enum reset_type method;
+ 
+-	if (efx->reset_pending != RESET_TYPE_NONE) {
+-		netif_info(efx, drv, efx->net_dev,
+-			   "quenching already scheduled reset\n");
+-		return;
+-	}
+-
+ 	switch (type) {
+ 	case RESET_TYPE_INVISIBLE:
+ 	case RESET_TYPE_ALL:
+@@ -2200,7 +2196,7 @@ void efx_schedule_reset(struct efx_nic *
+ 		netif_dbg(efx, drv, efx->net_dev, "scheduling %s reset\n",
+ 			  RESET_TYPE(method));
+ 
+-	efx->reset_pending = method;
++	set_bit(method, &efx->reset_pending);
+ 
+ 	/* efx_process_channel() will no longer read events once a
+ 	 * reset is scheduled. So switch back to poll'd MCDI completions. */
+@@ -2280,7 +2276,6 @@ static int efx_init_struct(struct efx_ni
+ 	efx->pci_dev = pci_dev;
+ 	efx->msg_enable = debug;
+ 	efx->state = STATE_INIT;
+-	efx->reset_pending = RESET_TYPE_NONE;
+ 	strlcpy(efx->name, pci_name(pci_dev), sizeof(efx->name));
+ 
+ 	efx->net_dev = net_dev;
+@@ -2502,7 +2497,7 @@ static int __devinit efx_pci_probe(struc
+ 		cancel_work_sync(&efx->reset_work);
+ 
+ 		if (rc == 0) {
+-			if (efx->reset_pending != RESET_TYPE_NONE) {
++			if (efx->reset_pending) {
+ 				/* If there was a scheduled reset during
+ 				 * probe, the NIC is probably hosed anyway */
+ 				efx_pci_remove_main(efx);
+@@ -2513,11 +2508,12 @@ static int __devinit efx_pci_probe(struc
+ 		}
+ 
+ 		/* Retry if a recoverably reset event has been scheduled */
+-		if ((efx->reset_pending != RESET_TYPE_INVISIBLE) &&
+-		    (efx->reset_pending != RESET_TYPE_ALL))
++		if (efx->reset_pending &
++		    ~(1 << RESET_TYPE_INVISIBLE | 1 << RESET_TYPE_ALL) ||
++		    !efx->reset_pending)
+ 			goto fail3;
+ 
+-		efx->reset_pending = RESET_TYPE_NONE;
++		efx->reset_pending = 0;
+ 	}
+ 
+ 	if (rc) {
+@@ -2601,7 +2597,7 @@ static int efx_pm_poweroff(struct device
+ 
+ 	efx->type->fini(efx);
+ 
+-	efx->reset_pending = RESET_TYPE_NONE;
++	efx->reset_pending = 0;
+ 
+ 	pci_save_state(pci_dev);
+ 	return pci_set_power_state(pci_dev, PCI_D3hot);
+--- a/drivers/net/sfc/enum.h
++++ b/drivers/net/sfc/enum.h
+@@ -134,6 +134,8 @@ enum efx_loopback_mode {
+  * other valuesspecify reasons, which efx_schedule_reset() will choose
+  * a method for.
+  *
++ * Reset methods are numbered in order of increasing scope.
++ *
+  * @RESET_TYPE_INVISIBLE: don't reset the PHYs or interrupts
+  * @RESET_TYPE_ALL: reset everything but PCI core blocks
+  * @RESET_TYPE_WORLD: reset everything, save & restore PCI config
+@@ -147,7 +149,6 @@ enum efx_loopback_mode {
+  * @RESET_TYPE_MC_FAILURE: MC reboot/assertion
+  */
+ enum reset_type {
+-	RESET_TYPE_NONE = -1,
+ 	RESET_TYPE_INVISIBLE = 0,
+ 	RESET_TYPE_ALL = 1,
+ 	RESET_TYPE_WORLD = 2,
+--- a/drivers/net/sfc/falcon.c
++++ b/drivers/net/sfc/falcon.c
+@@ -536,7 +536,7 @@ void falcon_reconfigure_mac_wrapper(stru
+ 	efx_oword_t reg;
+ 	int link_speed, isolate;
+ 
+-	isolate = (efx->reset_pending != RESET_TYPE_NONE);
++	isolate = !!ACCESS_ONCE(efx->reset_pending);
+ 
+ 	switch (link_state->speed) {
+ 	case 10000: link_speed = 3; break;
+--- a/drivers/net/sfc/net_driver.h
++++ b/drivers/net/sfc/net_driver.h
+@@ -644,7 +644,7 @@ struct efx_filter_state;
+  * @irq_rx_moderation: IRQ moderation time for RX event queues
+  * @msg_enable: Log message enable flags
+  * @state: Device state flag. Serialised by the rtnl_lock.
+- * @reset_pending: Pending reset method (normally RESET_TYPE_NONE)
++ * @reset_pending: Bitmask for pending resets
+  * @tx_queue: TX DMA queues
+  * @rx_queue: RX DMA queues
+  * @channel: Channels
+@@ -727,7 +727,7 @@ struct efx_nic {
+ 	u32 msg_enable;
+ 
+ 	enum nic_state state;
+-	enum reset_type reset_pending;
++	unsigned long reset_pending;
+ 
+ 	struct efx_channel *channel[EFX_MAX_CHANNELS];
+ 	char channel_name[EFX_MAX_CHANNELS][IFNAMSIZ + 6];
