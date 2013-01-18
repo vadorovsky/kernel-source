@@ -1,0 +1,245 @@
+From ba904635d498fea43fc3610983f9dc430ac324e4 Mon Sep 17 00:00:00 2001
+From: Will Auld <will.auld.intel@gmail.com>
+Date: Thu, 29 Nov 2012 12:42:50 -0800
+Subject: KVM: x86: Emulate IA32_TSC_ADJUST MSR
+Patch-mainline: v3.8
+Git-commit: ba904635d498fea43fc3610983f9dc430ac324e4
+References: fate#313619
+
+CPUID.7.0.EBX[1]=1 indicates IA32_TSC_ADJUST MSR 0x3b is supported
+
+Basic design is to emulate the MSR by allowing reads and writes to a guest
+vcpu specific location to store the value of the emulated MSR while adding
+the value to the vmcs tsc_offset. In this way the IA32_TSC_ADJUST value will
+be included in all reads to the TSC MSR whether through rdmsr or rdtsc. This
+is of course as long as the "use TSC counter offsetting" VM-execution control
+is enabled as well as the IA32_TSC_ADJUST control.
+
+However, because hardware will only return the TSC + IA32_TSC_ADJUST +
+vmsc tsc_offset for a guest process when it does and rdtsc (with the correct
+settings) the value of our virtualized IA32_TSC_ADJUST must be stored in one
+of these three locations. The argument against storing it in the actual MSR
+is performance. This is likely to be seldom used while the save/restore is
+required on every transition. IA32_TSC_ADJUST was created as a way to solve
+some issues with writing TSC itself so that is not an option either.
+
+The remaining option, defined above as our solution has the problem of
+returning incorrect vmcs tsc_offset values (unless we intercept and fix, not
+done here) as mentioned above. However, more problematic is that storing the
+data in vmcs tsc_offset will have a different semantic effect on the system
+than does using the actual MSR. This is illustrated in the following example:
+
+The hypervisor set the IA32_TSC_ADJUST, then the guest sets it and a guest
+process performs a rdtsc. In this case the guest process will get
+TSC + IA32_TSC_ADJUST_hyperviser + vmsc tsc_offset including
+IA32_TSC_ADJUST_guest. While the total system semantics changed the semantics
+as seen by the guest do not and hence this will not cause a problem.
+
+Signed-off-by: Will Auld <will.auld@intel.com>
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Acked-by: Bruce Rogers <brogers@suse.com>
+---
+ arch/x86/include/asm/cpufeature.h |    1 +
+ arch/x86/include/asm/kvm_host.h   |    2 ++
+ arch/x86/include/asm/msr-index.h  |    1 +
+ arch/x86/kvm/svm.c                |    8 ++++++++
+ arch/x86/kvm/vmx.c                |    9 +++++++++
+ arch/x86/kvm/x86.c                |   32 ++++++++++++++++++++++++++++++++
+ 6 files changed, 53 insertions(+)
+
+Index: b/arch/x86/include/asm/cpufeature.h
+===================================================================
+--- a/arch/x86/include/asm/cpufeature.h
++++ b/arch/x86/include/asm/cpufeature.h
+@@ -198,6 +198,7 @@
+ 
+ /* Intel-defined CPU features, CPUID level 0x00000007:0 (ebx), word 9 */
+ #define X86_FEATURE_FSGSBASE	(9*32+ 0) /* {RD/WR}{FS/GS}BASE instructions*/
++#define X86_FEATURE_TSC_ADJUST	(9*32+ 1) /* TSC adjustment MSR 0x3b */
+ #define X86_FEATURE_BMI1	(9*32+ 3) /* 1st group bit manipulation extensions */
+ #define X86_FEATURE_HLE		(9*32+ 4) /* Hardware Lock Elision */
+ #define X86_FEATURE_AVX2	(9*32+ 5) /* AVX2 instructions */
+Index: b/arch/x86/include/asm/kvm_host.h
+===================================================================
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -400,6 +400,7 @@ struct kvm_vcpu_arch {
+ 	u64 last_tsc_nsec;
+ 	u64 last_tsc_write;
+ 	u32 virtual_tsc_khz;
++	s64 ia32_tsc_adjust_msr;
+ 	bool tsc_catchup;
+ 	u32  tsc_catchup_mult;
+ 	s8   tsc_catchup_shift;
+@@ -623,6 +624,7 @@ struct kvm_x86_ops {
+ 	bool (*has_wbinvd_exit)(void);
+ 
+ 	void (*set_tsc_khz)(struct kvm_vcpu *vcpu, u32 user_tsc_khz);
++	u64 (*read_tsc_offset)(struct kvm_vcpu *vcpu);
+ 	void (*write_tsc_offset)(struct kvm_vcpu *vcpu, u64 offset);
+ 
+ 	u64 (*compute_tsc_offset)(struct kvm_vcpu *vcpu, u64 target_tsc);
+Index: b/arch/x86/include/asm/msr-index.h
+===================================================================
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -226,6 +226,7 @@
+ #define MSR_IA32_EBL_CR_POWERON		0x0000002a
+ #define MSR_EBC_FREQUENCY_ID		0x0000002c
+ #define MSR_IA32_FEATURE_CONTROL        0x0000003a
++#define MSR_IA32_TSC_ADJUST             0x0000003b
+ 
+ #define FEATURE_CONTROL_LOCKED				(1<<0)
+ #define FEATURE_CONTROL_VMXON_ENABLED_INSIDE_SMX	(1<<1)
+Index: b/arch/x86/kvm/svm.c
+===================================================================
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -999,6 +999,13 @@ static void svm_set_tsc_khz(struct kvm_v
+ 	svm->tsc_ratio             = ratio;
+ }
+ 
++static u64 svm_read_tsc_offset(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++
++	return svm->vmcb->control.tsc_offset;
++}
++
+ static void svm_write_tsc_offset(struct kvm_vcpu *vcpu, u64 offset)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+@@ -4334,6 +4341,7 @@ static struct kvm_x86_ops svm_x86_ops =
+ 	.has_wbinvd_exit = svm_has_wbinvd_exit,
+ 
+ 	.set_tsc_khz = svm_set_tsc_khz,
++	.read_tsc_offset = svm_read_tsc_offset,
+ 	.write_tsc_offset = svm_write_tsc_offset,
+ 	.adjust_tsc_offset = svm_adjust_tsc_offset,
+ 	.compute_tsc_offset = svm_compute_tsc_offset,
+Index: b/arch/x86/kvm/vmx.c
+===================================================================
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -1792,6 +1792,11 @@ static void vmx_set_tsc_khz(struct kvm_v
+ 	/* Nothing to do here */
+ }
+ 
++static u64 vmx_read_tsc_offset(struct kvm_vcpu *vcpu)
++{
++	return vmcs_read64(TSC_OFFSET);
++}
++
+ /*
+  * writes 'offset' into guest's timestamp counter offset register
+  */
+@@ -2176,6 +2181,9 @@ static int vmx_set_msr(struct kvm_vcpu *
+ 		}
+ 		ret = kvm_set_msr_common(vcpu, msr_info);
+ 		break;
++	case MSR_IA32_TSC_ADJUST:
++		ret = kvm_set_msr_common(vcpu, msr_info);
++		break;
+ 	case MSR_TSC_AUX:
+ 		if (!vmx->rdtscp_enabled)
+ 			return 1;
+@@ -7114,6 +7122,7 @@ static struct kvm_x86_ops vmx_x86_ops =
+ 	.has_wbinvd_exit = cpu_has_vmx_wbinvd_exit,
+ 
+ 	.set_tsc_khz = vmx_set_tsc_khz,
++	.read_tsc_offset = vmx_read_tsc_offset,
+ 	.write_tsc_offset = vmx_write_tsc_offset,
+ 	.adjust_tsc_offset = vmx_adjust_tsc_offset,
+ 	.compute_tsc_offset = vmx_compute_tsc_offset,
+Index: b/arch/x86/kvm/x86.c
+===================================================================
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -586,6 +586,14 @@ static bool guest_cpuid_has_xsave(struct
+ 	return best && (best->ecx & bit(X86_FEATURE_XSAVE));
+ }
+ 
++static inline bool guest_cpuid_has_tsc_adjust(struct kvm_vcpu *vcpu)
++{
++	struct kvm_cpuid_entry2 *best;
++
++	best = kvm_find_cpuid_entry(vcpu, 7, 0);
++	return best && (best->ebx & bit(X86_FEATURE_TSC_ADJUST));
++}
++
+ static bool guest_cpuid_has_smep(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_cpuid_entry2 *best;
+@@ -858,6 +866,7 @@ static u32 msrs_to_save[] = {
+ static unsigned num_msrs_to_save;
+ 
+ static u32 emulated_msrs[] = {
++	MSR_IA32_TSC_ADJUST,
+ 	MSR_IA32_TSCDEADLINE,
+ 	MSR_IA32_MISC_ENABLE,
+ 	MSR_IA32_MCG_STATUS,
+@@ -1081,6 +1090,12 @@ static u64 compute_guest_tsc(struct kvm_
+ 	return tsc;
+ }
+ 
++static void update_ia32_tsc_adjust_msr(struct kvm_vcpu *vcpu, s64 offset)
++{
++	u64 curr_offset = kvm_x86_ops->read_tsc_offset(vcpu);
++	vcpu->arch.ia32_tsc_adjust_msr += offset - curr_offset;
++}
++
+ void kvm_write_tsc(struct kvm_vcpu *vcpu, struct msr_data *msr)
+ {
+ 	struct kvm *kvm = vcpu->kvm;
+@@ -1121,6 +1136,8 @@ void kvm_write_tsc(struct kvm_vcpu *vcpu
+ 	kvm->arch.last_tsc_nsec = ns;
+ 	kvm->arch.last_tsc_write = data;
+ 	kvm->arch.last_tsc_offset = offset;
++	if (guest_cpuid_has_tsc_adjust(vcpu) && !msr->host_initiated)
++		update_ia32_tsc_adjust_msr(vcpu, offset);
+ 	kvm_x86_ops->write_tsc_offset(vcpu, offset);
+ 	raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
+ 
+@@ -1586,6 +1603,15 @@ int kvm_set_msr_common(struct kvm_vcpu *
+ 	case MSR_IA32_TSCDEADLINE:
+ 		kvm_set_lapic_tscdeadline_msr(vcpu, data);
+ 		break;
++	case MSR_IA32_TSC_ADJUST:
++		if (guest_cpuid_has_tsc_adjust(vcpu)) {
++			if (!msr_info->host_initiated) {
++				u64 adj = data - vcpu->arch.ia32_tsc_adjust_msr;
++				kvm_x86_ops->adjust_tsc_offset(vcpu, adj);
++			}
++			vcpu->arch.ia32_tsc_adjust_msr = data;
++		}
++		break;
+ 	case MSR_IA32_MISC_ENABLE:
+ 		vcpu->arch.ia32_misc_enable_msr = data;
+ 		break;
+@@ -1897,6 +1923,9 @@ int kvm_get_msr_common(struct kvm_vcpu *
+ 	case MSR_IA32_TSCDEADLINE:
+ 		data = kvm_get_lapic_tscdeadline_msr(vcpu);
+ 		break;
++	case MSR_IA32_TSC_ADJUST:
++		data = (u64)vcpu->arch.ia32_tsc_adjust_msr;
++		break;
+ 	case MSR_IA32_MISC_ENABLE:
+ 		data = vcpu->arch.ia32_misc_enable_msr;
+ 		break;
+@@ -2508,6 +2537,8 @@ static void do_cpuid_ent(struct kvm_cpui
+ 		if (index == 0) {
+ 			entry->ebx &= kvm_supported_word9_x86_features;
+ 			cpuid_mask(&entry->ebx, 9);
++			// TSC_ADJUST is emulated
++			entry->ebx |= F(TSC_ADJUST);
+ 		} else
+ 			entry->ebx = 0;
+ 		entry->eax = 0;
+@@ -6393,6 +6424,7 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *
+ 	if (!zalloc_cpumask_var(&vcpu->arch.wbinvd_dirty_mask, GFP_KERNEL))
+ 		goto fail_free_mce_banks;
+ 
++	vcpu->arch.ia32_tsc_adjust_msr = 0x0;
+ 	kvm_async_pf_hash_reset(vcpu);
+ 
+ 	return 0;
