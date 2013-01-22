@@ -14,7 +14,8 @@ all: $(dir)/.directory_symbols
 
 $(dir)/.directory_symbols: $(subdir_exports)
 	cat /dev/null $(subdir_exports) >$@
-	for part in $$(grep -sv '/built-in\.o$$' $(builtin_o).parts); do \
+	for part in $$(cat $(builtin_o).parts 2>/dev/null); do \
+		case $$part in */built-in.o) continue ;; esac; \
 		$(sourcedir)/symsets.pl --list-exported-symbols $$part | \
 		awk 'BEGIN { FS = "\t" ; OFS = "\t" } { $$3 = $$3 "/built-in"; print }'; \
 	done | sed 's:\./::g' >>$@
