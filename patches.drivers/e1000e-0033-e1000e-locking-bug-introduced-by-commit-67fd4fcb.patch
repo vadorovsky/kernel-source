@@ -1,0 +1,121 @@
+From: Bruce Allan <bruce.w.allan@intel.com>
+Date: Fri, 7 Oct 2011 03:50:38 +0000
+Subject: e1000e: locking bug introduced by commit 67fd4fcb
+Patch-mainline: v3.2-rc1
+Git-commit: a90b412cb8c7ccc1689f9ea130883d00a1f0a5bb
+References: bnc#795174 FATE#313648
+
+Commit 67fd4fcb (e1000e: convert to stats64) added the ability to update
+statistics more accurately and on-demand through the net_device_ops
+.ndo_get_stats64 hook, but introduced a locking bug on 82577/8/9 when
+linked at half-duplex (seen on kernels with CONFIG_DEBUG_ATOMIC_SLEEP=y and
+CONFIG_PROVE_LOCKING=y).  The commit introduced code paths that caused a
+mutex to be locked in atomic contexts, e.g. an rcu_read_lock is held when
+irqbalance reads the stats from /sys/class/net/ethX/statistics causing the
+mutex to be locked to read the Phy half-duplex statistics registers.
+
+The mutex was originally introduced to prevent concurrent accesses of
+resources (the NVM and Phy) shared by the driver, firmware and hardware
+a few years back when there was an issue with the NVM getting corrupted.
+It was later split into two mutexes - one for the NVM and one for the Phy
+when it was determined the NVM, unlike the Phy, should not be protected by
+the software/firmware/hardware semaphore (arbitration of which is done in
+part with the SWFLAG bit in the EXTCNF_CTRL register).  This latter
+semaphore should be sufficient to prevent resource contention of the Phy in
+the driver (i.e. the mutex for Phy accesses is not needed), but to be sure
+the mutex is replaced with an atomic bit flag which will warn if any
+contention is possible.
+
+Also add additional debug output to help determine when the sw/fw/hw
+semaphore is owned by the firmware or hardware.
+
+Signed-off-by: Bruce Allan <bruce.w.allan@intel.com>
+Reported-by: Francois Romieu <romieu@fr.zoreil.com>
+Tested-by: Jeff Pieper <jeffrey.e.pieper@intel.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/intel/e1000e/e1000.h   |    1 +
+ drivers/net/ethernet/intel/e1000e/ich8lan.c |   21 +++++++++++++--------
+ 2 files changed, 14 insertions(+), 8 deletions(-)
+--- a/drivers/net/ethernet/intel/e1000e/e1000.h
++++ b/drivers/net/ethernet/intel/e1000e/e1000.h
+@@ -470,6 +470,7 @@ struct e1000_info {
+ enum e1000_state_t {
+ 	__E1000_TESTING,
+ 	__E1000_RESETTING,
++	__E1000_ACCESS_SHARED_RESOURCE,
+ 	__E1000_DOWN
+ };
+ 
+--- a/drivers/net/ethernet/intel/e1000e/ich8lan.c
++++ b/drivers/net/ethernet/intel/e1000e/ich8lan.c
+@@ -852,8 +852,6 @@ static void e1000_release_nvm_ich8lan(st
+ 	mutex_unlock(&nvm_mutex);
+ }
+ 
+-static DEFINE_MUTEX(swflag_mutex);
+-
+ /**
+  *  e1000_acquire_swflag_ich8lan - Acquire software control flag
+  *  @hw: pointer to the HW structure
+@@ -866,7 +864,12 @@ static s32 e1000_acquire_swflag_ich8lan(
+ 	u32 extcnf_ctrl, timeout = PHY_CFG_TIMEOUT;
+ 	s32 ret_val = 0;
+ 
+-	mutex_lock(&swflag_mutex);
++	if (test_and_set_bit(__E1000_ACCESS_SHARED_RESOURCE,
++			     &hw->adapter->state)) {
++		WARN(1, "e1000e: %s: contention for Phy access\n",
++		     hw->adapter->netdev->name);
++		return -E1000_ERR_PHY;
++	}
+ 
+ 	while (timeout) {
+ 		extcnf_ctrl = er32(EXTCNF_CTRL);
+@@ -878,7 +881,7 @@ static s32 e1000_acquire_swflag_ich8lan(
+ 	}
+ 
+ 	if (!timeout) {
+-		e_dbg("SW/FW/HW has locked the resource for too long.\n");
++		e_dbg("SW has already locked the resource.\n");
+ 		ret_val = -E1000_ERR_CONFIG;
+ 		goto out;
+ 	}
+@@ -898,7 +901,9 @@ static s32 e1000_acquire_swflag_ich8lan(
+ 	}
+ 
+ 	if (!timeout) {
+-		e_dbg("Failed to acquire the semaphore.\n");
++		e_dbg("Failed to acquire the semaphore, FW or HW has it: "
++		      "FWSM=0x%8.8x EXTCNF_CTRL=0x%8.8x)\n",
++		      er32(FWSM), extcnf_ctrl);
+ 		extcnf_ctrl &= ~E1000_EXTCNF_CTRL_SWFLAG;
+ 		ew32(EXTCNF_CTRL, extcnf_ctrl);
+ 		ret_val = -E1000_ERR_CONFIG;
+@@ -907,7 +912,7 @@ static s32 e1000_acquire_swflag_ich8lan(
+ 
+ out:
+ 	if (ret_val)
+-		mutex_unlock(&swflag_mutex);
++		clear_bit(__E1000_ACCESS_SHARED_RESOURCE, &hw->adapter->state);
+ 
+ 	return ret_val;
+ }
+@@ -932,7 +937,7 @@ static void e1000_release_swflag_ich8lan
+ 		e_dbg("Semaphore unexpectedly released by sw/fw/hw\n");
+ 	}
+ 
+-	mutex_unlock(&swflag_mutex);
++	clear_bit(__E1000_ACCESS_SHARED_RESOURCE, &hw->adapter->state);
+ }
+ 
+ /**
+@@ -3139,7 +3144,7 @@ static s32 e1000_reset_hw_ich8lan(struct
+ 	msleep(20);
+ 
+ 	if (!ret_val)
+-		mutex_unlock(&swflag_mutex);
++		clear_bit(__E1000_ACCESS_SHARED_RESOURCE, &hw->adapter->state);
+ 
+ 	if (ctrl & E1000_CTRL_PHY_RST) {
+ 		ret_val = hw->phy.ops.get_cfg_done(hw);
