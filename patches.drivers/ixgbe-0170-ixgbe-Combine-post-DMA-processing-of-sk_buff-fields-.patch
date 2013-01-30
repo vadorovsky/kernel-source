@@ -1,0 +1,304 @@
+From: Alexander Duyck <alexander.h.duyck@intel.com>
+Date: Tue, 31 Jan 2012 02:59:49 +0000
+Subject: ixgbe: Combine post-DMA processing of sk_buff fields into single
+ function
+Patch-mainline: v3.4-rc1
+Git-commit: 8a0da21be84019d605af2c9a92b20a084db77de1
+References: bnc#795303 FATE#313662
+
+This change combines a number of post-DMA Rx packet processing functions
+into a single function.  The advantage of this is that it combines most of
+the Rx descriptor processing into one spot so it should all be warm in the
+cache.
+
+Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Tested-by: Stephen Ko <stephen.s.ko@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/intel/ixgbe/ixgbe.h      |    3 
+ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c |  127 ++++++++++++++------------
+ 2 files changed, 71 insertions(+), 59 deletions(-)
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -190,6 +190,7 @@ struct ixgbe_rx_queue_stats {
+ 	u64 non_eop_descs;
+ 	u64 alloc_rx_page_failed;
+ 	u64 alloc_rx_buff_failed;
++	u64 csum_err;
+ };
+ 
+ enum ixbge_ring_state_t {
+@@ -198,6 +199,7 @@ enum ixbge_ring_state_t {
+ 	__IXGBE_HANG_CHECK_ARMED,
+ 	__IXGBE_RX_PS_ENABLED,
+ 	__IXGBE_RX_RSC_ENABLED,
++	__IXGBE_RX_CSUM_UDP_ZERO_ERR,
+ };
+ 
+ #define ring_is_ps_enabled(ring) \
+@@ -379,7 +381,6 @@ struct ixgbe_adapter {
+ 	 * thus the additional *_CAPABLE flags.
+ 	 */
+ 	u32 flags;
+-#define IXGBE_FLAG_RX_CSUM_ENABLED              (u32)(1)
+ #define IXGBE_FLAG_MSI_CAPABLE                  (u32)(1 << 1)
+ #define IXGBE_FLAG_MSI_ENABLED                  (u32)(1 << 2)
+ #define IXGBE_FLAG_MSIX_CAPABLE                 (u32)(1 << 3)
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -995,10 +995,12 @@ static int __ixgbe_notify_dca(struct dev
+ }
+ #endif /* CONFIG_IXGBE_DCA */
+ 
+-static inline void ixgbe_rx_hash(union ixgbe_adv_rx_desc *rx_desc,
++static inline void ixgbe_rx_hash(struct ixgbe_ring *ring,
++				 union ixgbe_adv_rx_desc *rx_desc,
+ 				 struct sk_buff *skb)
+ {
+-	skb->rxhash = le32_to_cpu(rx_desc->wb.lower.hi_dword.rss);
++	if (ring->netdev->features & NETIF_F_RXHASH)
++		skb->rxhash = le32_to_cpu(rx_desc->wb.lower.hi_dword.rss);
+ }
+ 
+ /**
+@@ -1020,50 +1022,25 @@ static inline bool ixgbe_rx_is_fcoe(stru
+ }
+ 
+ /**
+- * ixgbe_receive_skb - Send a completed packet up the stack
+- * @adapter: board private structure
+- * @skb: packet to send up
+- * @rx_ring: rx descriptor ring (for a specific queue) to setup
+- * @rx_desc: rx descriptor
+- **/
+-static void ixgbe_receive_skb(struct ixgbe_q_vector *q_vector,
+-			      struct sk_buff *skb,
+-			      struct ixgbe_ring *ring,
+-			      union ixgbe_adv_rx_desc *rx_desc)
+-{
+-	struct ixgbe_adapter *adapter = q_vector->adapter;
+-
+-	if (ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_VP)) {
+-		u16 vid = le16_to_cpu(rx_desc->wb.upper.vlan);
+-		__vlan_hwaccel_put_tag(skb, vid);
+-	}
+-
+-	if (!(adapter->flags & IXGBE_FLAG_IN_NETPOLL))
+-		napi_gro_receive(&q_vector->napi, skb);
+-	else
+-		netif_rx(skb);
+-}
+-
+-/**
+  * ixgbe_rx_checksum - indicate in skb if hw indicated a good cksum
+- * @adapter: address of board private structure
+- * @status_err: hardware indication of status of receive
++ * @ring: structure containing ring specific data
++ * @rx_desc: current Rx descriptor being processed
+  * @skb: skb currently being received and modified
+  **/
+-static inline void ixgbe_rx_checksum(struct ixgbe_adapter *adapter,
++static inline void ixgbe_rx_checksum(struct ixgbe_ring *ring,
+ 				     union ixgbe_adv_rx_desc *rx_desc,
+ 				     struct sk_buff *skb)
+ {
+-	skb->ip_summed = CHECKSUM_NONE;
++	skb_checksum_none_assert(skb);
+ 
+ 	/* Rx csum disabled */
+-	if (!(adapter->flags & IXGBE_FLAG_RX_CSUM_ENABLED))
++	if (!(ring->netdev->features & NETIF_F_RXCSUM))
+ 		return;
+ 
+ 	/* if IP and error */
+ 	if (ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_IPCS) &&
+ 	    ixgbe_test_staterr(rx_desc, IXGBE_RXDADV_ERR_IPE)) {
+-		adapter->hw_csum_rx_error++;
++		ring->rx_stats.csum_err++;
+ 		return;
+ 	}
+ 
+@@ -1077,11 +1054,11 @@ static inline void ixgbe_rx_checksum(str
+ 		 * 82599 errata, UDP frames with a 0 checksum can be marked as
+ 		 * checksum errors.
+ 		 */
+-		if ((pkt_info & IXGBE_RXDADV_PKTTYPE_UDP) &&
+-		    (adapter->hw.mac.type == ixgbe_mac_82599EB))
++		if ((pkt_info & cpu_to_le16(IXGBE_RXDADV_PKTTYPE_UDP)) &&
++		    test_bit(__IXGBE_RX_CSUM_UDP_ZERO_ERR, &ring->state))
+ 			return;
+ 
+-		adapter->hw_csum_rx_error++;
++		ring->rx_stats.csum_err++;
+ 		return;
+ 	}
+ 
+@@ -1119,9 +1096,6 @@ static bool ixgbe_alloc_mapped_skb(struc
+ 			rx_ring->rx_stats.alloc_rx_buff_failed++;
+ 			return false;
+ 		}
+-
+-		/* initialize skb for ring */
+-		skb_record_rx_queue(skb, rx_ring->queue_index);
+ 	}
+ 
+ 	dma = dma_map_single(rx_ring->dev, skb->data,
+@@ -1455,17 +1429,58 @@ static void ixgbe_update_rsc_stats(struc
+ 	IXGBE_CB(skb)->append_cnt = 0;
+ }
+ 
++/**
++ * ixgbe_process_skb_fields - Populate skb header fields from Rx descriptor
++ * @rx_ring: rx descriptor ring packet is being transacted on
++ * @rx_desc: pointer to the EOP Rx descriptor
++ * @skb: pointer to current skb being populated
++ *
++ * This function checks the ring, descriptor, and packet information in
++ * order to populate the hash, checksum, VLAN, timestamp, protocol, and
++ * other fields within the skb.
++ **/
++static void ixgbe_process_skb_fields(struct ixgbe_ring *rx_ring,
++				     union ixgbe_adv_rx_desc *rx_desc,
++				     struct sk_buff *skb)
++{
++	ixgbe_update_rsc_stats(rx_ring, skb);
++
++	ixgbe_rx_hash(rx_ring, rx_desc, skb);
++
++	ixgbe_rx_checksum(rx_ring, rx_desc, skb);
++
++	if (ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_VP)) {
++		u16 vid = le16_to_cpu(rx_desc->wb.upper.vlan);
++		__vlan_hwaccel_put_tag(skb, vid);
++	}
++
++	skb_record_rx_queue(skb, rx_ring->queue_index);
++
++	skb->protocol = eth_type_trans(skb, rx_ring->netdev);
++}
++
++static void ixgbe_rx_skb(struct ixgbe_q_vector *q_vector,
++			 struct sk_buff *skb)
++{
++	struct ixgbe_adapter *adapter = q_vector->adapter;
++
++	if (!(adapter->flags & IXGBE_FLAG_IN_NETPOLL))
++		napi_gro_receive(&q_vector->napi, skb);
++	else
++		netif_rx(skb);
++}
++
+ static bool ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
+ 			       struct ixgbe_ring *rx_ring,
+ 			       int budget)
+ {
+-	struct ixgbe_adapter *adapter = q_vector->adapter;
+ 	union ixgbe_adv_rx_desc *rx_desc, *next_rxd;
+ 	struct ixgbe_rx_buffer *rx_buffer_info;
+ 	struct sk_buff *skb;
+ 	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
+ 	const int current_node = numa_node_id();
+ #ifdef IXGBE_FCOE
++	struct ixgbe_adapter *adapter = q_vector->adapter;
+ 	int ddp_bytes = 0;
+ #endif /* IXGBE_FCOE */
+ 	u16 i;
+@@ -1592,8 +1607,6 @@ static bool ixgbe_clean_rx_irq(struct ix
+ 			goto next_desc;
+ 		}
+ 
+-		ixgbe_update_rsc_stats(rx_ring, skb);
+-
+ 		/* ERR_MASK will only have valid bits if EOP set */
+ 		if (unlikely(ixgbe_test_staterr(rx_desc,
+ 					    IXGBE_RXDADV_ERR_FRAME_ERR_MASK))) {
+@@ -1601,15 +1614,13 @@ static bool ixgbe_clean_rx_irq(struct ix
+ 			goto next_desc;
+ 		}
+ 
+-		ixgbe_rx_checksum(adapter, rx_desc, skb);
+-		if (adapter->netdev->features & NETIF_F_RXHASH)
+-			ixgbe_rx_hash(rx_desc, skb);
+-
+ 		/* probably a little skewed due to removing CRC */
+ 		total_rx_bytes += skb->len;
+ 		total_rx_packets++;
+ 
+-		skb->protocol = eth_type_trans(skb, rx_ring->netdev);
++		/* populate checksum, timestamp, VLAN, and protocol */
++		ixgbe_process_skb_fields(rx_ring, rx_desc, skb);
++
+ #ifdef IXGBE_FCOE
+ 		/* if ddp, not passing to ULD unless for FCP_RSP or error */
+ 		if (ixgbe_rx_is_fcoe(adapter, rx_desc)) {
+@@ -1620,7 +1631,7 @@ static bool ixgbe_clean_rx_irq(struct ix
+ 			}
+ 		}
+ #endif /* IXGBE_FCOE */
+-		ixgbe_receive_skb(q_vector, skb, rx_ring, rx_desc);
++		ixgbe_rx_skb(q_vector, skb);
+ 
+ 		budget--;
+ next_desc:
+@@ -4867,6 +4878,13 @@ static int ixgbe_alloc_queues(struct ixg
+ 		ring->dev = &adapter->pdev->dev;
+ 		ring->netdev = adapter->netdev;
+ 
++		/*
++		 * 82599 errata, UDP frames with a 0 checksum can be marked as
++		 * checksum errors.
++		 */
++		if (adapter->hw.mac.type == ixgbe_mac_82599EB)
++			set_bit(__IXGBE_RX_CSUM_UDP_ZERO_ERR, &ring->state);
++
+ 		adapter->rx_ring[rx] = ring;
+ 	}
+ 
+@@ -5271,9 +5289,6 @@ static int __devinit ixgbe_sw_init(struc
+ 		return -EIO;
+ 	}
+ 
+-	/* enable rx csum by default */
+-	adapter->flags |= IXGBE_FLAG_RX_CSUM_ENABLED;
+-
+ 	/* get assigned NUMA node */
+ 	adapter->node = dev_to_node(&pdev->dev);
+ 
+@@ -5764,7 +5779,7 @@ void ixgbe_update_stats(struct ixgbe_ada
+ 	u32 i, missed_rx = 0, mpc, bprc, lxon, lxoff, xon_off_tot;
+ 	u64 non_eop_descs = 0, restart_queue = 0, tx_busy = 0;
+ 	u64 alloc_rx_page_failed = 0, alloc_rx_buff_failed = 0;
+-	u64 bytes = 0, packets = 0;
++	u64 bytes = 0, packets = 0, hw_csum_rx_error = 0;
+ #ifdef IXGBE_FCOE
+ 	struct ixgbe_fcoe *fcoe = &adapter->fcoe;
+ 	unsigned int cpu;
+@@ -5794,12 +5809,14 @@ void ixgbe_update_stats(struct ixgbe_ada
+ 		non_eop_descs += rx_ring->rx_stats.non_eop_descs;
+ 		alloc_rx_page_failed += rx_ring->rx_stats.alloc_rx_page_failed;
+ 		alloc_rx_buff_failed += rx_ring->rx_stats.alloc_rx_buff_failed;
++		hw_csum_rx_error += rx_ring->rx_stats.csum_err;
+ 		bytes += rx_ring->stats.bytes;
+ 		packets += rx_ring->stats.packets;
+ 	}
+ 	adapter->non_eop_descs = non_eop_descs;
+ 	adapter->alloc_rx_page_failed = alloc_rx_page_failed;
+ 	adapter->alloc_rx_buff_failed = alloc_rx_buff_failed;
++	adapter->hw_csum_rx_error = hw_csum_rx_error;
+ 	netdev->stats.rx_bytes = bytes;
+ 	netdev->stats.rx_packets = packets;
+ 
+@@ -7426,12 +7443,6 @@ static int ixgbe_set_features(struct net
+ 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
+ 	bool need_reset = false;
+ 
+-	/* If Rx checksum is disabled, then RSC/LRO should also be disabled */
+-	if (!(data & NETIF_F_RXCSUM))
+-		adapter->flags &= ~IXGBE_FLAG_RX_CSUM_ENABLED;
+-	else
+-		adapter->flags |= IXGBE_FLAG_RX_CSUM_ENABLED;
+-
+ 	/* Make sure RSC matches LRO, reset if change */
+ 	if (!!(data & NETIF_F_LRO) !=
+ 	     !!(adapter->flags2 & IXGBE_FLAG2_RSC_ENABLED)) {
