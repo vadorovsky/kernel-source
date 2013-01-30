@@ -1,0 +1,148 @@
+From: Alexander Duyck <alexander.h.duyck@intel.com>
+Date: Fri, 20 Jul 2012 08:08:23 +0000
+Subject: ixgbe: Only use double buffering if page size is less than 8K
+Patch-mainline: v3.7-rc1
+Git-commit: 09816fbea96ae81eac82dee2d52f29ea7241678d
+References: bnc#795303 FATE#313662
+
+This change makes it so that we do not use double buffering if the page
+size is larger than 4K.  Instead we will simply walk through the page using
+up to 3K per receive, and if we receive less than we only move the offset
+by that amount.  We will free the page when there is no longer any space
+left that we can use instead of checking the page count to see if we can
+cycle back to the start.
+
+The main motivation behind this is to avoid the unnecessary truesize cost
+for using a half page when most packets are 2K or smaller. With this new
+approach the largest possible truesize for a page fragment will be 3K when
+PAGE_SIZE is larger than 4K.
+
+Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Tested-by: Phil Schmitt <phillip.j.schmitt@intel.com>
+Signed-off-by: Peter P Waskiewicz Jr <peter.p.waskiewicz.jr@intel.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/intel/ixgbe/ixgbe.h      |   24 +++++++++++----
+ drivers/net/ethernet/intel/ixgbe/ixgbe_main.c |   40 +++++++++++++++++---------
+ 2 files changed, 45 insertions(+), 19 deletions(-)
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe.h
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe.h
+@@ -78,6 +78,9 @@
+ 
+ /* Supported Rx Buffer Sizes */
+ #define IXGBE_RXBUFFER_256    256  /* Used for skb receive header */
++#define IXGBE_RXBUFFER_2K    2048
++#define IXGBE_RXBUFFER_3K    3072
++#define IXGBE_RXBUFFER_4K    4096
+ #define IXGBE_MAX_RXBUFFER  16384  /* largest size for a single descriptor */
+ 
+ /*
+@@ -293,16 +296,25 @@ struct ixgbe_ring_feature {
+  * this is twice the size of a half page we need to double the page order
+  * for FCoE enabled Rx queues.
+  */
+-#if defined(IXGBE_FCOE) && (PAGE_SIZE < 8192)
+-static inline unsigned int ixgbe_rx_pg_order(struct ixgbe_ring *ring)
++static inline unsigned int ixgbe_rx_bufsz(struct ixgbe_ring *ring)
+ {
+-	return test_bit(__IXGBE_RX_FCOE, &ring->state) ? 1 : 0;
++#ifdef IXGBE_FCOE
++	if (test_bit(__IXGBE_RX_FCOE, &ring->state))
++		return (PAGE_SIZE < 8192) ? IXGBE_RXBUFFER_4K :
++					    IXGBE_RXBUFFER_3K;
++#endif
++	return IXGBE_RXBUFFER_2K;
+ }
+-#else
+-#define ixgbe_rx_pg_order(_ring) 0
++
++static inline unsigned int ixgbe_rx_pg_order(struct ixgbe_ring *ring)
++{
++#ifdef IXGBE_FCOE
++	if (test_bit(__IXGBE_RX_FCOE, &ring->state))
++		return (PAGE_SIZE < 8192) ? 1 : 0;
+ #endif
++	return 0;
++}
+ #define ixgbe_rx_pg_size(_ring) (PAGE_SIZE << ixgbe_rx_pg_order(_ring))
+-#define ixgbe_rx_bufsz(_ring) ((PAGE_SIZE / 2) << ixgbe_rx_pg_order(_ring))
+ 
+ struct ixgbe_ring_container {
+ 	struct ixgbe_ring *ring;	/* pointer to linked list of rings */
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -1615,21 +1615,45 @@ static bool ixgbe_add_rx_frag(struct ixg
+ {
+ 	struct page *page = rx_buffer->page;
+ 	unsigned int size = le16_to_cpu(rx_desc->wb.upper.length);
++#if (PAGE_SIZE < 8192)
+ 	unsigned int truesize = ixgbe_rx_bufsz(rx_ring);
++#else
++	unsigned int truesize = ALIGN(size, L1_CACHE_BYTES);
++	unsigned int last_offset = ixgbe_rx_pg_size(rx_ring) -
++				   ixgbe_rx_bufsz(rx_ring);
++#endif
+ 
+ 	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
+ 			rx_buffer->page_offset, size, truesize);
+ 
+-	/* if we are only owner of page and it is local we can reuse it */
+-	if (unlikely(page_count(page) != 1) ||
+-	    unlikely(page_to_nid(page) != numa_node_id()))
++	/* avoid re-using remote pages */
++	if (unlikely(page_to_nid(page) != numa_node_id()))
++		return false;
++
++#if (PAGE_SIZE < 8192)
++	/* if we are only owner of page we can reuse it */
++	if (unlikely(page_count(page) != 1))
+ 		return false;
+ 
+ 	/* flip page offset to other buffer */
+ 	rx_buffer->page_offset ^= truesize;
+ 
++	/*
++	 * since we are the only owner of the page and we need to
++	 * increment it, just set the value to 2 in order to avoid
++	 * an unecessary locked operation
++	 */
++	atomic_set(&page->_count, 2);
++#else
++	/* move offset up to the next cache line */
++	rx_buffer->page_offset += truesize;
++
++	if (rx_buffer->page_offset > last_offset)
++		return false;
++
+ 	/* bump ref count on page before it is given to the stack */
+ 	get_page(page);
++#endif
+ 
+ 	return true;
+ }
+@@ -2878,11 +2902,7 @@ static void ixgbe_configure_srrctl(struc
+ 	srrctl = IXGBE_RX_HDR_SIZE << IXGBE_SRRCTL_BSIZEHDRSIZE_SHIFT;
+ 
+ 	/* configure the packet buffer length */
+-#if PAGE_SIZE > IXGBE_MAX_RXBUFFER
+-	srrctl |= IXGBE_MAX_RXBUFFER >> IXGBE_SRRCTL_BSIZEPKT_SHIFT;
+-#else
+ 	srrctl |= ixgbe_rx_bufsz(rx_ring) >> IXGBE_SRRCTL_BSIZEPKT_SHIFT;
+-#endif
+ 
+ 	/* configure descriptor type */
+ 	srrctl |= IXGBE_SRRCTL_DESCTYPE_ADV_ONEBUF;
+@@ -2990,13 +3010,7 @@ static void ixgbe_configure_rscctl(struc
+ 	 * total size of max desc * buf_len is not greater
+ 	 * than 65536
+ 	 */
+-#if (PAGE_SIZE <= 8192)
+ 	rscctrl |= IXGBE_RSCCTL_MAXDESC_16;
+-#elif (PAGE_SIZE <= 16384)
+-	rscctrl |= IXGBE_RSCCTL_MAXDESC_8;
+-#else
+-	rscctrl |= IXGBE_RSCCTL_MAXDESC_4;
+-#endif
+ 	IXGBE_WRITE_REG(hw, IXGBE_RSCCTL(reg_idx), rscctrl);
+ }
+ 
