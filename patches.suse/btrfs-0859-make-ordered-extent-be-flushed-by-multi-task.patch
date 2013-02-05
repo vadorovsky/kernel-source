@@ -1,0 +1,115 @@
+From: Miao Xie <miaox@cn.fujitsu.com>
+Date: Thu, 25 Oct 2012 09:41:36 +0000
+Patch-mainline: 3.8
+Git-commit: 9afab8820bb8b55af669b199597d6716e04d1ba8
+References: FATE#312888
+Subject: [PATCH] Btrfs: make ordered extent be flushed by multi-task
+
+Though the process of the ordered extents is a bit different with the delalloc inode
+flush, but we can see it as a subset of the delalloc inode flush, so we also handle
+them by flush workers.
+
+Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+Signed-off-by: Chris Mason <chris.mason@fusionio.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/ordered-data.c |   41 +++++++++++++++++++++++++++++++++--------
+ fs/btrfs/ordered-data.h |    5 ++++-
+ 2 files changed, 37 insertions(+), 9 deletions(-)
+
+--- a/fs/btrfs/ordered-data.c
++++ b/fs/btrfs/ordered-data.c
+@@ -211,6 +211,8 @@ static int __btrfs_add_ordered_extent(st
+ 	init_waitqueue_head(&entry->wait);
+ 	INIT_LIST_HEAD(&entry->list);
+ 	INIT_LIST_HEAD(&entry->root_extent_list);
++	INIT_LIST_HEAD(&entry->work_list);
++	init_completion(&entry->completion);
+ 
+ 	trace_btrfs_ordered_extent_add(inode, entry);
+ 
+@@ -464,18 +466,28 @@ void btrfs_remove_ordered_extent(struct
+ 	wake_up(&entry->wait);
+ }
+ 
++static void btrfs_run_ordered_extent_work(struct btrfs_work *work)
++{
++	struct btrfs_ordered_extent *ordered;
++
++	ordered = container_of(work, struct btrfs_ordered_extent, flush_work);
++	btrfs_start_ordered_extent(ordered->inode, ordered, 1);
++	complete(&ordered->completion);
++}
++
+ /*
+  * wait for all the ordered extents in a root.  This is done when balancing
+  * space between drives.
+  */
+ void btrfs_wait_ordered_extents(struct btrfs_root *root, int delay_iput)
+ {
+-	struct list_head splice;
++	struct list_head splice, works;
+ 	struct list_head *cur;
+-	struct btrfs_ordered_extent *ordered;
++	struct btrfs_ordered_extent *ordered, *next;
+ 	struct inode *inode;
+ 
+ 	INIT_LIST_HEAD(&splice);
++	INIT_LIST_HEAD(&works);
+ 
+ 	spin_lock(&root->fs_info->ordered_extent_lock);
+ 	list_splice_init(&root->fs_info->ordered_extents, &splice);
+@@ -494,19 +506,32 @@ void btrfs_wait_ordered_extents(struct b
+ 		spin_unlock(&root->fs_info->ordered_extent_lock);
+ 
+ 		if (inode) {
+-			btrfs_start_ordered_extent(inode, ordered, 1);
+-			btrfs_put_ordered_extent(ordered);
+-			if (delay_iput)
+-				btrfs_add_delayed_iput(inode);
+-			else
+-				iput(inode);
++			ordered->flush_work.func = btrfs_run_ordered_extent_work;
++			list_add_tail(&ordered->work_list, &works);
++			btrfs_queue_worker(&root->fs_info->flush_workers,
++					   &ordered->flush_work);
+ 		} else {
+ 			btrfs_put_ordered_extent(ordered);
+ 		}
+ 
++		cond_resched();
+ 		spin_lock(&root->fs_info->ordered_extent_lock);
+ 	}
+ 	spin_unlock(&root->fs_info->ordered_extent_lock);
++
++	list_for_each_entry_safe(ordered, next, &works, work_list) {
++		list_del_init(&ordered->work_list);
++		wait_for_completion(&ordered->completion);
++
++		inode = ordered->inode;
++		btrfs_put_ordered_extent(ordered);
++		if (delay_iput)
++			btrfs_add_delayed_iput(inode);
++		else
++			iput(inode);
++
++		cond_resched();
++	}
+ }
+ 
+ /*
+--- a/fs/btrfs/ordered-data.h
++++ b/fs/btrfs/ordered-data.h
+@@ -128,8 +128,11 @@ struct btrfs_ordered_extent {
+ 	struct list_head root_extent_list;
+ 
+ 	struct btrfs_work work;
+-};
+ 
++	struct completion completion;
++	struct btrfs_work flush_work;
++	struct list_head work_list;
++};
+ 
+ /*
+  * calculates the total size you need to allocate for an ordered sum
