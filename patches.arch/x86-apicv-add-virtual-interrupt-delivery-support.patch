@@ -1,0 +1,978 @@
+From: Yang Zhang <yang.z.zhang@Intel.com>
+Date: Fri, 25 Jan 2013 10:18:51 +0800
+Subject: [PATCH 3/3] x86, apicv: add virtual interrupt delivery support
+Patch-mainline: Merged into kvm
+Git-commit: c7c9c56ca26f7b9458711b2d78b60b60e0d38ba7
+References: fate#313618
+
+Virtual interrupt delivery avoids KVM to inject vAPIC interrupts
+manually, which is fully taken care of by the hardware. This needs
+some special awareness into existing interrupr injection path:
+
+- for pending interrupt, instead of direct injection, we may need
+  update architecture specific indicators before resuming to guest.
+
+- A pending interrupt, which is masked by ISR, should be also
+  considered in above update action, since hardware will decide
+  when to inject it at right time. Current has_interrupt and
+  get_interrupt only returns a valid vector from injection p.o.v.
+
+Reviewed-by: Marcelo Tosatti <mtosatti@redhat.com>
+Signed-off-by: Kevin Tian <kevin.tian@intel.com>
+Signed-off-by: Yang Zhang <yang.z.zhang@Intel.com>
+Signed-off-by: Gleb Natapov <gleb@redhat.com>
+Acked-by: Bruce Rogers <brogers@suse.com>
+---
+ arch/ia64/kvm/lapic.h           |    6 +
+ arch/x86/include/asm/kvm_host.h |    5 +
+ arch/x86/include/asm/vmx.h      |   15 ++++
+ arch/x86/kvm/irq.c              |   55 ++++++++++++++++-
+ arch/x86/kvm/lapic.c            |  125 ++++++++++++++++++++++++++++------------
+ arch/x86/kvm/lapic.h            |   27 ++++++++
+ arch/x86/kvm/svm.c              |   18 +++++
+ arch/x86/kvm/vmx.c              |  119 ++++++++++++++++++++++++++++++++++----
+ arch/x86/kvm/x86.c              |   23 ++++++-
+ include/linux/kvm_host.h        |    3 
+ virt/kvm/ioapic.c               |   39 ++++++++++++
+ virt/kvm/ioapic.h               |    4 +
+ virt/kvm/irq_comm.c             |   25 ++++++++
+ virt/kvm/kvm_main.c             |    5 +
+ 14 files changed, 414 insertions(+), 55 deletions(-)
+
+Index: b/arch/ia64/kvm/lapic.h
+===================================================================
+--- a/arch/ia64/kvm/lapic.h
++++ b/arch/ia64/kvm/lapic.h
+@@ -27,4 +27,10 @@ int kvm_apic_set_irq(struct kvm_vcpu *vc
+ #define kvm_apic_present(x) (true)
+ #define kvm_lapic_enabled(x) (true)
+ 
++static inline bool kvm_apic_vid_enabled(void)
++{
++	/* IA64 has no apicv supporting, do nothing here */
++	return false;
++}
++
+ #endif
+Index: b/arch/x86/include/asm/kvm_host.h
+===================================================================
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -621,6 +621,10 @@ struct kvm_x86_ops {
+ 	void (*enable_nmi_window)(struct kvm_vcpu *vcpu);
+ 	void (*enable_irq_window)(struct kvm_vcpu *vcpu);
+ 	void (*update_cr8_intercept)(struct kvm_vcpu *vcpu, int tpr, int irr);
++	int (*vm_has_apicv)(struct kvm *kvm);
++	void (*hwapic_irr_update)(struct kvm_vcpu *vcpu, int max_irr);
++	void (*hwapic_isr_update)(struct kvm *kvm, int isr);
++	void (*load_eoi_exitmap)(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap);
+ 	void (*set_virtual_x2apic_mode)(struct kvm_vcpu *vcpu, bool set);
+ 	int (*set_tss_addr)(struct kvm *kvm, unsigned int addr);
+ 	int (*get_tdp_level)(void);
+@@ -883,6 +887,7 @@ int kvm_age_hva(struct kvm *kvm, unsigne
+ int kvm_test_age_hva(struct kvm *kvm, unsigned long hva);
+ void kvm_set_spte_hva(struct kvm *kvm, unsigned long hva, pte_t pte);
+ int cpuid_maxphyaddr(struct kvm_vcpu *vcpu);
++int kvm_cpu_has_injectable_intr(struct kvm_vcpu *v);
+ int kvm_cpu_has_interrupt(struct kvm_vcpu *vcpu);
+ int kvm_arch_interrupt_allowed(struct kvm_vcpu *vcpu);
+ int kvm_cpu_get_interrupt(struct kvm_vcpu *v);
+Index: b/arch/x86/include/asm/vmx.h
+===================================================================
+--- a/arch/x86/include/asm/vmx.h
++++ b/arch/x86/include/asm/vmx.h
+@@ -60,7 +60,8 @@
+ #define SECONDARY_EXEC_ENABLE_VPID              0x00000020
+ #define SECONDARY_EXEC_WBINVD_EXITING		0x00000040
+ #define SECONDARY_EXEC_UNRESTRICTED_GUEST	0x00000080
+-#define SECONDARY_EXEC_APIC_REGISTER_VIRT       0x00000100
++#define SECONDARY_EXEC_APIC_REGISTER_VIRT	0x00000100
++#define SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY    0x00000200
+ #define SECONDARY_EXEC_PAUSE_LOOP_EXITING	0x00000400
+ #define SECONDARY_EXEC_ENABLE_INVPCID		0x00001000
+ 
+@@ -98,6 +99,7 @@ enum vmcs_field {
+ 	GUEST_GS_SELECTOR               = 0x0000080a,
+ 	GUEST_LDTR_SELECTOR             = 0x0000080c,
+ 	GUEST_TR_SELECTOR               = 0x0000080e,
++	GUEST_INTR_STATUS               = 0x00000810,
+ 	HOST_ES_SELECTOR                = 0x00000c00,
+ 	HOST_CS_SELECTOR                = 0x00000c02,
+ 	HOST_SS_SELECTOR                = 0x00000c04,
+@@ -125,6 +127,14 @@ enum vmcs_field {
+ 	APIC_ACCESS_ADDR_HIGH		= 0x00002015,
+ 	EPT_POINTER                     = 0x0000201a,
+ 	EPT_POINTER_HIGH                = 0x0000201b,
++	EOI_EXIT_BITMAP0                = 0x0000201c,
++	EOI_EXIT_BITMAP0_HIGH           = 0x0000201d,
++	EOI_EXIT_BITMAP1                = 0x0000201e,
++	EOI_EXIT_BITMAP1_HIGH           = 0x0000201f,
++	EOI_EXIT_BITMAP2                = 0x00002020,
++	EOI_EXIT_BITMAP2_HIGH           = 0x00002021,
++	EOI_EXIT_BITMAP3                = 0x00002022,
++	EOI_EXIT_BITMAP3_HIGH           = 0x00002023,
+ 	GUEST_PHYSICAL_ADDRESS          = 0x00002400,
+ 	GUEST_PHYSICAL_ADDRESS_HIGH     = 0x00002401,
+ 	VMCS_LINK_POINTER               = 0x00002800,
+@@ -280,11 +290,12 @@ enum vmcs_field {
+ #define EXIT_REASON_MCE_DURING_VMENTRY	 41
+ #define EXIT_REASON_TPR_BELOW_THRESHOLD 43
+ #define EXIT_REASON_APIC_ACCESS         44
++#define EXIT_REASON_EOI_INDUCED         45
+ #define EXIT_REASON_EPT_VIOLATION       48
+ #define EXIT_REASON_EPT_MISCONFIG       49
+ #define EXIT_REASON_WBINVD		54
+ #define EXIT_REASON_XSETBV		55
+-#define EXIT_REASON_APIC_WRITE          56
++#define EXIT_REASON_APIC_WRITE		56
+ #define EXIT_REASON_INVPCID		58
+ 
+ /*
+Index: b/arch/x86/kvm/irq.c
+===================================================================
+--- a/arch/x86/kvm/irq.c
++++ b/arch/x86/kvm/irq.c
+@@ -38,6 +38,38 @@ int kvm_cpu_has_pending_timer(struct kvm
+ EXPORT_SYMBOL(kvm_cpu_has_pending_timer);
+ 
+ /*
++ * check if there is pending interrupt from
++ * non-APIC source without intack.
++ */
++static int kvm_cpu_has_extint(struct kvm_vcpu *v)
++{
++	if (kvm_apic_accept_pic_intr(v))
++		return pic_irqchip(v->kvm)->output;	/* PIC */
++	else
++		return 0;
++}
++
++/*
++ * check if there is injectable interrupt:
++ * when virtual interrupt delivery enabled,
++ * interrupt from apic will handled by hardware,
++ * we don't need to check it here.
++ */
++int kvm_cpu_has_injectable_intr(struct kvm_vcpu *v)
++{
++	if (!irqchip_in_kernel(v->kvm))
++		return v->arch.interrupt.pending;
++
++	if (kvm_cpu_has_extint(v))
++		return 1;
++
++	if (kvm_apic_vid_enabled(v->kvm))
++		return 0;
++
++	return kvm_apic_has_interrupt(v) != -1; /* LAPIC */
++}
++
++/*
+  * check if there is pending interrupt without
+  * intack.
+  */
+@@ -46,23 +78,38 @@ int kvm_cpu_has_interrupt(struct kvm_vcp
+ 	if (!irqchip_in_kernel(v->kvm))
+ 		return v->arch.interrupt.pending;
+ 
+-	if (kvm_apic_accept_pic_intr(v) && pic_irqchip(v->kvm)->output)
+-		return pic_irqchip(v->kvm)->output;	/* PIC */
++	if (kvm_cpu_has_extint(v))
++		return 1;
+ 
+ 	return kvm_apic_has_interrupt(v) != -1;	/* LAPIC */
+ }
+ EXPORT_SYMBOL_GPL(kvm_cpu_has_interrupt);
+ 
+ /*
++ * Read pending interrupt(from non-APIC source)
++ * vector and intack.
++ */
++static int kvm_cpu_get_extint(struct kvm_vcpu *v)
++{
++	if (kvm_cpu_has_extint(v))
++		return kvm_pic_read_irq(v->kvm); /* PIC */
++	return -1;
++}
++
++/*
+  * Read pending interrupt vector and intack.
+  */
+ int kvm_cpu_get_interrupt(struct kvm_vcpu *v)
+ {
++	int vector;
++
+ 	if (!irqchip_in_kernel(v->kvm))
+ 		return v->arch.interrupt.nr;
+ 
+-	if (kvm_apic_accept_pic_intr(v) && pic_irqchip(v->kvm)->output)
+-		return kvm_pic_read_irq(v->kvm);	/* PIC */
++	vector = kvm_cpu_get_extint(v);
++
++	if (kvm_apic_vid_enabled(v->kvm) || vector != -1)
++		return vector;			/* PIC */
+ 
+ 	return kvm_get_apic_interrupt(v);	/* APIC */
+ }
+Index: b/arch/x86/kvm/lapic.c
+===================================================================
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -144,23 +144,6 @@ static inline int kvm_apic_id(struct kvm
+ 	return (apic_get_reg(apic, APIC_ID) >> 24) & 0xff;
+ }
+ 
+-static inline u16 apic_cluster_id(struct kvm_apic_map *map, u32 ldr)
+-{
+-	u16 cid;
+-	ldr >>= 32 - map->ldr_bits;
+-	cid = (ldr >> map->cid_shift) & map->cid_mask;
+-
+-	BUG_ON(cid >= ARRAY_SIZE(map->logical_map));
+-
+-	return cid;
+-}
+-
+-static inline u16 apic_logical_id(struct kvm_apic_map *map, u32 ldr)
+-{
+-	ldr >>= (32 - map->ldr_bits);
+-	return ldr & map->lid_mask;
+-}
+-
+ static void recalculate_apic_map(struct kvm *kvm)
+ {
+ 	struct kvm_apic_map *new, *old = NULL;
+@@ -199,9 +182,9 @@ static void recalculate_apic_map(struct
+ 			new->ldr_bits = 32;
+ 			new->cid_shift = 16;
+ 			new->cid_mask = new->lid_mask = 0xffff;
+-		} else if (kvm_apic_sw_enabled(apic) &&
++		} else if (apic_sw_enabled(apic) &&
+ 				!new->cid_mask /* flat mode */ &&
+-				kvm_apic_get_reg(apic, APIC_DFR) == APIC_DFR_CLUSTER) {
++				apic_get_reg(apic, APIC_DFR) == APIC_DFR_CLUSTER) {
+ 			new->cid_shift = 4;
+ 			new->cid_mask = 0xf;
+ 			new->lid_mask = 0xf;
+@@ -209,7 +192,7 @@ static void recalculate_apic_map(struct
+ 
+ 		new->phys_map[kvm_apic_id(apic)] = apic;
+ 
+-		ldr = kvm_apic_get_reg(apic, APIC_LDR);
++		ldr = apic_get_reg(apic, APIC_LDR);
+ 		cid = apic_cluster_id(new, ldr);
+ 		lid = apic_logical_id(new, ldr);
+ 
+@@ -238,6 +221,53 @@ static inline void kvm_apic_set_ldr(stru
+ 	recalculate_apic_map(apic->vcpu->kvm);
+ }
+ 
++void kvm_calculate_eoi_exitmap(struct kvm_vcpu *vcpu,
++				struct kvm_lapic_irq *irq,
++				u64 *eoi_exit_bitmap)
++{
++	struct kvm_lapic **dst;
++	struct kvm_apic_map *map;
++	unsigned long bitmap = 1;
++	int i;
++
++	rcu_read_lock();
++	map = rcu_dereference(vcpu->kvm->arch.apic_map);
++
++	if (unlikely(!map)) {
++		__set_bit(irq->vector, (unsigned long *)eoi_exit_bitmap);
++		goto out;
++	}
++
++	if (irq->dest_mode == 0) { /* physical mode */
++		if (irq->delivery_mode == APIC_DM_LOWEST ||
++				irq->dest_id == 0xff) {
++			__set_bit(irq->vector,
++				  (unsigned long *)eoi_exit_bitmap);
++			goto out;
++		}
++		dst = &map->phys_map[irq->dest_id & 0xff];
++	} else {
++		u32 mda = irq->dest_id << (32 - map->ldr_bits);
++
++		dst = map->logical_map[apic_cluster_id(map, mda)];
++
++		bitmap = apic_logical_id(map, mda);
++	}
++
++	for_each_set_bit(i, &bitmap, 16) {
++		if (!dst[i])
++			continue;
++		if (dst[i]->vcpu == vcpu) {
++			__set_bit(irq->vector,
++				  (unsigned long *)eoi_exit_bitmap);
++			break;
++		}
++	}
++
++out:
++	rcu_read_unlock();
++}
++
+ static inline int apic_lvt_enabled(struct kvm_lapic *apic, int lvt_type)
+ {
+ 	return !(apic_get_reg(apic, lvt_type) & APIC_LVT_MASKED);
+@@ -287,11 +317,6 @@ void kvm_apic_set_version(struct kvm_vcp
+ 	apic_set_reg(apic, APIC_LVR, v);
+ }
+ 
+-static inline int apic_x2apic_mode(struct kvm_lapic *apic)
+-{
+-	return apic->vcpu->arch.apic_base & X2APIC_ENABLE;
+-}
+-
+ static unsigned int apic_lvt_mask[APIC_LVT_NUM] = {
+ 	LVT_MASK ,      /* part LVTT mask, timer mode mask added at runtime */
+ 	LVT_MASK | APIC_MODE_MASK,	/* LVTTHMR */
+@@ -344,6 +369,10 @@ static inline int apic_find_highest_irr(
+ {
+ 	int result;
+ 
++	/*
++	 * Note that irr_pending is just a hint. It will be always
++	 * true with virtual interrupt delivery enabled.
++	 */
+ 	if (!apic->irr_pending)
+ 		return -1;
+ 
+@@ -418,6 +447,8 @@ static inline int apic_find_highest_isr(
+ 	if (likely(apic->highest_isr_cache != -1))
+ 		return apic->highest_isr_cache;
+ 
++
++	/* Note that isr_count is always 1 with vid enabled */
+ 	result = find_highest_vector(apic->regs + APIC_ISR);
+ 	ASSERT(result == -1 || result >= 16);
+ 
+@@ -692,6 +723,19 @@ int kvm_apic_compare_prio(struct kvm_vcp
+ 	return vcpu1->arch.apic_arb_prio - vcpu2->arch.apic_arb_prio;
+ }
+ 
++static void kvm_ioapic_send_eoi(struct kvm_lapic *apic, int vector)
++{
++	if (!(apic_get_reg(apic, APIC_SPIV) & APIC_SPIV_DIRECTED_EOI) &&
++	    kvm_ioapic_handles_vector(apic->vcpu->kvm, vector)) {
++		int trigger_mode;
++		if (apic_test_vector(vector, apic->regs + APIC_TMR))
++			trigger_mode = IOAPIC_LEVEL_TRIG;
++		else
++			trigger_mode = IOAPIC_EDGE_TRIG;
++		kvm_ioapic_update_eoi(apic->vcpu->kvm, vector, trigger_mode);
++	}
++}
++
+ static void apic_set_eoi(struct kvm_lapic *apic)
+ {
+ 	int vector = apic_find_highest_isr(apic);
+@@ -705,18 +749,23 @@ static void apic_set_eoi(struct kvm_lapi
+ 	apic_clear_isr(vector, apic);
+ 	apic_update_ppr(apic);
+ 
+-	if (!(apic_get_reg(apic, APIC_SPIV) & APIC_SPIV_DIRECTED_EOI) &&
+-	    kvm_ioapic_handles_vector(apic->vcpu->kvm, vector)) {
+-		int trigger_mode;
+-		if (apic_test_vector(vector, apic->regs + APIC_TMR))
+-			trigger_mode = IOAPIC_LEVEL_TRIG;
+-		else
+-			trigger_mode = IOAPIC_EDGE_TRIG;
+-		kvm_ioapic_update_eoi(apic->vcpu->kvm, vector, trigger_mode);
+-	}
++	kvm_ioapic_send_eoi(apic, vector);
+ 	kvm_make_request(KVM_REQ_EVENT, apic->vcpu);
+ }
+ 
++/*
++ * this interface assumes a trap-like exit, which has already finished
++ * desired side effect including vISR and vPPR update.
++ */
++void kvm_apic_set_eoi_accelerated(struct kvm_vcpu *vcpu, int vector)
++{
++	struct kvm_lapic *apic = vcpu->arch.apic;
++
++	kvm_ioapic_send_eoi(apic, vector);
++ 	kvm_make_request(KVM_REQ_EVENT, apic->vcpu);
++ }
++EXPORT_SYMBOL_GPL(kvm_apic_set_eoi_accelerated);
++
+ static void apic_send_ipi(struct kvm_lapic *apic)
+ {
+ 	u32 icr_low = apic_get_reg(apic, APIC_ICR);
+@@ -1309,8 +1358,8 @@ void kvm_lapic_reset(struct kvm_vcpu *vc
+ 		apic_set_reg(apic, APIC_ISR + 0x10 * i, 0);
+ 		apic_set_reg(apic, APIC_TMR + 0x10 * i, 0);
+ 	}
+-	apic->irr_pending = false;
+-	apic->isr_count = 0;
++	apic->irr_pending = kvm_apic_vid_enabled(vcpu->kvm);
++	apic->isr_count = kvm_apic_vid_enabled(vcpu->kvm);
+ 	apic->highest_isr_cache = -1;
+ 	update_divide_count(apic);
+ 	atomic_set(&apic->lapic_timer.pending, 0);
+@@ -1501,7 +1550,9 @@ void kvm_apic_post_state_restore(struct
+ 	update_divide_count(apic);
+ 	start_apic_timer(apic);
+ 	apic->irr_pending = true;
+-	apic->isr_count = count_vectors(apic->regs + APIC_ISR);
++	apic->isr_count = kvm_apic_vid_enabled(vcpu->kvm) ?
++				1 : count_vectors(apic->regs + APIC_ISR);
++	kvm_x86_ops->hwapic_isr_update(vcpu->kvm, apic_find_highest_isr(apic));
+ 	apic->highest_isr_cache = -1;
+ 	kvm_make_request(KVM_REQ_EVENT, vcpu);
+ }
+Index: b/arch/x86/kvm/lapic.h
+===================================================================
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -53,6 +53,7 @@ u64 kvm_get_lapic_tscdeadline_msr(struct
+ void kvm_set_lapic_tscdeadline_msr(struct kvm_vcpu *vcpu, u64 data);
+ 
+ void kvm_apic_write_nodecode(struct kvm_vcpu *vcpu, u32 offset);
++void kvm_apic_set_eoi_accelerated(struct kvm_vcpu *vcpu, int vector);
+ 
+ void kvm_lapic_set_vapic_addr(struct kvm_vcpu *vcpu, gpa_t vapic_addr);
+ void kvm_lapic_sync_from_vapic(struct kvm_vcpu *vcpu);
+@@ -74,4 +75,30 @@ static inline int apic_x2apic_mode(struc
+ 	return apic->vcpu->arch.apic_base & X2APIC_ENABLE;
+ }
+ 
++static inline bool kvm_apic_vid_enabled(struct kvm *kvm)
++{
++	return kvm_x86_ops->vm_has_apicv(kvm);
++}
++
++static inline u16 apic_cluster_id(struct kvm_apic_map *map, u32 ldr)
++{
++	u16 cid;
++	ldr >>= 32 - map->ldr_bits;
++	cid = (ldr >> map->cid_shift) & map->cid_mask;
++
++	BUG_ON(cid >= ARRAY_SIZE(map->logical_map));
++
++	return cid;
++}
++
++static inline u16 apic_logical_id(struct kvm_apic_map *map, u32 ldr)
++{
++	ldr >>= (32 - map->ldr_bits);
++	return ldr & map->lid_mask;
++}
++
++void kvm_calculate_eoi_exitmap(struct kvm_vcpu *vcpu,
++				struct kvm_lapic_irq *irq,
++				u64 *eoi_bitmap);
++
+ #endif
+Index: b/arch/x86/kvm/svm.c
+===================================================================
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -3549,6 +3549,21 @@ static void svm_set_virtual_x2apic_mode(
+ 	return;
+ }
+ 
++static int svm_vm_has_apicv(struct kvm *kvm)
++{
++	return 0;
++}
++
++static void svm_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
++{
++	return;
++}
++
++static void svm_hwapic_isr_update(struct kvm *kvm, int isr)
++{
++	return;
++}
++
+ static int svm_nmi_allowed(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+@@ -4327,6 +4342,9 @@ static struct kvm_x86_ops svm_x86_ops =
+ 	.enable_irq_window = enable_irq_window,
+ 	.update_cr8_intercept = update_cr8_intercept,
+ 	.set_virtual_x2apic_mode = svm_set_virtual_x2apic_mode,
++	.vm_has_apicv = svm_vm_has_apicv,
++	.load_eoi_exitmap = svm_load_eoi_exitmap,
++	.hwapic_isr_update = svm_hwapic_isr_update,
+ 
+ 	.set_tss_addr = svm_set_tss_addr,
+ 	.get_tdp_level = get_npt_level,
+Index: b/arch/x86/kvm/vmx.c
+===================================================================
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -75,8 +75,8 @@ module_param(vmm_exclusive, bool, S_IRUG
+ static int __read_mostly yield_on_hlt = 1;
+ module_param(yield_on_hlt, bool, S_IRUGO);
+ 
+-static bool __read_mostly enable_apicv_reg = 1;
+-module_param(enable_apicv_reg, bool, S_IRUGO);
++static bool __read_mostly enable_apicv_reg_vid = 1;
++module_param(enable_apicv_reg_vid, bool, S_IRUGO);
+ 
+ /*
+  * If nested=1, nested virtualization is supported, i.e., guests may use
+@@ -761,6 +761,12 @@ static inline bool cpu_has_vmx_apic_regi
+ 		SECONDARY_EXEC_APIC_REGISTER_VIRT;
+ }
+ 
++static inline bool cpu_has_vmx_virtual_intr_delivery(void)
++{
++	return vmcs_config.cpu_based_2nd_exec_ctrl &
++		SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY;
++}
++
+ static inline bool cpu_has_vmx_flexpriority(void)
+ {
+ 	return cpu_has_vmx_tpr_shadow() &&
+@@ -2446,7 +2452,8 @@ static __init int setup_vmcs_config(stru
+ 			SECONDARY_EXEC_PAUSE_LOOP_EXITING |
+ 			SECONDARY_EXEC_RDTSCP |
+ 			SECONDARY_EXEC_ENABLE_INVPCID |
+-			SECONDARY_EXEC_APIC_REGISTER_VIRT;
++			SECONDARY_EXEC_APIC_REGISTER_VIRT |
++			SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY;
+ 		if (adjust_vmx_controls(min2, opt2,
+ 					MSR_IA32_VMX_PROCBASED_CTLS2,
+ 					&_cpu_based_2nd_exec_control) < 0)
+@@ -2461,7 +2468,8 @@ static __init int setup_vmcs_config(stru
+ 	if (!(_cpu_based_exec_control & CPU_BASED_TPR_SHADOW))
+ 		_cpu_based_2nd_exec_control &= ~(
+ 				SECONDARY_EXEC_APIC_REGISTER_VIRT |
+-				SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE);
++				SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE |
++				SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY);
+ 
+ 	if (_cpu_based_2nd_exec_control & SECONDARY_EXEC_ENABLE_EPT) {
+ 		/* CR3 accesses and invlpg don't need to cause VM Exits when EPT
+@@ -2624,8 +2632,14 @@ static __init int hardware_setup(void)
+ 	if (!cpu_has_vmx_ple())
+ 		ple_gap = 0;
+ 
+-	if (!cpu_has_vmx_apic_register_virt())
+-		enable_apicv_reg = 0;
++	if (!cpu_has_vmx_apic_register_virt() ||
++				!cpu_has_vmx_virtual_intr_delivery())
++		enable_apicv_reg_vid = 0;
++
++	if (enable_apicv_reg_vid)
++		kvm_x86_ops->update_cr8_intercept = NULL;
++	else
++		kvm_x86_ops->hwapic_irr_update = NULL;
+ 
+ 	if (nested)
+ 		nested_vmx_setup_ctls_msrs();
+@@ -3752,6 +3766,11 @@ static u32 vmx_exec_control(struct vcpu_
+ 	return exec_control;
+ }
+ 
++static int vmx_vm_has_apicv(struct kvm *kvm)
++{
++	return enable_apicv_reg_vid && irqchip_in_kernel(kvm);
++}
++
+ static u32 vmx_secondary_exec_control(struct vcpu_vmx *vmx)
+ {
+ 	u32 exec_control = vmcs_config.cpu_based_2nd_exec_ctrl;
+@@ -3767,8 +3786,9 @@ static u32 vmx_secondary_exec_control(st
+ 		exec_control &= ~SECONDARY_EXEC_UNRESTRICTED_GUEST;
+ 	if (!ple_gap)
+ 		exec_control &= ~SECONDARY_EXEC_PAUSE_LOOP_EXITING;
+-	if (!enable_apicv_reg || !irqchip_in_kernel(vmx->vcpu.kvm))
+-		exec_control &= ~SECONDARY_EXEC_APIC_REGISTER_VIRT;
++	if (!vmx_vm_has_apicv(vmx->vcpu.kvm))
++		exec_control &= ~(SECONDARY_EXEC_APIC_REGISTER_VIRT |
++				  SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY);
+ 	exec_control &= ~SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE;
+ 	return exec_control;
+ }
+@@ -3801,6 +3821,15 @@ static int vmx_vcpu_setup(struct vcpu_vm
+ 				vmx_secondary_exec_control(vmx));
+ 	}
+ 
++	if (enable_apicv_reg_vid) {
++		vmcs_write64(EOI_EXIT_BITMAP0, 0);
++		vmcs_write64(EOI_EXIT_BITMAP1, 0);
++		vmcs_write64(EOI_EXIT_BITMAP2, 0);
++		vmcs_write64(EOI_EXIT_BITMAP3, 0);
++
++		vmcs_write16(GUEST_INTR_STATUS, 0);
++	}
++
+ 	if (ple_gap) {
+ 		vmcs_write32(PLE_GAP, ple_gap);
+ 		vmcs_write32(PLE_WINDOW, ple_window);
+@@ -4689,6 +4718,16 @@ static int handle_apic_access(struct kvm
+ 	return emulate_instruction(vcpu, 0) == EMULATE_DONE;
+ }
+ 
++static int handle_apic_eoi_induced(struct kvm_vcpu *vcpu)
++{
++	unsigned long exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++	int vector = exit_qualification & 0xff;
++
++	/* EOI-induced VM exit is trap-like and thus no need to adjust IP */
++	kvm_apic_set_eoi_accelerated(vcpu, vector);
++	return 1;
++}
++
+ static int handle_apic_write(struct kvm_vcpu *vcpu)
+ {
+ 	unsigned long exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
+@@ -5614,6 +5653,7 @@ static int (*kvm_vmx_exit_handlers[])(st
+ 	[EXIT_REASON_TPR_BELOW_THRESHOLD]     = handle_tpr_below_threshold,
+ 	[EXIT_REASON_APIC_ACCESS]             = handle_apic_access,
+ 	[EXIT_REASON_APIC_WRITE]              = handle_apic_write,
++	[EXIT_REASON_EOI_INDUCED]             = handle_apic_eoi_induced,
+ 	[EXIT_REASON_WBINVD]                  = handle_wbinvd,
+ 	[EXIT_REASON_XSETBV]                  = handle_xsetbv,
+ 	[EXIT_REASON_TASK_SWITCH]             = handle_task_switch,
+@@ -5962,7 +6002,8 @@ static void vmx_set_virtual_x2apic_mode(
+ 	 * There is not point to enable virtualize x2apic without enable
+ 	 * apicv
+ 	 */
+-	if (!cpu_has_vmx_virtualize_x2apic_mode() || !enable_apicv_reg)
++	if (!cpu_has_vmx_virtualize_x2apic_mode() ||
++				!vmx_vm_has_apicv(vcpu->kvm))
+ 		return;
+ 
+ 	if (!vm_need_tpr_shadow(vcpu->kvm))
+@@ -5982,6 +6023,56 @@ static void vmx_set_virtual_x2apic_mode(
+ 	vmx_set_msr_bitmap(vcpu);
+ }
+ 
++static void vmx_hwapic_isr_update(struct kvm *kvm, int isr)
++{
++	u16 status;
++	u8 old;
++
++	if (!vmx_vm_has_apicv(kvm))
++		return;
++
++	if (isr == -1)
++		isr = 0;
++
++	status = vmcs_read16(GUEST_INTR_STATUS);
++	old = status >> 8;
++	if (isr != old) {
++		status &= 0xff;
++		status |= isr << 8;
++		vmcs_write16(GUEST_INTR_STATUS, status);
++	}
++}
++
++static void vmx_set_rvi(int vector)
++{
++	u16 status;
++	u8 old;
++
++	status = vmcs_read16(GUEST_INTR_STATUS);
++	old = (u8)status & 0xff;
++	if ((u8)vector != old) {
++		status &= ~0xff;
++		status |= (u8)vector;
++		vmcs_write16(GUEST_INTR_STATUS, status);
++	}
++}
++
++static void vmx_hwapic_irr_update(struct kvm_vcpu *vcpu, int max_irr)
++{
++	if (max_irr == -1)
++		return;
++
++	vmx_set_rvi(max_irr);
++}
++
++static void vmx_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
++{
++	vmcs_write64(EOI_EXIT_BITMAP0, eoi_exit_bitmap[0]);
++	vmcs_write64(EOI_EXIT_BITMAP1, eoi_exit_bitmap[1]);
++	vmcs_write64(EOI_EXIT_BITMAP2, eoi_exit_bitmap[2]);
++	vmcs_write64(EOI_EXIT_BITMAP3, eoi_exit_bitmap[3]);
++}
++
+ static void vmx_complete_atomic_exit(struct vcpu_vmx *vmx)
+ {
+ 	u32 exit_intr_info;
+@@ -7264,6 +7355,10 @@ static struct kvm_x86_ops vmx_x86_ops =
+ 	.enable_irq_window = enable_irq_window,
+ 	.update_cr8_intercept = update_cr8_intercept,
+ 	.set_virtual_x2apic_mode = vmx_set_virtual_x2apic_mode,
++	.vm_has_apicv = vmx_vm_has_apicv,
++	.load_eoi_exitmap = vmx_load_eoi_exitmap,
++	.hwapic_irr_update = vmx_hwapic_irr_update,
++	.hwapic_isr_update = vmx_hwapic_isr_update,
+ 
+ 	.set_tss_addr = vmx_set_tss_addr,
+ 	.get_tdp_level = get_ept_level,
+@@ -7365,7 +7460,7 @@ static int __init vmx_init(void)
+ 	memcpy(vmx_msr_bitmap_longmode_x2apic,
+ 			vmx_msr_bitmap_longmode, PAGE_SIZE);
+ 
+-	if (enable_apicv_reg) {
++	if (enable_apicv_reg_vid) {
+ 		for (msr = 0x800; msr <= 0x8ff; msr++)
+ 			vmx_disable_intercept_msr_read_x2apic(msr);
+ 
+@@ -7377,6 +7472,10 @@ static int __init vmx_init(void)
+ 		vmx_enable_intercept_msr_read_x2apic(0x839);
+ 		/* TPR */
+ 		vmx_disable_intercept_msr_write_x2apic(0x808);
++		/* EOI */
++		vmx_disable_intercept_msr_write_x2apic(0x80b);
++		/* SELF-IPI */
++		vmx_disable_intercept_msr_write_x2apic(0x83f);
+ 	}
+ 
+ 	if (enable_ept) {
+Index: b/arch/x86/kvm/x86.c
+===================================================================
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5501,7 +5501,7 @@ static void inject_pending_event(struct
+ 			vcpu->arch.nmi_injected = true;
+ 			kvm_x86_ops->set_nmi(vcpu);
+ 		}
+-	} else if (kvm_cpu_has_interrupt(vcpu)) {
++	} else if (kvm_cpu_has_injectable_intr(vcpu)) {
+ 		if (kvm_x86_ops->interrupt_allowed(vcpu)) {
+ 			kvm_queue_interrupt(vcpu, kvm_cpu_get_interrupt(vcpu),
+ 					    false);
+@@ -5529,6 +5529,16 @@ static void kvm_put_guest_xcr0(struct kv
+ 	}
+ }
+ 
++static void update_eoi_exitmap(struct kvm_vcpu *vcpu)
++{
++	u64 eoi_exit_bitmap[4];
++
++	memset(eoi_exit_bitmap, 0, 32);
++
++	kvm_ioapic_calculate_eoi_exitmap(vcpu, eoi_exit_bitmap);
++	kvm_x86_ops->load_eoi_exitmap(vcpu, eoi_exit_bitmap);
++}
++
+ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ {
+ 	int r;
+@@ -5570,6 +5580,8 @@ static int vcpu_enter_guest(struct kvm_v
+ 			r = 1;
+ 			goto out;
+ 		}
++		if (kvm_check_request(KVM_REQ_EOIBITMAP, vcpu))
++			update_eoi_exitmap(vcpu);
+ 	}
+ 
+ 	r = kvm_mmu_reload(vcpu);
+@@ -5590,10 +5602,17 @@ static int vcpu_enter_guest(struct kvm_v
+ 		/* enable NMI/IRQ window open exits if needed */
+ 		if (nmi_pending)
+ 			kvm_x86_ops->enable_nmi_window(vcpu);
+-		else if (kvm_cpu_has_interrupt(vcpu) || req_int_win)
++		else if (kvm_cpu_has_injectable_intr(vcpu) || req_int_win)
+ 			kvm_x86_ops->enable_irq_window(vcpu);
+ 
+ 		if (kvm_lapic_enabled(vcpu)) {
++			/*
++			 * Update architecture specific hints for APIC
++			 * virtual interrupt delivery.
++			 */
++			if (kvm_x86_ops->hwapic_irr_update)
++				kvm_x86_ops->hwapic_irr_update(vcpu,
++					kvm_lapic_find_highest_irr(vcpu));
+ 			update_cr8_intercept(vcpu);
+ 			kvm_lapic_sync_to_vapic(vcpu);
+ 		}
+Index: b/include/linux/kvm_host.h
+===================================================================
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -47,6 +47,7 @@
+ #define KVM_REQ_DEACTIVATE_FPU    10
+ #define KVM_REQ_EVENT             11
+ #define KVM_REQ_APF_HALT          12
++#define KVM_REQ_EOIBITMAP         22
+ 
+ #define KVM_USERSPACE_IRQ_SOURCE_ID	0
+ 
+@@ -408,6 +409,7 @@ void kvm_put_guest_fpu(struct kvm_vcpu *
+ 
+ void kvm_flush_remote_tlbs(struct kvm *kvm);
+ void kvm_reload_remote_mmus(struct kvm *kvm);
++void kvm_make_update_eoibitmap_request(struct kvm *kvm);
+ 
+ long kvm_arch_dev_ioctl(struct file *filp,
+ 			unsigned int ioctl, unsigned long arg);
+@@ -544,6 +546,7 @@ void kvm_get_intr_delivery_bitmask(struc
+ int kvm_set_irq(struct kvm *kvm, int irq_source_id, u32 irq, int level);
+ int kvm_set_msi(struct kvm_kernel_irq_routing_entry *irq_entry, struct kvm *kvm,
+ 		int irq_source_id, int level);
++bool kvm_irq_has_notifier(struct kvm *kvm, unsigned irqchip, unsigned pin);
+ void kvm_notify_acked_irq(struct kvm *kvm, unsigned irqchip, unsigned pin);
+ void kvm_register_irq_ack_notifier(struct kvm *kvm,
+ 				   struct kvm_irq_ack_notifier *kian);
+Index: b/virt/kvm/ioapic.c
+===================================================================
+--- a/virt/kvm/ioapic.c
++++ b/virt/kvm/ioapic.c
+@@ -35,6 +35,7 @@
+ #include <linux/hrtimer.h>
+ #include <linux/io.h>
+ #include <linux/slab.h>
++#include <linux/module.h>
+ #include <asm/processor.h>
+ #include <asm/page.h>
+ #include <asm/current.h>
+@@ -115,6 +116,42 @@ static void update_handled_vectors(struc
+ 	smp_wmb();
+ }
+ 
++void kvm_ioapic_calculate_eoi_exitmap(struct kvm_vcpu *vcpu,
++					u64 *eoi_exit_bitmap)
++{
++	struct kvm_ioapic *ioapic = vcpu->kvm->arch.vioapic;
++	union kvm_ioapic_redirect_entry *e;
++	struct kvm_lapic_irq irqe;
++	int index;
++
++	spin_lock(&ioapic->lock);
++	/* traverse ioapic entry to set eoi exit bitmap*/
++	for (index = 0; index < IOAPIC_NUM_PINS; index++) {
++		e = &ioapic->redirtbl[index];
++		if (!e->fields.mask &&
++			(e->fields.trig_mode == IOAPIC_LEVEL_TRIG ||
++			 kvm_irq_has_notifier(ioapic->kvm, KVM_IRQCHIP_IOAPIC,
++				 index))) {
++			irqe.dest_id = e->fields.dest_id;
++			irqe.vector = e->fields.vector;
++			irqe.dest_mode = e->fields.dest_mode;
++			irqe.delivery_mode = e->fields.delivery_mode << 8;
++			kvm_calculate_eoi_exitmap(vcpu, &irqe, eoi_exit_bitmap);
++		}
++	}
++	spin_unlock(&ioapic->lock);
++}
++EXPORT_SYMBOL_GPL(kvm_ioapic_calculate_eoi_exitmap);
++
++void kvm_ioapic_make_eoibitmap_request(struct kvm *kvm)
++{
++	struct kvm_ioapic *ioapic = kvm->arch.vioapic;
++
++	if (!kvm_apic_vid_enabled(kvm) || !ioapic)
++		return;
++	kvm_make_update_eoibitmap_request(kvm);
++}
++
+ static void ioapic_write_indirect(struct kvm_ioapic *ioapic, u32 val)
+ {
+ 	unsigned index;
+@@ -156,6 +193,7 @@ static void ioapic_write_indirect(struct
+ 		if (e->fields.trig_mode == IOAPIC_LEVEL_TRIG
+ 		    && ioapic->irr & (1 << index))
+ 			ioapic_service(ioapic, index);
++		kvm_ioapic_make_eoibitmap_request(ioapic->kvm);
+ 		break;
+ 	}
+ }
+@@ -441,6 +479,7 @@ int kvm_set_ioapic(struct kvm *kvm, stru
+ 	spin_lock(&ioapic->lock);
+ 	memcpy(ioapic, state, sizeof(struct kvm_ioapic_state));
+ 	update_handled_vectors(ioapic);
++	kvm_ioapic_make_eoibitmap_request(kvm);
+ 	spin_unlock(&ioapic->lock);
+ 	return 0;
+ }
+Index: b/virt/kvm/ioapic.h
+===================================================================
+--- a/virt/kvm/ioapic.h
++++ b/virt/kvm/ioapic.h
+@@ -80,5 +80,9 @@ int kvm_irq_delivery_to_apic(struct kvm
+ 		struct kvm_lapic_irq *irq);
+ int kvm_get_ioapic(struct kvm *kvm, struct kvm_ioapic_state *state);
+ int kvm_set_ioapic(struct kvm *kvm, struct kvm_ioapic_state *state);
++void kvm_ioapic_make_eoibitmap_request(struct kvm *kvm);
++void kvm_ioapic_calculate_eoi_exitmap(struct kvm_vcpu *vcpu,
++					u64 *eoi_exit_bitmap);
++
+ 
+ #endif
+Index: b/virt/kvm/irq_comm.c
+===================================================================
+--- a/virt/kvm/irq_comm.c
++++ b/virt/kvm/irq_comm.c
+@@ -22,6 +22,7 @@
+ 
+ #include <linux/kvm_host.h>
+ #include <linux/slab.h>
++#include <linux/module.h>
+ #include <trace/events/kvm.h>
+ 
+ #include <asm/msidef.h>
+@@ -181,6 +182,28 @@ int kvm_set_irq(struct kvm *kvm, int irq
+ 	return ret;
+ }
+ 
++bool kvm_irq_has_notifier(struct kvm *kvm, unsigned irqchip, unsigned pin)
++{
++	struct kvm_irq_ack_notifier *kian;
++	struct hlist_node *n;
++	int gsi;
++
++	rcu_read_lock();
++	gsi = rcu_dereference(kvm->irq_routing)->chip[irqchip][pin];
++	if (gsi != -1)
++		hlist_for_each_entry_rcu(kian, n, &kvm->irq_ack_notifier_list,
++					 link)
++			if (kian->gsi == gsi) {
++				rcu_read_unlock();
++				return true;
++			}
++
++	rcu_read_unlock();
++
++	return false;
++}
++EXPORT_SYMBOL_GPL(kvm_irq_has_notifier);
++
+ void kvm_notify_acked_irq(struct kvm *kvm, unsigned irqchip, unsigned pin)
+ {
+ 	struct kvm_irq_ack_notifier *kian;
+@@ -205,6 +228,7 @@ void kvm_register_irq_ack_notifier(struc
+ 	mutex_lock(&kvm->irq_lock);
+ 	hlist_add_head_rcu(&kian->link, &kvm->irq_ack_notifier_list);
+ 	mutex_unlock(&kvm->irq_lock);
++	kvm_ioapic_make_eoibitmap_request(kvm);
+ }
+ 
+ void kvm_unregister_irq_ack_notifier(struct kvm *kvm,
+@@ -214,6 +238,7 @@ void kvm_unregister_irq_ack_notifier(str
+ 	hlist_del_init_rcu(&kian->link);
+ 	mutex_unlock(&kvm->irq_lock);
+ 	synchronize_rcu();
++	kvm_ioapic_make_eoibitmap_request(kvm);
+ }
+ 
+ int kvm_request_irq_source_id(struct kvm *kvm)
+Index: b/virt/kvm/kvm_main.c
+===================================================================
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -210,6 +210,11 @@ void kvm_reload_remote_mmus(struct kvm *
+ 	make_all_cpus_request(kvm, KVM_REQ_MMU_RELOAD);
+ }
+ 
++void kvm_make_update_eoibitmap_request(struct kvm *kvm)
++{
++	make_all_cpus_request(kvm, KVM_REQ_EOIBITMAP);
++}
++
+ int kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id)
+ {
+ 	struct page *page;
+
