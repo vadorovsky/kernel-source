@@ -1,0 +1,127 @@
+From: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Subject: powerpc/perf: Fix instruction address sampling on 970 and Power4
+Git-commit: 1ce447b90f3e71c81ae59e0062bc305ef267668b
+Patch-mainline: yes
+References: bnc#796891 
+
+    970 and Power4 don't support "continuous sampling" which means that
+    when we aren't in marked instruction sampling mode (marked events),
+    SIAR isn't updated with the last instruction sampled before the
+    perf interrupt. On those processors, we must thus use the exception
+    SRR0 value as the sampled instruction pointer.
+    
+    Those processors also don't support the SIPR and SIHV bits in MMCRA
+    which means we need some kind of heuristic to decide if SIAR values
+    represent kernel or user addresses.
+    
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Signed-off-by: Sukadev Bhattiprolu <sukadev@linux.vnet.ibm.com>
+Acked-by: Torsten Duwe <duwe@suse.de>
+
+Index: linux-3.0.53-83/arch/powerpc/include/asm/perf_event_server.h
+===================================================================
+--- linux-3.0.53-83.orig/arch/powerpc/include/asm/perf_event_server.h
++++ linux-3.0.53-83/arch/powerpc/include/asm/perf_event_server.h
+@@ -47,6 +47,8 @@ struct power_pmu {
+  */
+ #define PPMU_LIMITED_PMC5_6	1	/* PMC5/6 have limited function */
+ #define PPMU_ALT_SIPR		2	/* uses alternate posn for SIPR/HV */
++#define PPMU_NO_SIPR		4	/* no SIPR/HV in MMCRA at all */
++#define PPMU_NO_CONT_SAMPLING	8	/* no continuous sampling */
+ #define PPMU_SIAR_VALID         16      /* Processor has SIAR Valid bit */
+ /*
+  * Values for flags to get_alternatives()
+Index: linux-3.0.53-83/arch/powerpc/kernel/perf_event.c
+===================================================================
+--- linux-3.0.53-83.orig/arch/powerpc/kernel/perf_event.c
++++ linux-3.0.53-83/arch/powerpc/kernel/perf_event.c
+@@ -127,14 +127,45 @@ static inline void perf_get_data_addr(st
+ 		*addrp = mfspr(SPRN_SDAR);
+ }
+ 
++static inline u32 perf_flags_from_msr(struct pt_regs *regs)
++{
++	if (regs->msr & MSR_PR)
++		return PERF_RECORD_MISC_USER;
++	if ((regs->msr & MSR_HV) && freeze_events_kernel != MMCR0_FCHV)
++		return PERF_RECORD_MISC_HYPERVISOR;
++	return PERF_RECORD_MISC_KERNEL;
++}
++
+ static inline u32 perf_get_misc_flags(struct pt_regs *regs)
+ {
+ 	unsigned long mmcra = regs->dsisr;
+ 	unsigned long sihv = MMCRA_SIHV;
+ 	unsigned long sipr = MMCRA_SIPR;
+ 
++	/* Not a PMU interrupt: Make up flags from regs->msr */
+ 	if (TRAP(regs) != 0xf00)
+-		return 0;	/* not a PMU interrupt */
++		return perf_flags_from_msr(regs);
++
++	/*
++	 * If we don't support continuous sampling and this
++	 * is not a marked event, same deal
++	 */
++	if ((ppmu->flags & PPMU_NO_CONT_SAMPLING) &&
++			!(mmcra & MMCRA_SAMPLE_ENABLE))
++		return perf_flags_from_msr(regs);
++
++	/*
++	 * If we don't have flags in MMCRA, rather than using
++	 * the MSR, we intuit the flags from the address in
++	 * SIAR which should give slightly more reliable
++	 * results
++	 */
++	if (ppmu->flags & PPMU_NO_SIPR) {
++		unsigned long siar = mfspr(SPRN_SIAR);
++		if (siar >= PAGE_OFFSET)
++			return PERF_RECORD_MISC_KERNEL;
++		return PERF_RECORD_MISC_USER;
++	}
+ 
+ 	if (ppmu->flags & PPMU_ALT_SIPR) {
+ 		sihv = POWER6_MMCRA_SIHV;
+@@ -1323,10 +1354,17 @@ unsigned long perf_misc_flags(struct pt_
+  */
+ unsigned long perf_instruction_pointer(struct pt_regs *regs)
+ {
++	unsigned long mmcra = regs->dsisr;
+ 	unsigned long use_siar = regs->result;
+ 
++	/* Not a PMU interrupt */
+ 	if (TRAP(regs) != 0xf00)
+-		return regs->nip;	/* not a PMU interrupt */
++		return regs->nip;
++
++	/* Processor doesn't support sampling non marked events */
++	if ((ppmu->flags & PPMU_NO_CONT_SAMPLING) &&
++			!(mmcra & MMCRA_SAMPLE_ENABLE))
++		return regs->nip;
+ 
+ 	if (use_siar && siar_valid(regs))
+ 		return mfspr(SPRN_SIAR) + perf_ip_adjust(regs);
+Index: linux-3.0.53-83/arch/powerpc/kernel/power4-pmu.c
+===================================================================
+--- linux-3.0.53-83.orig/arch/powerpc/kernel/power4-pmu.c
++++ linux-3.0.53-83/arch/powerpc/kernel/power4-pmu.c
+@@ -607,6 +607,7 @@ static struct power_pmu power4_pmu = {
+ 	.n_generic		= ARRAY_SIZE(p4_generic_events),
+ 	.generic_events		= p4_generic_events,
+ 	.cache_events		= &power4_cache_events,
++	.flags			= PPMU_NO_SIPR | PPMU_NO_CONT_SAMPLING,
+ };
+ 
+ static int init_power4_pmu(void)
+Index: linux-3.0.53-83/arch/powerpc/kernel/ppc970-pmu.c
+===================================================================
+--- linux-3.0.53-83.orig/arch/powerpc/kernel/ppc970-pmu.c
++++ linux-3.0.53-83/arch/powerpc/kernel/ppc970-pmu.c
+@@ -487,6 +487,7 @@ static struct power_pmu ppc970_pmu = {
+ 	.n_generic		= ARRAY_SIZE(ppc970_generic_events),
+ 	.generic_events		= ppc970_generic_events,
+ 	.cache_events		= &ppc970_cache_events,
++	.flags 			= PPMU_NO_SIPR | PPMU_NO_CONT_SAMPLING,
+ };
+ 
+ static int init_ppc970_pmu(void)
