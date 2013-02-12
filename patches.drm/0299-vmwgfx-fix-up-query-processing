@@ -1,0 +1,910 @@
+From e2fa3a76839ada0d788549607263a036aa654243 Mon Sep 17 00:00:00 2001
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Tue, 4 Oct 2011 20:13:30 +0200
+Subject: vmwgfx: Fix up query processing
+Git-commit: e2fa3a76839ada0d788549607263a036aa654243
+Patch-mainline: v3.2-rc1
+
+Previously, query results could be placed in any buffer object, but since
+we didn't allow pinned buffer objects, query results could be written when
+that buffer was evicted, corrupting data in other buffers.
+
+Now, require that buffers holding query results are no more than two pages
+large, and allow one single pinned such buffer. When the command submission
+code encounters query result structures in other buffers, the queries in the
+pinned buffer will be finished using a query barrier for the last hardware
+context using the buffer. Also if the command submission code detects
+that a new hardware context is used for queries, all queries of the previous
+hardware context is also flushed. Currently we use waiting for a no-op
+occlusion query as a query barrier for a specific context.
+
+The query buffer is also flushed and unpinned on context destructions,
+master drops and before scanout bo placement.
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Jakob Bornecrantz <jakob@vmware.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c   |   44 ++++
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.c      |   86 +++++++
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.h      |   24 ++
+ drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c  |  375 ++++++++++++++++++++++++++++--
+ drivers/gpu/drm/vmwgfx/vmwgfx_fifo.c     |   57 +++++
+ drivers/gpu/drm/vmwgfx/vmwgfx_resource.c |    8 +-
+ 6 files changed, 572 insertions(+), 22 deletions(-)
+
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
+@@ -42,6 +42,7 @@
+  * May only be called by the current master since it assumes that the
+  * master lock is the current master's lock.
+  * This function takes the master's lock in write mode.
++ * Flushes and unpins the query bo to avoid failures.
+  *
+  * Returns
+  *  -ERESTARTSYS if interrupted by a signal.
+@@ -59,6 +60,8 @@ int vmw_dmabuf_to_placement(struct vmw_p
+ 	if (unlikely(ret != 0))
+ 		return ret;
+ 
++	vmw_execbuf_release_pinned_bo(dev_priv, false, 0);
++
+ 	ret = ttm_bo_reserve(bo, interruptible, false, false, 0);
+ 	if (unlikely(ret != 0))
+ 		goto err;
+@@ -78,6 +81,7 @@ err:
+  * May only be called by the current master since it assumes that the
+  * master lock is the current master's lock.
+  * This function takes the master's lock in write mode.
++ * Flushes and unpins the query bo if @pin == true to avoid failures.
+  *
+  * @dev_priv:  Driver private.
+  * @buf:  DMA buffer to move.
+@@ -100,6 +104,9 @@ int vmw_dmabuf_to_vram_or_gmr(struct vmw
+ 	if (unlikely(ret != 0))
+ 		return ret;
+ 
++	if (pin)
++		vmw_execbuf_release_pinned_bo(dev_priv, false, 0);
++
+ 	ret = ttm_bo_reserve(bo, interruptible, false, false, 0);
+ 	if (unlikely(ret != 0))
+ 		goto err;
+@@ -177,6 +184,7 @@ int vmw_dmabuf_to_vram(struct vmw_privat
+  * May only be called by the current master since it assumes that the
+  * master lock is the current master's lock.
+  * This function takes the master's lock in write mode.
++ * Flushes and unpins the query bo if @pin == true to avoid failures.
+  *
+  * @dev_priv:  Driver private.
+  * @buf:  DMA buffer to move.
+@@ -205,6 +213,9 @@ int vmw_dmabuf_to_start_of_vram(struct v
+ 	if (unlikely(ret != 0))
+ 		return ret;
+ 
++	if (pin)
++		vmw_execbuf_release_pinned_bo(dev_priv, false, 0);
++
+ 	ret = ttm_bo_reserve(bo, interruptible, false, false, 0);
+ 	if (unlikely(ret != 0))
+ 		goto err_unlock;
+@@ -276,3 +287,36 @@ void vmw_bo_get_guest_ptr(const struct t
+ 		ptr->offset = 0;
+ 	}
+ }
++
++
++/**
++ * vmw_bo_pin - Pin or unpin a buffer object without moving it.
++ *
++ * @bo: The buffer object. Must be reserved, and present either in VRAM
++ * or GMR memory.
++ * @pin: Whether to pin or unpin.
++ *
++ */
++void vmw_bo_pin(struct ttm_buffer_object *bo, bool pin)
++{
++	uint32_t pl_flags;
++	struct ttm_placement placement;
++	uint32_t old_mem_type = bo->mem.mem_type;
++	int ret;
++
++	BUG_ON(!atomic_read(&bo->reserved));
++	BUG_ON(old_mem_type != TTM_PL_VRAM &&
++	       old_mem_type != VMW_PL_FLAG_GMR);
++
++	pl_flags = TTM_PL_FLAG_VRAM | VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED;
++	if (pin)
++		pl_flags |= TTM_PL_FLAG_NO_EVICT;
++
++	memset(&placement, 0, sizeof(placement));
++	placement.num_placement = 1;
++	placement.placement = &pl_flags;
++
++	ret = ttm_bo_validate(bo, &placement, false, true, true);
++
++	BUG_ON(ret != 0 || bo->mem.mem_type != old_mem_type);
++}
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -214,6 +214,72 @@ static void vmw_print_capabilities(uint3
+ 		DRM_INFO("  Screen Object 2.\n");
+ }
+ 
++
++/**
++ * vmw_execbuf_prepare_dummy_query - Initialize a query result structure at
++ * the start of a buffer object.
++ *
++ * @dev_priv: The device private structure.
++ *
++ * This function will idle the buffer using an uninterruptible wait, then
++ * map the first page and initialize a pending occlusion query result structure,
++ * Finally it will unmap the buffer.
++ *
++ * TODO: Since we're only mapping a single page, we should optimize the map
++ * to use kmap_atomic / iomap_atomic.
++ */
++static void vmw_dummy_query_bo_prepare(struct vmw_private *dev_priv)
++{
++	struct ttm_bo_kmap_obj map;
++	volatile SVGA3dQueryResult *result;
++	bool dummy;
++	int ret;
++	struct ttm_bo_device *bdev = &dev_priv->bdev;
++	struct ttm_buffer_object *bo = dev_priv->dummy_query_bo;
++
++	ttm_bo_reserve(bo, false, false, false, 0);
++	spin_lock(&bdev->fence_lock);
++	ret = ttm_bo_wait(bo, false, false, false, TTM_USAGE_READWRITE);
++	spin_unlock(&bdev->fence_lock);
++	if (unlikely(ret != 0))
++		(void) vmw_fallback_wait(dev_priv, false, true, 0, false,
++					 10*HZ);
++
++	ret = ttm_bo_kmap(bo, 0, 1, &map);
++	if (likely(ret == 0)) {
++		result = ttm_kmap_obj_virtual(&map, &dummy);
++		result->totalSize = sizeof(*result);
++		result->state = SVGA3D_QUERYSTATE_PENDING;
++		result->result32 = 0xff;
++		ttm_bo_kunmap(&map);
++	} else
++		DRM_ERROR("Dummy query buffer map failed.\n");
++	ttm_bo_unreserve(bo);
++}
++
++
++/**
++ * vmw_dummy_query_bo_create - create a bo to hold a dummy query result
++ *
++ * @dev_priv: A device private structure.
++ *
++ * This function creates a small buffer object that holds the query
++ * result for dummy queries emitted as query barriers.
++ * No interruptible waits are done within this function.
++ *
++ * Returns an error if bo creation fails.
++ */
++static int vmw_dummy_query_bo_create(struct vmw_private *dev_priv)
++{
++	return ttm_bo_create(&dev_priv->bdev,
++			     PAGE_SIZE,
++			     ttm_bo_type_device,
++			     &vmw_vram_sys_placement,
++			     0, 0, false, NULL,
++			     &dev_priv->dummy_query_bo);
++}
++
++
+ static int vmw_request_device(struct vmw_private *dev_priv)
+ {
+ 	int ret;
+@@ -224,12 +290,29 @@ static int vmw_request_device(struct vmw
+ 		return ret;
+ 	}
+ 	vmw_fence_fifo_up(dev_priv->fman);
++	ret = vmw_dummy_query_bo_create(dev_priv);
++	if (unlikely(ret != 0))
++		goto out_no_query_bo;
++	vmw_dummy_query_bo_prepare(dev_priv);
+ 
+ 	return 0;
++
++out_no_query_bo:
++	vmw_fence_fifo_down(dev_priv->fman);
++	vmw_fifo_release(dev_priv, &dev_priv->fifo);
++	return ret;
+ }
+ 
+ static void vmw_release_device(struct vmw_private *dev_priv)
+ {
++	/*
++	 * Previous destructions should've released
++	 * the pinned bo.
++	 */
++
++	BUG_ON(dev_priv->pinned_bo != NULL);
++
++	ttm_bo_unref(&dev_priv->dummy_query_bo);
+ 	vmw_fence_fifo_down(dev_priv->fman);
+ 	vmw_fifo_release(dev_priv, &dev_priv->fifo);
+ }
+@@ -795,6 +878,8 @@ static void vmw_master_drop(struct drm_d
+ 
+ 	vmw_fp->locked_master = drm_master_get(file_priv->master);
+ 	ret = ttm_vt_lock(&vmaster->lock, false, vmw_fp->tfile);
++	vmw_execbuf_release_pinned_bo(dev_priv, false, 0);
++
+ 	if (unlikely((ret != 0))) {
+ 		DRM_ERROR("Unable to lock TTM at VT switch.\n");
+ 		drm_master_put(&vmw_fp->locked_master);
+@@ -845,6 +930,7 @@ static int vmwgfx_pm_notifier(struct not
+ 		 * This empties VRAM and unbinds all GMR bindings.
+ 		 * Buffer contents is moved to swappable memory.
+ 		 */
++		vmw_execbuf_release_pinned_bo(dev_priv, false, 0);
+ 		ttm_bo_swapout_all(&dev_priv->bdev);
+ 
+ 		break;
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -82,6 +82,7 @@ struct vmw_resource {
+ 	void (*hw_destroy) (struct vmw_resource *res);
+ 	void (*res_free) (struct vmw_resource *res);
+ 	bool on_validate_list;
++	struct list_head query_head; /* Protected by the cmdbuf mutex */
+ 	/* TODO is a generic snooper needed? */
+ #if 0
+ 	void (*snoop)(struct vmw_resource *res,
+@@ -142,6 +143,7 @@ struct vmw_sw_context{
+ 	uint32_t last_cid;
+ 	bool cid_valid;
+ 	bool kernel; /**< is the called made from the kernel */
++	struct vmw_resource *cur_ctx;
+ 	uint32_t last_sid;
+ 	uint32_t sid_translation;
+ 	bool sid_valid;
+@@ -155,6 +157,11 @@ struct vmw_sw_context{
+ 	uint32_t cmd_bounce_size;
+ 	struct vmw_resource *resources[VMWGFX_MAX_VALIDATIONS];
+ 	uint32_t num_ref_resources;
++	uint32_t fence_flags;
++	struct list_head query_list;
++	struct ttm_buffer_object *cur_query_bo;
++	uint32_t cur_query_cid;
++	bool query_cid_valid;
+ };
+ 
+ struct vmw_legacy_display;
+@@ -294,6 +301,16 @@ struct vmw_private {
+ 
+ 	struct mutex release_mutex;
+ 	uint32_t num_3d_resources;
++
++	/*
++	 * Query processing. These members
++	 * are protected by the cmdbuf mutex.
++	 */
++
++	struct ttm_buffer_object *dummy_query_bo;
++	struct ttm_buffer_object *pinned_bo;
++	uint32_t query_cid;
++	bool dummy_query_bo_pinned;
+ };
+ 
+ static inline struct vmw_private *vmw_priv(struct drm_device *dev)
+@@ -418,6 +435,7 @@ extern int vmw_dmabuf_unpin(struct vmw_p
+ 			    bool interruptible);
+ extern void vmw_bo_get_guest_ptr(const struct ttm_buffer_object *buf,
+ 				 SVGAGuestPtr *ptr);
++extern void vmw_bo_pin(struct ttm_buffer_object *bo, bool pin);
+ 
+ /**
+  * Misc Ioctl functionality - vmwgfx_ioctl.c
+@@ -447,6 +465,8 @@ extern int vmw_fifo_send_fence(struct vm
+ extern void vmw_fifo_ping_host(struct vmw_private *dev_priv, uint32_t reason);
+ extern bool vmw_fifo_have_3d(struct vmw_private *dev_priv);
+ extern bool vmw_fifo_have_pitchlock(struct vmw_private *dev_priv);
++extern int vmw_fifo_emit_dummy_query(struct vmw_private *dev_priv,
++				     uint32_t cid);
+ 
+ /**
+  * TTM glue - vmwgfx_ttm_glue.c
+@@ -485,6 +505,10 @@ extern int vmw_execbuf_process(struct dr
+ 			       struct drm_vmw_fence_rep __user
+ 			       *user_fence_rep);
+ 
++extern void
++vmw_execbuf_release_pinned_bo(struct vmw_private *dev_priv,
++			      bool only_on_cid_match, uint32_t cid);
++
+ /**
+  * IRQs and wating - vmwgfx_irq.c
+  */
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+@@ -44,7 +44,6 @@ static int vmw_cmd_ok(struct vmw_private
+ 	return 0;
+ }
+ 
+-
+ static int vmw_resource_to_validate_list(struct vmw_sw_context *sw_context,
+ 					 struct vmw_resource **p_res)
+ {
+@@ -68,6 +67,54 @@ out:
+ 	return ret;
+ }
+ 
++/**
++ * vmw_bo_to_validate_list - add a bo to a validate list
++ *
++ * @sw_context: The software context used for this command submission batch.
++ * @bo: The buffer object to add.
++ * @fence_flags: Fence flags to be or'ed with any other fence flags for
++ * this buffer on this submission batch.
++ * @p_val_node: If non-NULL Will be updated with the validate node number
++ * on return.
++ *
++ * Returns -EINVAL if the limit of number of buffer objects per command
++ * submission is reached.
++ */
++static int vmw_bo_to_validate_list(struct vmw_sw_context *sw_context,
++				   struct ttm_buffer_object *bo,
++				   uint32_t fence_flags,
++				   uint32_t *p_val_node)
++{
++	uint32_t val_node;
++	struct ttm_validate_buffer *val_buf;
++
++	val_node = vmw_dmabuf_validate_node(bo, sw_context->cur_val_buf);
++
++	if (unlikely(val_node >= VMWGFX_MAX_VALIDATIONS)) {
++		DRM_ERROR("Max number of DMA buffers per submission"
++			  " exceeded.\n");
++		return -EINVAL;
++	}
++
++	val_buf = &sw_context->val_bufs[val_node];
++	if (unlikely(val_node == sw_context->cur_val_buf)) {
++		val_buf->new_sync_obj_arg = NULL;
++		val_buf->bo = ttm_bo_reference(bo);
++		val_buf->usage = TTM_USAGE_READWRITE;
++		list_add_tail(&val_buf->head, &sw_context->validate_nodes);
++		++sw_context->cur_val_buf;
++	}
++
++	val_buf->new_sync_obj_arg = (void *)
++		((unsigned long) val_buf->new_sync_obj_arg | fence_flags);
++	sw_context->fence_flags |= fence_flags;
++
++	if (p_val_node)
++		*p_val_node = val_node;
++
++	return 0;
++}
++
+ static int vmw_cmd_cid_check(struct vmw_private *dev_priv,
+ 			     struct vmw_sw_context *sw_context,
+ 			     SVGA3dCmdHeader *header)
+@@ -94,6 +141,7 @@ static int vmw_cmd_cid_check(struct vmw_
+ 
+ 	sw_context->last_cid = cmd->cid;
+ 	sw_context->cid_valid = true;
++	sw_context->cur_ctx = ctx;
+ 	return vmw_resource_to_validate_list(sw_context, &ctx);
+ }
+ 
+@@ -114,7 +162,8 @@ static int vmw_cmd_sid_check(struct vmw_
+ 		return 0;
+ 	}
+ 
+-	ret = vmw_user_surface_lookup_handle(dev_priv, sw_context->tfile,
++	ret = vmw_user_surface_lookup_handle(dev_priv,
++					     sw_context->tfile,
+ 					     *sid, &srf);
+ 	if (unlikely(ret != 0)) {
+ 		DRM_ERROR("Could ot find or use surface 0x%08x "
+@@ -225,6 +274,168 @@ static int vmw_cmd_present_check(struct
+ 	return vmw_cmd_sid_check(dev_priv, sw_context, &cmd->body.sid);
+ }
+ 
++/**
++ * vmw_query_bo_switch_prepare - Prepare to switch pinned buffer for queries.
++ *
++ * @dev_priv: The device private structure.
++ * @cid: The hardware context for the next query.
++ * @new_query_bo: The new buffer holding query results.
++ * @sw_context: The software context used for this command submission.
++ *
++ * This function checks whether @new_query_bo is suitable for holding
++ * query results, and if another buffer currently is pinned for query
++ * results. If so, the function prepares the state of @sw_context for
++ * switching pinned buffers after successful submission of the current
++ * command batch. It also checks whether we're using a new query context.
++ * In that case, it makes sure we emit a query barrier for the old
++ * context before the current query buffer is fenced.
++ */
++static int vmw_query_bo_switch_prepare(struct vmw_private *dev_priv,
++				       uint32_t cid,
++				       struct ttm_buffer_object *new_query_bo,
++				       struct vmw_sw_context *sw_context)
++{
++	int ret;
++	bool add_cid = false;
++	uint32_t cid_to_add;
++
++	if (unlikely(new_query_bo != sw_context->cur_query_bo)) {
++
++		if (unlikely(new_query_bo->num_pages > 4)) {
++			DRM_ERROR("Query buffer too large.\n");
++			return -EINVAL;
++		}
++
++		if (unlikely(sw_context->cur_query_bo != NULL)) {
++			BUG_ON(!sw_context->query_cid_valid);
++			add_cid = true;
++			cid_to_add = sw_context->cur_query_cid;
++			ret = vmw_bo_to_validate_list(sw_context,
++						      sw_context->cur_query_bo,
++						      DRM_VMW_FENCE_FLAG_EXEC,
++						      NULL);
++			if (unlikely(ret != 0))
++				return ret;
++		}
++		sw_context->cur_query_bo = new_query_bo;
++
++		ret = vmw_bo_to_validate_list(sw_context,
++					      dev_priv->dummy_query_bo,
++					      DRM_VMW_FENCE_FLAG_EXEC,
++					      NULL);
++		if (unlikely(ret != 0))
++			return ret;
++
++	}
++
++	if (unlikely(cid != sw_context->cur_query_cid &&
++		     sw_context->query_cid_valid)) {
++		add_cid = true;
++		cid_to_add = sw_context->cur_query_cid;
++	}
++
++	sw_context->cur_query_cid = cid;
++	sw_context->query_cid_valid = true;
++
++	if (add_cid) {
++		struct vmw_resource *ctx = sw_context->cur_ctx;
++
++		if (list_empty(&ctx->query_head))
++			list_add_tail(&ctx->query_head,
++				      &sw_context->query_list);
++		ret = vmw_bo_to_validate_list(sw_context,
++					      dev_priv->dummy_query_bo,
++					      DRM_VMW_FENCE_FLAG_EXEC,
++					      NULL);
++		if (unlikely(ret != 0))
++			return ret;
++	}
++	return 0;
++}
++
++
++/**
++ * vmw_query_bo_switch_commit - Finalize switching pinned query buffer
++ *
++ * @dev_priv: The device private structure.
++ * @sw_context: The software context used for this command submission batch.
++ *
++ * This function will check if we're switching query buffers, and will then,
++ * if no other query waits are issued this command submission batch,
++ * issue a dummy occlusion query wait used as a query barrier. When the fence
++ * object following that query wait has signaled, we are sure that all
++ * preseding queries have finished, and the old query buffer can be unpinned.
++ * However, since both the new query buffer and the old one are fenced with
++ * that fence, we can do an asynchronus unpin now, and be sure that the
++ * old query buffer won't be moved until the fence has signaled.
++ *
++ * As mentioned above, both the new - and old query buffers need to be fenced
++ * using a sequence emitted *after* calling this function.
++ */
++static void vmw_query_bo_switch_commit(struct vmw_private *dev_priv,
++				     struct vmw_sw_context *sw_context)
++{
++
++	struct vmw_resource *ctx, *next_ctx;
++	int ret;
++
++	/*
++	 * The validate list should still hold references to all
++	 * contexts here.
++	 */
++
++	list_for_each_entry_safe(ctx, next_ctx, &sw_context->query_list,
++				 query_head) {
++		list_del_init(&ctx->query_head);
++
++		BUG_ON(!ctx->on_validate_list);
++
++		ret = vmw_fifo_emit_dummy_query(dev_priv, ctx->id);
++
++		if (unlikely(ret != 0))
++			DRM_ERROR("Out of fifo space for dummy query.\n");
++	}
++
++	if (dev_priv->pinned_bo != sw_context->cur_query_bo) {
++		if (dev_priv->pinned_bo) {
++			vmw_bo_pin(dev_priv->pinned_bo, false);
++			ttm_bo_unref(&dev_priv->pinned_bo);
++		}
++
++		vmw_bo_pin(sw_context->cur_query_bo, true);
++
++		/*
++		 * We pin also the dummy_query_bo buffer so that we
++		 * don't need to validate it when emitting
++		 * dummy queries in context destroy paths.
++		 */
++
++		vmw_bo_pin(dev_priv->dummy_query_bo, true);
++		dev_priv->dummy_query_bo_pinned = true;
++
++		dev_priv->query_cid = sw_context->cur_query_cid;
++		dev_priv->pinned_bo =
++			ttm_bo_reference(sw_context->cur_query_bo);
++	}
++}
++
++/**
++ * vmw_query_switch_backoff - clear query barrier list
++ * @sw_context: The sw context used for this submission batch.
++ *
++ * This function is used as part of an error path, where a previously
++ * set up list of query barriers needs to be cleared.
++ *
++ */
++static void vmw_query_switch_backoff(struct vmw_sw_context *sw_context)
++{
++	struct list_head *list, *next;
++
++	list_for_each_safe(list, next, &sw_context->query_list) {
++		list_del_init(list);
++	}
++}
++
+ static int vmw_translate_guest_ptr(struct vmw_private *dev_priv,
+ 				   struct vmw_sw_context *sw_context,
+ 				   SVGAGuestPtr *ptr,
+@@ -234,8 +445,6 @@ static int vmw_translate_guest_ptr(struc
+ 	struct ttm_buffer_object *bo;
+ 	uint32_t handle = ptr->gmrId;
+ 	struct vmw_relocation *reloc;
+-	uint32_t cur_validate_node;
+-	struct ttm_validate_buffer *val_buf;
+ 	int ret;
+ 
+ 	ret = vmw_user_dmabuf_lookup(sw_context->tfile, handle, &vmw_bo);
+@@ -255,23 +464,11 @@ static int vmw_translate_guest_ptr(struc
+ 	reloc = &sw_context->relocs[sw_context->cur_reloc++];
+ 	reloc->location = ptr;
+ 
+-	cur_validate_node = vmw_dmabuf_validate_node(bo, sw_context->cur_val_buf);
+-	if (unlikely(cur_validate_node >= VMWGFX_MAX_VALIDATIONS)) {
+-		DRM_ERROR("Max number of DMA buffers per submission"
+-			  " exceeded.\n");
+-		ret = -EINVAL;
++	ret = vmw_bo_to_validate_list(sw_context, bo, DRM_VMW_FENCE_FLAG_EXEC,
++				      &reloc->index);
++	if (unlikely(ret != 0))
+ 		goto out_no_reloc;
+-	}
+ 
+-	reloc->index = cur_validate_node;
+-	if (unlikely(cur_validate_node == sw_context->cur_val_buf)) {
+-		val_buf = &sw_context->val_bufs[cur_validate_node];
+-		val_buf->bo = ttm_bo_reference(bo);
+-		val_buf->usage = TTM_USAGE_READWRITE;
+-		val_buf->new_sync_obj_arg = (void *) DRM_VMW_FENCE_FLAG_EXEC;
+-		list_add_tail(&val_buf->head, &sw_context->validate_nodes);
+-		++sw_context->cur_val_buf;
+-	}
+ 	*vmw_bo_p = vmw_bo;
+ 	return 0;
+ 
+@@ -303,8 +500,11 @@ static int vmw_cmd_end_query(struct vmw_
+ 	if (unlikely(ret != 0))
+ 		return ret;
+ 
++	ret = vmw_query_bo_switch_prepare(dev_priv, cmd->q.cid,
++					  &vmw_bo->base, sw_context);
++
+ 	vmw_dmabuf_unreference(&vmw_bo);
+-	return 0;
++	return ret;
+ }
+ 
+ static int vmw_cmd_wait_query(struct vmw_private *dev_priv,
+@@ -317,6 +517,7 @@ static int vmw_cmd_wait_query(struct vmw
+ 		SVGA3dCmdWaitForQuery q;
+ 	} *cmd;
+ 	int ret;
++	struct vmw_resource *ctx;
+ 
+ 	cmd = container_of(header, struct vmw_query_cmd, header);
+ 	ret = vmw_cmd_cid_check(dev_priv, sw_context, header);
+@@ -330,6 +531,16 @@ static int vmw_cmd_wait_query(struct vmw
+ 		return ret;
+ 
+ 	vmw_dmabuf_unreference(&vmw_bo);
++
++	/*
++	 * This wait will act as a barrier for previous waits for this
++	 * context.
++	 */
++
++	ctx = sw_context->cur_ctx;
++	if (!list_empty(&ctx->query_head))
++		list_del_init(&ctx->query_head);
++
+ 	return 0;
+ }
+ 
+@@ -687,6 +898,16 @@ static int vmw_validate_single_buffer(st
+ {
+ 	int ret;
+ 
++
++	/*
++	 * Don't validate pinned buffers.
++	 */
++
++	if (bo == dev_priv->pinned_bo ||
++	    (bo == dev_priv->dummy_query_bo &&
++	     dev_priv->dummy_query_bo_pinned))
++		return 0;
++
+ 	/**
+ 	 * Put BO in VRAM if there is space, otherwise as a GMR.
+ 	 * If there is no space in VRAM and GMR ids are all used up,
+@@ -846,6 +1067,11 @@ int vmw_execbuf_process(struct drm_file
+ 	sw_context->cur_reloc = 0;
+ 	sw_context->cur_val_buf = 0;
+ 	sw_context->num_ref_resources = 0;
++	sw_context->fence_flags = 0;
++	INIT_LIST_HEAD(&sw_context->query_list);
++	sw_context->cur_query_bo = dev_priv->pinned_bo;
++	sw_context->cur_query_cid = dev_priv->query_cid;
++	sw_context->query_cid_valid = (dev_priv->pinned_bo != NULL);
+ 
+ 	INIT_LIST_HEAD(&sw_context->validate_nodes);
+ 
+@@ -882,6 +1108,7 @@ int vmw_execbuf_process(struct drm_file
+ 	memcpy(cmd, kernel_commands, command_size);
+ 	vmw_fifo_commit(dev_priv, command_size);
+ 
++	vmw_query_bo_switch_commit(dev_priv, sw_context);
+ 	ret = vmw_execbuf_fence_commands(file_priv, dev_priv,
+ 					 &fence,
+ 					 (user_fence_rep) ? &handle : NULL);
+@@ -940,6 +1167,7 @@ int vmw_execbuf_process(struct drm_file
+ out_err:
+ 	vmw_free_relocations(sw_context);
+ out_throttle:
++	vmw_query_switch_backoff(sw_context);
+ 	ttm_eu_backoff_reservation(&sw_context->validate_nodes);
+ 	vmw_clear_validations(sw_context);
+ out_unlock:
+@@ -947,6 +1175,113 @@ out_unlock:
+ 	return ret;
+ }
+ 
++/**
++ * vmw_execbuf_unpin_panic - Idle the fifo and unpin the query buffer.
++ *
++ * @dev_priv: The device private structure.
++ *
++ * This function is called to idle the fifo and unpin the query buffer
++ * if the normal way to do this hits an error, which should typically be
++ * extremely rare.
++ */
++static void vmw_execbuf_unpin_panic(struct vmw_private *dev_priv)
++{
++	DRM_ERROR("Can't unpin query buffer. Trying to recover.\n");
++
++	(void) vmw_fallback_wait(dev_priv, false, true, 0, false, 10*HZ);
++	vmw_bo_pin(dev_priv->pinned_bo, false);
++	vmw_bo_pin(dev_priv->dummy_query_bo, false);
++	dev_priv->dummy_query_bo_pinned = false;
++}
++
++
++/**
++ * vmw_execbuf_release_pinned_bo - Flush queries and unpin the pinned
++ * query bo.
++ *
++ * @dev_priv: The device private structure.
++ * @only_on_cid_match: Only flush and unpin if the current active query cid
++ * matches @cid.
++ * @cid: Optional context id to match.
++ *
++ * This function should be used to unpin the pinned query bo, or
++ * as a query barrier when we need to make sure that all queries have
++ * finished before the next fifo command. (For example on hardware
++ * context destructions where the hardware may otherwise leak unfinished
++ * queries).
++ *
++ * This function does not return any failure codes, but make attempts
++ * to do safe unpinning in case of errors.
++ *
++ * The function will synchronize on the previous query barrier, and will
++ * thus not finish until that barrier has executed.
++ */
++void vmw_execbuf_release_pinned_bo(struct vmw_private *dev_priv,
++				   bool only_on_cid_match, uint32_t cid)
++{
++	int ret = 0;
++	struct list_head validate_list;
++	struct ttm_validate_buffer pinned_val, query_val;
++	struct vmw_fence_obj *fence;
++
++	mutex_lock(&dev_priv->cmdbuf_mutex);
++
++	if (dev_priv->pinned_bo == NULL)
++		goto out_unlock;
++
++	if (only_on_cid_match && cid != dev_priv->query_cid)
++		goto out_unlock;
++
++	INIT_LIST_HEAD(&validate_list);
++
++	pinned_val.new_sync_obj_arg = (void *)(unsigned long)
++		DRM_VMW_FENCE_FLAG_EXEC;
++	pinned_val.bo = ttm_bo_reference(dev_priv->pinned_bo);
++	list_add_tail(&pinned_val.head, &validate_list);
++
++	query_val.new_sync_obj_arg = pinned_val.new_sync_obj_arg;
++	query_val.bo = ttm_bo_reference(dev_priv->dummy_query_bo);
++	list_add_tail(&query_val.head, &validate_list);
++
++	do {
++		ret = ttm_eu_reserve_buffers(&validate_list);
++	} while (ret == -ERESTARTSYS);
++
++	if (unlikely(ret != 0)) {
++		vmw_execbuf_unpin_panic(dev_priv);
++		goto out_no_reserve;
++	}
++
++	ret = vmw_fifo_emit_dummy_query(dev_priv, dev_priv->query_cid);
++	if (unlikely(ret != 0)) {
++		vmw_execbuf_unpin_panic(dev_priv);
++		goto out_no_emit;
++	}
++
++	vmw_bo_pin(dev_priv->pinned_bo, false);
++	vmw_bo_pin(dev_priv->dummy_query_bo, false);
++	dev_priv->dummy_query_bo_pinned = false;
++
++	(void) vmw_execbuf_fence_commands(NULL, dev_priv, &fence, NULL);
++	ttm_eu_fence_buffer_objects(&validate_list, (void *) fence);
++
++	ttm_bo_unref(&query_val.bo);
++	ttm_bo_unref(&pinned_val.bo);
++	ttm_bo_unref(&dev_priv->pinned_bo);
++
++out_unlock:
++	mutex_unlock(&dev_priv->cmdbuf_mutex);
++	return;
++
++out_no_emit:
++	ttm_eu_backoff_reservation(&validate_list);
++out_no_reserve:
++	ttm_bo_unref(&query_val.bo);
++	ttm_bo_unref(&pinned_val.bo);
++	ttm_bo_unref(&dev_priv->pinned_bo);
++	mutex_unlock(&dev_priv->cmdbuf_mutex);
++}
++
+ 
+ int vmw_execbuf_ioctl(struct drm_device *dev, void *data,
+ 		      struct drm_file *file_priv)
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_fifo.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/vmwgfx/vmwgfx_fifo.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_fifo.c
+@@ -505,3 +505,60 @@ int vmw_fifo_send_fence(struct vmw_priva
+ out_err:
+ 	return ret;
+ }
++
++/**
++ * vmw_fifo_emit_dummy_query - emits a dummy query to the fifo.
++ *
++ * @dev_priv: The device private structure.
++ * @cid: The hardware context id used for the query.
++ *
++ * This function is used to emit a dummy occlusion query with
++ * no primitives rendered between query begin and query end.
++ * It's used to provide a query barrier, in order to know that when
++ * this query is finished, all preceding queries are also finished.
++ *
++ * A Query results structure should have been initialized at the start
++ * of the dev_priv->dummy_query_bo buffer object. And that buffer object
++ * must also be either reserved or pinned when this function is called.
++ *
++ * Returns -ENOMEM on failure to reserve fifo space.
++ */
++int vmw_fifo_emit_dummy_query(struct vmw_private *dev_priv,
++			      uint32_t cid)
++{
++	/*
++	 * A query wait without a preceding query end will
++	 * actually finish all queries for this cid
++	 * without writing to the query result structure.
++	 */
++
++	struct ttm_buffer_object *bo = dev_priv->dummy_query_bo;
++	struct {
++		SVGA3dCmdHeader header;
++		SVGA3dCmdWaitForQuery body;
++	} *cmd;
++
++	cmd = vmw_fifo_reserve(dev_priv, sizeof(*cmd));
++
++	if (unlikely(cmd == NULL)) {
++		DRM_ERROR("Out of fifo space for dummy query.\n");
++		return -ENOMEM;
++	}
++
++	cmd->header.id = SVGA_3D_CMD_WAIT_FOR_QUERY;
++	cmd->header.size = sizeof(cmd->body);
++	cmd->body.cid = cid;
++	cmd->body.type = SVGA3D_QUERYTYPE_OCCLUSION;
++
++	if (bo->mem.mem_type == TTM_PL_VRAM) {
++		cmd->body.guestResult.gmrId = SVGA_GMR_FRAMEBUFFER;
++		cmd->body.guestResult.offset = bo->offset;
++	} else {
++		cmd->body.guestResult.gmrId = bo->mem.start;
++		cmd->body.guestResult.offset = 0;
++	}
++
++	vmw_fifo_commit(dev_priv, sizeof(*cmd));
++
++	return 0;
++}
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+@@ -126,7 +126,7 @@ static int vmw_resource_init(struct vmw_
+ 	res->idr = idr;
+ 	res->avail = false;
+ 	res->dev_priv = dev_priv;
+-
++	INIT_LIST_HEAD(&res->query_head);
+ 	do {
+ 		if (unlikely(idr_pre_get(idr, GFP_KERNEL) == 0))
+ 			return -ENOMEM;
+@@ -194,8 +194,12 @@ static void vmw_hw_context_destroy(struc
+ 	struct {
+ 		SVGA3dCmdHeader header;
+ 		SVGA3dCmdDestroyContext body;
+-	} *cmd = vmw_fifo_reserve(dev_priv, sizeof(*cmd));
++	} *cmd;
++
++
++	vmw_execbuf_release_pinned_bo(dev_priv, true, res->id);
+ 
++	cmd = vmw_fifo_reserve(dev_priv, sizeof(*cmd));
+ 	if (unlikely(cmd == NULL)) {
+ 		DRM_ERROR("Failed reserving FIFO space for surface "
+ 			  "destruction.\n");
