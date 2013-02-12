@@ -1,0 +1,200 @@
+From 7a1619b97e978bb9c05fa4bbe64171068bd5bf85 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Michel=20D=C3=A4nzer?= <michel.daenzer@amd.com>
+Date: Thu, 10 Nov 2011 18:57:26 +0100
+Subject: drm/radeon: Make sure CS mutex is held across GPU reset.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 7a1619b97e978bb9c05fa4bbe64171068bd5bf85
+Patch-mainline: v3.2-rc2
+
+This was only the case if the GPU reset was triggered from the CS ioctl,
+otherwise other processes could happily enter the CS ioctl and wreak havoc
+during the GPU reset.
+
+This is a little complicated because the GPU reset can be triggered from the
+CS ioctl, in which case we're already holding the mutex, or from other call
+paths, in which case we need to lock the mutex. AFAICT the mutex API doesn't
+allow recursive locking or finding out the mutex owner, so we need to handle
+this with helper functions which allow recursive locking from the same
+process.
+
+Signed-off-by: Michel Dänzer <michel.daenzer@amd.com>
+Reviewed-by: Jerome Glisse <jglisse@redhat.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/radeon.h        |   44 +++++++++++++++++++++++++++++++-
+ drivers/gpu/drm/radeon/radeon_cs.c     |   14 +++++-----
+ drivers/gpu/drm/radeon/radeon_device.c |   16 ++++++++---
+ 3 files changed, 62 insertions(+), 12 deletions(-)
+
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon.h
+@@ -1142,6 +1142,48 @@ struct r600_vram_scratch {
+ 	u64				gpu_addr;
+ };
+ 
++
++/*
++ * Mutex which allows recursive locking from the same process.
++ */
++struct radeon_mutex {
++	struct mutex		mutex;
++	struct task_struct	*owner;
++	int			level;
++};
++
++static inline void radeon_mutex_init(struct radeon_mutex *mutex)
++{
++	mutex_init(&mutex->mutex);
++	mutex->owner = NULL;
++	mutex->level = 0;
++}
++
++static inline void radeon_mutex_lock(struct radeon_mutex *mutex)
++{
++	if (mutex_trylock(&mutex->mutex)) {
++		/* The mutex was unlocked before, so it's ours now */
++		mutex->owner = current;
++	} else if (mutex->owner != current) {
++		/* Another process locked the mutex, take it */
++		mutex_lock(&mutex->mutex);
++		mutex->owner = current;
++	}
++	/* Otherwise the mutex was already locked by this process */
++
++	mutex->level++;
++}
++
++static inline void radeon_mutex_unlock(struct radeon_mutex *mutex)
++{
++	if (--mutex->level > 0)
++		return;
++
++	mutex->owner = NULL;
++	mutex_unlock(&mutex->mutex);
++}
++
++
+ /*
+  * Core structure, functions and helpers.
+  */
+@@ -1197,7 +1239,7 @@ struct radeon_device {
+ 	struct radeon_gem		gem;
+ 	struct radeon_pm		pm;
+ 	uint32_t			bios_scratch[RADEON_BIOS_NUM_SCRATCH];
+-	struct mutex			cs_mutex;
++	struct radeon_mutex		cs_mutex;
+ 	struct radeon_wb		wb;
+ 	struct radeon_dummy_page	dummy_page;
+ 	bool				gpu_lockup;
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_cs.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_cs.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_cs.c
+@@ -222,7 +222,7 @@ int radeon_cs_ioctl(struct drm_device *d
+ 	struct radeon_cs_chunk *ib_chunk;
+ 	int r;
+ 
+-	mutex_lock(&rdev->cs_mutex);
++	radeon_mutex_lock(&rdev->cs_mutex);
+ 	/* initialize parser */
+ 	memset(&parser, 0, sizeof(struct radeon_cs_parser));
+ 	parser.filp = filp;
+@@ -233,14 +233,14 @@ int radeon_cs_ioctl(struct drm_device *d
+ 	if (r) {
+ 		DRM_ERROR("Failed to initialize parser !\n");
+ 		radeon_cs_parser_fini(&parser, r);
+-		mutex_unlock(&rdev->cs_mutex);
++		radeon_mutex_unlock(&rdev->cs_mutex);
+ 		return r;
+ 	}
+ 	r =  radeon_ib_get(rdev, &parser.ib);
+ 	if (r) {
+ 		DRM_ERROR("Failed to get ib !\n");
+ 		radeon_cs_parser_fini(&parser, r);
+-		mutex_unlock(&rdev->cs_mutex);
++		radeon_mutex_unlock(&rdev->cs_mutex);
+ 		return r;
+ 	}
+ 	r = radeon_cs_parser_relocs(&parser);
+@@ -248,7 +248,7 @@ int radeon_cs_ioctl(struct drm_device *d
+ 		if (r != -ERESTARTSYS)
+ 			DRM_ERROR("Failed to parse relocation %d!\n", r);
+ 		radeon_cs_parser_fini(&parser, r);
+-		mutex_unlock(&rdev->cs_mutex);
++		radeon_mutex_unlock(&rdev->cs_mutex);
+ 		return r;
+ 	}
+ 	/* Copy the packet into the IB, the parser will read from the
+@@ -260,14 +260,14 @@ int radeon_cs_ioctl(struct drm_device *d
+ 	if (r || parser.parser_error) {
+ 		DRM_ERROR("Invalid command stream !\n");
+ 		radeon_cs_parser_fini(&parser, r);
+-		mutex_unlock(&rdev->cs_mutex);
++		radeon_mutex_unlock(&rdev->cs_mutex);
+ 		return r;
+ 	}
+ 	r = radeon_cs_finish_pages(&parser);
+ 	if (r) {
+ 		DRM_ERROR("Invalid command stream !\n");
+ 		radeon_cs_parser_fini(&parser, r);
+-		mutex_unlock(&rdev->cs_mutex);
++		radeon_mutex_unlock(&rdev->cs_mutex);
+ 		return r;
+ 	}
+ 	r = radeon_ib_schedule(rdev, parser.ib);
+@@ -275,7 +275,7 @@ int radeon_cs_ioctl(struct drm_device *d
+ 		DRM_ERROR("Failed to schedule IB !\n");
+ 	}
+ 	radeon_cs_parser_fini(&parser, r);
+-	mutex_unlock(&rdev->cs_mutex);
++	radeon_mutex_unlock(&rdev->cs_mutex);
+ 	return r;
+ }
+ 
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_device.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_device.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_device.c
+@@ -719,7 +719,7 @@ int radeon_device_init(struct radeon_dev
+ 
+ 	/* mutex initialization are all done here so we
+ 	 * can recall function without having locking issues */
+-	mutex_init(&rdev->cs_mutex);
++	radeon_mutex_init(&rdev->cs_mutex);
+ 	mutex_init(&rdev->ib_pool.mutex);
+ 	mutex_init(&rdev->cp.mutex);
+ 	mutex_init(&rdev->dc_hw_i2c_mutex);
+@@ -962,6 +962,9 @@ int radeon_gpu_reset(struct radeon_devic
+ 	int r;
+ 	int resched;
+ 
++	/* Prevent CS ioctl from interfering */
++	radeon_mutex_lock(&rdev->cs_mutex);
++
+ 	radeon_save_bios_scratch_regs(rdev);
+ 	/* block TTM */
+ 	resched = ttm_bo_lock_delayed_workqueue(&rdev->mman.bdev);
+@@ -974,10 +977,15 @@ int radeon_gpu_reset(struct radeon_devic
+ 		radeon_restore_bios_scratch_regs(rdev);
+ 		drm_helper_resume_force_mode(rdev->ddev);
+ 		ttm_bo_unlock_delayed_workqueue(&rdev->mman.bdev, resched);
+-		return 0;
+ 	}
+-	/* bad news, how to tell it to userspace ? */
+-	dev_info(rdev->dev, "GPU reset failed\n");
++
++	radeon_mutex_unlock(&rdev->cs_mutex);
++
++	if (r) {
++		/* bad news, how to tell it to userspace ? */
++		dev_info(rdev->dev, "GPU reset failed\n");
++	}
++
+ 	return r;
+ }
+ 
