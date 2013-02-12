@@ -1,0 +1,2391 @@
+From 721604a15b934f0a8d1909acb8017f029128be2f Mon Sep 17 00:00:00 2001
+From: Jerome Glisse <jglisse@redhat.com>
+Date: Thu, 5 Jan 2012 22:11:05 -0500
+Subject: drm/radeon: GPU virtual memory support v22
+Git-commit: 721604a15b934f0a8d1909acb8017f029128be2f
+Patch-mainline: v3.3-rc1
+
+Virtual address space are per drm client (opener of /dev/drm).
+Client are in charge of virtual address space, they need to
+map bo into it by calling DRM_RADEON_GEM_VA ioctl.
+
+First 16M of virtual address space is reserved by the kernel.
+
+Once using 2 level page table we should be able to have a small
+vram memory footprint for each pt (there would be one pt for all
+gart, one for all vram and then one first level for each virtual
+address space).
+
+Plan include using the sub allocator for a common vm page table
+area and using memcpy to copy vm page table in & out. Or use
+a gart object and copy things in & out using dma.
+
+v2: agd5f fixes:
+- Add vram base offset for vram pages.  The GPU physical address of a
+vram page is FB_OFFSET + page offset.  FB_OFFSET is 0 on discrete
+cards and the physical bus address of the stolen memory on
+integrated chips.
+- VM_CONTEXT1_PROTECTION_FAULT_DEFAULT_ADDR covers all vmid's >= 1
+
+v3: agd5f:
+- integrate with the semaphore/multi-ring stuff
+
+v4:
+- rebase on top ttm dma & multi-ring stuff
+- userspace is now in charge of the address space
+- no more specific cs vm ioctl, instead cs ioctl has a new
+  chunk
+
+v5:
+- properly handle mem == NULL case from move_notify callback
+- fix the vm cleanup path
+
+v6:
+- fix update of page table to only happen on valid mem placement
+
+v7:
+- add tlb flush for each vm context
+- add flags to define mapping property (readable, writeable, snooped)
+- make ring id implicit from ib->fence->ring, up to each asic callback
+  to then do ring specific scheduling if vm ib scheduling function
+
+v8:
+- add query for ib limit and kernel reserved virtual space
+- rename vm->size to max_pfn (maximum number of page)
+- update gem_va ioctl to also allow unmap operation
+- bump kernel version to allow userspace to query for vm support
+
+v9:
+- rebuild page table only when bind and incrementaly depending
+  on bo referenced by cs and that have been moved
+- allow virtual address space to grow
+- use sa allocator for vram page table
+- return invalid when querying vm limit on non cayman GPU
+- dump vm fault register on lockup
+
+v10: agd5f:
+- Move the vm schedule_ib callback to a standalone function, remove
+  the callback and use the existing ib_execute callback for VM IBs.
+
+v11:
+- rebase on top of lastest Linus
+
+v12: agd5f:
+- remove spurious backslash
+- set IB vm_id to 0 in radeon_ib_get()
+
+v13: agd5f:
+- fix handling of RADEON_CHUNK_ID_FLAGS
+
+v14:
+- fix va destruction
+- fix suspend resume
+- forbid bo to have several different va in same vm
+
+v15:
+- rebase
+
+v16:
+- cleanup left over of vm init/fini
+
+v17: agd5f:
+- cs checker
+
+v18: agd5f:
+- reworks the CS ioctl to better support multiple rings and
+VM.  Rather than adding a new chunk id for VM, just re-use the
+IB chunk id and add a new flags for VM mode.  Also define additional
+dwords for the flags chunk id to define the what ring we want to use
+(gfx, compute, uvd, etc.) and the priority.
+
+v19:
+- fix cs fini in weird case of no ib
+- semi working flush fix for ni
+- rebase on top of sa allocator changes
+
+v20: agd5f:
+- further CS ioctl cleanups from Christian's comments
+
+v21: agd5f:
+- integrate CS checker improvements
+
+v22: agd5f:
+- final cleanups for release, only allow VM CS on cayman
+
+Signed-off-by: Jerome Glisse <jglisse@redhat.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/evergreen_cs.c  |  246 ++++++++++++++++++++-
+ drivers/gpu/drm/radeon/evergreend.h    |   63 +++++-
+ drivers/gpu/drm/radeon/ni.c            |  160 +++++++++++++-
+ drivers/gpu/drm/radeon/nid.h           |    2 +
+ drivers/gpu/drm/radeon/r300.c          |    6 +-
+ drivers/gpu/drm/radeon/r600_cs.c       |    8 +-
+ drivers/gpu/drm/radeon/radeon.h        |  123 ++++++++++-
+ drivers/gpu/drm/radeon/radeon_asic.c   |   20 ++-
+ drivers/gpu/drm/radeon/radeon_asic.h   |   12 +
+ drivers/gpu/drm/radeon/radeon_cs.c     |  253 +++++++++++++++++----
+ drivers/gpu/drm/radeon/radeon_device.c |    4 +
+ drivers/gpu/drm/radeon/radeon_drv.c    |    9 +-
+ drivers/gpu/drm/radeon/radeon_gart.c   |  388 ++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/radeon/radeon_gem.c    |  136 +++++++++++
+ drivers/gpu/drm/radeon/radeon_kms.c    |   47 ++++-
+ drivers/gpu/drm/radeon/radeon_object.c |   30 +++
+ drivers/gpu/drm/radeon/radeon_object.h |   12 +
+ drivers/gpu/drm/radeon/radeon_ring.c   |    1 +
+ include/drm/radeon_drm.h               |   36 +++
+ 19 files changed, 1479 insertions(+), 77 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/evergreen_cs.c b/drivers/gpu/drm/radeon/evergreen_cs.c
+index cd4590a..f7442e6 100644
+--- a/drivers/gpu/drm/radeon/evergreen_cs.c
++++ b/drivers/gpu/drm/radeon/evergreen_cs.c
+@@ -520,7 +520,7 @@ static int evergreen_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 		break;
+ 	case DB_Z_INFO:
+ 		track->db_z_info = radeon_get_ib_value(p, idx);
+-		if (!p->keep_tiling_flags) {
++		if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS)) {
+ 			r = evergreen_cs_packet_next_reloc(p, &reloc);
+ 			if (r) {
+ 				dev_warn(p->dev, "bad SET_CONTEXT_REG "
+@@ -649,7 +649,7 @@ static int evergreen_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 	case CB_COLOR7_INFO:
+ 		tmp = (reg - CB_COLOR0_INFO) / 0x3c;
+ 		track->cb_color_info[tmp] = radeon_get_ib_value(p, idx);
+-		if (!p->keep_tiling_flags) {
++		if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS)) {
+ 			r = evergreen_cs_packet_next_reloc(p, &reloc);
+ 			if (r) {
+ 				dev_warn(p->dev, "bad SET_CONTEXT_REG "
+@@ -666,7 +666,7 @@ static int evergreen_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 	case CB_COLOR11_INFO:
+ 		tmp = ((reg - CB_COLOR8_INFO) / 0x1c) + 8;
+ 		track->cb_color_info[tmp] = radeon_get_ib_value(p, idx);
+-		if (!p->keep_tiling_flags) {
++		if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS)) {
+ 			r = evergreen_cs_packet_next_reloc(p, &reloc);
+ 			if (r) {
+ 				dev_warn(p->dev, "bad SET_CONTEXT_REG "
+@@ -1355,7 +1355,7 @@ static int evergreen_packet3_check(struct radeon_cs_parser *p,
+ 					return -EINVAL;
+ 				}
+ 				ib[idx+1+(i*8)+2] += (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
+-				if (!p->keep_tiling_flags) {
++				if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS)) {
+ 					ib[idx+1+(i*8)+1] |=
+ 						TEX_ARRAY_MODE(evergreen_cs_get_aray_mode(reloc->lobj.tiling_flags));
+ 					if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
+@@ -1572,3 +1572,241 @@ int evergreen_cs_parse(struct radeon_cs_parser *p)
+ 	return 0;
+ }
+ 
++/* vm parser */
++static bool evergreen_vm_reg_valid(u32 reg)
++{
++	/* context regs are fine */
++	if (reg >= 0x28000)
++		return true;
++
++	/* check config regs */
++	switch (reg) {
++	case GRBM_GFX_INDEX:
++	case VGT_VTX_VECT_EJECT_REG:
++	case VGT_CACHE_INVALIDATION:
++	case VGT_GS_VERTEX_REUSE:
++	case VGT_PRIMITIVE_TYPE:
++	case VGT_INDEX_TYPE:
++	case VGT_NUM_INDICES:
++	case VGT_NUM_INSTANCES:
++	case VGT_COMPUTE_DIM_X:
++	case VGT_COMPUTE_DIM_Y:
++	case VGT_COMPUTE_DIM_Z:
++	case VGT_COMPUTE_START_X:
++	case VGT_COMPUTE_START_Y:
++	case VGT_COMPUTE_START_Z:
++	case VGT_COMPUTE_INDEX:
++	case VGT_COMPUTE_THREAD_GROUP_SIZE:
++	case VGT_HS_OFFCHIP_PARAM:
++	case PA_CL_ENHANCE:
++	case PA_SU_LINE_STIPPLE_VALUE:
++	case PA_SC_LINE_STIPPLE_STATE:
++	case PA_SC_ENHANCE:
++	case SQ_DYN_GPR_CNTL_PS_FLUSH_REQ:
++	case SQ_DYN_GPR_SIMD_LOCK_EN:
++	case SQ_CONFIG:
++	case SQ_GPR_RESOURCE_MGMT_1:
++	case SQ_GLOBAL_GPR_RESOURCE_MGMT_1:
++	case SQ_GLOBAL_GPR_RESOURCE_MGMT_2:
++	case SQ_CONST_MEM_BASE:
++	case SQ_STATIC_THREAD_MGMT_1:
++	case SQ_STATIC_THREAD_MGMT_2:
++	case SQ_STATIC_THREAD_MGMT_3:
++	case SPI_CONFIG_CNTL:
++	case SPI_CONFIG_CNTL_1:
++	case TA_CNTL_AUX:
++	case DB_DEBUG:
++	case DB_DEBUG2:
++	case DB_DEBUG3:
++	case DB_DEBUG4:
++	case DB_WATERMARKS:
++	case TD_PS_BORDER_COLOR_INDEX:
++	case TD_PS_BORDER_COLOR_RED:
++	case TD_PS_BORDER_COLOR_GREEN:
++	case TD_PS_BORDER_COLOR_BLUE:
++	case TD_PS_BORDER_COLOR_ALPHA:
++	case TD_VS_BORDER_COLOR_INDEX:
++	case TD_VS_BORDER_COLOR_RED:
++	case TD_VS_BORDER_COLOR_GREEN:
++	case TD_VS_BORDER_COLOR_BLUE:
++	case TD_VS_BORDER_COLOR_ALPHA:
++	case TD_GS_BORDER_COLOR_INDEX:
++	case TD_GS_BORDER_COLOR_RED:
++	case TD_GS_BORDER_COLOR_GREEN:
++	case TD_GS_BORDER_COLOR_BLUE:
++	case TD_GS_BORDER_COLOR_ALPHA:
++	case TD_HS_BORDER_COLOR_INDEX:
++	case TD_HS_BORDER_COLOR_RED:
++	case TD_HS_BORDER_COLOR_GREEN:
++	case TD_HS_BORDER_COLOR_BLUE:
++	case TD_HS_BORDER_COLOR_ALPHA:
++	case TD_LS_BORDER_COLOR_INDEX:
++	case TD_LS_BORDER_COLOR_RED:
++	case TD_LS_BORDER_COLOR_GREEN:
++	case TD_LS_BORDER_COLOR_BLUE:
++	case TD_LS_BORDER_COLOR_ALPHA:
++	case TD_CS_BORDER_COLOR_INDEX:
++	case TD_CS_BORDER_COLOR_RED:
++	case TD_CS_BORDER_COLOR_GREEN:
++	case TD_CS_BORDER_COLOR_BLUE:
++	case TD_CS_BORDER_COLOR_ALPHA:
++	case SQ_ESGS_RING_SIZE:
++	case SQ_GSVS_RING_SIZE:
++	case SQ_ESTMP_RING_SIZE:
++	case SQ_GSTMP_RING_SIZE:
++	case SQ_HSTMP_RING_SIZE:
++	case SQ_LSTMP_RING_SIZE:
++	case SQ_PSTMP_RING_SIZE:
++	case SQ_VSTMP_RING_SIZE:
++	case SQ_ESGS_RING_ITEMSIZE:
++	case SQ_ESTMP_RING_ITEMSIZE:
++	case SQ_GSTMP_RING_ITEMSIZE:
++	case SQ_GSVS_RING_ITEMSIZE:
++	case SQ_GS_VERT_ITEMSIZE:
++	case SQ_GS_VERT_ITEMSIZE_1:
++	case SQ_GS_VERT_ITEMSIZE_2:
++	case SQ_GS_VERT_ITEMSIZE_3:
++	case SQ_GSVS_RING_OFFSET_1:
++	case SQ_GSVS_RING_OFFSET_2:
++	case SQ_GSVS_RING_OFFSET_3:
++	case SQ_HSTMP_RING_ITEMSIZE:
++	case SQ_LSTMP_RING_ITEMSIZE:
++	case SQ_PSTMP_RING_ITEMSIZE:
++	case SQ_VSTMP_RING_ITEMSIZE:
++	case VGT_TF_RING_SIZE:
++	case SQ_ESGS_RING_BASE:
++	case SQ_GSVS_RING_BASE:
++	case SQ_ESTMP_RING_BASE:
++	case SQ_GSTMP_RING_BASE:
++	case SQ_HSTMP_RING_BASE:
++	case SQ_LSTMP_RING_BASE:
++	case SQ_PSTMP_RING_BASE:
++	case SQ_VSTMP_RING_BASE:
++	case CAYMAN_VGT_OFFCHIP_LDS_BASE:
++	case CAYMAN_SQ_EX_ALLOC_TABLE_SLOTS:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static int evergreen_vm_packet3_check(struct radeon_device *rdev,
++				      u32 *ib, struct radeon_cs_packet *pkt)
++{
++	u32 idx = pkt->idx + 1;
++	u32 idx_value = ib[idx];
++	u32 start_reg, end_reg, reg, i;
++
++	switch (pkt->opcode) {
++	case PACKET3_NOP:
++	case PACKET3_SET_BASE:
++	case PACKET3_CLEAR_STATE:
++	case PACKET3_INDEX_BUFFER_SIZE:
++	case PACKET3_DISPATCH_DIRECT:
++	case PACKET3_DISPATCH_INDIRECT:
++	case PACKET3_MODE_CONTROL:
++	case PACKET3_SET_PREDICATION:
++	case PACKET3_COND_EXEC:
++	case PACKET3_PRED_EXEC:
++	case PACKET3_DRAW_INDIRECT:
++	case PACKET3_DRAW_INDEX_INDIRECT:
++	case PACKET3_INDEX_BASE:
++	case PACKET3_DRAW_INDEX_2:
++	case PACKET3_CONTEXT_CONTROL:
++	case PACKET3_DRAW_INDEX_OFFSET:
++	case PACKET3_INDEX_TYPE:
++	case PACKET3_DRAW_INDEX:
++	case PACKET3_DRAW_INDEX_AUTO:
++	case PACKET3_DRAW_INDEX_IMMD:
++	case PACKET3_NUM_INSTANCES:
++	case PACKET3_DRAW_INDEX_MULTI_AUTO:
++	case PACKET3_STRMOUT_BUFFER_UPDATE:
++	case PACKET3_DRAW_INDEX_OFFSET_2:
++	case PACKET3_DRAW_INDEX_MULTI_ELEMENT:
++	case PACKET3_MPEG_INDEX:
++	case PACKET3_WAIT_REG_MEM:
++	case PACKET3_MEM_WRITE:
++	case PACKET3_SURFACE_SYNC:
++	case PACKET3_EVENT_WRITE:
++	case PACKET3_EVENT_WRITE_EOP:
++	case PACKET3_EVENT_WRITE_EOS:
++	case PACKET3_SET_CONTEXT_REG:
++	case PACKET3_SET_BOOL_CONST:
++	case PACKET3_SET_LOOP_CONST:
++	case PACKET3_SET_RESOURCE:
++	case PACKET3_SET_SAMPLER:
++	case PACKET3_SET_CTL_CONST:
++	case PACKET3_SET_RESOURCE_OFFSET:
++	case PACKET3_SET_CONTEXT_REG_INDIRECT:
++	case PACKET3_SET_RESOURCE_INDIRECT:
++	case CAYMAN_PACKET3_DEALLOC_STATE:
++		break;
++	case PACKET3_COND_WRITE:
++		if (idx_value & 0x100) {
++			reg = ib[idx + 5] * 4;
++			if (!evergreen_vm_reg_valid(reg))
++				return -EINVAL;
++		}
++		break;
++	case PACKET3_COPY_DW:
++		if (idx_value & 0x2) {
++			reg = ib[idx + 3] * 4;
++			if (!evergreen_vm_reg_valid(reg))
++				return -EINVAL;
++		}
++		break;
++	case PACKET3_SET_CONFIG_REG:
++		start_reg = (idx_value << 2) + PACKET3_SET_CONFIG_REG_START;
++		end_reg = 4 * pkt->count + start_reg - 4;
++		if ((start_reg < PACKET3_SET_CONFIG_REG_START) ||
++		    (start_reg >= PACKET3_SET_CONFIG_REG_END) ||
++		    (end_reg >= PACKET3_SET_CONFIG_REG_END)) {
++			DRM_ERROR("bad PACKET3_SET_CONFIG_REG\n");
++			return -EINVAL;
++		}
++		for (i = 0; i < pkt->count; i++) {
++			reg = start_reg + (4 * i);
++			if (!evergreen_vm_reg_valid(reg))
++				return -EINVAL;
++		}
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++int evergreen_ib_parse(struct radeon_device *rdev, struct radeon_ib *ib)
++{
++	int ret = 0;
++	u32 idx = 0;
++	struct radeon_cs_packet pkt;
++
++	do {
++		pkt.idx = idx;
++		pkt.type = CP_PACKET_GET_TYPE(ib->ptr[idx]);
++		pkt.count = CP_PACKET_GET_COUNT(ib->ptr[idx]);
++		pkt.one_reg_wr = 0;
++		switch (pkt.type) {
++		case PACKET_TYPE0:
++			dev_err(rdev->dev, "Packet0 not allowed!\n");
++			ret = -EINVAL;
++			break;
++		case PACKET_TYPE2:
++			break;
++		case PACKET_TYPE3:
++			pkt.opcode = CP_PACKET3_GET_OPCODE(ib->ptr[idx]);
++			ret = evergreen_vm_packet3_check(rdev, ib->ptr, &pkt);
++			break;
++		default:
++			dev_err(rdev->dev, "Unknown packet type %d !\n", pkt.type);
++			ret = -EINVAL;
++			break;
++		}
++		if (ret)
++			break;
++		idx += pkt.count + 2;
++	} while (idx < ib->length_dw);
++
++	return ret;
++}
+diff --git a/drivers/gpu/drm/radeon/evergreend.h b/drivers/gpu/drm/radeon/evergreend.h
+index e00039e..b502216 100644
+--- a/drivers/gpu/drm/radeon/evergreend.h
++++ b/drivers/gpu/drm/radeon/evergreend.h
+@@ -242,6 +242,7 @@
+ #define	PA_CL_ENHANCE					0x8A14
+ #define		CLIP_VTX_REORDER_ENA				(1 << 0)
+ #define		NUM_CLIP_SEQ(x)					((x) << 1)
++#define	PA_SC_ENHANCE					0x8BF0
+ #define PA_SC_AA_CONFIG					0x28C04
+ #define         MSAA_NUM_SAMPLES_SHIFT                  0
+ #define         MSAA_NUM_SAMPLES_MASK                   0x3
+@@ -319,6 +320,8 @@
+ #define	SQ_GPR_RESOURCE_MGMT_3				0x8C0C
+ #define		NUM_HS_GPRS(x)					((x) << 0)
+ #define		NUM_LS_GPRS(x)					((x) << 16)
++#define	SQ_GLOBAL_GPR_RESOURCE_MGMT_1			0x8C10
++#define	SQ_GLOBAL_GPR_RESOURCE_MGMT_2			0x8C14
+ #define	SQ_THREAD_RESOURCE_MGMT				0x8C18
+ #define		NUM_PS_THREADS(x)				((x) << 0)
+ #define		NUM_VS_THREADS(x)				((x) << 8)
+@@ -337,6 +340,10 @@
+ #define		NUM_HS_STACK_ENTRIES(x)				((x) << 0)
+ #define		NUM_LS_STACK_ENTRIES(x)				((x) << 16)
+ #define	SQ_DYN_GPR_CNTL_PS_FLUSH_REQ    		0x8D8C
++#define	SQ_DYN_GPR_SIMD_LOCK_EN    			0x8D94
++#define	SQ_STATIC_THREAD_MGMT_1    			0x8E20
++#define	SQ_STATIC_THREAD_MGMT_2    			0x8E24
++#define	SQ_STATIC_THREAD_MGMT_3    			0x8E28
+ #define	SQ_LDS_RESOURCE_MGMT    			0x8E2C
+ 
+ #define	SQ_MS_FIFO_SIZES				0x8CF0
+@@ -691,6 +698,7 @@
+ #define	PACKET3_DRAW_INDEX_MULTI_ELEMENT		0x36
+ #define	PACKET3_MEM_SEMAPHORE				0x39
+ #define	PACKET3_MPEG_INDEX				0x3A
++#define	PACKET3_COPY_DW					0x3B
+ #define	PACKET3_WAIT_REG_MEM				0x3C
+ #define	PACKET3_MEM_WRITE				0x3D
+ #define	PACKET3_INDIRECT_BUFFER				0x32
+@@ -768,6 +776,8 @@
+ #define			SQ_TEX_VTX_VALID_TEXTURE			0x2
+ #define			SQ_TEX_VTX_VALID_BUFFER				0x3
+ 
++#define VGT_VTX_VECT_EJECT_REG				0x88b0
++
+ #define SQ_CONST_MEM_BASE				0x8df8
+ 
+ #define SQ_ESGS_RING_BASE				0x8c40
+@@ -892,8 +902,27 @@
+ #define PA_SC_SCREEN_SCISSOR_TL                         0x28030
+ #define PA_SC_GENERIC_SCISSOR_TL                        0x28240
+ #define PA_SC_WINDOW_SCISSOR_TL                         0x28204
++
+ #define VGT_PRIMITIVE_TYPE                              0x8958
++#define VGT_INDEX_TYPE                                  0x895C
++
++#define VGT_NUM_INDICES                                 0x8970
+ 
++#define VGT_COMPUTE_DIM_X                               0x8990
++#define VGT_COMPUTE_DIM_Y                               0x8994
++#define VGT_COMPUTE_DIM_Z                               0x8998
++#define VGT_COMPUTE_START_X                             0x899C
++#define VGT_COMPUTE_START_Y                             0x89A0
++#define VGT_COMPUTE_START_Z                             0x89A4
++#define VGT_COMPUTE_INDEX                               0x89A8
++#define VGT_COMPUTE_THREAD_GROUP_SIZE                   0x89AC
++#define VGT_HS_OFFCHIP_PARAM                            0x89B0
++
++#define DB_DEBUG					0x9830
++#define DB_DEBUG2					0x9834
++#define DB_DEBUG3					0x9838
++#define DB_DEBUG4					0x983C
++#define DB_WATERMARKS					0x9854
+ #define DB_DEPTH_CONTROL				0x28800
+ #define DB_DEPTH_VIEW					0x28008
+ #define DB_HTILE_DATA_BASE				0x28014
+@@ -1189,8 +1218,40 @@
+ #define SQ_VTX_CONSTANT_WORD6_0                         0x30018
+ #define SQ_VTX_CONSTANT_WORD7_0                         0x3001c
+ 
++#define TD_PS_BORDER_COLOR_INDEX                        0xA400
++#define TD_PS_BORDER_COLOR_RED                          0xA404
++#define TD_PS_BORDER_COLOR_GREEN                        0xA408
++#define TD_PS_BORDER_COLOR_BLUE                         0xA40C
++#define TD_PS_BORDER_COLOR_ALPHA                        0xA410
++#define TD_VS_BORDER_COLOR_INDEX                        0xA414
++#define TD_VS_BORDER_COLOR_RED                          0xA418
++#define TD_VS_BORDER_COLOR_GREEN                        0xA41C
++#define TD_VS_BORDER_COLOR_BLUE                         0xA420
++#define TD_VS_BORDER_COLOR_ALPHA                        0xA424
++#define TD_GS_BORDER_COLOR_INDEX                        0xA428
++#define TD_GS_BORDER_COLOR_RED                          0xA42C
++#define TD_GS_BORDER_COLOR_GREEN                        0xA430
++#define TD_GS_BORDER_COLOR_BLUE                         0xA434
++#define TD_GS_BORDER_COLOR_ALPHA                        0xA438
++#define TD_HS_BORDER_COLOR_INDEX                        0xA43C
++#define TD_HS_BORDER_COLOR_RED                          0xA440
++#define TD_HS_BORDER_COLOR_GREEN                        0xA444
++#define TD_HS_BORDER_COLOR_BLUE                         0xA448
++#define TD_HS_BORDER_COLOR_ALPHA                        0xA44C
++#define TD_LS_BORDER_COLOR_INDEX                        0xA450
++#define TD_LS_BORDER_COLOR_RED                          0xA454
++#define TD_LS_BORDER_COLOR_GREEN                        0xA458
++#define TD_LS_BORDER_COLOR_BLUE                         0xA45C
++#define TD_LS_BORDER_COLOR_ALPHA                        0xA460
++#define TD_CS_BORDER_COLOR_INDEX                        0xA464
++#define TD_CS_BORDER_COLOR_RED                          0xA468
++#define TD_CS_BORDER_COLOR_GREEN                        0xA46C
++#define TD_CS_BORDER_COLOR_BLUE                         0xA470
++#define TD_CS_BORDER_COLOR_ALPHA                        0xA474
++
+ /* cayman 3D regs */
+-#define CAYMAN_VGT_OFFCHIP_LDS_BASE			0x89B0
++#define CAYMAN_VGT_OFFCHIP_LDS_BASE			0x89B4
++#define CAYMAN_SQ_EX_ALLOC_TABLE_SLOTS			0x8E48
+ #define CAYMAN_DB_EQAA					0x28804
+ #define CAYMAN_DB_DEPTH_INFO				0x2803C
+ #define CAYMAN_PA_SC_AA_CONFIG				0x28BE0
+diff --git a/drivers/gpu/drm/radeon/ni.c b/drivers/gpu/drm/radeon/ni.c
+index d89b2eb..3211372 100644
+--- a/drivers/gpu/drm/radeon/ni.c
++++ b/drivers/gpu/drm/radeon/ni.c
+@@ -934,7 +934,7 @@ void cayman_pcie_gart_tlb_flush(struct radeon_device *rdev)
+ 
+ int cayman_pcie_gart_enable(struct radeon_device *rdev)
+ {
+-	int r;
++	int i, r;
+ 
+ 	if (rdev->gart.robj == NULL) {
+ 		dev_err(rdev->dev, "No VRAM object for PCIE GART.\n");
+@@ -945,9 +945,12 @@ int cayman_pcie_gart_enable(struct radeon_device *rdev)
+ 		return r;
+ 	radeon_gart_restore(rdev);
+ 	/* Setup TLB control */
+-	WREG32(MC_VM_MX_L1_TLB_CNTL, ENABLE_L1_TLB |
++	WREG32(MC_VM_MX_L1_TLB_CNTL,
++	       (0xA << 7) |
++	       ENABLE_L1_TLB |
+ 	       ENABLE_L1_FRAGMENT_PROCESSING |
+ 	       SYSTEM_ACCESS_MODE_NOT_IN_SYS |
++	       ENABLE_ADVANCED_DRIVER_MODEL |
+ 	       SYSTEM_APERTURE_UNMAPPED_ACCESS_PASS_THRU);
+ 	/* Setup L2 cache */
+ 	WREG32(VM_L2_CNTL, ENABLE_L2_CACHE |
+@@ -967,9 +970,26 @@ int cayman_pcie_gart_enable(struct radeon_device *rdev)
+ 	WREG32(VM_CONTEXT0_CNTL2, 0);
+ 	WREG32(VM_CONTEXT0_CNTL, ENABLE_CONTEXT | PAGE_TABLE_DEPTH(0) |
+ 				RANGE_PROTECTION_FAULT_ENABLE_DEFAULT);
+-	/* disable context1-7 */
++
++	WREG32(0x15D4, 0);
++	WREG32(0x15D8, 0);
++	WREG32(0x15DC, 0);
++
++	/* empty context1-7 */
++	for (i = 1; i < 8; i++) {
++		WREG32(VM_CONTEXT0_PAGE_TABLE_START_ADDR + (i << 2), 0);
++		WREG32(VM_CONTEXT0_PAGE_TABLE_END_ADDR + (i << 2), 0);
++		WREG32(VM_CONTEXT0_PAGE_TABLE_BASE_ADDR + (i << 2),
++			rdev->gart.table_addr >> 12);
++	}
++
++	/* enable context1-7 */
++	WREG32(VM_CONTEXT1_PROTECTION_FAULT_DEFAULT_ADDR,
++	       (u32)(rdev->dummy_page.addr >> 12));
+ 	WREG32(VM_CONTEXT1_CNTL2, 0);
+ 	WREG32(VM_CONTEXT1_CNTL, 0);
++	WREG32(VM_CONTEXT1_CNTL, ENABLE_CONTEXT | PAGE_TABLE_DEPTH(0) |
++				RANGE_PROTECTION_FAULT_ENABLE_DEFAULT);
+ 
+ 	cayman_pcie_gart_tlb_flush(rdev);
+ 	DRM_INFO("PCIE GART of %uM enabled (table at 0x%016llX).\n",
+@@ -1024,7 +1044,10 @@ void cayman_fence_ring_emit(struct radeon_device *rdev,
+ 	struct radeon_ring *ring = &rdev->ring[fence->ring];
+ 	u64 addr = rdev->fence_drv[fence->ring].gpu_addr;
+ 
+-	/* flush read cache over gart */
++	/* flush read cache over gart for this vmid */
++	radeon_ring_write(ring, PACKET3(PACKET3_SET_CONFIG_REG, 1));
++	radeon_ring_write(ring, (CP_COHER_CNTL2 - PACKET3_SET_CONFIG_REG_START) >> 2);
++	radeon_ring_write(ring, 0);
+ 	radeon_ring_write(ring, PACKET3(PACKET3_SURFACE_SYNC, 3));
+ 	radeon_ring_write(ring, PACKET3_TC_ACTION_ENA | PACKET3_SH_ACTION_ENA);
+ 	radeon_ring_write(ring, 0xFFFFFFFF);
+@@ -1039,6 +1062,33 @@ void cayman_fence_ring_emit(struct radeon_device *rdev,
+ 	radeon_ring_write(ring, 0);
+ }
+ 
++void cayman_ring_ib_execute(struct radeon_device *rdev, struct radeon_ib *ib)
++{
++	struct radeon_ring *ring = &rdev->ring[ib->fence->ring];
++
++	/* set to DX10/11 mode */
++	radeon_ring_write(ring, PACKET3(PACKET3_MODE_CONTROL, 0));
++	radeon_ring_write(ring, 1);
++	radeon_ring_write(ring, PACKET3(PACKET3_INDIRECT_BUFFER, 2));
++	radeon_ring_write(ring,
++#ifdef __BIG_ENDIAN
++			  (2 << 0) |
++#endif
++			  (ib->gpu_addr & 0xFFFFFFFC));
++	radeon_ring_write(ring, upper_32_bits(ib->gpu_addr) & 0xFF);
++	radeon_ring_write(ring, ib->length_dw | (ib->vm_id << 24));
++
++	/* flush read cache over gart for this vmid */
++	radeon_ring_write(ring, PACKET3(PACKET3_SET_CONFIG_REG, 1));
++	radeon_ring_write(ring, (CP_COHER_CNTL2 - PACKET3_SET_CONFIG_REG_START) >> 2);
++	radeon_ring_write(ring, ib->vm_id);
++	radeon_ring_write(ring, PACKET3(PACKET3_SURFACE_SYNC, 3));
++	radeon_ring_write(ring, PACKET3_TC_ACTION_ENA | PACKET3_SH_ACTION_ENA);
++	radeon_ring_write(ring, 0xFFFFFFFF);
++	radeon_ring_write(ring, 0);
++	radeon_ring_write(ring, 10); /* poll interval */
++}
++
+ static void cayman_cp_enable(struct radeon_device *rdev, bool enable)
+ {
+ 	if (enable)
+@@ -1324,6 +1374,15 @@ static int cayman_gpu_soft_reset(struct radeon_device *rdev)
+ 		RREG32(GRBM_STATUS_SE1));
+ 	dev_info(rdev->dev, "  SRBM_STATUS=0x%08X\n",
+ 		RREG32(SRBM_STATUS));
++	dev_info(rdev->dev, "  VM_CONTEXT0_PROTECTION_FAULT_ADDR   0x%08X\n",
++		 RREG32(0x14F8));
++	dev_info(rdev->dev, "  VM_CONTEXT0_PROTECTION_FAULT_STATUS 0x%08X\n",
++		 RREG32(0x14D8));
++	dev_info(rdev->dev, "  VM_CONTEXT1_PROTECTION_FAULT_ADDR   0x%08X\n",
++		 RREG32(0x14FC));
++	dev_info(rdev->dev, "  VM_CONTEXT1_PROTECTION_FAULT_STATUS 0x%08X\n",
++		 RREG32(0x14DC));
++
+ 	evergreen_mc_stop(rdev, &save);
+ 	if (evergreen_mc_wait_for_idle(rdev)) {
+ 		dev_warn(rdev->dev, "Wait for MC idle timedout !\n");
+@@ -1354,6 +1413,7 @@ static int cayman_gpu_soft_reset(struct radeon_device *rdev)
+ 	(void)RREG32(GRBM_SOFT_RESET);
+ 	/* Wait a little for things to settle down */
+ 	udelay(50);
++
+ 	dev_info(rdev->dev, "  GRBM_STATUS=0x%08X\n",
+ 		RREG32(GRBM_STATUS));
+ 	dev_info(rdev->dev, "  GRBM_STATUS_SE0=0x%08X\n",
+@@ -1464,6 +1524,10 @@ static int cayman_startup(struct radeon_device *rdev)
+ 		return r;
+ 	}
+ 
++	r = radeon_vm_manager_start(rdev);
++	if (r)
++		return r;
++
+ 	return 0;
+ }
+ 
+@@ -1491,6 +1555,7 @@ int cayman_suspend(struct radeon_device *rdev)
+ {
+ 	/* FIXME: we should wait for ring to be empty */
+ 	radeon_ib_pool_suspend(rdev);
++	radeon_vm_manager_suspend(rdev);
+ 	r600_blit_suspend(rdev);
+ 	cayman_cp_enable(rdev, false);
+ 	rdev->ring[RADEON_RING_TYPE_GFX_INDEX].ready = false;
+@@ -1577,6 +1642,10 @@ int cayman_init(struct radeon_device *rdev)
+ 		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
+ 		rdev->accel_working = false;
+ 	}
++	r = radeon_vm_manager_init(rdev);
++	if (r) {
++		dev_err(rdev->dev, "vm manager initialization failed (%d).\n", r);
++	}
+ 
+ 	r = cayman_startup(rdev);
+ 	if (r) {
+@@ -1585,6 +1654,7 @@ int cayman_init(struct radeon_device *rdev)
+ 		r600_irq_fini(rdev);
+ 		radeon_wb_fini(rdev);
+ 		r100_ib_fini(rdev);
++		radeon_vm_manager_fini(rdev);
+ 		radeon_irq_kms_fini(rdev);
+ 		cayman_pcie_gart_fini(rdev);
+ 		rdev->accel_working = false;
+@@ -1608,6 +1678,7 @@ void cayman_fini(struct radeon_device *rdev)
+ 	cayman_cp_fini(rdev);
+ 	r600_irq_fini(rdev);
+ 	radeon_wb_fini(rdev);
++	radeon_vm_manager_fini(rdev);
+ 	r100_ib_fini(rdev);
+ 	radeon_irq_kms_fini(rdev);
+ 	cayman_pcie_gart_fini(rdev);
+@@ -1621,3 +1692,84 @@ void cayman_fini(struct radeon_device *rdev)
+ 	rdev->bios = NULL;
+ }
+ 
++/*
++ * vm
++ */
++int cayman_vm_init(struct radeon_device *rdev)
++{
++	/* number of VMs */
++	rdev->vm_manager.nvm = 8;
++	/* base offset of vram pages */
++	rdev->vm_manager.vram_base_offset = 0;
++	return 0;
++}
++
++void cayman_vm_fini(struct radeon_device *rdev)
++{
++}
++
++int cayman_vm_bind(struct radeon_device *rdev, struct radeon_vm *vm, int id)
++{
++	WREG32(VM_CONTEXT0_PAGE_TABLE_START_ADDR + (id << 2), 0);
++	WREG32(VM_CONTEXT0_PAGE_TABLE_END_ADDR + (id << 2), vm->last_pfn);
++	WREG32(VM_CONTEXT0_PAGE_TABLE_BASE_ADDR + (id << 2), vm->pt_gpu_addr >> 12);
++	/* flush hdp cache */
++	WREG32(HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
++	/* bits 0-7 are the VM contexts0-7 */
++	WREG32(VM_INVALIDATE_REQUEST, 1 << id);
++	return 0;
++}
++
++void cayman_vm_unbind(struct radeon_device *rdev, struct radeon_vm *vm)
++{
++	WREG32(VM_CONTEXT0_PAGE_TABLE_START_ADDR + (vm->id << 2), 0);
++	WREG32(VM_CONTEXT0_PAGE_TABLE_END_ADDR + (vm->id << 2), 0);
++	WREG32(VM_CONTEXT0_PAGE_TABLE_BASE_ADDR + (vm->id << 2), 0);
++	/* flush hdp cache */
++	WREG32(HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
++	/* bits 0-7 are the VM contexts0-7 */
++	WREG32(VM_INVALIDATE_REQUEST, 1 << vm->id);
++}
++
++void cayman_vm_tlb_flush(struct radeon_device *rdev, struct radeon_vm *vm)
++{
++	if (vm->id == -1)
++		return;
++
++	/* flush hdp cache */
++	WREG32(HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
++	/* bits 0-7 are the VM contexts0-7 */
++	WREG32(VM_INVALIDATE_REQUEST, 1 << vm->id);
++}
++
++#define R600_PTE_VALID     (1 << 0)
++#define R600_PTE_SYSTEM    (1 << 1)
++#define R600_PTE_SNOOPED   (1 << 2)
++#define R600_PTE_READABLE  (1 << 5)
++#define R600_PTE_WRITEABLE (1 << 6)
++
++uint32_t cayman_vm_page_flags(struct radeon_device *rdev,
++			      struct radeon_vm *vm,
++			      uint32_t flags)
++{
++	uint32_t r600_flags = 0;
++
++	r600_flags |= (flags & RADEON_VM_PAGE_VALID) ? R600_PTE_VALID : 0;
++	r600_flags |= (flags & RADEON_VM_PAGE_READABLE) ? R600_PTE_READABLE : 0;
++	r600_flags |= (flags & RADEON_VM_PAGE_WRITEABLE) ? R600_PTE_WRITEABLE : 0;
++	if (flags & RADEON_VM_PAGE_SYSTEM) {
++		r600_flags |= R600_PTE_SYSTEM;
++		r600_flags |= (flags & RADEON_VM_PAGE_SNOOPED) ? R600_PTE_SNOOPED : 0;
++	}
++	return r600_flags;
++}
++
++void cayman_vm_set_page(struct radeon_device *rdev, struct radeon_vm *vm,
++			unsigned pfn, uint64_t addr, uint32_t flags)
++{
++	void __iomem *ptr = (void *)vm->pt;
++
++	addr = addr & 0xFFFFFFFFFFFFF000ULL;
++	addr |= flags;
++	writeq(addr, ptr + (pfn * 8));
++}
+diff --git a/drivers/gpu/drm/radeon/nid.h b/drivers/gpu/drm/radeon/nid.h
+index 0d3f52c..f9df2a6 100644
+--- a/drivers/gpu/drm/radeon/nid.h
++++ b/drivers/gpu/drm/radeon/nid.h
+@@ -222,6 +222,7 @@
+ #define	SCRATCH_UMSK					0x8540
+ #define	SCRATCH_ADDR					0x8544
+ #define	CP_SEM_WAIT_TIMER				0x85BC
++#define	CP_COHER_CNTL2					0x85E8
+ #define CP_ME_CNTL					0x86D8
+ #define		CP_ME_HALT					(1 << 28)
+ #define		CP_PFP_HALT					(1 << 26)
+@@ -458,6 +459,7 @@
+ #define	PACKET3_DISPATCH_DIRECT				0x15
+ #define	PACKET3_DISPATCH_INDIRECT			0x16
+ #define	PACKET3_INDIRECT_BUFFER_END			0x17
++#define	PACKET3_MODE_CONTROL				0x18
+ #define	PACKET3_SET_PREDICATION				0x20
+ #define	PACKET3_REG_RMW					0x21
+ #define	PACKET3_COND_EXEC				0x22
+diff --git a/drivers/gpu/drm/radeon/r300.c b/drivers/gpu/drm/radeon/r300.c
+index 8ad5c64..3fc0d29 100644
+--- a/drivers/gpu/drm/radeon/r300.c
++++ b/drivers/gpu/drm/radeon/r300.c
+@@ -704,7 +704,7 @@ static int r300_packet0_check(struct radeon_cs_parser *p,
+ 			return r;
+ 		}
+ 
+-		if (p->keep_tiling_flags) {
++		if (p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS) {
+ 			ib[idx] = (idx_value & 31) | /* keep the 1st 5 bits */
+ 				  ((idx_value & ~31) + (u32)reloc->lobj.gpu_offset);
+ 		} else {
+@@ -768,7 +768,7 @@ static int r300_packet0_check(struct radeon_cs_parser *p,
+ 		/* RB3D_COLORPITCH1 */
+ 		/* RB3D_COLORPITCH2 */
+ 		/* RB3D_COLORPITCH3 */
+-		if (!p->keep_tiling_flags) {
++		if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS)) {
+ 			r = r100_cs_packet_next_reloc(p, &reloc);
+ 			if (r) {
+ 				DRM_ERROR("No reloc for ib[%d]=0x%04X\n",
+@@ -853,7 +853,7 @@ static int r300_packet0_check(struct radeon_cs_parser *p,
+ 		break;
+ 	case 0x4F24:
+ 		/* ZB_DEPTHPITCH */
+-		if (!p->keep_tiling_flags) {
++		if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS)) {
+ 			r = r100_cs_packet_next_reloc(p, &reloc);
+ 			if (r) {
+ 				DRM_ERROR("No reloc for ib[%d]=0x%04X\n",
+diff --git a/drivers/gpu/drm/radeon/r600_cs.c b/drivers/gpu/drm/radeon/r600_cs.c
+index cb1acff..38ce5d0 100644
+--- a/drivers/gpu/drm/radeon/r600_cs.c
++++ b/drivers/gpu/drm/radeon/r600_cs.c
+@@ -941,7 +941,7 @@ static int r600_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 		track->db_depth_control = radeon_get_ib_value(p, idx);
+ 		break;
+ 	case R_028010_DB_DEPTH_INFO:
+-		if (!p->keep_tiling_flags &&
++		if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS) &&
+ 		    r600_cs_packet_next_is_pkt3_nop(p)) {
+ 			r = r600_cs_packet_next_reloc(p, &reloc);
+ 			if (r) {
+@@ -993,7 +993,7 @@ static int r600_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 	case R_0280B4_CB_COLOR5_INFO:
+ 	case R_0280B8_CB_COLOR6_INFO:
+ 	case R_0280BC_CB_COLOR7_INFO:
+-		if (!p->keep_tiling_flags &&
++		if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS) &&
+ 		     r600_cs_packet_next_is_pkt3_nop(p)) {
+ 			r = r600_cs_packet_next_reloc(p, &reloc);
+ 			if (r) {
+@@ -1293,7 +1293,7 @@ static int r600_check_texture_resource(struct radeon_cs_parser *p,  u32 idx,
+ 	mip_offset <<= 8;
+ 
+ 	word0 = radeon_get_ib_value(p, idx + 0);
+-	if (!p->keep_tiling_flags) {
++	if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS)) {
+ 		if (tiling_flags & RADEON_TILING_MACRO)
+ 			word0 |= S_038000_TILE_MODE(V_038000_ARRAY_2D_TILED_THIN1);
+ 		else if (tiling_flags & RADEON_TILING_MICRO)
+@@ -1625,7 +1625,7 @@ static int r600_packet3_check(struct radeon_cs_parser *p,
+ 					return -EINVAL;
+ 				}
+ 				base_offset = (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
+-				if (!p->keep_tiling_flags) {
++				if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS)) {
+ 					if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO)
+ 						ib[idx+1+(i*7)+0] |= S_038000_TILE_MODE(V_038000_ARRAY_2D_TILED_THIN1);
+ 					else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO)
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 374f9a4..5e35423 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -118,6 +118,10 @@ extern int radeon_msi;
+ #define CAYMAN_RING_TYPE_CP1_INDEX 1
+ #define CAYMAN_RING_TYPE_CP2_INDEX 2
+ 
++/* hardcode those limit for now */
++#define RADEON_VA_RESERVED_SIZE		(8 << 20)
++#define RADEON_IB_VM_MAX_SIZE		(64 << 10)
++
+ /*
+  * Errata workarounds.
+  */
+@@ -262,6 +266,21 @@ struct radeon_mman {
+ 	bool				initialized;
+ };
+ 
++/* bo virtual address in a specific vm */
++struct radeon_bo_va {
++	/* bo list is protected by bo being reserved */
++	struct list_head		bo_list;
++	/* vm list is protected by vm mutex */
++	struct list_head		vm_list;
++	/* constant after initialization */
++	struct radeon_vm		*vm;
++	struct radeon_bo		*bo;
++	uint64_t			soffset;
++	uint64_t			eoffset;
++	uint32_t			flags;
++	bool				valid;
++};
++
+ struct radeon_bo {
+ 	/* Protected by gem.mutex */
+ 	struct list_head		list;
+@@ -275,6 +294,10 @@ struct radeon_bo {
+ 	u32				tiling_flags;
+ 	u32				pitch;
+ 	int				surface_reg;
++	/* list of all virtual address to which this bo
++	 * is associated to
++	 */
++	struct list_head		va;
+ 	/* Constant after initialization */
+ 	struct radeon_device		*rdev;
+ 	struct drm_gem_object		gem_base;
+@@ -408,6 +431,7 @@ struct radeon_mc;
+ #define RADEON_GPU_PAGE_SIZE 4096
+ #define RADEON_GPU_PAGE_MASK (RADEON_GPU_PAGE_SIZE - 1)
+ #define RADEON_GPU_PAGE_SHIFT 12
++#define RADEON_GPU_PAGE_ALIGN(a) (((a) + RADEON_GPU_PAGE_MASK) & ~RADEON_GPU_PAGE_MASK)
+ 
+ struct radeon_gart {
+ 	dma_addr_t			table_addr;
+@@ -565,6 +589,7 @@ struct radeon_ib {
+ 	uint64_t		gpu_addr;
+ 	uint32_t		*ptr;
+ 	struct radeon_fence	*fence;
++	unsigned		vm_id;
+ };
+ 
+ /*
+@@ -602,6 +627,56 @@ struct radeon_ring {
+ };
+ 
+ /*
++ * VM
++ */
++struct radeon_vm {
++	struct list_head		list;
++	struct list_head		va;
++	int				id;
++	unsigned			last_pfn;
++	u64				pt_gpu_addr;
++	u64				*pt;
++	struct radeon_sa_bo		sa_bo;
++	struct mutex			mutex;
++	/* last fence for cs using this vm */
++	struct radeon_fence		*fence;
++};
++
++struct radeon_vm_funcs {
++	int (*init)(struct radeon_device *rdev);
++	void (*fini)(struct radeon_device *rdev);
++	/* cs mutex must be lock for schedule_ib */
++	int (*bind)(struct radeon_device *rdev, struct radeon_vm *vm, int id);
++	void (*unbind)(struct radeon_device *rdev, struct radeon_vm *vm);
++	void (*tlb_flush)(struct radeon_device *rdev, struct radeon_vm *vm);
++	uint32_t (*page_flags)(struct radeon_device *rdev,
++			       struct radeon_vm *vm,
++			       uint32_t flags);
++	void (*set_page)(struct radeon_device *rdev, struct radeon_vm *vm,
++			unsigned pfn, uint64_t addr, uint32_t flags);
++};
++
++struct radeon_vm_manager {
++	struct list_head		lru_vm;
++	uint32_t			use_bitmap;
++	struct radeon_sa_manager	sa_manager;
++	uint32_t			max_pfn;
++	/* fields constant after init */
++	const struct radeon_vm_funcs	*funcs;
++	/* number of VMIDs */
++	unsigned			nvm;
++	/* vram base address for page table entry  */
++	u64				vram_base_offset;
++};
++
++/*
++ * file private structure
++ */
++struct radeon_fpriv {
++	struct radeon_vm		vm;
++};
++
++/*
+  * R6xx+ IH ring
+  */
+ struct r600_ih {
+@@ -691,12 +766,12 @@ struct radeon_cs_reloc {
+ struct radeon_cs_chunk {
+ 	uint32_t		chunk_id;
+ 	uint32_t		length_dw;
+-	int kpage_idx[2];
+-	uint32_t                *kpage[2];
++	int			kpage_idx[2];
++	uint32_t		*kpage[2];
+ 	uint32_t		*kdata;
+-	void __user *user_ptr;
+-	int last_copied_page;
+-	int last_page_index;
++	void __user		*user_ptr;
++	int			last_copied_page;
++	int			last_page_index;
+ };
+ 
+ struct radeon_cs_parser {
+@@ -717,11 +792,14 @@ struct radeon_cs_parser {
+ 	/* indices of various chunks */
+ 	int			chunk_ib_idx;
+ 	int			chunk_relocs_idx;
++	int			chunk_flags_idx;
+ 	struct radeon_ib	*ib;
+ 	void			*track;
+ 	unsigned		family;
+ 	int			parser_error;
+-	bool			keep_tiling_flags;
++	u32			cs_flags;
++	u32			ring;
++	s32			priority;
+ };
+ 
+ extern int radeon_cs_update_pages(struct radeon_cs_parser *p, int pg_idx);
+@@ -1018,6 +1096,7 @@ struct radeon_asic {
+ 
+ 	struct {
+ 		void (*ib_execute)(struct radeon_device *rdev, struct radeon_ib *ib);
++		int (*ib_parse)(struct radeon_device *rdev, struct radeon_ib *ib);
+ 		void (*emit_fence)(struct radeon_device *rdev, struct radeon_fence *fence);
+ 		void (*emit_semaphore)(struct radeon_device *rdev, struct radeon_ring *cp,
+ 				       struct radeon_semaphore *semaphore, bool emit_wait);
+@@ -1255,6 +1334,8 @@ int radeon_gem_busy_ioctl(struct drm_device *dev, void *data,
+ 			  struct drm_file *filp);
+ int radeon_gem_wait_idle_ioctl(struct drm_device *dev, void *data,
+ 			      struct drm_file *filp);
++int radeon_gem_va_ioctl(struct drm_device *dev, void *data,
++			  struct drm_file *filp);
+ int radeon_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
+ int radeon_gem_set_tiling_ioctl(struct drm_device *dev, void *data,
+ 				struct drm_file *filp);
+@@ -1404,6 +1485,8 @@ struct radeon_device {
+ 	/* debugfs */
+ 	struct radeon_debugfs	debugfs[RADEON_DEBUGFS_MAX_COMPONENTS];
+ 	unsigned 		debugfs_count;
++	/* virtual memory */
++	struct radeon_vm_manager	vm_manager;
+ };
+ 
+ int radeon_device_init(struct radeon_device *rdev,
+@@ -1568,6 +1651,7 @@ void radeon_ring_write(struct radeon_ring *ring, uint32_t v);
+ #define radeon_ring_start(rdev) (rdev)->asic->ring_start((rdev))
+ #define radeon_ring_test(rdev, cp) (rdev)->asic->ring_test((rdev), (cp))
+ #define radeon_ring_ib_execute(rdev, r, ib) (rdev)->asic->ring[(r)].ib_execute((rdev), (ib))
++#define radeon_ring_ib_parse(rdev, r, ib) (rdev)->asic->ring[(r)].ib_parse((rdev), (ib))
+ #define radeon_irq_set(rdev) (rdev)->asic->irq_set((rdev))
+ #define radeon_irq_process(rdev) (rdev)->asic->irq_process((rdev))
+ #define radeon_get_vblank_counter(rdev, crtc) (rdev)->asic->get_vblank_counter((rdev), (crtc))
+@@ -1627,6 +1711,33 @@ extern int radeon_suspend_kms(struct drm_device *dev, pm_message_t state);
+ extern void radeon_ttm_set_active_vram_size(struct radeon_device *rdev, u64 size);
+ 
+ /*
++ * vm
++ */
++int radeon_vm_manager_init(struct radeon_device *rdev);
++void radeon_vm_manager_fini(struct radeon_device *rdev);
++int radeon_vm_manager_start(struct radeon_device *rdev);
++int radeon_vm_manager_suspend(struct radeon_device *rdev);
++int radeon_vm_init(struct radeon_device *rdev, struct radeon_vm *vm);
++void radeon_vm_fini(struct radeon_device *rdev, struct radeon_vm *vm);
++int radeon_vm_bind(struct radeon_device *rdev, struct radeon_vm *vm);
++void radeon_vm_unbind(struct radeon_device *rdev, struct radeon_vm *vm);
++int radeon_vm_bo_update_pte(struct radeon_device *rdev,
++			    struct radeon_vm *vm,
++			    struct radeon_bo *bo,
++			    struct ttm_mem_reg *mem);
++void radeon_vm_bo_invalidate(struct radeon_device *rdev,
++			     struct radeon_bo *bo);
++int radeon_vm_bo_add(struct radeon_device *rdev,
++		     struct radeon_vm *vm,
++		     struct radeon_bo *bo,
++		     uint64_t offset,
++		     uint32_t flags);
++int radeon_vm_bo_rmv(struct radeon_device *rdev,
++		     struct radeon_vm *vm,
++		     struct radeon_bo *bo);
++
++
++/*
+  * R600 vram scratch functions
+  */
+ int r600_vram_scratch_init(struct radeon_device *rdev);
+diff --git a/drivers/gpu/drm/radeon/radeon_asic.c b/drivers/gpu/drm/radeon/radeon_asic.c
+index 8493d40..123a196 100644
+--- a/drivers/gpu/drm/radeon/radeon_asic.c
++++ b/drivers/gpu/drm/radeon/radeon_asic.c
+@@ -952,6 +952,16 @@ static struct radeon_asic btc_asic = {
+ 	.post_page_flip = &evergreen_post_page_flip,
+ };
+ 
++static const struct radeon_vm_funcs cayman_vm_funcs = {
++	.init = &cayman_vm_init,
++	.fini = &cayman_vm_fini,
++	.bind = &cayman_vm_bind,
++	.unbind = &cayman_vm_unbind,
++	.tlb_flush = &cayman_vm_tlb_flush,
++	.page_flags = &cayman_vm_page_flags,
++	.set_page = &cayman_vm_set_page,
++};
++
+ static struct radeon_asic cayman_asic = {
+ 	.init = &cayman_init,
+ 	.fini = &cayman_fini,
+@@ -965,17 +975,20 @@ static struct radeon_asic cayman_asic = {
+ 	.ring_test = &r600_ring_test,
+ 	.ring = {
+ 		[RADEON_RING_TYPE_GFX_INDEX] = {
+-			.ib_execute = &evergreen_ring_ib_execute,
++			.ib_execute = &cayman_ring_ib_execute,
++			.ib_parse = &evergreen_ib_parse,
+ 			.emit_fence = &cayman_fence_ring_emit,
+ 			.emit_semaphore = &r600_semaphore_ring_emit,
+ 		},
+ 		[CAYMAN_RING_TYPE_CP1_INDEX] = {
+-			.ib_execute = &r600_ring_ib_execute,
++			.ib_execute = &cayman_ring_ib_execute,
++			.ib_parse = &evergreen_ib_parse,
+ 			.emit_fence = &cayman_fence_ring_emit,
+ 			.emit_semaphore = &r600_semaphore_ring_emit,
+ 		},
+ 		[CAYMAN_RING_TYPE_CP2_INDEX] = {
+-			.ib_execute = &r600_ring_ib_execute,
++			.ib_execute = &cayman_ring_ib_execute,
++			.ib_parse = &evergreen_ib_parse,
+ 			.emit_fence = &cayman_fence_ring_emit,
+ 			.emit_semaphore = &r600_semaphore_ring_emit,
+ 		}
+@@ -1128,6 +1141,7 @@ int radeon_asic_init(struct radeon_device *rdev)
+ 		rdev->asic = &cayman_asic;
+ 		/* set num crtcs */
+ 		rdev->num_crtc = 6;
++		rdev->vm_manager.funcs = &cayman_vm_funcs;
+ 		break;
+ 	default:
+ 		/* FIXME: not supported yet */
+diff --git a/drivers/gpu/drm/radeon/radeon_asic.h b/drivers/gpu/drm/radeon/radeon_asic.h
+index c002ed1..6304aef 100644
+--- a/drivers/gpu/drm/radeon/radeon_asic.h
++++ b/drivers/gpu/drm/radeon/radeon_asic.h
+@@ -438,5 +438,17 @@ int cayman_suspend(struct radeon_device *rdev);
+ int cayman_resume(struct radeon_device *rdev);
+ bool cayman_gpu_is_lockup(struct radeon_device *rdev, struct radeon_ring *cp);
+ int cayman_asic_reset(struct radeon_device *rdev);
++void cayman_ring_ib_execute(struct radeon_device *rdev, struct radeon_ib *ib);
++int cayman_vm_init(struct radeon_device *rdev);
++void cayman_vm_fini(struct radeon_device *rdev);
++int cayman_vm_bind(struct radeon_device *rdev, struct radeon_vm *vm, int id);
++void cayman_vm_unbind(struct radeon_device *rdev, struct radeon_vm *vm);
++void cayman_vm_tlb_flush(struct radeon_device *rdev, struct radeon_vm *vm);
++uint32_t cayman_vm_page_flags(struct radeon_device *rdev,
++			      struct radeon_vm *vm,
++			      uint32_t flags);
++void cayman_vm_set_page(struct radeon_device *rdev, struct radeon_vm *vm,
++			unsigned pfn, uint64_t addr, uint32_t flags);
++int evergreen_ib_parse(struct radeon_device *rdev, struct radeon_ib *ib);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/radeon/radeon_cs.c b/drivers/gpu/drm/radeon/radeon_cs.c
+index 6559cc4..4d59540 100644
+--- a/drivers/gpu/drm/radeon/radeon_cs.c
++++ b/drivers/gpu/drm/radeon/radeon_cs.c
+@@ -90,11 +90,32 @@ int radeon_cs_parser_relocs(struct radeon_cs_parser *p)
+ 	return radeon_bo_list_validate(&p->validated);
+ }
+ 
++static int radeon_cs_get_ring(struct radeon_cs_parser *p, u32 ring, s32 priority)
++{
++	p->priority = priority;
++
++	switch (ring) {
++	default:
++		DRM_ERROR("unknown ring id: %d\n", ring);
++		return -EINVAL;
++	case RADEON_CS_RING_GFX:
++		p->ring = RADEON_RING_TYPE_GFX_INDEX;
++		break;
++	case RADEON_CS_RING_COMPUTE:
++		/* for now */
++		p->ring = RADEON_RING_TYPE_GFX_INDEX;
++		break;
++	}
++	return 0;
++}
++
+ int radeon_cs_parser_init(struct radeon_cs_parser *p, void *data)
+ {
+ 	struct drm_radeon_cs *cs = data;
+ 	uint64_t *chunk_array_ptr;
+-	unsigned size, i, flags = 0;
++	unsigned size, i;
++	u32 ring = RADEON_CS_RING_GFX;
++	s32 priority = 0;
+ 
+ 	if (!cs->num_chunks) {
+ 		return 0;
+@@ -104,6 +125,7 @@ int radeon_cs_parser_init(struct radeon_cs_parser *p, void *data)
+ 	p->idx = 0;
+ 	p->chunk_ib_idx = -1;
+ 	p->chunk_relocs_idx = -1;
++	p->chunk_flags_idx = -1;
+ 	p->chunks_array = kcalloc(cs->num_chunks, sizeof(uint64_t), GFP_KERNEL);
+ 	if (p->chunks_array == NULL) {
+ 		return -ENOMEM;
+@@ -113,6 +135,7 @@ int radeon_cs_parser_init(struct radeon_cs_parser *p, void *data)
+ 			       sizeof(uint64_t)*cs->num_chunks)) {
+ 		return -EFAULT;
+ 	}
++	p->cs_flags = 0;
+ 	p->nchunks = cs->num_chunks;
+ 	p->chunks = kcalloc(p->nchunks, sizeof(struct radeon_cs_chunk), GFP_KERNEL);
+ 	if (p->chunks == NULL) {
+@@ -141,16 +164,19 @@ int radeon_cs_parser_init(struct radeon_cs_parser *p, void *data)
+ 			if (p->chunks[i].length_dw == 0)
+ 				return -EINVAL;
+ 		}
+-		if (p->chunks[i].chunk_id == RADEON_CHUNK_ID_FLAGS &&
+-		    !p->chunks[i].length_dw) {
+-			return -EINVAL;
++		if (p->chunks[i].chunk_id == RADEON_CHUNK_ID_FLAGS) {
++			p->chunk_flags_idx = i;
++			/* zero length flags aren't useful */
++			if (p->chunks[i].length_dw == 0)
++				return -EINVAL;
+ 		}
+ 
+ 		p->chunks[i].length_dw = user_chunk.length_dw;
+ 		p->chunks[i].user_ptr = (void __user *)(unsigned long)user_chunk.chunk_data;
+ 
+ 		cdata = (uint32_t *)(unsigned long)user_chunk.chunk_data;
+-		if (p->chunks[i].chunk_id != RADEON_CHUNK_ID_IB) {
++		if ((p->chunks[i].chunk_id == RADEON_CHUNK_ID_RELOCS) ||
++		    (p->chunks[i].chunk_id == RADEON_CHUNK_ID_FLAGS)) {
+ 			size = p->chunks[i].length_dw * sizeof(uint32_t);
+ 			p->chunks[i].kdata = kmalloc(size, GFP_KERNEL);
+ 			if (p->chunks[i].kdata == NULL) {
+@@ -161,29 +187,58 @@ int radeon_cs_parser_init(struct radeon_cs_parser *p, void *data)
+ 				return -EFAULT;
+ 			}
+ 			if (p->chunks[i].chunk_id == RADEON_CHUNK_ID_FLAGS) {
+-				flags = p->chunks[i].kdata[0];
++				p->cs_flags = p->chunks[i].kdata[0];
++				if (p->chunks[i].length_dw > 1)
++					ring = p->chunks[i].kdata[1];
++				if (p->chunks[i].length_dw > 2)
++					priority = (s32)p->chunks[i].kdata[2];
+ 			}
+-		} else {
+-			p->chunks[i].kpage[0] = kmalloc(PAGE_SIZE, GFP_KERNEL);
+-			p->chunks[i].kpage[1] = kmalloc(PAGE_SIZE, GFP_KERNEL);
+-			if (p->chunks[i].kpage[0] == NULL || p->chunks[i].kpage[1] == NULL) {
+-				kfree(p->chunks[i].kpage[0]);
+-				kfree(p->chunks[i].kpage[1]);
+-				return -ENOMEM;
+-			}
+-			p->chunks[i].kpage_idx[0] = -1;
+-			p->chunks[i].kpage_idx[1] = -1;
+-			p->chunks[i].last_copied_page = -1;
+-			p->chunks[i].last_page_index = ((p->chunks[i].length_dw * 4) - 1) / PAGE_SIZE;
+ 		}
+ 	}
+-	if (p->chunks[p->chunk_ib_idx].length_dw > (16 * 1024)) {
+-		DRM_ERROR("cs IB too big: %d\n",
+-			  p->chunks[p->chunk_ib_idx].length_dw);
++
++	if ((p->cs_flags & RADEON_CS_USE_VM) &&
++	    (p->rdev->family < CHIP_CAYMAN)) {
++		DRM_ERROR("VM not supported on asic!\n");
++		if (p->chunk_relocs_idx != -1)
++			kfree(p->chunks[p->chunk_relocs_idx].kdata);
++		if (p->chunk_flags_idx != -1)
++			kfree(p->chunks[p->chunk_flags_idx].kdata);
+ 		return -EINVAL;
+ 	}
+ 
+-	p->keep_tiling_flags = (flags & RADEON_CS_KEEP_TILING_FLAGS) != 0;
++	if (radeon_cs_get_ring(p, ring, priority)) {
++		if (p->chunk_relocs_idx != -1)
++			kfree(p->chunks[p->chunk_relocs_idx].kdata);
++		if (p->chunk_flags_idx != -1)
++			kfree(p->chunks[p->chunk_flags_idx].kdata);
++		return -EINVAL;
++	}
++
++
++	/* deal with non-vm */
++	if ((p->chunk_ib_idx != -1) &&
++	    ((p->cs_flags & RADEON_CS_USE_VM) == 0) &&
++	    (p->chunks[p->chunk_ib_idx].chunk_id == RADEON_CHUNK_ID_IB)) {
++		if (p->chunks[p->chunk_ib_idx].length_dw > (16 * 1024)) {
++			DRM_ERROR("cs IB too big: %d\n",
++				  p->chunks[p->chunk_ib_idx].length_dw);
++			return -EINVAL;
++		}
++		p->chunks[p->chunk_ib_idx].kpage[0] = kmalloc(PAGE_SIZE, GFP_KERNEL);
++		p->chunks[p->chunk_ib_idx].kpage[1] = kmalloc(PAGE_SIZE, GFP_KERNEL);
++		if (p->chunks[p->chunk_ib_idx].kpage[0] == NULL ||
++		    p->chunks[p->chunk_ib_idx].kpage[1] == NULL) {
++			kfree(p->chunks[p->chunk_ib_idx].kpage[0]);
++			kfree(p->chunks[p->chunk_ib_idx].kpage[1]);
++			return -ENOMEM;
++		}
++		p->chunks[p->chunk_ib_idx].kpage_idx[0] = -1;
++		p->chunks[p->chunk_ib_idx].kpage_idx[1] = -1;
++		p->chunks[p->chunk_ib_idx].last_copied_page = -1;
++		p->chunks[p->chunk_ib_idx].last_page_index =
++			((p->chunks[p->chunk_ib_idx].length_dw * 4) - 1) / PAGE_SIZE;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -225,11 +280,131 @@ static void radeon_cs_parser_fini(struct radeon_cs_parser *parser, int error)
+ 	radeon_ib_free(parser->rdev, &parser->ib);
+ }
+ 
++static int radeon_cs_ib_chunk(struct radeon_device *rdev,
++			      struct radeon_cs_parser *parser)
++{
++	struct radeon_cs_chunk *ib_chunk;
++	int r;
++
++	if (parser->chunk_ib_idx == -1)
++		return 0;
++
++	if (parser->cs_flags & RADEON_CS_USE_VM)
++		return 0;
++
++	ib_chunk = &parser->chunks[parser->chunk_ib_idx];
++	/* Copy the packet into the IB, the parser will read from the
++	 * input memory (cached) and write to the IB (which can be
++	 * uncached).
++	 */
++	r =  radeon_ib_get(rdev, parser->ring, &parser->ib,
++			   ib_chunk->length_dw * 4);
++	if (r) {
++		DRM_ERROR("Failed to get ib !\n");
++		return r;
++	}
++	parser->ib->length_dw = ib_chunk->length_dw;
++	r = radeon_cs_parse(parser);
++	if (r || parser->parser_error) {
++		DRM_ERROR("Invalid command stream !\n");
++		return r;
++	}
++	r = radeon_cs_finish_pages(parser);
++	if (r) {
++		DRM_ERROR("Invalid command stream !\n");
++		return r;
++	}
++	parser->ib->vm_id = 0;
++	r = radeon_ib_schedule(rdev, parser->ib);
++	if (r) {
++		DRM_ERROR("Failed to schedule IB !\n");
++	}
++	return 0;
++}
++
++static int radeon_bo_vm_update_pte(struct radeon_cs_parser *parser,
++				   struct radeon_vm *vm)
++{
++	struct radeon_bo_list *lobj;
++	struct radeon_bo *bo;
++	int r;
++
++	list_for_each_entry(lobj, &parser->validated, tv.head) {
++		bo = lobj->bo;
++		r = radeon_vm_bo_update_pte(parser->rdev, vm, bo, &bo->tbo.mem);
++		if (r) {
++			return r;
++		}
++	}
++	return 0;
++}
++
++static int radeon_cs_ib_vm_chunk(struct radeon_device *rdev,
++				 struct radeon_cs_parser *parser)
++{
++	struct radeon_cs_chunk *ib_chunk;
++	struct radeon_fpriv *fpriv = parser->filp->driver_priv;
++	struct radeon_vm *vm = &fpriv->vm;
++	int r;
++
++	if (parser->chunk_ib_idx == -1)
++		return 0;
++
++	if ((parser->cs_flags & RADEON_CS_USE_VM) == 0)
++		return 0;
++
++	ib_chunk = &parser->chunks[parser->chunk_ib_idx];
++	if (ib_chunk->length_dw > RADEON_IB_VM_MAX_SIZE) {
++		DRM_ERROR("cs IB too big: %d\n", ib_chunk->length_dw);
++		return -EINVAL;
++	}
++	r =  radeon_ib_get(rdev, parser->ring, &parser->ib,
++			   ib_chunk->length_dw * 4);
++	if (r) {
++		DRM_ERROR("Failed to get ib !\n");
++		return r;
++	}
++	parser->ib->length_dw = ib_chunk->length_dw;
++	/* Copy the packet into the IB */
++	if (DRM_COPY_FROM_USER(parser->ib->ptr, ib_chunk->user_ptr,
++			       ib_chunk->length_dw * 4)) {
++		return -EFAULT;
++	}
++	r = radeon_ring_ib_parse(rdev, parser->ring, parser->ib);
++	if (r) {
++		return r;
++	}
++
++	mutex_lock(&vm->mutex);
++	r = radeon_vm_bind(rdev, vm);
++	if (r) {
++		goto out;
++	}
++	r = radeon_bo_vm_update_pte(parser, vm);
++	if (r) {
++		goto out;
++	}
++	parser->ib->vm_id = vm->id;
++	/* ib pool is bind at 0 in virtual address space to gpu_addr is the
++	 * offset inside the pool bo
++	 */
++	parser->ib->gpu_addr = parser->ib->sa_bo.offset;
++	r = radeon_ib_schedule(rdev, parser->ib);
++out:
++	if (!r) {
++		if (vm->fence) {
++			radeon_fence_unref(&vm->fence);
++		}
++		vm->fence = radeon_fence_ref(parser->ib->fence);
++	}
++	mutex_unlock(&fpriv->vm.mutex);
++	return r;
++}
++
+ int radeon_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ {
+ 	struct radeon_device *rdev = dev->dev_private;
+ 	struct radeon_cs_parser parser;
+-	struct radeon_cs_chunk *ib_chunk;
+ 	int r;
+ 
+ 	radeon_mutex_lock(&rdev->cs_mutex);
+@@ -246,15 +421,6 @@ int radeon_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		radeon_mutex_unlock(&rdev->cs_mutex);
+ 		return r;
+ 	}
+-	ib_chunk = &parser.chunks[parser.chunk_ib_idx];
+-	r =  radeon_ib_get(rdev, RADEON_RING_TYPE_GFX_INDEX, &parser.ib,
+-			   ib_chunk->length_dw * 4);
+-	if (r) {
+-		DRM_ERROR("Failed to get ib !\n");
+-		radeon_cs_parser_fini(&parser, r);
+-		radeon_mutex_unlock(&rdev->cs_mutex);
+-		return r;
+-	}
+ 	r = radeon_cs_parser_relocs(&parser);
+ 	if (r) {
+ 		if (r != -ERESTARTSYS)
+@@ -263,28 +429,15 @@ int radeon_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		radeon_mutex_unlock(&rdev->cs_mutex);
+ 		return r;
+ 	}
+-	/* Copy the packet into the IB, the parser will read from the
+-	 * input memory (cached) and write to the IB (which can be
+-	 * uncached). */
+-	parser.ib->length_dw = ib_chunk->length_dw;
+-	r = radeon_cs_parse(&parser);
+-	if (r || parser.parser_error) {
+-		DRM_ERROR("Invalid command stream !\n");
+-		radeon_cs_parser_fini(&parser, r);
+-		radeon_mutex_unlock(&rdev->cs_mutex);
+-		return r;
+-	}
+-	r = radeon_cs_finish_pages(&parser);
++	r = radeon_cs_ib_chunk(rdev, &parser);
+ 	if (r) {
+-		DRM_ERROR("Invalid command stream !\n");
+-		radeon_cs_parser_fini(&parser, r);
+-		radeon_mutex_unlock(&rdev->cs_mutex);
+-		return r;
++		goto out;
+ 	}
+-	r = radeon_ib_schedule(rdev, parser.ib);
++	r = radeon_cs_ib_vm_chunk(rdev, &parser);
+ 	if (r) {
+-		DRM_ERROR("Failed to schedule IB !\n");
++		goto out;
+ 	}
++out:
+ 	radeon_cs_parser_fini(&parser, r);
+ 	radeon_mutex_unlock(&rdev->cs_mutex);
+ 	return r;
+diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
+index 79b08b4..0afb13b 100644
+--- a/drivers/gpu/drm/radeon/radeon_device.c
++++ b/drivers/gpu/drm/radeon/radeon_device.c
+@@ -735,6 +735,10 @@ int radeon_device_init(struct radeon_device *rdev,
+ 	init_waitqueue_head(&rdev->irq.vblank_queue);
+ 	init_waitqueue_head(&rdev->irq.idle_queue);
+ 	INIT_LIST_HEAD(&rdev->semaphore_drv.bo);
++	/* initialize vm here */
++	rdev->vm_manager.use_bitmap = 1;
++	rdev->vm_manager.max_pfn = 1 << 20;
++	INIT_LIST_HEAD(&rdev->vm_manager.lru_vm);
+ 
+ 	/* Set asic functions */
+ 	r = radeon_asic_init(rdev);
+diff --git a/drivers/gpu/drm/radeon/radeon_drv.c b/drivers/gpu/drm/radeon/radeon_drv.c
+index c3ef1d2..31da622 100644
+--- a/drivers/gpu/drm/radeon/radeon_drv.c
++++ b/drivers/gpu/drm/radeon/radeon_drv.c
+@@ -54,9 +54,10 @@
+  *   2.10.0 - fusion 2D tiling
+  *   2.11.0 - backend map, initial compute support for the CS checker
+  *   2.12.0 - RADEON_CS_KEEP_TILING_FLAGS
++ *   2.13.0 - virtual memory support
+  */
+ #define KMS_DRIVER_MAJOR	2
+-#define KMS_DRIVER_MINOR	12
++#define KMS_DRIVER_MINOR	13
+ #define KMS_DRIVER_PATCHLEVEL	0
+ int radeon_driver_load_kms(struct drm_device *dev, unsigned long flags);
+ int radeon_driver_unload_kms(struct drm_device *dev);
+@@ -84,6 +85,10 @@ int radeon_dma_ioctl_kms(struct drm_device *dev, void *data,
+ 			 struct drm_file *file_priv);
+ int radeon_gem_object_init(struct drm_gem_object *obj);
+ void radeon_gem_object_free(struct drm_gem_object *obj);
++int radeon_gem_object_open(struct drm_gem_object *obj,
++				struct drm_file *file_priv);
++void radeon_gem_object_close(struct drm_gem_object *obj,
++				struct drm_file *file_priv);
+ extern int radeon_get_crtc_scanoutpos(struct drm_device *dev, int crtc,
+ 				      int *vpos, int *hpos);
+ extern struct drm_ioctl_desc radeon_ioctls_kms[];
+@@ -350,6 +355,8 @@ static struct drm_driver kms_driver = {
+ 	.ioctls = radeon_ioctls_kms,
+ 	.gem_init_object = radeon_gem_object_init,
+ 	.gem_free_object = radeon_gem_object_free,
++	.gem_open_object = radeon_gem_object_open,
++	.gem_close_object = radeon_gem_object_close,
+ 	.dma_ioctl = radeon_dma_ioctl_kms,
+ 	.dumb_create = radeon_mode_dumb_create,
+ 	.dumb_map_offset = radeon_mode_dumb_mmap,
+diff --git a/drivers/gpu/drm/radeon/radeon_gart.c b/drivers/gpu/drm/radeon/radeon_gart.c
+index a4d9816..3ef58ca 100644
+--- a/drivers/gpu/drm/radeon/radeon_gart.c
++++ b/drivers/gpu/drm/radeon/radeon_gart.c
+@@ -276,3 +276,391 @@ void radeon_gart_fini(struct radeon_device *rdev)
+ 
+ 	radeon_dummy_page_fini(rdev);
+ }
++
++/*
++ * vm helpers
++ *
++ * TODO bind a default page at vm initialization for default address
++ */
++int radeon_vm_manager_init(struct radeon_device *rdev)
++{
++	int r;
++
++	/* mark first vm as always in use, it's the system one */
++	r = radeon_sa_bo_manager_init(rdev, &rdev->vm_manager.sa_manager,
++				      rdev->vm_manager.max_pfn * 8,
++				      RADEON_GEM_DOMAIN_VRAM);
++	if (r) {
++		dev_err(rdev->dev, "failed to allocate vm bo (%dKB)\n",
++			(rdev->vm_manager.max_pfn * 8) >> 10);
++		return r;
++	}
++	return rdev->vm_manager.funcs->init(rdev);
++}
++
++/* cs mutex must be lock */
++static void radeon_vm_unbind_locked(struct radeon_device *rdev,
++				    struct radeon_vm *vm)
++{
++	struct radeon_bo_va *bo_va;
++
++	if (vm->id == -1) {
++		return;
++	}
++
++	/* wait for vm use to end */
++	if (vm->fence) {
++		radeon_fence_wait(vm->fence, false);
++		radeon_fence_unref(&vm->fence);
++	}
++
++	/* hw unbind */
++	rdev->vm_manager.funcs->unbind(rdev, vm);
++	rdev->vm_manager.use_bitmap &= ~(1 << vm->id);
++	list_del_init(&vm->list);
++	vm->id = -1;
++	radeon_sa_bo_free(rdev, &vm->sa_bo);
++	vm->pt = NULL;
++
++	list_for_each_entry(bo_va, &vm->va, vm_list) {
++		bo_va->valid = false;
++	}
++}
++
++void radeon_vm_manager_fini(struct radeon_device *rdev)
++{
++	if (rdev->vm_manager.sa_manager.bo == NULL)
++		return;
++	radeon_vm_manager_suspend(rdev);
++	rdev->vm_manager.funcs->fini(rdev);
++	radeon_sa_bo_manager_fini(rdev, &rdev->vm_manager.sa_manager);
++}
++
++int radeon_vm_manager_start(struct radeon_device *rdev)
++{
++	if (rdev->vm_manager.sa_manager.bo == NULL) {
++		return -EINVAL;
++	}
++	return radeon_sa_bo_manager_start(rdev, &rdev->vm_manager.sa_manager);
++}
++
++int radeon_vm_manager_suspend(struct radeon_device *rdev)
++{
++	struct radeon_vm *vm, *tmp;
++
++	radeon_mutex_lock(&rdev->cs_mutex);
++	/* unbind all active vm */
++	list_for_each_entry_safe(vm, tmp, &rdev->vm_manager.lru_vm, list) {
++		radeon_vm_unbind_locked(rdev, vm);
++	}
++	rdev->vm_manager.funcs->fini(rdev);
++	radeon_mutex_unlock(&rdev->cs_mutex);
++	return radeon_sa_bo_manager_suspend(rdev, &rdev->vm_manager.sa_manager);
++}
++
++/* cs mutex must be lock */
++void radeon_vm_unbind(struct radeon_device *rdev, struct radeon_vm *vm)
++{
++	mutex_lock(&vm->mutex);
++	radeon_vm_unbind_locked(rdev, vm);
++	mutex_unlock(&vm->mutex);
++}
++
++/* cs mutex must be lock & vm mutex must be lock */
++int radeon_vm_bind(struct radeon_device *rdev, struct radeon_vm *vm)
++{
++	struct radeon_vm *vm_evict;
++	unsigned i;
++	int id = -1, r;
++
++	if (vm == NULL) {
++		return -EINVAL;
++	}
++
++	if (vm->id != -1) {
++		/* update lru */
++		list_del_init(&vm->list);
++		list_add_tail(&vm->list, &rdev->vm_manager.lru_vm);
++		return 0;
++	}
++
++retry:
++	r = radeon_sa_bo_new(rdev, &rdev->vm_manager.sa_manager, &vm->sa_bo,
++			     RADEON_GPU_PAGE_ALIGN(vm->last_pfn * 8),
++			     RADEON_GPU_PAGE_SIZE);
++	if (r) {
++		if (list_empty(&rdev->vm_manager.lru_vm)) {
++			return r;
++		}
++		vm_evict = list_first_entry(&rdev->vm_manager.lru_vm, struct radeon_vm, list);
++		radeon_vm_unbind(rdev, vm_evict);
++		goto retry;
++	}
++	vm->pt = rdev->vm_manager.sa_manager.cpu_ptr;
++	vm->pt += (vm->sa_bo.offset >> 3);
++	vm->pt_gpu_addr = rdev->vm_manager.sa_manager.gpu_addr;
++	vm->pt_gpu_addr += vm->sa_bo.offset;
++	memset(vm->pt, 0, RADEON_GPU_PAGE_ALIGN(vm->last_pfn * 8));
++
++retry_id:
++	/* search for free vm */
++	for (i = 0; i < rdev->vm_manager.nvm; i++) {
++		if (!(rdev->vm_manager.use_bitmap & (1 << i))) {
++			id = i;
++			break;
++		}
++	}
++	/* evict vm if necessary */
++	if (id == -1) {
++		vm_evict = list_first_entry(&rdev->vm_manager.lru_vm, struct radeon_vm, list);
++		radeon_vm_unbind(rdev, vm_evict);
++		goto retry_id;
++	}
++
++	/* do hw bind */
++	r = rdev->vm_manager.funcs->bind(rdev, vm, id);
++	if (r) {
++		radeon_sa_bo_free(rdev, &vm->sa_bo);
++		return r;
++	}
++	rdev->vm_manager.use_bitmap |= 1 << id;
++	vm->id = id;
++	list_add_tail(&vm->list, &rdev->vm_manager.lru_vm);
++	return radeon_vm_bo_update_pte(rdev, vm, rdev->ib_pool.sa_manager.bo,
++				       &rdev->ib_pool.sa_manager.bo->tbo.mem);
++}
++
++/* object have to be reserved */
++int radeon_vm_bo_add(struct radeon_device *rdev,
++		     struct radeon_vm *vm,
++		     struct radeon_bo *bo,
++		     uint64_t offset,
++		     uint32_t flags)
++{
++	struct radeon_bo_va *bo_va, *tmp;
++	struct list_head *head;
++	uint64_t size = radeon_bo_size(bo), last_offset = 0;
++	unsigned last_pfn;
++
++	bo_va = kzalloc(sizeof(struct radeon_bo_va), GFP_KERNEL);
++	if (bo_va == NULL) {
++		return -ENOMEM;
++	}
++	bo_va->vm = vm;
++	bo_va->bo = bo;
++	bo_va->soffset = offset;
++	bo_va->eoffset = offset + size;
++	bo_va->flags = flags;
++	bo_va->valid = false;
++	INIT_LIST_HEAD(&bo_va->bo_list);
++	INIT_LIST_HEAD(&bo_va->vm_list);
++	/* make sure object fit at this offset */
++	if (bo_va->soffset >= bo_va->eoffset) {
++		kfree(bo_va);
++		return -EINVAL;
++	}
++
++	last_pfn = bo_va->eoffset / RADEON_GPU_PAGE_SIZE;
++	if (last_pfn > rdev->vm_manager.max_pfn) {
++		kfree(bo_va);
++		dev_err(rdev->dev, "va above limit (0x%08X > 0x%08X)\n",
++			last_pfn, rdev->vm_manager.max_pfn);
++		return -EINVAL;
++	}
++
++	mutex_lock(&vm->mutex);
++	if (last_pfn > vm->last_pfn) {
++		/* grow va space 32M by 32M */
++		unsigned align = ((32 << 20) >> 12) - 1;
++		radeon_mutex_lock(&rdev->cs_mutex);
++		radeon_vm_unbind_locked(rdev, vm);
++		radeon_mutex_unlock(&rdev->cs_mutex);
++		vm->last_pfn = (last_pfn + align) & ~align;
++	}
++	head = &vm->va;
++	last_offset = 0;
++	list_for_each_entry(tmp, &vm->va, vm_list) {
++		if (bo_va->soffset >= last_offset && bo_va->eoffset < tmp->soffset) {
++			/* bo can be added before this one */
++			break;
++		}
++		if (bo_va->soffset >= tmp->soffset && bo_va->soffset < tmp->eoffset) {
++			/* bo and tmp overlap, invalid offset */
++			kfree(bo_va);
++			dev_err(rdev->dev, "bo %p va 0x%08X conflict with (bo %p 0x%08X 0x%08X)\n",
++				bo, (unsigned)bo_va->soffset, tmp->bo,
++				(unsigned)tmp->soffset, (unsigned)tmp->eoffset);
++			mutex_unlock(&vm->mutex);
++			return -EINVAL;
++		}
++		last_offset = tmp->eoffset;
++		head = &tmp->vm_list;
++	}
++	list_add(&bo_va->vm_list, head);
++	list_add_tail(&bo_va->bo_list, &bo->va);
++	mutex_unlock(&vm->mutex);
++	return 0;
++}
++
++static u64 radeon_vm_get_addr(struct radeon_device *rdev,
++			      struct ttm_mem_reg *mem,
++			      unsigned pfn)
++{
++	u64 addr = 0;
++
++	switch (mem->mem_type) {
++	case TTM_PL_VRAM:
++		addr = (mem->start << PAGE_SHIFT);
++		addr += pfn * RADEON_GPU_PAGE_SIZE;
++		addr += rdev->vm_manager.vram_base_offset;
++		break;
++	case TTM_PL_TT:
++		/* offset inside page table */
++		addr = mem->start << PAGE_SHIFT;
++		addr += pfn * RADEON_GPU_PAGE_SIZE;
++		addr = addr >> PAGE_SHIFT;
++		/* page table offset */
++		addr = rdev->gart.pages_addr[addr];
++		/* in case cpu page size != gpu page size*/
++		addr += (pfn * RADEON_GPU_PAGE_SIZE) & (~PAGE_MASK);
++		break;
++	default:
++		break;
++	}
++	return addr;
++}
++
++/* object have to be reserved & cs mutex took & vm mutex took */
++int radeon_vm_bo_update_pte(struct radeon_device *rdev,
++			    struct radeon_vm *vm,
++			    struct radeon_bo *bo,
++			    struct ttm_mem_reg *mem)
++{
++	struct radeon_bo_va *bo_va;
++	unsigned ngpu_pages, i;
++	uint64_t addr = 0, pfn;
++	uint32_t flags;
++
++	/* nothing to do if vm isn't bound */
++	if (vm->id == -1)
++		return 0;;
++
++	bo_va = radeon_bo_va(bo, vm);
++	if (bo_va == NULL) {
++		dev_err(rdev->dev, "bo %p not in vm %p\n", bo, vm);
++		return -EINVAL;
++	}
++
++	if (bo_va->valid)
++		return 0;
++
++	ngpu_pages = radeon_bo_ngpu_pages(bo);
++	bo_va->flags &= ~RADEON_VM_PAGE_VALID;
++	bo_va->flags &= ~RADEON_VM_PAGE_SYSTEM;
++	if (mem) {
++		if (mem->mem_type != TTM_PL_SYSTEM) {
++			bo_va->flags |= RADEON_VM_PAGE_VALID;
++			bo_va->valid = true;
++		}
++		if (mem->mem_type == TTM_PL_TT) {
++			bo_va->flags |= RADEON_VM_PAGE_SYSTEM;
++		}
++	}
++	pfn = bo_va->soffset / RADEON_GPU_PAGE_SIZE;
++	flags = rdev->vm_manager.funcs->page_flags(rdev, bo_va->vm, bo_va->flags);
++	for (i = 0, addr = 0; i < ngpu_pages; i++) {
++		if (mem && bo_va->valid) {
++			addr = radeon_vm_get_addr(rdev, mem, i);
++		}
++		rdev->vm_manager.funcs->set_page(rdev, bo_va->vm, i + pfn, addr, flags);
++	}
++	rdev->vm_manager.funcs->tlb_flush(rdev, bo_va->vm);
++	return 0;
++}
++
++/* object have to be reserved */
++int radeon_vm_bo_rmv(struct radeon_device *rdev,
++		     struct radeon_vm *vm,
++		     struct radeon_bo *bo)
++{
++	struct radeon_bo_va *bo_va;
++
++	bo_va = radeon_bo_va(bo, vm);
++	if (bo_va == NULL)
++		return 0;
++
++	list_del(&bo_va->bo_list);
++	mutex_lock(&vm->mutex);
++	radeon_mutex_lock(&rdev->cs_mutex);
++	radeon_vm_bo_update_pte(rdev, vm, bo, NULL);
++	radeon_mutex_unlock(&rdev->cs_mutex);
++	list_del(&bo_va->vm_list);
++	mutex_lock(&vm->mutex);
++
++	kfree(bo_va);
++	return 0;
++}
++
++void radeon_vm_bo_invalidate(struct radeon_device *rdev,
++			     struct radeon_bo *bo)
++{
++	struct radeon_bo_va *bo_va;
++
++	BUG_ON(!atomic_read(&bo->tbo.reserved));
++	list_for_each_entry(bo_va, &bo->va, bo_list) {
++		bo_va->valid = false;
++	}
++}
++
++int radeon_vm_init(struct radeon_device *rdev, struct radeon_vm *vm)
++{
++	int r;
++
++	vm->id = -1;
++	vm->fence = NULL;
++	mutex_init(&vm->mutex);
++	INIT_LIST_HEAD(&vm->list);
++	INIT_LIST_HEAD(&vm->va);
++	vm->last_pfn = 0;
++	/* map the ib pool buffer at 0 in virtual address space, set
++	 * read only
++	 */
++	r = radeon_vm_bo_add(rdev, vm, rdev->ib_pool.sa_manager.bo, 0,
++			     RADEON_VM_PAGE_READABLE | RADEON_VM_PAGE_SNOOPED);
++	return r;
++}
++
++void radeon_vm_fini(struct radeon_device *rdev, struct radeon_vm *vm)
++{
++	struct radeon_bo_va *bo_va, *tmp;
++	int r;
++
++	mutex_lock(&vm->mutex);
++
++	radeon_mutex_lock(&rdev->cs_mutex);
++	radeon_vm_unbind_locked(rdev, vm);
++	radeon_mutex_unlock(&rdev->cs_mutex);
++
++	/* remove all bo */
++	r = radeon_bo_reserve(rdev->ib_pool.sa_manager.bo, false);
++	if (!r) {
++		bo_va = radeon_bo_va(rdev->ib_pool.sa_manager.bo, vm);
++		list_del_init(&bo_va->bo_list);
++		list_del_init(&bo_va->vm_list);
++		radeon_bo_unreserve(rdev->ib_pool.sa_manager.bo);
++		kfree(bo_va);
++	}
++	if (!list_empty(&vm->va)) {
++		dev_err(rdev->dev, "still active bo inside vm\n");
++	}
++	list_for_each_entry_safe(bo_va, tmp, &vm->va, vm_list) {
++		list_del_init(&bo_va->vm_list);
++		r = radeon_bo_reserve(bo_va->bo, false);
++		if (!r) {
++			list_del_init(&bo_va->bo_list);
++			radeon_bo_unreserve(bo_va->bo);
++			kfree(bo_va);
++		}
++	}
++	mutex_unlock(&vm->mutex);
++}
+diff --git a/drivers/gpu/drm/radeon/radeon_gem.c b/drivers/gpu/drm/radeon/radeon_gem.c
+index ae32197..003eeec 100644
+--- a/drivers/gpu/drm/radeon/radeon_gem.c
++++ b/drivers/gpu/drm/radeon/radeon_gem.c
+@@ -142,6 +142,44 @@ void radeon_gem_fini(struct radeon_device *rdev)
+ 	radeon_bo_force_delete(rdev);
+ }
+ 
++/*
++ * Call from drm_gem_handle_create which appear in both new and open ioctl
++ * case.
++ */
++int radeon_gem_object_open(struct drm_gem_object *obj, struct drm_file *file_priv)
++{
++	return 0;
++}
++
++void radeon_gem_object_close(struct drm_gem_object *obj,
++			     struct drm_file *file_priv)
++{
++	struct radeon_bo *rbo = gem_to_radeon_bo(obj);
++	struct radeon_device *rdev = rbo->rdev;
++	struct radeon_fpriv *fpriv = file_priv->driver_priv;
++	struct radeon_vm *vm = &fpriv->vm;
++	struct radeon_bo_va *bo_va, *tmp;
++
++	if (rdev->family < CHIP_CAYMAN) {
++		return;
++	}
++
++	if (radeon_bo_reserve(rbo, false)) {
++		return;
++	}
++	list_for_each_entry_safe(bo_va, tmp, &rbo->va, bo_list) {
++		if (bo_va->vm == vm) {
++			/* remove from this vm address space */
++			mutex_lock(&vm->mutex);
++			list_del(&bo_va->vm_list);
++			mutex_unlock(&vm->mutex);
++			list_del(&bo_va->bo_list);
++			kfree(bo_va);
++		}
++	}
++	radeon_bo_unreserve(rbo);
++}
++
+ 
+ /*
+  * GEM ioctls.
+@@ -354,6 +392,104 @@ out:
+ 	return r;
+ }
+ 
++int radeon_gem_va_ioctl(struct drm_device *dev, void *data,
++			  struct drm_file *filp)
++{
++	struct drm_radeon_gem_va *args = data;
++	struct drm_gem_object *gobj;
++	struct radeon_device *rdev = dev->dev_private;
++	struct radeon_fpriv *fpriv = filp->driver_priv;
++	struct radeon_bo *rbo;
++	struct radeon_bo_va *bo_va;
++	u32 invalid_flags;
++	int r = 0;
++
++	/* !! DONT REMOVE !!
++	 * We don't support vm_id yet, to be sure we don't have have broken
++	 * userspace, reject anyone trying to use non 0 value thus moving
++	 * forward we can use those fields without breaking existant userspace
++	 */
++	if (args->vm_id) {
++		args->operation = RADEON_VA_RESULT_ERROR;
++		return -EINVAL;
++	}
++
++	if (args->offset < RADEON_VA_RESERVED_SIZE) {
++		dev_err(&dev->pdev->dev,
++			"offset 0x%lX is in reserved area 0x%X\n",
++			(unsigned long)args->offset,
++			RADEON_VA_RESERVED_SIZE);
++		args->operation = RADEON_VA_RESULT_ERROR;
++		return -EINVAL;
++	}
++
++	/* don't remove, we need to enforce userspace to set the snooped flag
++	 * otherwise we will endup with broken userspace and we won't be able
++	 * to enable this feature without adding new interface
++	 */
++	invalid_flags = RADEON_VM_PAGE_VALID | RADEON_VM_PAGE_SYSTEM;
++	if ((args->flags & invalid_flags)) {
++		dev_err(&dev->pdev->dev, "invalid flags 0x%08X vs 0x%08X\n",
++			args->flags, invalid_flags);
++		args->operation = RADEON_VA_RESULT_ERROR;
++		return -EINVAL;
++	}
++	if (!(args->flags & RADEON_VM_PAGE_SNOOPED)) {
++		dev_err(&dev->pdev->dev, "only supported snooped mapping for now\n");
++		args->operation = RADEON_VA_RESULT_ERROR;
++		return -EINVAL;
++	}
++
++	switch (args->operation) {
++	case RADEON_VA_MAP:
++	case RADEON_VA_UNMAP:
++		break;
++	default:
++		dev_err(&dev->pdev->dev, "unsupported operation %d\n",
++			args->operation);
++		args->operation = RADEON_VA_RESULT_ERROR;
++		return -EINVAL;
++	}
++
++	gobj = drm_gem_object_lookup(dev, filp, args->handle);
++	if (gobj == NULL) {
++		args->operation = RADEON_VA_RESULT_ERROR;
++		return -ENOENT;
++	}
++	rbo = gem_to_radeon_bo(gobj);
++	r = radeon_bo_reserve(rbo, false);
++	if (r) {
++		args->operation = RADEON_VA_RESULT_ERROR;
++		drm_gem_object_unreference_unlocked(gobj);
++		return r;
++	}
++	switch (args->operation) {
++	case RADEON_VA_MAP:
++		bo_va = radeon_bo_va(rbo, &fpriv->vm);
++		if (bo_va) {
++			args->operation = RADEON_VA_RESULT_VA_EXIST;
++			args->offset = bo_va->soffset;
++			goto out;
++		}
++		r = radeon_vm_bo_add(rdev, &fpriv->vm, rbo,
++				     args->offset, args->flags);
++		break;
++	case RADEON_VA_UNMAP:
++		r = radeon_vm_bo_rmv(rdev, &fpriv->vm, rbo);
++		break;
++	default:
++		break;
++	}
++	args->operation = RADEON_VA_RESULT_OK;
++	if (r) {
++		args->operation = RADEON_VA_RESULT_ERROR;
++	}
++out:
++	radeon_bo_unreserve(rbo);
++	drm_gem_object_unreference_unlocked(gobj);
++	return r;
++}
++
+ int radeon_mode_dumb_create(struct drm_file *file_priv,
+ 			    struct drm_device *dev,
+ 			    struct drm_mode_create_dumb *args)
+diff --git a/drivers/gpu/drm/radeon/radeon_kms.c b/drivers/gpu/drm/radeon/radeon_kms.c
+index be2c122..d335288 100644
+--- a/drivers/gpu/drm/radeon/radeon_kms.c
++++ b/drivers/gpu/drm/radeon/radeon_kms.c
+@@ -250,6 +250,18 @@ int radeon_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 			return -EINVAL;
+ 		}
+ 		break;
++	case RADEON_INFO_VA_START:
++		/* this is where we report if vm is supported or not */
++		if (rdev->family < CHIP_CAYMAN)
++			return -EINVAL;
++		value = RADEON_VA_RESERVED_SIZE;
++		break;
++	case RADEON_INFO_IB_VM_MAX_SIZE:
++		/* this is where we report if vm is supported or not */
++		if (rdev->family < CHIP_CAYMAN)
++			return -EINVAL;
++		value = RADEON_IB_VM_MAX_SIZE;
++		break;
+ 	default:
+ 		DRM_DEBUG_KMS("Invalid request %d\n", info->request);
+ 		return -EINVAL;
+@@ -270,7 +282,6 @@ int radeon_driver_firstopen_kms(struct drm_device *dev)
+ 	return 0;
+ }
+ 
+-
+ void radeon_driver_lastclose_kms(struct drm_device *dev)
+ {
+ 	vga_switcheroo_process_delayed_switch();
+@@ -278,12 +289,45 @@ void radeon_driver_lastclose_kms(struct drm_device *dev)
+ 
+ int radeon_driver_open_kms(struct drm_device *dev, struct drm_file *file_priv)
+ {
++	struct radeon_device *rdev = dev->dev_private;
++
++	file_priv->driver_priv = NULL;
++
++	/* new gpu have virtual address space support */
++	if (rdev->family >= CHIP_CAYMAN) {
++		struct radeon_fpriv *fpriv;
++		int r;
++
++		fpriv = kzalloc(sizeof(*fpriv), GFP_KERNEL);
++		if (unlikely(!fpriv)) {
++			return -ENOMEM;
++		}
++
++		r = radeon_vm_init(rdev, &fpriv->vm);
++		if (r) {
++			radeon_vm_fini(rdev, &fpriv->vm);
++			kfree(fpriv);
++			return r;
++		}
++
++		file_priv->driver_priv = fpriv;
++	}
+ 	return 0;
+ }
+ 
+ void radeon_driver_postclose_kms(struct drm_device *dev,
+ 				 struct drm_file *file_priv)
+ {
++	struct radeon_device *rdev = dev->dev_private;
++
++	/* new gpu have virtual address space support */
++	if (rdev->family >= CHIP_CAYMAN && file_priv->driver_priv) {
++		struct radeon_fpriv *fpriv = file_priv->driver_priv;
++
++		radeon_vm_fini(rdev, &fpriv->vm);
++		kfree(fpriv);
++		file_priv->driver_priv = NULL;
++	}
+ }
+ 
+ void radeon_driver_preclose_kms(struct drm_device *dev,
+@@ -451,5 +495,6 @@ struct drm_ioctl_desc radeon_ioctls_kms[] = {
+ 	DRM_IOCTL_DEF_DRV(RADEON_GEM_SET_TILING, radeon_gem_set_tiling_ioctl, DRM_AUTH|DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF_DRV(RADEON_GEM_GET_TILING, radeon_gem_get_tiling_ioctl, DRM_AUTH|DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF_DRV(RADEON_GEM_BUSY, radeon_gem_busy_ioctl, DRM_AUTH|DRM_UNLOCKED),
++	DRM_IOCTL_DEF_DRV(RADEON_GEM_VA, radeon_gem_va_ioctl, DRM_AUTH|DRM_UNLOCKED),
+ };
+ int radeon_max_kms_ioctl = DRM_ARRAY_SIZE(radeon_ioctls_kms);
+diff --git a/drivers/gpu/drm/radeon/radeon_object.c b/drivers/gpu/drm/radeon/radeon_object.c
+index 695b480..d45df17 100644
+--- a/drivers/gpu/drm/radeon/radeon_object.c
++++ b/drivers/gpu/drm/radeon/radeon_object.c
+@@ -46,6 +46,20 @@ static void radeon_bo_clear_surface_reg(struct radeon_bo *bo);
+  * function are calling it.
+  */
+ 
++void radeon_bo_clear_va(struct radeon_bo *bo)
++{
++	struct radeon_bo_va *bo_va, *tmp;
++
++	list_for_each_entry_safe(bo_va, tmp, &bo->va, bo_list) {
++		/* remove from all vm address space */
++		mutex_lock(&bo_va->vm->mutex);
++		list_del(&bo_va->vm_list);
++		mutex_unlock(&bo_va->vm->mutex);
++		list_del(&bo_va->bo_list);
++		kfree(bo_va);
++	}
++}
++
+ static void radeon_ttm_bo_destroy(struct ttm_buffer_object *tbo)
+ {
+ 	struct radeon_bo *bo;
+@@ -55,6 +69,7 @@ static void radeon_ttm_bo_destroy(struct ttm_buffer_object *tbo)
+ 	list_del_init(&bo->list);
+ 	mutex_unlock(&bo->rdev->gem.mutex);
+ 	radeon_bo_clear_surface_reg(bo);
++	radeon_bo_clear_va(bo);
+ 	drm_gem_object_release(&bo->gem_base);
+ 	kfree(bo);
+ }
+@@ -134,6 +149,7 @@ retry:
+ 	bo->gem_base.driver_private = NULL;
+ 	bo->surface_reg = -1;
+ 	INIT_LIST_HEAD(&bo->list);
++	INIT_LIST_HEAD(&bo->va);
+ 	radeon_ttm_placement_from_domain(bo, domain);
+ 	/* Kernel allocation are uninterruptible */
+ 	mutex_lock(&rdev->vram_mutex);
+@@ -487,6 +503,7 @@ void radeon_bo_move_notify(struct ttm_buffer_object *bo,
+ 		return;
+ 	rbo = container_of(bo, struct radeon_bo, tbo);
+ 	radeon_bo_check_tiling(rbo, 0, 1);
++	radeon_vm_bo_invalidate(rbo->rdev, rbo);
+ }
+ 
+ int radeon_bo_fault_reserve_notify(struct ttm_buffer_object *bo)
+@@ -560,3 +577,16 @@ int radeon_bo_reserve(struct radeon_bo *bo, bool no_wait)
+ 	}
+ 	return 0;
+ }
++
++/* object have to be reserved */
++struct radeon_bo_va *radeon_bo_va(struct radeon_bo *rbo, struct radeon_vm *vm)
++{
++	struct radeon_bo_va *bo_va;
++
++	list_for_each_entry(bo_va, &rbo->va, bo_list) {
++		if (bo_va->vm == vm) {
++			return bo_va;
++		}
++	}
++	return NULL;
++}
+diff --git a/drivers/gpu/drm/radeon/radeon_object.h b/drivers/gpu/drm/radeon/radeon_object.h
+index cc236fb..cde4303 100644
+--- a/drivers/gpu/drm/radeon/radeon_object.h
++++ b/drivers/gpu/drm/radeon/radeon_object.h
+@@ -83,6 +83,16 @@ static inline bool radeon_bo_is_reserved(struct radeon_bo *bo)
+ 	return !!atomic_read(&bo->tbo.reserved);
+ }
+ 
++static inline unsigned radeon_bo_ngpu_pages(struct radeon_bo *bo)
++{
++	return (bo->tbo.num_pages << PAGE_SHIFT) / RADEON_GPU_PAGE_SIZE;
++}
++
++static inline unsigned radeon_bo_gpu_page_alignment(struct radeon_bo *bo)
++{
++	return (bo->tbo.mem.page_alignment << PAGE_SHIFT) / RADEON_GPU_PAGE_SIZE;
++}
++
+ /**
+  * radeon_bo_mmap_offset - return mmap offset of bo
+  * @bo:	radeon object for which we query the offset
+@@ -128,6 +138,8 @@ extern void radeon_bo_move_notify(struct ttm_buffer_object *bo,
+ 					struct ttm_mem_reg *mem);
+ extern int radeon_bo_fault_reserve_notify(struct ttm_buffer_object *bo);
+ extern int radeon_bo_get_surface_reg(struct radeon_bo *bo);
++extern struct radeon_bo_va *radeon_bo_va(struct radeon_bo *rbo,
++					 struct radeon_vm *vm);
+ 
+ /*
+  * sub allocation
+diff --git a/drivers/gpu/drm/radeon/radeon_ring.c b/drivers/gpu/drm/radeon/radeon_ring.c
+index 465fb34..e8bc709 100644
+--- a/drivers/gpu/drm/radeon/radeon_ring.c
++++ b/drivers/gpu/drm/radeon/radeon_ring.c
+@@ -132,6 +132,7 @@ retry:
+ 				(*ib)->gpu_addr = rdev->ib_pool.sa_manager.gpu_addr;
+ 				(*ib)->gpu_addr += (*ib)->sa_bo.offset;
+ 				(*ib)->fence = fence;
++				(*ib)->vm_id = 0;
+ 				/* ib are most likely to be allocated in a ring fashion
+ 				 * thus rdev->ib_pool.head_id should be the id of the
+ 				 * oldest ib
+diff --git a/include/drm/radeon_drm.h b/include/drm/radeon_drm.h
+index be94be6..d7079f4 100644
+--- a/include/drm/radeon_drm.h
++++ b/include/drm/radeon_drm.h
+@@ -509,6 +509,7 @@ typedef struct {
+ #define DRM_RADEON_GEM_SET_TILING	0x28
+ #define DRM_RADEON_GEM_GET_TILING	0x29
+ #define DRM_RADEON_GEM_BUSY		0x2a
++#define DRM_RADEON_GEM_VA		0x2b
+ 
+ #define DRM_IOCTL_RADEON_CP_INIT    DRM_IOW( DRM_COMMAND_BASE + DRM_RADEON_CP_INIT, drm_radeon_init_t)
+ #define DRM_IOCTL_RADEON_CP_START   DRM_IO(  DRM_COMMAND_BASE + DRM_RADEON_CP_START)
+@@ -550,6 +551,7 @@ typedef struct {
+ #define DRM_IOCTL_RADEON_GEM_SET_TILING	DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_GEM_SET_TILING, struct drm_radeon_gem_set_tiling)
+ #define DRM_IOCTL_RADEON_GEM_GET_TILING	DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_GEM_GET_TILING, struct drm_radeon_gem_get_tiling)
+ #define DRM_IOCTL_RADEON_GEM_BUSY	DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_GEM_BUSY, struct drm_radeon_gem_busy)
++#define DRM_IOCTL_RADEON_GEM_VA		DRM_IOWR(DRM_COMMAND_BASE + DRM_RADEON_GEM_VA, struct drm_radeon_gem_va)
+ 
+ typedef struct drm_radeon_init {
+ 	enum {
+@@ -872,12 +874,42 @@ struct drm_radeon_gem_pwrite {
+ 	uint64_t data_ptr;
+ };
+ 
++#define RADEON_VA_MAP			1
++#define RADEON_VA_UNMAP			2
++
++#define RADEON_VA_RESULT_OK		0
++#define RADEON_VA_RESULT_ERROR		1
++#define RADEON_VA_RESULT_VA_EXIST	2
++
++#define RADEON_VM_PAGE_VALID		(1 << 0)
++#define RADEON_VM_PAGE_READABLE		(1 << 1)
++#define RADEON_VM_PAGE_WRITEABLE	(1 << 2)
++#define RADEON_VM_PAGE_SYSTEM		(1 << 3)
++#define RADEON_VM_PAGE_SNOOPED		(1 << 4)
++
++struct drm_radeon_gem_va {
++	uint32_t		handle;
++	uint32_t		operation;
++	uint32_t		vm_id;
++	uint32_t		flags;
++	uint64_t		offset;
++};
++
+ #define RADEON_CHUNK_ID_RELOCS	0x01
+ #define RADEON_CHUNK_ID_IB	0x02
+ #define RADEON_CHUNK_ID_FLAGS	0x03
+ 
+ /* The first dword of RADEON_CHUNK_ID_FLAGS is a uint32 of these flags: */
+ #define RADEON_CS_KEEP_TILING_FLAGS 0x01
++#define RADEON_CS_USE_VM            0x02
++/* The second dword of RADEON_CHUNK_ID_FLAGS is a uint32 that sets the ring type */
++#define RADEON_CS_RING_GFX          0
++#define RADEON_CS_RING_COMPUTE      1
++/* The third dword of RADEON_CHUNK_ID_FLAGS is a sint32 that sets the priority */
++/* 0 = normal, + = higher priority, - = lower priority */
++struct drm_radeon_cs_ring_priority {
++	int32_t			priority;
++};
+ 
+ struct drm_radeon_cs_chunk {
+ 	uint32_t		chunk_id;
+@@ -916,6 +948,10 @@ struct drm_radeon_cs {
+ #define RADEON_INFO_NUM_TILE_PIPES	0x0b /* tile pipes for r600+ */
+ #define RADEON_INFO_FUSION_GART_WORKING	0x0c /* fusion writes to GTT were broken before this */
+ #define RADEON_INFO_BACKEND_MAP		0x0d /* pipe to backend map, needed by mesa */
++/* virtual address start, va < start are reserved by the kernel */
++#define RADEON_INFO_VA_START		0x0e
++/* maximum size of ib using the virtual memory cs */
++#define RADEON_INFO_IB_VM_MAX_SIZE	0x0f
+ 
+ struct drm_radeon_info {
+ 	uint32_t		request;
+
