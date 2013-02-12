@@ -1,0 +1,1950 @@
+From 285484e2d55e76031b45926720c10b1aec8b782a Mon Sep 17 00:00:00 2001
+From: Jerome Glisse <jglisse@redhat.com>
+Date: Fri, 16 Dec 2011 17:03:42 -0500
+Subject: drm/radeon: add support for evergreen/ni tiling informations v11
+Git-commit: 285484e2d55e76031b45926720c10b1aec8b782a
+Patch-mainline: v3.4-rc1
+
+evergreen and northern island gpu needs more informations for 2D tiling
+than previous r6xx/r7xx. Add field to tiling ioctl to allow userspace
+to provide those.
+
+The v8 cs checking change to track color view on r6xx/r7xx doesn't
+affect old userspace as old userspace always emited 0 for this register.
+
+v2 fix r6xx/r7xx 2D tiling computation
+v3 fix r6xx/r7xx height align for untiled surface & add support for
+   tile split on evergreen and newer
+v4 improve tiling debugging output
+v5 fix tile split code for evergreen and newer
+v6 set proper tile split for crtc register
+v7 fix tile split limit value
+v8 add COLOR_VIEW checking to r6xx/r7xx checker, add evergreen cs
+   checking, update safe reg for r600, evergreen and cayman.
+   Evergreen checking need some work around for stencil alignment
+   issues
+v9 fix tile split value range, fix compressed texture handling and
+   mipmap calculation, allow evergreen check to be silencious in
+   front of current broken userspace (depth/stencil alignment issue)
+v10 fix eg 3d texture and compressed texture, fix r600 depth array,
+    fix r600 color view computation, add support for evergreen stencil
+    split
+v11 more verbose debugging in some case
+
+Signed-off-by: Jerome Glisse <jglisse@redhat.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/atombios_crtc.c    |   20 +-
+ drivers/gpu/drm/radeon/evergreen.c        |   31 ++
+ drivers/gpu/drm/radeon/evergreen_cs.c     |  777 +++++++++++++++++++++++++++--
+ drivers/gpu/drm/radeon/evergreend.h       |  368 ++++++++++++++
+ drivers/gpu/drm/radeon/r600_cs.c          |  103 +++--
+ drivers/gpu/drm/radeon/r600d.h            |   14 +
+ drivers/gpu/drm/radeon/radeon.h           |   13 +
+ drivers/gpu/drm/radeon/radeon_drv.c       |    3 +-
+ drivers/gpu/drm/radeon/radeon_object.c    |   46 ++
+ drivers/gpu/drm/radeon/reg_srcs/cayman    |    1 -
+ drivers/gpu/drm/radeon/reg_srcs/evergreen |    1 -
+ drivers/gpu/drm/radeon/reg_srcs/r600      |    8 -
+ include/drm/radeon_drm.h                  |   24 +-
+ 13 files changed, 1299 insertions(+), 110 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/atombios_crtc.c b/drivers/gpu/drm/radeon/atombios_crtc.c
+index 742f17f..72672ea 100644
+--- a/drivers/gpu/drm/radeon/atombios_crtc.c
++++ b/drivers/gpu/drm/radeon/atombios_crtc.c
+@@ -1031,6 +1031,7 @@ static int dce4_crtc_do_set_base(struct drm_crtc *crtc,
+ 	struct radeon_bo *rbo;
+ 	uint64_t fb_location;
+ 	uint32_t fb_format, fb_pitch_pixels, tiling_flags;
++	unsigned bankw, bankh, mtaspect, tile_split;
+ 	u32 fb_swap = EVERGREEN_GRPH_ENDIAN_SWAP(EVERGREEN_GRPH_ENDIAN_NONE);
+ 	u32 tmp, viewport_w, viewport_h;
+ 	int r;
+@@ -1121,20 +1122,13 @@ static int dce4_crtc_do_set_base(struct drm_crtc *crtc,
+ 			break;
+ 		}
+ 
+-		switch ((tmp & 0xf000) >> 12) {
+-		case 0: /* 1KB rows */
+-		default:
+-			fb_format |= EVERGREEN_GRPH_TILE_SPLIT(EVERGREEN_ADDR_SURF_TILE_SPLIT_1KB);
+-			break;
+-		case 1: /* 2KB rows */
+-			fb_format |= EVERGREEN_GRPH_TILE_SPLIT(EVERGREEN_ADDR_SURF_TILE_SPLIT_2KB);
+-			break;
+-		case 2: /* 4KB rows */
+-			fb_format |= EVERGREEN_GRPH_TILE_SPLIT(EVERGREEN_ADDR_SURF_TILE_SPLIT_4KB);
+-			break;
+-		}
+-
+ 		fb_format |= EVERGREEN_GRPH_ARRAY_MODE(EVERGREEN_GRPH_ARRAY_2D_TILED_THIN1);
++
++		evergreen_tiling_fields(tiling_flags, &bankw, &bankh, &mtaspect, &tile_split);
++		fb_format |= EVERGREEN_GRPH_TILE_SPLIT(tile_split);
++		fb_format |= EVERGREEN_GRPH_BANK_WIDTH(bankw);
++		fb_format |= EVERGREEN_GRPH_BANK_HEIGHT(bankh);
++		fb_format |= EVERGREEN_GRPH_MACRO_TILE_ASPECT(mtaspect);
+ 	} else if (tiling_flags & RADEON_TILING_MICRO)
+ 		fb_format |= EVERGREEN_GRPH_ARRAY_MODE(EVERGREEN_GRPH_ARRAY_1D_TILED_THIN1);
+ 
+diff --git a/drivers/gpu/drm/radeon/evergreen.c b/drivers/gpu/drm/radeon/evergreen.c
+index ae09fe8..b7a7102 100644
+--- a/drivers/gpu/drm/radeon/evergreen.c
++++ b/drivers/gpu/drm/radeon/evergreen.c
+@@ -43,6 +43,37 @@ void evergreen_pcie_gen2_enable(struct radeon_device *rdev);
+ extern void cayman_cp_int_cntl_setup(struct radeon_device *rdev,
+ 				     int ring, u32 cp_int_cntl);
+ 
++void evergreen_tiling_fields(unsigned tiling_flags, unsigned *bankw,
++			     unsigned *bankh, unsigned *mtaspect,
++			     unsigned *tile_split)
++{
++	*bankw = (tiling_flags >> RADEON_TILING_EG_BANKW_SHIFT) & RADEON_TILING_EG_BANKW_MASK;
++	*bankh = (tiling_flags >> RADEON_TILING_EG_BANKH_SHIFT) & RADEON_TILING_EG_BANKH_MASK;
++	*mtaspect = (tiling_flags >> RADEON_TILING_EG_MACRO_TILE_ASPECT_SHIFT) & RADEON_TILING_EG_MACRO_TILE_ASPECT_MASK;
++	*tile_split = (tiling_flags >> RADEON_TILING_EG_TILE_SPLIT_SHIFT) & RADEON_TILING_EG_TILE_SPLIT_MASK;
++	switch (*bankw) {
++	default:
++	case 1: *bankw = EVERGREEN_ADDR_SURF_BANK_WIDTH_1; break;
++	case 2: *bankw = EVERGREEN_ADDR_SURF_BANK_WIDTH_2; break;
++	case 4: *bankw = EVERGREEN_ADDR_SURF_BANK_WIDTH_4; break;
++	case 8: *bankw = EVERGREEN_ADDR_SURF_BANK_WIDTH_8; break;
++	}
++	switch (*bankh) {
++	default:
++	case 1: *bankh = EVERGREEN_ADDR_SURF_BANK_HEIGHT_1; break;
++	case 2: *bankh = EVERGREEN_ADDR_SURF_BANK_HEIGHT_2; break;
++	case 4: *bankh = EVERGREEN_ADDR_SURF_BANK_HEIGHT_4; break;
++	case 8: *bankh = EVERGREEN_ADDR_SURF_BANK_HEIGHT_8; break;
++	}
++	switch (*mtaspect) {
++	default:
++	case 1: *mtaspect = EVERGREEN_ADDR_SURF_MACRO_TILE_ASPECT_1; break;
++	case 2: *mtaspect = EVERGREEN_ADDR_SURF_MACRO_TILE_ASPECT_2; break;
++	case 4: *mtaspect = EVERGREEN_ADDR_SURF_MACRO_TILE_ASPECT_4; break;
++	case 8: *mtaspect = EVERGREEN_ADDR_SURF_MACRO_TILE_ASPECT_8; break;
++	}
++}
++
+ void evergreen_fix_pci_max_read_req_size(struct radeon_device *rdev)
+ {
+ 	u16 ctl, v;
+diff --git a/drivers/gpu/drm/radeon/evergreen_cs.c b/drivers/gpu/drm/radeon/evergreen_cs.c
+index 4e2cadc..2ed17f7 100644
+--- a/drivers/gpu/drm/radeon/evergreen_cs.c
++++ b/drivers/gpu/drm/radeon/evergreen_cs.c
+@@ -31,6 +31,9 @@
+ #include "evergreen_reg_safe.h"
+ #include "cayman_reg_safe.h"
+ 
++#define MAX(a,b)                   (((a)>(b))?(a):(b))
++#define MIN(a,b)                   (((a)<(b))?(a):(b))
++
+ static int evergreen_cs_packet_next_reloc(struct radeon_cs_parser *p,
+ 					  struct radeon_cs_reloc **cs_reloc);
+ 
+@@ -54,6 +57,7 @@ struct evergreen_cs_track {
+ 	u32			cb_color_dim[12];
+ 	u32			cb_color_pitch[12];
+ 	u32			cb_color_slice[12];
++	u32			cb_color_attrib[12];
+ 	u32			cb_color_cmask_slice[8];
+ 	u32			cb_color_fmask_slice[8];
+ 	u32			cb_target_mask;
+@@ -66,6 +70,7 @@ struct evergreen_cs_track {
+ 	u32			vgt_strmout_size[4];
+ 	u32			db_depth_control;
+ 	u32			db_depth_view;
++	u32			db_depth_slice;
+ 	u32			db_depth_size;
+ 	u32			db_depth_size_idx;
+ 	u32			db_z_info;
+@@ -107,19 +112,6 @@ static u32 evergreen_cs_get_num_banks(u32 nbanks)
+ 	}
+ }
+ 
+-static u32 evergreen_cs_get_tile_split(u32 row_size)
+-{
+-	switch (row_size) {
+-	case 1:
+-	default:
+-		return ADDR_SURF_TILE_SPLIT_1KB;
+-	case 2:
+-		return ADDR_SURF_TILE_SPLIT_2KB;
+-	case 4:
+-		return ADDR_SURF_TILE_SPLIT_4KB;
+-	}
+-}
+-
+ static void evergreen_cs_track_init(struct evergreen_cs_track *track)
+ {
+ 	int i;
+@@ -136,7 +128,7 @@ static void evergreen_cs_track_init(struct evergreen_cs_track *track)
+ 		track->cb_color_bo[i] = NULL;
+ 		track->cb_color_bo_offset[i] = 0xFFFFFFFF;
+ 		track->cb_color_info[i] = 0;
+-		track->cb_color_view[i] = 0;
++		track->cb_color_view[i] = 0xFFFFFFFF;
+ 		track->cb_color_pitch_idx[i] = 0;
+ 		track->cb_color_slice_idx[i] = 0;
+ 		track->cb_color_dim[i] = 0;
+@@ -172,10 +164,639 @@ static void evergreen_cs_track_init(struct evergreen_cs_track *track)
+ 	}
+ }
+ 
++struct eg_surface {
++	/* value gathered from cs */
++	unsigned	nbx;
++	unsigned	nby;
++	unsigned	format;
++	unsigned	mode;
++	unsigned	nbanks;
++	unsigned	bankw;
++	unsigned	bankh;
++	unsigned	tsplit;
++	unsigned	mtilea;
++	unsigned	nsamples;
++	/* output value */
++	unsigned	bpe;
++	unsigned	layer_size;
++	unsigned	palign;
++	unsigned	halign;
++	unsigned long	base_align;
++};
++
++static int evergreen_surface_check_linear(struct radeon_cs_parser *p,
++					  struct eg_surface *surf,
++					  const char *prefix)
++{
++	surf->layer_size = surf->nbx * surf->nby * surf->bpe * surf->nsamples;
++	surf->base_align = surf->bpe;
++	surf->palign = 1;
++	surf->halign = 1;
++	return 0;
++}
++
++static int evergreen_surface_check_linear_aligned(struct radeon_cs_parser *p,
++						  struct eg_surface *surf,
++						  const char *prefix)
++{
++	struct evergreen_cs_track *track = p->track;
++	unsigned palign;
++
++	palign = MAX(64, track->group_size / surf->bpe);
++	surf->layer_size = surf->nbx * surf->nby * surf->bpe * surf->nsamples;
++	surf->base_align = track->group_size;
++	surf->palign = palign;
++	surf->halign = 1;
++	if (surf->nbx & (palign - 1)) {
++		if (prefix) {
++			dev_warn(p->dev, "%s:%d %s pitch %d invalid must be aligned with %d\n",
++				 __func__, __LINE__, prefix, surf->nbx, palign);
++		}
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int evergreen_surface_check_1d(struct radeon_cs_parser *p,
++				      struct eg_surface *surf,
++				      const char *prefix)
++{
++	struct evergreen_cs_track *track = p->track;
++	unsigned palign;
++
++	palign = track->group_size / (8 * surf->bpe * surf->nsamples);
++	palign = MAX(8, palign);
++	surf->layer_size = surf->nbx * surf->nby * surf->bpe;
++	surf->base_align = track->group_size;
++	surf->palign = palign;
++	surf->halign = 8;
++	if ((surf->nbx & (palign - 1))) {
++		if (prefix) {
++			dev_warn(p->dev, "%s:%d %s pitch %d invalid must be aligned with %d (%d %d %d)\n",
++				 __func__, __LINE__, prefix, surf->nbx, palign,
++				 track->group_size, surf->bpe, surf->nsamples);
++		}
++		return -EINVAL;
++	}
++	if ((surf->nby & (8 - 1))) {
++		if (prefix) {
++			dev_warn(p->dev, "%s:%d %s height %d invalid must be aligned with 8\n",
++				 __func__, __LINE__, prefix, surf->nby);
++		}
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int evergreen_surface_check_2d(struct radeon_cs_parser *p,
++				      struct eg_surface *surf,
++				      const char *prefix)
++{
++	struct evergreen_cs_track *track = p->track;
++	unsigned palign, halign, tileb, slice_pt;
++
++	tileb = 64 * surf->bpe * surf->nsamples;
++	palign = track->group_size / (8 * surf->bpe * surf->nsamples);
++	palign = MAX(8, palign);
++	slice_pt = 1;
++	if (tileb > surf->tsplit) {
++		slice_pt = tileb / surf->tsplit;
++	}
++	tileb = tileb / slice_pt;
++	/* macro tile width & height */
++	palign = (8 * surf->bankw * track->npipes) * surf->mtilea;
++	halign = (8 * surf->bankh * surf->nbanks) / surf->mtilea;
++	surf->layer_size = surf->nbx * surf->nby * surf->bpe * slice_pt;
++	surf->base_align = (palign / 8) * (halign / 8) * tileb;
++	surf->palign = palign;
++	surf->halign = halign;
++
++	if ((surf->nbx & (palign - 1))) {
++		if (prefix) {
++			dev_warn(p->dev, "%s:%d %s pitch %d invalid must be aligned with %d\n",
++				 __func__, __LINE__, prefix, surf->nbx, palign);
++		}
++		return -EINVAL;
++	}
++	if ((surf->nby & (halign - 1))) {
++		if (prefix) {
++			dev_warn(p->dev, "%s:%d %s height %d invalid must be aligned with %d\n",
++				 __func__, __LINE__, prefix, surf->nby, halign);
++		}
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int evergreen_surface_check(struct radeon_cs_parser *p,
++				   struct eg_surface *surf,
++				   const char *prefix)
++{
++	/* some common value computed here */
++	surf->bpe = r600_fmt_get_blocksize(surf->format);
++
++	switch (surf->mode) {
++	case ARRAY_LINEAR_GENERAL:
++		return evergreen_surface_check_linear(p, surf, prefix);
++	case ARRAY_LINEAR_ALIGNED:
++		return evergreen_surface_check_linear_aligned(p, surf, prefix);
++	case ARRAY_1D_TILED_THIN1:
++		return evergreen_surface_check_1d(p, surf, prefix);
++	case ARRAY_2D_TILED_THIN1:
++		return evergreen_surface_check_2d(p, surf, prefix);
++	default:
++		dev_warn(p->dev, "%s:%d invalid array mode %d\n",
++				__func__, __LINE__, surf->mode);
++		return -EINVAL;
++	}
++	return -EINVAL;
++}
++
++static int evergreen_surface_value_conv_check(struct radeon_cs_parser *p,
++					      struct eg_surface *surf,
++					      const char *prefix)
++{
++	switch (surf->mode) {
++	case ARRAY_2D_TILED_THIN1:
++		break;
++	case ARRAY_LINEAR_GENERAL:
++	case ARRAY_LINEAR_ALIGNED:
++	case ARRAY_1D_TILED_THIN1:
++		return 0;
++	default:
++		dev_warn(p->dev, "%s:%d invalid array mode %d\n",
++				__func__, __LINE__, surf->mode);
++		return -EINVAL;
++	}
++
++	switch (surf->nbanks) {
++	case 0: surf->nbanks = 2; break;
++	case 1: surf->nbanks = 4; break;
++	case 2: surf->nbanks = 8; break;
++	case 3: surf->nbanks = 16; break;
++	default:
++		dev_warn(p->dev, "%s:%d %s invalid number of banks %d\n",
++			 __func__, __LINE__, prefix, surf->nbanks);
++		return -EINVAL;
++	}
++	switch (surf->bankw) {
++	case 0: surf->bankw = 1; break;
++	case 1: surf->bankw = 2; break;
++	case 2: surf->bankw = 4; break;
++	case 3: surf->bankw = 8; break;
++	default:
++		dev_warn(p->dev, "%s:%d %s invalid bankw %d\n",
++			 __func__, __LINE__, prefix, surf->bankw);
++		return -EINVAL;
++	}
++	switch (surf->bankh) {
++	case 0: surf->bankh = 1; break;
++	case 1: surf->bankh = 2; break;
++	case 2: surf->bankh = 4; break;
++	case 3: surf->bankh = 8; break;
++	default:
++		dev_warn(p->dev, "%s:%d %s invalid bankh %d\n",
++			 __func__, __LINE__, prefix, surf->bankh);
++		return -EINVAL;
++	}
++	switch (surf->mtilea) {
++	case 0: surf->mtilea = 1; break;
++	case 1: surf->mtilea = 2; break;
++	case 2: surf->mtilea = 4; break;
++	case 3: surf->mtilea = 8; break;
++	default:
++		dev_warn(p->dev, "%s:%d %s invalid macro tile aspect %d\n",
++			 __func__, __LINE__, prefix, surf->mtilea);
++		return -EINVAL;
++	}
++	switch (surf->tsplit) {
++	case 0: surf->tsplit = 64; break;
++	case 1: surf->tsplit = 128; break;
++	case 2: surf->tsplit = 256; break;
++	case 3: surf->tsplit = 512; break;
++	case 4: surf->tsplit = 1024; break;
++	case 5: surf->tsplit = 2048; break;
++	case 6: surf->tsplit = 4096; break;
++	default:
++		dev_warn(p->dev, "%s:%d %s invalid tile split %d\n",
++			 __func__, __LINE__, prefix, surf->tsplit);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int evergreen_cs_track_validate_cb(struct radeon_cs_parser *p, unsigned id)
++{
++	struct evergreen_cs_track *track = p->track;
++	struct eg_surface surf;
++	unsigned pitch, slice, mslice;
++	unsigned long offset;
++	int r;
++
++	mslice = G_028C6C_SLICE_MAX(track->cb_color_view[id]) + 1;
++	pitch = track->cb_color_pitch[id];
++	slice = track->cb_color_slice[id];
++	surf.nbx = (pitch + 1) * 8;
++	surf.nby = ((slice + 1) * 64) / surf.nbx;
++	surf.mode = G_028C70_ARRAY_MODE(track->cb_color_info[id]);
++	surf.format = G_028C70_FORMAT(track->cb_color_info[id]);
++	surf.tsplit = G_028C74_TILE_SPLIT(track->cb_color_attrib[id]);
++	surf.nbanks = G_028C74_NUM_BANKS(track->cb_color_attrib[id]);
++	surf.bankw = G_028C74_BANK_WIDTH(track->cb_color_attrib[id]);
++	surf.bankh = G_028C74_BANK_HEIGHT(track->cb_color_attrib[id]);
++	surf.mtilea = G_028C74_MACRO_TILE_ASPECT(track->cb_color_attrib[id]);
++	surf.nsamples = 1;
++
++	if (!r600_fmt_is_valid_color(surf.format)) {
++		dev_warn(p->dev, "%s:%d cb invalid format %d for %d (0x%08x)\n",
++			 __func__, __LINE__, surf.format,
++			id, track->cb_color_info[id]);
++		return -EINVAL;
++	}
++
++	r = evergreen_surface_value_conv_check(p, &surf, "cb");
++	if (r) {
++		return r;
++	}
++
++	r = evergreen_surface_check(p, &surf, "cb");
++	if (r) {
++		dev_warn(p->dev, "%s:%d cb[%d] invalid (0x%08x 0x%08x 0x%08x 0x%08x)\n",
++			 __func__, __LINE__, id, track->cb_color_pitch[id],
++			 track->cb_color_slice[id], track->cb_color_attrib[id],
++			 track->cb_color_info[id]);
++		return r;
++	}
++
++	offset = track->cb_color_bo_offset[id] << 8;
++	if (offset & (surf.base_align - 1)) {
++		dev_warn(p->dev, "%s:%d cb[%d] bo base %ld not aligned with %ld\n",
++			 __func__, __LINE__, id, offset, surf.base_align);
++		return -EINVAL;
++	}
++
++	offset += surf.layer_size * mslice;
++	if (offset > radeon_bo_size(track->cb_color_bo[id])) {
++		dev_warn(p->dev, "%s:%d cb[%d] bo too small (layer size %d, "
++			 "offset %d, max layer %d, bo size %ld, slice %d)\n",
++			 __func__, __LINE__, id, surf.layer_size,
++			track->cb_color_bo_offset[id] << 8, mslice,
++			radeon_bo_size(track->cb_color_bo[id]), slice);
++		dev_warn(p->dev, "%s:%d problematic surf: (%d %d) (%d %d %d %d %d %d %d)\n",
++			 __func__, __LINE__, surf.nbx, surf.nby,
++			surf.mode, surf.bpe, surf.nsamples,
++			surf.bankw, surf.bankh,
++			surf.tsplit, surf.mtilea);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int evergreen_cs_track_validate_stencil(struct radeon_cs_parser *p)
++{
++	struct evergreen_cs_track *track = p->track;
++	struct eg_surface surf;
++	unsigned pitch, slice, mslice;
++	unsigned long offset;
++	int r;
++
++	mslice = G_028008_SLICE_MAX(track->db_depth_view) + 1;
++	pitch = G_028058_PITCH_TILE_MAX(track->db_depth_size);
++	slice = track->db_depth_slice;
++	surf.nbx = (pitch + 1) * 8;
++	surf.nby = ((slice + 1) * 64) / surf.nbx;
++	surf.mode = G_028040_ARRAY_MODE(track->db_z_info);
++	surf.format = G_028044_FORMAT(track->db_s_info);
++	surf.tsplit = G_028044_TILE_SPLIT(track->db_s_info);
++	surf.nbanks = G_028040_NUM_BANKS(track->db_z_info);
++	surf.bankw = G_028040_BANK_WIDTH(track->db_z_info);
++	surf.bankh = G_028040_BANK_HEIGHT(track->db_z_info);
++	surf.mtilea = G_028040_MACRO_TILE_ASPECT(track->db_z_info);
++	surf.nsamples = 1;
++
++	if (surf.format != 1) {
++		dev_warn(p->dev, "%s:%d stencil invalid format %d\n",
++			 __func__, __LINE__, surf.format);
++		return -EINVAL;
++	}
++	/* replace by color format so we can use same code */
++	surf.format = V_028C70_COLOR_8;
++
++	r = evergreen_surface_value_conv_check(p, &surf, "stencil");
++	if (r) {
++		return r;
++	}
++
++	r = evergreen_surface_check(p, &surf, NULL);
++	if (r) {
++		/* old userspace doesn't compute proper depth/stencil alignment
++		 * check that alignment against a bigger byte per elements and
++		 * only report if that alignment is wrong too.
++		 */
++		surf.format = V_028C70_COLOR_8_8_8_8;
++		r = evergreen_surface_check(p, &surf, "stencil");
++		if (r) {
++			dev_warn(p->dev, "%s:%d stencil invalid (0x%08x 0x%08x 0x%08x 0x%08x)\n",
++				 __func__, __LINE__, track->db_depth_size,
++				 track->db_depth_slice, track->db_s_info, track->db_z_info);
++		}
++		return r;
++	}
++
++	offset = track->db_s_read_offset << 8;
++	if (offset & (surf.base_align - 1)) {
++		dev_warn(p->dev, "%s:%d stencil read bo base %ld not aligned with %ld\n",
++			 __func__, __LINE__, offset, surf.base_align);
++		return -EINVAL;
++	}
++	offset += surf.layer_size * mslice;
++	if (offset > radeon_bo_size(track->db_s_read_bo)) {
++		dev_warn(p->dev, "%s:%d stencil read bo too small (layer size %d, "
++			 "offset %ld, max layer %d, bo size %ld)\n",
++			 __func__, __LINE__, surf.layer_size,
++			(unsigned long)track->db_s_read_offset << 8, mslice,
++			radeon_bo_size(track->db_s_read_bo));
++		dev_warn(p->dev, "%s:%d stencil invalid (0x%08x 0x%08x 0x%08x 0x%08x)\n",
++			 __func__, __LINE__, track->db_depth_size,
++			 track->db_depth_slice, track->db_s_info, track->db_z_info);
++		return -EINVAL;
++	}
++
++	offset = track->db_s_write_offset << 8;
++	if (offset & (surf.base_align - 1)) {
++		dev_warn(p->dev, "%s:%d stencil write bo base %ld not aligned with %ld\n",
++			 __func__, __LINE__, offset, surf.base_align);
++		return -EINVAL;
++	}
++	offset += surf.layer_size * mslice;
++	if (offset > radeon_bo_size(track->db_s_write_bo)) {
++		dev_warn(p->dev, "%s:%d stencil write bo too small (layer size %d, "
++			 "offset %ld, max layer %d, bo size %ld)\n",
++			 __func__, __LINE__, surf.layer_size,
++			(unsigned long)track->db_s_write_offset << 8, mslice,
++			radeon_bo_size(track->db_s_write_bo));
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int evergreen_cs_track_validate_depth(struct radeon_cs_parser *p)
++{
++	struct evergreen_cs_track *track = p->track;
++	struct eg_surface surf;
++	unsigned pitch, slice, mslice;
++	unsigned long offset;
++	int r;
++
++	mslice = G_028008_SLICE_MAX(track->db_depth_view) + 1;
++	pitch = G_028058_PITCH_TILE_MAX(track->db_depth_size);
++	slice = track->db_depth_slice;
++	surf.nbx = (pitch + 1) * 8;
++	surf.nby = ((slice + 1) * 64) / surf.nbx;
++	surf.mode = G_028040_ARRAY_MODE(track->db_z_info);
++	surf.format = G_028040_FORMAT(track->db_z_info);
++	surf.tsplit = G_028040_TILE_SPLIT(track->db_z_info);
++	surf.nbanks = G_028040_NUM_BANKS(track->db_z_info);
++	surf.bankw = G_028040_BANK_WIDTH(track->db_z_info);
++	surf.bankh = G_028040_BANK_HEIGHT(track->db_z_info);
++	surf.mtilea = G_028040_MACRO_TILE_ASPECT(track->db_z_info);
++	surf.nsamples = 1;
++
++	switch (surf.format) {
++	case V_028040_Z_16:
++		surf.format = V_028C70_COLOR_16;
++		break;
++	case V_028040_Z_24:
++	case V_028040_Z_32_FLOAT:
++		surf.format = V_028C70_COLOR_8_8_8_8;
++		break;
++	default:
++		dev_warn(p->dev, "%s:%d depth invalid format %d\n",
++			 __func__, __LINE__, surf.format);
++		return -EINVAL;
++	}
++
++	r = evergreen_surface_value_conv_check(p, &surf, "depth");
++	if (r) {
++		dev_warn(p->dev, "%s:%d depth invalid (0x%08x 0x%08x 0x%08x)\n",
++			 __func__, __LINE__, track->db_depth_size,
++			 track->db_depth_slice, track->db_z_info);
++		return r;
++	}
++
++	r = evergreen_surface_check(p, &surf, "depth");
++	if (r) {
++		dev_warn(p->dev, "%s:%d depth invalid (0x%08x 0x%08x 0x%08x)\n",
++			 __func__, __LINE__, track->db_depth_size,
++			 track->db_depth_slice, track->db_z_info);
++		return r;
++	}
++
++	offset = track->db_z_read_offset << 8;
++	if (offset & (surf.base_align - 1)) {
++		dev_warn(p->dev, "%s:%d stencil read bo base %ld not aligned with %ld\n",
++			 __func__, __LINE__, offset, surf.base_align);
++		return -EINVAL;
++	}
++	offset += surf.layer_size * mslice;
++	if (offset > radeon_bo_size(track->db_z_read_bo)) {
++		dev_warn(p->dev, "%s:%d depth read bo too small (layer size %d, "
++			 "offset %ld, max layer %d, bo size %ld)\n",
++			 __func__, __LINE__, surf.layer_size,
++			(unsigned long)track->db_z_read_offset << 8, mslice,
++			radeon_bo_size(track->db_z_read_bo));
++		return -EINVAL;
++	}
++
++	offset = track->db_z_write_offset << 8;
++	if (offset & (surf.base_align - 1)) {
++		dev_warn(p->dev, "%s:%d stencil write bo base %ld not aligned with %ld\n",
++			 __func__, __LINE__, offset, surf.base_align);
++		return -EINVAL;
++	}
++	offset += surf.layer_size * mslice;
++	if (offset > radeon_bo_size(track->db_z_write_bo)) {
++		dev_warn(p->dev, "%s:%d depth write bo too small (layer size %d, "
++			 "offset %ld, max layer %d, bo size %ld)\n",
++			 __func__, __LINE__, surf.layer_size,
++			(unsigned long)track->db_z_write_offset << 8, mslice,
++			radeon_bo_size(track->db_z_write_bo));
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int evergreen_cs_track_validate_texture(struct radeon_cs_parser *p,
++					       struct radeon_bo *texture,
++					       struct radeon_bo *mipmap,
++					       unsigned idx)
++{
++	struct eg_surface surf;
++	unsigned long toffset, moffset;
++	unsigned dim, llevel, mslice, width, height, depth, i;
++	u32 texdw[7];
++	int r;
++
++	texdw[0] = radeon_get_ib_value(p, idx + 0);
++	texdw[1] = radeon_get_ib_value(p, idx + 1);
++	texdw[2] = radeon_get_ib_value(p, idx + 2);
++	texdw[3] = radeon_get_ib_value(p, idx + 3);
++	texdw[4] = radeon_get_ib_value(p, idx + 4);
++	texdw[5] = radeon_get_ib_value(p, idx + 5);
++	texdw[6] = radeon_get_ib_value(p, idx + 6);
++	texdw[7] = radeon_get_ib_value(p, idx + 7);
++	dim = G_030000_DIM(texdw[0]);
++	llevel = G_030014_LAST_LEVEL(texdw[5]);
++	mslice = G_030014_LAST_ARRAY(texdw[5]) + 1;
++	width = G_030000_TEX_WIDTH(texdw[0]) + 1;
++	height =  G_030004_TEX_HEIGHT(texdw[1]) + 1;
++	depth = G_030004_TEX_DEPTH(texdw[1]) + 1;
++	surf.format = G_03001C_DATA_FORMAT(texdw[7]);
++	surf.nbx = (G_030000_PITCH(texdw[0]) + 1) * 8;
++	surf.nbx = r600_fmt_get_nblocksx(surf.format, surf.nbx);
++	surf.nby = r600_fmt_get_nblocksy(surf.format, height);
++	surf.mode = G_030004_ARRAY_MODE(texdw[1]);
++	surf.tsplit = G_030018_TILE_SPLIT(texdw[6]);
++	surf.nbanks = G_03001C_NUM_BANKS(texdw[7]);
++	surf.bankw = G_03001C_BANK_WIDTH(texdw[7]);
++	surf.bankh = G_03001C_BANK_HEIGHT(texdw[7]);
++	surf.mtilea = G_03001C_MACRO_TILE_ASPECT(texdw[7]);
++	surf.nsamples = 1;
++	toffset = texdw[2] << 8;
++	moffset = texdw[3] << 8;
++
++	if (!r600_fmt_is_valid_texture(surf.format, p->family)) {
++		dev_warn(p->dev, "%s:%d texture invalid format %d\n",
++			 __func__, __LINE__, surf.format);
++		return -EINVAL;
++	}
++	switch (dim) {
++	case V_030000_SQ_TEX_DIM_1D:
++	case V_030000_SQ_TEX_DIM_2D:
++	case V_030000_SQ_TEX_DIM_CUBEMAP:
++	case V_030000_SQ_TEX_DIM_1D_ARRAY:
++	case V_030000_SQ_TEX_DIM_2D_ARRAY:
++		depth = 1;
++	case V_030000_SQ_TEX_DIM_3D:
++		break;
++	default:
++		dev_warn(p->dev, "%s:%d texture invalid dimension %d\n",
++			 __func__, __LINE__, dim);
++		return -EINVAL;
++	}
++
++	r = evergreen_surface_value_conv_check(p, &surf, "texture");
++	if (r) {
++		return r;
++	}
++
++	/* align height */
++	evergreen_surface_check(p, &surf, NULL);
++	surf.nby = ALIGN(surf.nby, surf.halign);
++
++	r = evergreen_surface_check(p, &surf, "texture");
++	if (r) {
++		dev_warn(p->dev, "%s:%d texture invalid 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x\n",
++			 __func__, __LINE__, texdw[0], texdw[1], texdw[4],
++			 texdw[5], texdw[6], texdw[7]);
++		return r;
++	}
++
++	/* check texture size */
++	if (toffset & (surf.base_align - 1)) {
++		dev_warn(p->dev, "%s:%d texture bo base %ld not aligned with %ld\n",
++			 __func__, __LINE__, toffset, surf.base_align);
++		return -EINVAL;
++	}
++	if (moffset & (surf.base_align - 1)) {
++		dev_warn(p->dev, "%s:%d mipmap bo base %ld not aligned with %ld\n",
++			 __func__, __LINE__, moffset, surf.base_align);
++		return -EINVAL;
++	}
++	if (dim == SQ_TEX_DIM_3D) {
++		toffset += surf.layer_size * depth;
++	} else {
++		toffset += surf.layer_size * mslice;
++	}
++	if (toffset > radeon_bo_size(texture)) {
++		dev_warn(p->dev, "%s:%d texture bo too small (layer size %d, "
++			 "offset %ld, max layer %d, depth %d, bo size %ld) (%d %d)\n",
++			 __func__, __LINE__, surf.layer_size,
++			(unsigned long)texdw[2] << 8, mslice,
++			depth, radeon_bo_size(texture),
++			surf.nbx, surf.nby);
++		return -EINVAL;
++	}
++
++	/* check mipmap size */
++	for (i = 1; i <= llevel; i++) {
++		unsigned w, h, d;
++
++		w = r600_mip_minify(width, i);
++		h = r600_mip_minify(height, i);
++		d = r600_mip_minify(depth, i);
++		surf.nbx = r600_fmt_get_nblocksx(surf.format, w);
++		surf.nby = r600_fmt_get_nblocksy(surf.format, h);
++
++		switch (surf.mode) {
++		case ARRAY_2D_TILED_THIN1:
++			if (surf.nbx < surf.palign || surf.nby < surf.halign) {
++				surf.mode = ARRAY_1D_TILED_THIN1;
++			}
++			/* recompute alignment */
++			evergreen_surface_check(p, &surf, NULL);
++			break;
++		case ARRAY_LINEAR_GENERAL:
++		case ARRAY_LINEAR_ALIGNED:
++		case ARRAY_1D_TILED_THIN1:
++			break;
++		default:
++			dev_warn(p->dev, "%s:%d invalid array mode %d\n",
++				 __func__, __LINE__, surf.mode);
++			return -EINVAL;
++		}
++		surf.nbx = ALIGN(surf.nbx, surf.palign);
++		surf.nby = ALIGN(surf.nby, surf.halign);
++
++		r = evergreen_surface_check(p, &surf, "mipmap");
++		if (r) {
++			return r;
++		}
++
++		if (dim == SQ_TEX_DIM_3D) {
++			moffset += surf.layer_size * d;
++		} else {
++			moffset += surf.layer_size * mslice;
++		}
++		if (moffset > radeon_bo_size(mipmap)) {
++			dev_warn(p->dev, "%s:%d mipmap [%d] bo too small (layer size %d, "
++					"offset %ld, coffset %ld, max layer %d, depth %d, "
++					"bo size %ld) level0 (%d %d %d)\n",
++					__func__, __LINE__, i, surf.layer_size,
++					(unsigned long)texdw[3] << 8, moffset, mslice,
++					d, radeon_bo_size(mipmap),
++					width, height, depth);
++			dev_warn(p->dev, "%s:%d problematic surf: (%d %d) (%d %d %d %d %d %d %d)\n",
++				 __func__, __LINE__, surf.nbx, surf.nby,
++				surf.mode, surf.bpe, surf.nsamples,
++				surf.bankw, surf.bankh,
++				surf.tsplit, surf.mtilea);
++			return -EINVAL;
++		}
++	}
++
++	return 0;
++}
++
+ static int evergreen_cs_track_check(struct radeon_cs_parser *p)
+ {
+ 	struct evergreen_cs_track *track = p->track;
+-	int i, j;
++	unsigned tmp, i, j;
++	int r;
+ 
+ 	/* check streamout */
+ 	for (i = 0; i < 4; i++) {
+@@ -200,7 +821,38 @@ static int evergreen_cs_track_check(struct radeon_cs_parser *p)
+ 		}
+ 	}
+ 
+-	/* XXX fill in */
++	/* check that we have a cb for each enabled target
++	 */
++	tmp = track->cb_target_mask;
++	for (i = 0; i < 8; i++) {
++		if ((tmp >> (i * 4)) & 0xF) {
++			/* at least one component is enabled */
++			if (track->cb_color_bo[i] == NULL) {
++				dev_warn(p->dev, "%s:%d mask 0x%08X | 0x%08X no cb for %d\n",
++					__func__, __LINE__, track->cb_target_mask, track->cb_shader_mask, i);
++				return -EINVAL;
++			}
++			/* check cb */
++			r = evergreen_cs_track_validate_cb(p, i);
++			if (r) {
++				return r;
++			}
++		}
++	}
++
++	/* Check stencil buffer */
++	if (G_028800_STENCIL_ENABLE(track->db_depth_control)) {
++		r = evergreen_cs_track_validate_stencil(p);
++		if (r)
++			return r;
++	}
++	/* Check depth buffer */
++	if (G_028800_Z_WRITE_ENABLE(track->db_depth_control)) {
++		r = evergreen_cs_track_validate_depth(p);
++		if (r)
++			return r;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -561,8 +1213,16 @@ static int evergreen_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 			ib[idx] |= Z_ARRAY_MODE(evergreen_cs_get_aray_mode(reloc->lobj.tiling_flags));
+ 			track->db_z_info |= Z_ARRAY_MODE(evergreen_cs_get_aray_mode(reloc->lobj.tiling_flags));
+ 			if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
++				unsigned bankw, bankh, mtaspect, tile_split;
++
++				evergreen_tiling_fields(reloc->lobj.tiling_flags,
++							&bankw, &bankh, &mtaspect,
++							&tile_split);
+ 				ib[idx] |= DB_NUM_BANKS(evergreen_cs_get_num_banks(track->nbanks));
+-				ib[idx] |= DB_TILE_SPLIT(evergreen_cs_get_tile_split(track->row_size));
++				ib[idx] |= DB_TILE_SPLIT(tile_split) |
++						DB_BANK_WIDTH(bankw) |
++						DB_BANK_HEIGHT(bankh) |
++						DB_MACRO_TILE_ASPECT(mtaspect);
+ 			}
+ 		}
+ 		break;
+@@ -576,6 +1236,9 @@ static int evergreen_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 		track->db_depth_size = radeon_get_ib_value(p, idx);
+ 		track->db_depth_size_idx = idx;
+ 		break;
++	case R_02805C_DB_DEPTH_SLICE:
++		track->db_depth_slice = radeon_get_ib_value(p, idx);
++		break;
+ 	case DB_Z_READ_BASE:
+ 		r = evergreen_cs_packet_next_reloc(p, &reloc);
+ 		if (r) {
+@@ -786,6 +1449,29 @@ static int evergreen_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 	case CB_COLOR5_ATTRIB:
+ 	case CB_COLOR6_ATTRIB:
+ 	case CB_COLOR7_ATTRIB:
++		r = evergreen_cs_packet_next_reloc(p, &reloc);
++		if (r) {
++			dev_warn(p->dev, "bad SET_CONTEXT_REG "
++					"0x%04X\n", reg);
++			return -EINVAL;
++		}
++		if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS)) {
++			if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
++				unsigned bankw, bankh, mtaspect, tile_split;
++
++				evergreen_tiling_fields(reloc->lobj.tiling_flags,
++							&bankw, &bankh, &mtaspect,
++							&tile_split);
++				ib[idx] |= CB_NUM_BANKS(evergreen_cs_get_num_banks(track->nbanks));
++				ib[idx] |= CB_TILE_SPLIT(tile_split) |
++					   CB_BANK_WIDTH(bankw) |
++					   CB_BANK_HEIGHT(bankh) |
++					   CB_MACRO_TILE_ASPECT(mtaspect);
++			}
++		}
++		tmp = ((reg - CB_COLOR0_ATTRIB) / 0x3c);
++		track->cb_color_attrib[tmp] = ib[idx];
++		break;
+ 	case CB_COLOR8_ATTRIB:
+ 	case CB_COLOR9_ATTRIB:
+ 	case CB_COLOR10_ATTRIB:
+@@ -796,10 +1482,22 @@ static int evergreen_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 					"0x%04X\n", reg);
+ 			return -EINVAL;
+ 		}
+-		if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
+-			ib[idx] |= CB_NUM_BANKS(evergreen_cs_get_num_banks(track->nbanks));
+-			ib[idx] |= CB_TILE_SPLIT(evergreen_cs_get_tile_split(track->row_size));
++		if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS)) {
++			if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
++				unsigned bankw, bankh, mtaspect, tile_split;
++
++				evergreen_tiling_fields(reloc->lobj.tiling_flags,
++							&bankw, &bankh, &mtaspect,
++							&tile_split);
++				ib[idx] |= CB_NUM_BANKS(evergreen_cs_get_num_banks(track->nbanks));
++				ib[idx] |= CB_TILE_SPLIT(tile_split) |
++					   CB_BANK_WIDTH(bankw) |
++					   CB_BANK_HEIGHT(bankh) |
++					   CB_MACRO_TILE_ASPECT(mtaspect);
++			}
+ 		}
++		tmp = ((reg - CB_COLOR8_ATTRIB) / 0x1c) + 8;
++		track->cb_color_attrib[tmp] = ib[idx];
+ 		break;
+ 	case CB_COLOR0_DIM:
+ 	case CB_COLOR1_DIM:
+@@ -1057,24 +1755,6 @@ static int evergreen_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 	return 0;
+ }
+ 
+-/**
+- * evergreen_check_texture_resource() - check if register is authorized or not
+- * @p: parser structure holding parsing context
+- * @idx: index into the cs buffer
+- * @texture: texture's bo structure
+- * @mipmap: mipmap's bo structure
+- *
+- * This function will check that the resource has valid field and that
+- * the texture and mipmap bo object are big enough to cover this resource.
+- */
+-static int evergreen_check_texture_resource(struct radeon_cs_parser *p,  u32 idx,
+-						   struct radeon_bo *texture,
+-						   struct radeon_bo *mipmap)
+-{
+-	/* XXX fill in */
+-	return 0;
+-}
+-
+ static bool evergreen_is_safe_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ {
+ 	u32 last_reg, m, i;
+@@ -1431,6 +2111,7 @@ static int evergreen_packet3_check(struct radeon_cs_parser *p,
+ 		}
+ 		for (i = 0; i < (pkt->count / 8); i++) {
+ 			struct radeon_bo *texture, *mipmap;
++			u32 toffset, moffset;
+ 			u32 size, offset;
+ 
+ 			switch (G__SQ_CONSTANT_TYPE(radeon_get_ib_value(p, idx+1+(i*8)+7))) {
+@@ -1441,30 +2122,38 @@ static int evergreen_packet3_check(struct radeon_cs_parser *p,
+ 					DRM_ERROR("bad SET_RESOURCE (tex)\n");
+ 					return -EINVAL;
+ 				}
+-				ib[idx+1+(i*8)+2] += (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
+ 				if (!(p->cs_flags & RADEON_CS_KEEP_TILING_FLAGS)) {
+ 					ib[idx+1+(i*8)+1] |=
+ 						TEX_ARRAY_MODE(evergreen_cs_get_aray_mode(reloc->lobj.tiling_flags));
+ 					if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
+-						ib[idx+1+(i*8)+6] |=
+-							TEX_TILE_SPLIT(evergreen_cs_get_tile_split(track->row_size));
++						unsigned bankw, bankh, mtaspect, tile_split;
++
++						evergreen_tiling_fields(reloc->lobj.tiling_flags,
++									&bankw, &bankh, &mtaspect,
++									&tile_split);
++						ib[idx+1+(i*8)+6] |= TEX_TILE_SPLIT(tile_split);
+ 						ib[idx+1+(i*8)+7] |=
++							TEX_BANK_WIDTH(bankw) |
++							TEX_BANK_HEIGHT(bankh) |
++							MACRO_TILE_ASPECT(mtaspect) |
+ 							TEX_NUM_BANKS(evergreen_cs_get_num_banks(track->nbanks));
+ 					}
+ 				}
+ 				texture = reloc->robj;
++				toffset = (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
+ 				/* tex mip base */
+ 				r = evergreen_cs_packet_next_reloc(p, &reloc);
+ 				if (r) {
+ 					DRM_ERROR("bad SET_RESOURCE (tex)\n");
+ 					return -EINVAL;
+ 				}
+-				ib[idx+1+(i*8)+3] += (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
++				moffset = (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
+ 				mipmap = reloc->robj;
+-				r = evergreen_check_texture_resource(p,  idx+1+(i*8),
+-						texture, mipmap);
++				r = evergreen_cs_track_validate_texture(p, texture, mipmap, idx+1+(i*8));
+ 				if (r)
+ 					return r;
++				ib[idx+1+(i*8)+2] += toffset;
++				ib[idx+1+(i*8)+3] += moffset;
+ 				break;
+ 			case SQ_TEX_VTX_VALID_BUFFER:
+ 				/* vtx base */
+diff --git a/drivers/gpu/drm/radeon/evergreend.h b/drivers/gpu/drm/radeon/evergreend.h
+index 50d20da..eb5708c 100644
+--- a/drivers/gpu/drm/radeon/evergreend.h
++++ b/drivers/gpu/drm/radeon/evergreend.h
+@@ -926,7 +926,70 @@
+ #define DB_DEBUG4					0x983C
+ #define DB_WATERMARKS					0x9854
+ #define DB_DEPTH_CONTROL				0x28800
++#define R_028800_DB_DEPTH_CONTROL                    0x028800
++#define   S_028800_STENCIL_ENABLE(x)                   (((x) & 0x1) << 0)
++#define   G_028800_STENCIL_ENABLE(x)                   (((x) >> 0) & 0x1)
++#define   C_028800_STENCIL_ENABLE                      0xFFFFFFFE
++#define   S_028800_Z_ENABLE(x)                         (((x) & 0x1) << 1)
++#define   G_028800_Z_ENABLE(x)                         (((x) >> 1) & 0x1)
++#define   C_028800_Z_ENABLE                            0xFFFFFFFD
++#define   S_028800_Z_WRITE_ENABLE(x)                   (((x) & 0x1) << 2)
++#define   G_028800_Z_WRITE_ENABLE(x)                   (((x) >> 2) & 0x1)
++#define   C_028800_Z_WRITE_ENABLE                      0xFFFFFFFB
++#define   S_028800_ZFUNC(x)                            (((x) & 0x7) << 4)
++#define   G_028800_ZFUNC(x)                            (((x) >> 4) & 0x7)
++#define   C_028800_ZFUNC                               0xFFFFFF8F
++#define   S_028800_BACKFACE_ENABLE(x)                  (((x) & 0x1) << 7)
++#define   G_028800_BACKFACE_ENABLE(x)                  (((x) >> 7) & 0x1)
++#define   C_028800_BACKFACE_ENABLE                     0xFFFFFF7F
++#define   S_028800_STENCILFUNC(x)                      (((x) & 0x7) << 8)
++#define   G_028800_STENCILFUNC(x)                      (((x) >> 8) & 0x7)
++#define   C_028800_STENCILFUNC                         0xFFFFF8FF
++#define     V_028800_STENCILFUNC_NEVER                 0x00000000
++#define     V_028800_STENCILFUNC_LESS                  0x00000001
++#define     V_028800_STENCILFUNC_EQUAL                 0x00000002
++#define     V_028800_STENCILFUNC_LEQUAL                0x00000003
++#define     V_028800_STENCILFUNC_GREATER               0x00000004
++#define     V_028800_STENCILFUNC_NOTEQUAL              0x00000005
++#define     V_028800_STENCILFUNC_GEQUAL                0x00000006
++#define     V_028800_STENCILFUNC_ALWAYS                0x00000007
++#define   S_028800_STENCILFAIL(x)                      (((x) & 0x7) << 11)
++#define   G_028800_STENCILFAIL(x)                      (((x) >> 11) & 0x7)
++#define   C_028800_STENCILFAIL                         0xFFFFC7FF
++#define     V_028800_STENCIL_KEEP                      0x00000000
++#define     V_028800_STENCIL_ZERO                      0x00000001
++#define     V_028800_STENCIL_REPLACE                   0x00000002
++#define     V_028800_STENCIL_INCR                      0x00000003
++#define     V_028800_STENCIL_DECR                      0x00000004
++#define     V_028800_STENCIL_INVERT                    0x00000005
++#define     V_028800_STENCIL_INCR_WRAP                 0x00000006
++#define     V_028800_STENCIL_DECR_WRAP                 0x00000007
++#define   S_028800_STENCILZPASS(x)                     (((x) & 0x7) << 14)
++#define   G_028800_STENCILZPASS(x)                     (((x) >> 14) & 0x7)
++#define   C_028800_STENCILZPASS                        0xFFFE3FFF
++#define   S_028800_STENCILZFAIL(x)                     (((x) & 0x7) << 17)
++#define   G_028800_STENCILZFAIL(x)                     (((x) >> 17) & 0x7)
++#define   C_028800_STENCILZFAIL                        0xFFF1FFFF
++#define   S_028800_STENCILFUNC_BF(x)                   (((x) & 0x7) << 20)
++#define   G_028800_STENCILFUNC_BF(x)                   (((x) >> 20) & 0x7)
++#define   C_028800_STENCILFUNC_BF                      0xFF8FFFFF
++#define   S_028800_STENCILFAIL_BF(x)                   (((x) & 0x7) << 23)
++#define   G_028800_STENCILFAIL_BF(x)                   (((x) >> 23) & 0x7)
++#define   C_028800_STENCILFAIL_BF                      0xFC7FFFFF
++#define   S_028800_STENCILZPASS_BF(x)                  (((x) & 0x7) << 26)
++#define   G_028800_STENCILZPASS_BF(x)                  (((x) >> 26) & 0x7)
++#define   C_028800_STENCILZPASS_BF                     0xE3FFFFFF
++#define   S_028800_STENCILZFAIL_BF(x)                  (((x) & 0x7) << 29)
++#define   G_028800_STENCILZFAIL_BF(x)                  (((x) >> 29) & 0x7)
++#define   C_028800_STENCILZFAIL_BF                     0x1FFFFFFF
+ #define DB_DEPTH_VIEW					0x28008
++#define R_028008_DB_DEPTH_VIEW                       0x00028008
++#define   S_028008_SLICE_START(x)                      (((x) & 0x7FF) << 0)
++#define   G_028008_SLICE_START(x)                      (((x) >> 0) & 0x7FF)
++#define   C_028008_SLICE_START                         0xFFFFF800
++#define   S_028008_SLICE_MAX(x)                        (((x) & 0x7FF) << 13)
++#define   G_028008_SLICE_MAX(x)                        (((x) >> 13) & 0x7FF)
++#define   C_028008_SLICE_MAX                           0xFF001FFF
+ #define DB_HTILE_DATA_BASE				0x28014
+ #define DB_Z_INFO					0x28040
+ #       define Z_ARRAY_MODE(x)                          ((x) << 4)
+@@ -934,12 +997,59 @@
+ #       define DB_NUM_BANKS(x)                          (((x) & 0x3) << 12)
+ #       define DB_BANK_WIDTH(x)                         (((x) & 0x3) << 16)
+ #       define DB_BANK_HEIGHT(x)                        (((x) & 0x3) << 20)
++#       define DB_MACRO_TILE_ASPECT(x)                  (((x) & 0x3) << 24)
++#define R_028040_DB_Z_INFO                       0x028040
++#define   S_028040_FORMAT(x)                           (((x) & 0x3) << 0)
++#define   G_028040_FORMAT(x)                           (((x) >> 0) & 0x3)
++#define   C_028040_FORMAT                              0xFFFFFFFC
++#define     V_028040_Z_INVALID                     0x00000000
++#define     V_028040_Z_16                          0x00000001
++#define     V_028040_Z_24                          0x00000002
++#define     V_028040_Z_32_FLOAT                    0x00000003
++#define   S_028040_ARRAY_MODE(x)                       (((x) & 0xF) << 4)
++#define   G_028040_ARRAY_MODE(x)                       (((x) >> 4) & 0xF)
++#define   C_028040_ARRAY_MODE                          0xFFFFFF0F
++#define   S_028040_READ_SIZE(x)                        (((x) & 0x1) << 28)
++#define   G_028040_READ_SIZE(x)                        (((x) >> 28) & 0x1)
++#define   C_028040_READ_SIZE                           0xEFFFFFFF
++#define   S_028040_TILE_SURFACE_ENABLE(x)              (((x) & 0x1) << 29)
++#define   G_028040_TILE_SURFACE_ENABLE(x)              (((x) >> 29) & 0x1)
++#define   C_028040_TILE_SURFACE_ENABLE                 0xDFFFFFFF
++#define   S_028040_ZRANGE_PRECISION(x)                 (((x) & 0x1) << 31)
++#define   G_028040_ZRANGE_PRECISION(x)                 (((x) >> 31) & 0x1)
++#define   C_028040_ZRANGE_PRECISION                    0x7FFFFFFF
++#define   S_028040_TILE_SPLIT(x)                       (((x) & 0x7) << 8)
++#define   G_028040_TILE_SPLIT(x)                       (((x) >> 8) & 0x7)
++#define   S_028040_NUM_BANKS(x)                        (((x) & 0x3) << 12)
++#define   G_028040_NUM_BANKS(x)                        (((x) >> 12) & 0x3)
++#define   S_028040_BANK_WIDTH(x)                       (((x) & 0x3) << 16)
++#define   G_028040_BANK_WIDTH(x)                       (((x) >> 16) & 0x3)
++#define   S_028040_BANK_HEIGHT(x)                      (((x) & 0x3) << 20)
++#define   G_028040_BANK_HEIGHT(x)                      (((x) >> 20) & 0x3)
++#define   S_028040_MACRO_TILE_ASPECT(x)                (((x) & 0x3) << 24)
++#define   G_028040_MACRO_TILE_ASPECT(x)                (((x) >> 24) & 0x3)
+ #define DB_STENCIL_INFO					0x28044
++#define R_028044_DB_STENCIL_INFO                     0x028044
++#define   S_028044_FORMAT(x)                           (((x) & 0x1) << 0)
++#define   G_028044_FORMAT(x)                           (((x) >> 0) & 0x1)
++#define   C_028044_FORMAT                              0xFFFFFFFE
++#define   G_028044_TILE_SPLIT(x)                       (((x) >> 8) & 0x7)
+ #define DB_Z_READ_BASE					0x28048
+ #define DB_STENCIL_READ_BASE				0x2804c
+ #define DB_Z_WRITE_BASE					0x28050
+ #define DB_STENCIL_WRITE_BASE				0x28054
+ #define DB_DEPTH_SIZE					0x28058
++#define R_028058_DB_DEPTH_SIZE                       0x028058
++#define   S_028058_PITCH_TILE_MAX(x)                   (((x) & 0x7FF) << 0)
++#define   G_028058_PITCH_TILE_MAX(x)                   (((x) >> 0) & 0x7FF)
++#define   C_028058_PITCH_TILE_MAX                      0xFFFFF800
++#define   S_028058_HEIGHT_TILE_MAX(x)                   (((x) & 0x7FF) << 11)
++#define   G_028058_HEIGHT_TILE_MAX(x)                   (((x) >> 11) & 0x7FF)
++#define   C_028058_HEIGHT_TILE_MAX                      0xFFC007FF
++#define R_02805C_DB_DEPTH_SLICE                      0x02805C
++#define   S_02805C_SLICE_TILE_MAX(x)                   (((x) & 0x3FFFFF) << 0)
++#define   G_02805C_SLICE_TILE_MAX(x)                   (((x) >> 0) & 0x3FFFFF)
++#define   C_02805C_SLICE_TILE_MAX                      0xFFC00000
+ 
+ #define SQ_PGM_START_PS					0x28840
+ #define SQ_PGM_START_VS					0x2885c
+@@ -983,6 +1093,114 @@
+ #define	CB_COLOR0_PITCH					0x28c64
+ #define	CB_COLOR0_SLICE					0x28c68
+ #define	CB_COLOR0_VIEW					0x28c6c
++#define R_028C6C_CB_COLOR0_VIEW                      0x00028C6C
++#define   S_028C6C_SLICE_START(x)                      (((x) & 0x7FF) << 0)
++#define   G_028C6C_SLICE_START(x)                      (((x) >> 0) & 0x7FF)
++#define   C_028C6C_SLICE_START                         0xFFFFF800
++#define   S_028C6C_SLICE_MAX(x)                        (((x) & 0x7FF) << 13)
++#define   G_028C6C_SLICE_MAX(x)                        (((x) >> 13) & 0x7FF)
++#define   C_028C6C_SLICE_MAX                           0xFF001FFF
++#define R_028C70_CB_COLOR0_INFO                      0x028C70
++#define   S_028C70_ENDIAN(x)                           (((x) & 0x3) << 0)
++#define   G_028C70_ENDIAN(x)                           (((x) >> 0) & 0x3)
++#define   C_028C70_ENDIAN                              0xFFFFFFFC
++#define   S_028C70_FORMAT(x)                           (((x) & 0x3F) << 2)
++#define   G_028C70_FORMAT(x)                           (((x) >> 2) & 0x3F)
++#define   C_028C70_FORMAT                              0xFFFFFF03
++#define     V_028C70_COLOR_INVALID                     0x00000000
++#define     V_028C70_COLOR_8                           0x00000001
++#define     V_028C70_COLOR_4_4                         0x00000002
++#define     V_028C70_COLOR_3_3_2                       0x00000003
++#define     V_028C70_COLOR_16                          0x00000005
++#define     V_028C70_COLOR_16_FLOAT                    0x00000006
++#define     V_028C70_COLOR_8_8                         0x00000007
++#define     V_028C70_COLOR_5_6_5                       0x00000008
++#define     V_028C70_COLOR_6_5_5                       0x00000009
++#define     V_028C70_COLOR_1_5_5_5                     0x0000000A
++#define     V_028C70_COLOR_4_4_4_4                     0x0000000B
++#define     V_028C70_COLOR_5_5_5_1                     0x0000000C
++#define     V_028C70_COLOR_32                          0x0000000D
++#define     V_028C70_COLOR_32_FLOAT                    0x0000000E
++#define     V_028C70_COLOR_16_16                       0x0000000F
++#define     V_028C70_COLOR_16_16_FLOAT                 0x00000010
++#define     V_028C70_COLOR_8_24                        0x00000011
++#define     V_028C70_COLOR_8_24_FLOAT                  0x00000012
++#define     V_028C70_COLOR_24_8                        0x00000013
++#define     V_028C70_COLOR_24_8_FLOAT                  0x00000014
++#define     V_028C70_COLOR_10_11_11                    0x00000015
++#define     V_028C70_COLOR_10_11_11_FLOAT              0x00000016
++#define     V_028C70_COLOR_11_11_10                    0x00000017
++#define     V_028C70_COLOR_11_11_10_FLOAT              0x00000018
++#define     V_028C70_COLOR_2_10_10_10                  0x00000019
++#define     V_028C70_COLOR_8_8_8_8                     0x0000001A
++#define     V_028C70_COLOR_10_10_10_2                  0x0000001B
++#define     V_028C70_COLOR_X24_8_32_FLOAT              0x0000001C
++#define     V_028C70_COLOR_32_32                       0x0000001D
++#define     V_028C70_COLOR_32_32_FLOAT                 0x0000001E
++#define     V_028C70_COLOR_16_16_16_16                 0x0000001F
++#define     V_028C70_COLOR_16_16_16_16_FLOAT           0x00000020
++#define     V_028C70_COLOR_32_32_32_32                 0x00000022
++#define     V_028C70_COLOR_32_32_32_32_FLOAT           0x00000023
++#define     V_028C70_COLOR_32_32_32_FLOAT              0x00000030
++#define   S_028C70_ARRAY_MODE(x)                       (((x) & 0xF) << 8)
++#define   G_028C70_ARRAY_MODE(x)                       (((x) >> 8) & 0xF)
++#define   C_028C70_ARRAY_MODE                          0xFFFFF0FF
++#define     V_028C70_ARRAY_LINEAR_GENERAL              0x00000000
++#define     V_028C70_ARRAY_LINEAR_ALIGNED              0x00000001
++#define     V_028C70_ARRAY_1D_TILED_THIN1              0x00000002
++#define     V_028C70_ARRAY_2D_TILED_THIN1              0x00000004
++#define   S_028C70_NUMBER_TYPE(x)                      (((x) & 0x7) << 12)
++#define   G_028C70_NUMBER_TYPE(x)                      (((x) >> 12) & 0x7)
++#define   C_028C70_NUMBER_TYPE                         0xFFFF8FFF
++#define     V_028C70_NUMBER_UNORM                      0x00000000
++#define     V_028C70_NUMBER_SNORM                      0x00000001
++#define     V_028C70_NUMBER_USCALED                    0x00000002
++#define     V_028C70_NUMBER_SSCALED                    0x00000003
++#define     V_028C70_NUMBER_UINT                       0x00000004
++#define     V_028C70_NUMBER_SINT                       0x00000005
++#define     V_028C70_NUMBER_SRGB                       0x00000006
++#define     V_028C70_NUMBER_FLOAT                      0x00000007
++#define   S_028C70_COMP_SWAP(x)                        (((x) & 0x3) << 15)
++#define   G_028C70_COMP_SWAP(x)                        (((x) >> 15) & 0x3)
++#define   C_028C70_COMP_SWAP                           0xFFFE7FFF
++#define     V_028C70_SWAP_STD                          0x00000000
++#define     V_028C70_SWAP_ALT                          0x00000001
++#define     V_028C70_SWAP_STD_REV                      0x00000002
++#define     V_028C70_SWAP_ALT_REV                      0x00000003
++#define   S_028C70_FAST_CLEAR(x)                       (((x) & 0x1) << 17)
++#define   G_028C70_FAST_CLEAR(x)                       (((x) >> 17) & 0x1)
++#define   C_028C70_FAST_CLEAR                          0xFFFDFFFF
++#define   S_028C70_COMPRESSION(x)                      (((x) & 0x3) << 18)
++#define   G_028C70_COMPRESSION(x)                      (((x) >> 18) & 0x3)
++#define   C_028C70_COMPRESSION                         0xFFF3FFFF
++#define   S_028C70_BLEND_CLAMP(x)                      (((x) & 0x1) << 19)
++#define   G_028C70_BLEND_CLAMP(x)                      (((x) >> 19) & 0x1)
++#define   C_028C70_BLEND_CLAMP                         0xFFF7FFFF
++#define   S_028C70_BLEND_BYPASS(x)                     (((x) & 0x1) << 20)
++#define   G_028C70_BLEND_BYPASS(x)                     (((x) >> 20) & 0x1)
++#define   C_028C70_BLEND_BYPASS                        0xFFEFFFFF
++#define   S_028C70_SIMPLE_FLOAT(x)                     (((x) & 0x1) << 21)
++#define   G_028C70_SIMPLE_FLOAT(x)                     (((x) >> 21) & 0x1)
++#define   C_028C70_SIMPLE_FLOAT                        0xFFDFFFFF
++#define   S_028C70_ROUND_MODE(x)                       (((x) & 0x1) << 22)
++#define   G_028C70_ROUND_MODE(x)                       (((x) >> 22) & 0x1)
++#define   C_028C70_ROUND_MODE                          0xFFBFFFFF
++#define   S_028C70_TILE_COMPACT(x)                     (((x) & 0x1) << 23)
++#define   G_028C70_TILE_COMPACT(x)                     (((x) >> 23) & 0x1)
++#define   C_028C70_TILE_COMPACT                        0xFF7FFFFF
++#define   S_028C70_SOURCE_FORMAT(x)                    (((x) & 0x3) << 24)
++#define   G_028C70_SOURCE_FORMAT(x)                    (((x) >> 24) & 0x3)
++#define   C_028C70_SOURCE_FORMAT                       0xFCFFFFFF
++#define     V_028C70_EXPORT_4C_32BPC                   0x0
++#define     V_028C70_EXPORT_4C_16BPC                   0x1
++#define     V_028C70_EXPORT_2C_32BPC                   0x2 /* Do not use */
++#define   S_028C70_RAT(x)                              (((x) & 0x1) << 26)
++#define   G_028C70_RAT(x)                              (((x) >> 26) & 0x1)
++#define   C_028C70_RAT                                 0xFBFFFFFF
++#define   S_028C70_RESOURCE_TYPE(x)                    (((x) & 0x7) << 27)
++#define   G_028C70_RESOURCE_TYPE(x)                    (((x) >> 27) & 0x7)
++#define   C_028C70_RESOURCE_TYPE                       0xC7FFFFFF
++
+ #define	CB_COLOR0_INFO					0x28c70
+ #	define CB_FORMAT(x)				((x) << 2)
+ #       define CB_ARRAY_MODE(x)                         ((x) << 8)
+@@ -993,6 +1211,20 @@
+ #	define CB_SOURCE_FORMAT(x)			((x) << 24)
+ #	define CB_SF_EXPORT_FULL			0
+ #	define CB_SF_EXPORT_NORM			1
++#define R_028C74_CB_COLOR0_ATTRIB                      0x028C74
++#define   S_028C74_NON_DISP_TILING_ORDER(x)            (((x) & 0x1) << 4)
++#define   G_028C74_NON_DISP_TILING_ORDER(x)            (((x) >> 4) & 0x1)
++#define   C_028C74_NON_DISP_TILING_ORDER               0xFFFFFFEF
++#define   S_028C74_TILE_SPLIT(x)                       (((x) & 0xf) << 5)
++#define   G_028C74_TILE_SPLIT(x)                       (((x) >> 5) & 0xf)
++#define   S_028C74_NUM_BANKS(x)                        (((x) & 0x3) << 10)
++#define   G_028C74_NUM_BANKS(x)                        (((x) >> 10) & 0x3)
++#define   S_028C74_BANK_WIDTH(x)                       (((x) & 0x3) << 13)
++#define   G_028C74_BANK_WIDTH(x)                       (((x) >> 13) & 0x3)
++#define   S_028C74_BANK_HEIGHT(x)                      (((x) & 0x3) << 16)
++#define   G_028C74_BANK_HEIGHT(x)                      (((x) >> 16) & 0x3)
++#define   S_028C74_MACRO_TILE_ASPECT(x)                (((x) & 0x3) << 19)
++#define   G_028C74_MACRO_TILE_ASPECT(x)                (((x) >> 19) & 0x3)
+ #define	CB_COLOR0_ATTRIB				0x28c74
+ #       define CB_TILE_SPLIT(x)                         (((x) & 0x7) << 5)
+ #       define ADDR_SURF_TILE_SPLIT_64B                 0
+@@ -1017,6 +1249,7 @@
+ #       define ADDR_SURF_BANK_HEIGHT_2                  1
+ #       define ADDR_SURF_BANK_HEIGHT_4                  2
+ #       define ADDR_SURF_BANK_HEIGHT_8                  3
++#       define CB_MACRO_TILE_ASPECT(x)                  (((x) & 0x3) << 19)
+ #define	CB_COLOR0_DIM					0x28c78
+ /* only CB0-7 blocks have these regs */
+ #define	CB_COLOR0_CMASK					0x28c7c
+@@ -1205,9 +1438,144 @@
+ #define SQ_TEX_RESOURCE_WORD6_0                         0x30018
+ #       define TEX_TILE_SPLIT(x)                        (((x) & 0x7) << 29)
+ #define SQ_TEX_RESOURCE_WORD7_0                         0x3001c
++#       define MACRO_TILE_ASPECT(x)                     (((x) & 0x3) << 6)
+ #       define TEX_BANK_WIDTH(x)                        (((x) & 0x3) << 8)
+ #       define TEX_BANK_HEIGHT(x)                       (((x) & 0x3) << 10)
+ #       define TEX_NUM_BANKS(x)                         (((x) & 0x3) << 16)
++#define R_030000_SQ_TEX_RESOURCE_WORD0_0             0x030000
++#define   S_030000_DIM(x)                              (((x) & 0x7) << 0)
++#define   G_030000_DIM(x)                              (((x) >> 0) & 0x7)
++#define   C_030000_DIM                                 0xFFFFFFF8
++#define     V_030000_SQ_TEX_DIM_1D                     0x00000000
++#define     V_030000_SQ_TEX_DIM_2D                     0x00000001
++#define     V_030000_SQ_TEX_DIM_3D                     0x00000002
++#define     V_030000_SQ_TEX_DIM_CUBEMAP                0x00000003
++#define     V_030000_SQ_TEX_DIM_1D_ARRAY               0x00000004
++#define     V_030000_SQ_TEX_DIM_2D_ARRAY               0x00000005
++#define     V_030000_SQ_TEX_DIM_2D_MSAA                0x00000006
++#define     V_030000_SQ_TEX_DIM_2D_ARRAY_MSAA          0x00000007
++#define   S_030000_NON_DISP_TILING_ORDER(x)            (((x) & 0x1) << 5)
++#define   G_030000_NON_DISP_TILING_ORDER(x)            (((x) >> 5) & 0x1)
++#define   C_030000_NON_DISP_TILING_ORDER               0xFFFFFFDF
++#define   S_030000_PITCH(x)                            (((x) & 0xFFF) << 6)
++#define   G_030000_PITCH(x)                            (((x) >> 6) & 0xFFF)
++#define   C_030000_PITCH                               0xFFFC003F
++#define   S_030000_TEX_WIDTH(x)                        (((x) & 0x3FFF) << 18)
++#define   G_030000_TEX_WIDTH(x)                        (((x) >> 18) & 0x3FFF)
++#define   C_030000_TEX_WIDTH                           0x0003FFFF
++#define R_030004_SQ_TEX_RESOURCE_WORD1_0             0x030004
++#define   S_030004_TEX_HEIGHT(x)                       (((x) & 0x3FFF) << 0)
++#define   G_030004_TEX_HEIGHT(x)                       (((x) >> 0) & 0x3FFF)
++#define   C_030004_TEX_HEIGHT                          0xFFFFC000
++#define   S_030004_TEX_DEPTH(x)                        (((x) & 0x1FFF) << 14)
++#define   G_030004_TEX_DEPTH(x)                        (((x) >> 14) & 0x1FFF)
++#define   C_030004_TEX_DEPTH                           0xF8003FFF
++#define   S_030004_ARRAY_MODE(x)                       (((x) & 0xF) << 28)
++#define   G_030004_ARRAY_MODE(x)                       (((x) >> 28) & 0xF)
++#define   C_030004_ARRAY_MODE                          0x0FFFFFFF
++#define R_030008_SQ_TEX_RESOURCE_WORD2_0             0x030008
++#define   S_030008_BASE_ADDRESS(x)                     (((x) & 0xFFFFFFFF) << 0)
++#define   G_030008_BASE_ADDRESS(x)                     (((x) >> 0) & 0xFFFFFFFF)
++#define   C_030008_BASE_ADDRESS                        0x00000000
++#define R_03000C_SQ_TEX_RESOURCE_WORD3_0             0x03000C
++#define   S_03000C_MIP_ADDRESS(x)                      (((x) & 0xFFFFFFFF) << 0)
++#define   G_03000C_MIP_ADDRESS(x)                      (((x) >> 0) & 0xFFFFFFFF)
++#define   C_03000C_MIP_ADDRESS                         0x00000000
++#define R_030010_SQ_TEX_RESOURCE_WORD4_0             0x030010
++#define   S_030010_FORMAT_COMP_X(x)                    (((x) & 0x3) << 0)
++#define   G_030010_FORMAT_COMP_X(x)                    (((x) >> 0) & 0x3)
++#define   C_030010_FORMAT_COMP_X                       0xFFFFFFFC
++#define     V_030010_SQ_FORMAT_COMP_UNSIGNED           0x00000000
++#define     V_030010_SQ_FORMAT_COMP_SIGNED             0x00000001
++#define     V_030010_SQ_FORMAT_COMP_UNSIGNED_BIASED    0x00000002
++#define   S_030010_FORMAT_COMP_Y(x)                    (((x) & 0x3) << 2)
++#define   G_030010_FORMAT_COMP_Y(x)                    (((x) >> 2) & 0x3)
++#define   C_030010_FORMAT_COMP_Y                       0xFFFFFFF3
++#define   S_030010_FORMAT_COMP_Z(x)                    (((x) & 0x3) << 4)
++#define   G_030010_FORMAT_COMP_Z(x)                    (((x) >> 4) & 0x3)
++#define   C_030010_FORMAT_COMP_Z                       0xFFFFFFCF
++#define   S_030010_FORMAT_COMP_W(x)                    (((x) & 0x3) << 6)
++#define   G_030010_FORMAT_COMP_W(x)                    (((x) >> 6) & 0x3)
++#define   C_030010_FORMAT_COMP_W                       0xFFFFFF3F
++#define   S_030010_NUM_FORMAT_ALL(x)                   (((x) & 0x3) << 8)
++#define   G_030010_NUM_FORMAT_ALL(x)                   (((x) >> 8) & 0x3)
++#define   C_030010_NUM_FORMAT_ALL                      0xFFFFFCFF
++#define     V_030010_SQ_NUM_FORMAT_NORM                0x00000000
++#define     V_030010_SQ_NUM_FORMAT_INT                 0x00000001
++#define     V_030010_SQ_NUM_FORMAT_SCALED              0x00000002
++#define   S_030010_SRF_MODE_ALL(x)                     (((x) & 0x1) << 10)
++#define   G_030010_SRF_MODE_ALL(x)                     (((x) >> 10) & 0x1)
++#define   C_030010_SRF_MODE_ALL                        0xFFFFFBFF
++#define     V_030010_SRF_MODE_ZERO_CLAMP_MINUS_ONE     0x00000000
++#define     V_030010_SRF_MODE_NO_ZERO                  0x00000001
++#define   S_030010_FORCE_DEGAMMA(x)                    (((x) & 0x1) << 11)
++#define   G_030010_FORCE_DEGAMMA(x)                    (((x) >> 11) & 0x1)
++#define   C_030010_FORCE_DEGAMMA                       0xFFFFF7FF
++#define   S_030010_ENDIAN_SWAP(x)                      (((x) & 0x3) << 12)
++#define   G_030010_ENDIAN_SWAP(x)                      (((x) >> 12) & 0x3)
++#define   C_030010_ENDIAN_SWAP                         0xFFFFCFFF
++#define   S_030010_DST_SEL_X(x)                        (((x) & 0x7) << 16)
++#define   G_030010_DST_SEL_X(x)                        (((x) >> 16) & 0x7)
++#define   C_030010_DST_SEL_X                           0xFFF8FFFF
++#define     V_030010_SQ_SEL_X                          0x00000000
++#define     V_030010_SQ_SEL_Y                          0x00000001
++#define     V_030010_SQ_SEL_Z                          0x00000002
++#define     V_030010_SQ_SEL_W                          0x00000003
++#define     V_030010_SQ_SEL_0                          0x00000004
++#define     V_030010_SQ_SEL_1                          0x00000005
++#define   S_030010_DST_SEL_Y(x)                        (((x) & 0x7) << 19)
++#define   G_030010_DST_SEL_Y(x)                        (((x) >> 19) & 0x7)
++#define   C_030010_DST_SEL_Y                           0xFFC7FFFF
++#define   S_030010_DST_SEL_Z(x)                        (((x) & 0x7) << 22)
++#define   G_030010_DST_SEL_Z(x)                        (((x) >> 22) & 0x7)
++#define   C_030010_DST_SEL_Z                           0xFE3FFFFF
++#define   S_030010_DST_SEL_W(x)                        (((x) & 0x7) << 25)
++#define   G_030010_DST_SEL_W(x)                        (((x) >> 25) & 0x7)
++#define   C_030010_DST_SEL_W                           0xF1FFFFFF
++#define   S_030010_BASE_LEVEL(x)                       (((x) & 0xF) << 28)
++#define   G_030010_BASE_LEVEL(x)                       (((x) >> 28) & 0xF)
++#define   C_030010_BASE_LEVEL                          0x0FFFFFFF
++#define R_030014_SQ_TEX_RESOURCE_WORD5_0             0x030014
++#define   S_030014_LAST_LEVEL(x)                       (((x) & 0xF) << 0)
++#define   G_030014_LAST_LEVEL(x)                       (((x) >> 0) & 0xF)
++#define   C_030014_LAST_LEVEL                          0xFFFFFFF0
++#define   S_030014_BASE_ARRAY(x)                       (((x) & 0x1FFF) << 4)
++#define   G_030014_BASE_ARRAY(x)                       (((x) >> 4) & 0x1FFF)
++#define   C_030014_BASE_ARRAY                          0xFFFE000F
++#define   S_030014_LAST_ARRAY(x)                       (((x) & 0x1FFF) << 17)
++#define   G_030014_LAST_ARRAY(x)                       (((x) >> 17) & 0x1FFF)
++#define   C_030014_LAST_ARRAY                          0xC001FFFF
++#define R_030018_SQ_TEX_RESOURCE_WORD6_0             0x030018
++#define   S_030018_MAX_ANISO(x)                        (((x) & 0x7) << 0)
++#define   G_030018_MAX_ANISO(x)                        (((x) >> 0) & 0x7)
++#define   C_030018_MAX_ANISO                           0xFFFFFFF8
++#define   S_030018_PERF_MODULATION(x)                  (((x) & 0x7) << 3)
++#define   G_030018_PERF_MODULATION(x)                  (((x) >> 3) & 0x7)
++#define   C_030018_PERF_MODULATION                     0xFFFFFFC7
++#define   S_030018_INTERLACED(x)                       (((x) & 0x1) << 6)
++#define   G_030018_INTERLACED(x)                       (((x) >> 6) & 0x1)
++#define   C_030018_INTERLACED                          0xFFFFFFBF
++#define   S_030018_TILE_SPLIT(x)                       (((x) & 0x7) << 29)
++#define   G_030018_TILE_SPLIT(x)                       (((x) >> 29) & 0x7)
++#define R_03001C_SQ_TEX_RESOURCE_WORD7_0             0x03001C
++#define   S_03001C_MACRO_TILE_ASPECT(x)                (((x) & 0x3) << 6)
++#define   G_03001C_MACRO_TILE_ASPECT(x)                (((x) >> 6) & 0x3)
++#define   S_03001C_BANK_WIDTH(x)                       (((x) & 0x3) << 8)
++#define   G_03001C_BANK_WIDTH(x)                       (((x) >> 8) & 0x3)
++#define   S_03001C_BANK_HEIGHT(x)                      (((x) & 0x3) << 10)
++#define   G_03001C_BANK_HEIGHT(x)                      (((x) >> 10) & 0x3)
++#define   S_03001C_NUM_BANKS(x)                        (((x) & 0x3) << 16)
++#define   G_03001C_NUM_BANKS(x)                        (((x) >> 16) & 0x3)
++#define   S_03001C_TYPE(x)                             (((x) & 0x3) << 30)
++#define   G_03001C_TYPE(x)                             (((x) >> 30) & 0x3)
++#define   C_03001C_TYPE                                0x3FFFFFFF
++#define     V_03001C_SQ_TEX_VTX_INVALID_TEXTURE        0x00000000
++#define     V_03001C_SQ_TEX_VTX_INVALID_BUFFER         0x00000001
++#define     V_03001C_SQ_TEX_VTX_VALID_TEXTURE          0x00000002
++#define     V_03001C_SQ_TEX_VTX_VALID_BUFFER           0x00000003
++#define   S_03001C_DATA_FORMAT(x)                      (((x) & 0x3F) << 0)
++#define   G_03001C_DATA_FORMAT(x)                      (((x) >> 0) & 0x3F)
++#define   C_03001C_DATA_FORMAT                         0xFFFFFFC0
+ 
+ #define SQ_VTX_CONSTANT_WORD0_0				0x30000
+ #define SQ_VTX_CONSTANT_WORD1_0				0x30004
+diff --git a/drivers/gpu/drm/radeon/r600_cs.c b/drivers/gpu/drm/radeon/r600_cs.c
+index 9f17571..5cbe948 100644
+--- a/drivers/gpu/drm/radeon/r600_cs.c
++++ b/drivers/gpu/drm/radeon/r600_cs.c
+@@ -55,6 +55,7 @@ struct r600_cs_track {
+ 	struct radeon_bo	*cb_color_frag_bo[8];
+ 	struct radeon_bo	*cb_color_tile_bo[8];
+ 	u32			cb_color_info[8];
++	u32			cb_color_view[8];
+ 	u32			cb_color_size_idx[8];
+ 	u32			cb_target_mask;
+ 	u32			cb_shader_mask;
+@@ -77,9 +78,9 @@ struct r600_cs_track {
+ 
+ #define FMT_8_BIT(fmt, vc)   [fmt] = { 1, 1, 1, vc, CHIP_R600 }
+ #define FMT_16_BIT(fmt, vc)  [fmt] = { 1, 1, 2, vc, CHIP_R600 }
+-#define FMT_24_BIT(fmt)      [fmt] = { 1, 1, 3,  0, CHIP_R600 }
++#define FMT_24_BIT(fmt)      [fmt] = { 1, 1, 4,  0, CHIP_R600 }
+ #define FMT_32_BIT(fmt, vc)  [fmt] = { 1, 1, 4, vc, CHIP_R600 }
+-#define FMT_48_BIT(fmt)      [fmt] = { 1, 1, 6,  0, CHIP_R600 }
++#define FMT_48_BIT(fmt)      [fmt] = { 1, 1, 8,  0, CHIP_R600 }
+ #define FMT_64_BIT(fmt, vc)  [fmt] = { 1, 1, 8, vc, CHIP_R600 }
+ #define FMT_96_BIT(fmt)      [fmt] = { 1, 1, 12, 0, CHIP_R600 }
+ #define FMT_128_BIT(fmt, vc) [fmt] = { 1, 1, 16,vc, CHIP_R600 }
+@@ -111,7 +112,7 @@ static const struct gpu_formats color_formats_table[] = {
+ 
+ 	/* 24-bit */
+ 	FMT_24_BIT(V_038004_FMT_8_8_8),
+-					       
++
+ 	/* 32-bit */
+ 	FMT_32_BIT(V_038004_COLOR_32, 1),
+ 	FMT_32_BIT(V_038004_COLOR_32_FLOAT, 1),
+@@ -166,22 +167,22 @@ static const struct gpu_formats color_formats_table[] = {
+ 	[V_038004_FMT_32_AS_32_32_32_32] = { 1, 1, 4, 0, CHIP_CEDAR},
+ };
+ 
+-static bool fmt_is_valid_color(u32 format)
++bool r600_fmt_is_valid_color(u32 format)
+ {
+ 	if (format >= ARRAY_SIZE(color_formats_table))
+ 		return false;
+-	
++
+ 	if (color_formats_table[format].valid_color)
+ 		return true;
+ 
+ 	return false;
+ }
+ 
+-static bool fmt_is_valid_texture(u32 format, enum radeon_family family)
++bool r600_fmt_is_valid_texture(u32 format, enum radeon_family family)
+ {
+ 	if (format >= ARRAY_SIZE(color_formats_table))
+ 		return false;
+-	
++
+ 	if (family < color_formats_table[format].min_family)
+ 		return false;
+ 
+@@ -191,7 +192,7 @@ static bool fmt_is_valid_texture(u32 format, enum radeon_family family)
+ 	return false;
+ }
+ 
+-static int fmt_get_blocksize(u32 format)
++int r600_fmt_get_blocksize(u32 format)
+ {
+ 	if (format >= ARRAY_SIZE(color_formats_table))
+ 		return 0;
+@@ -199,7 +200,7 @@ static int fmt_get_blocksize(u32 format)
+ 	return color_formats_table[format].blocksize;
+ }
+ 
+-static int fmt_get_nblocksx(u32 format, u32 w)
++int r600_fmt_get_nblocksx(u32 format, u32 w)
+ {
+ 	unsigned bw;
+ 
+@@ -213,7 +214,7 @@ static int fmt_get_nblocksx(u32 format, u32 w)
+ 	return (w + bw - 1) / bw;
+ }
+ 
+-static int fmt_get_nblocksy(u32 format, u32 h)
++int r600_fmt_get_nblocksy(u32 format, u32 h)
+ {
+ 	unsigned bh;
+ 
+@@ -260,7 +261,7 @@ static int r600_get_array_mode_alignment(struct array_mode_checker *values,
+ 		break;
+ 	case ARRAY_LINEAR_ALIGNED:
+ 		*pitch_align = max((u32)64, (u32)(values->group_size / values->blocksize));
+-		*height_align = tile_height;
++		*height_align = 1;
+ 		*depth_align = 1;
+ 		*base_align = values->group_size;
+ 		break;
+@@ -273,10 +274,9 @@ static int r600_get_array_mode_alignment(struct array_mode_checker *values,
+ 		*base_align = values->group_size;
+ 		break;
+ 	case ARRAY_2D_TILED_THIN1:
+-		*pitch_align = max((u32)macro_tile_width,
+-				  (u32)(((values->group_size / tile_height) /
+-					 (values->blocksize * values->nsamples)) *
+-					values->nbanks)) * tile_width;
++		*pitch_align = max((u32)macro_tile_width * tile_width,
++				(u32)((values->group_size * values->nbanks) /
++				(values->blocksize * values->nsamples * tile_width)));
+ 		*height_align = macro_tile_height * tile_height;
+ 		*depth_align = 1;
+ 		*base_align = max(macro_tile_bytes,
+@@ -300,6 +300,7 @@ static void r600_cs_track_init(struct r600_cs_track *track)
+ 		track->cb_color_size[i] = 0;
+ 		track->cb_color_size_idx[i] = 0;
+ 		track->cb_color_info[i] = 0;
++		track->cb_color_view[i] = 0xFFFFFFFF;
+ 		track->cb_color_bo[i] = NULL;
+ 		track->cb_color_bo_offset[i] = 0xFFFFFFFF;
+ 		track->cb_color_bo_mc[i] = 0xFFFFFFFF;
+@@ -333,13 +334,14 @@ static int r600_cs_track_validate_cb(struct radeon_cs_parser *p, int i)
+ 	volatile u32 *ib = p->ib->ptr;
+ 	unsigned array_mode;
+ 	u32 format;
++
+ 	if (G_0280A0_TILE_MODE(track->cb_color_info[i])) {
+ 		dev_warn(p->dev, "FMASK or CMASK buffer are not supported by this kernel\n");
+ 		return -EINVAL;
+ 	}
+ 	size = radeon_bo_size(track->cb_color_bo[i]) - track->cb_color_bo_offset[i];
+ 	format = G_0280A0_FORMAT(track->cb_color_info[i]);
+-	if (!fmt_is_valid_color(format)) {
++	if (!r600_fmt_is_valid_color(format)) {
+ 		dev_warn(p->dev, "%s:%d cb invalid format %d for %d (0x%08X)\n",
+ 			 __func__, __LINE__, format,
+ 			i, track->cb_color_info[i]);
+@@ -360,7 +362,7 @@ static int r600_cs_track_validate_cb(struct radeon_cs_parser *p, int i)
+ 	array_check.nbanks = track->nbanks;
+ 	array_check.npipes = track->npipes;
+ 	array_check.nsamples = track->nsamples;
+-	array_check.blocksize = fmt_get_blocksize(format);
++	array_check.blocksize = r600_fmt_get_blocksize(format);
+ 	if (r600_get_array_mode_alignment(&array_check,
+ 					  &pitch_align, &height_align, &depth_align, &base_align)) {
+ 		dev_warn(p->dev, "%s invalid tiling %d for %d (0x%08X)\n", __func__,
+@@ -404,7 +406,18 @@ static int r600_cs_track_validate_cb(struct radeon_cs_parser *p, int i)
+ 	}
+ 
+ 	/* check offset */
+-	tmp = fmt_get_nblocksy(format, height) * fmt_get_nblocksx(format, pitch) * fmt_get_blocksize(format);
++	tmp = r600_fmt_get_nblocksy(format, height) * r600_fmt_get_nblocksx(format, pitch) * r600_fmt_get_blocksize(format);
++	switch (array_mode) {
++	default:
++	case V_0280A0_ARRAY_LINEAR_GENERAL:
++	case V_0280A0_ARRAY_LINEAR_ALIGNED:
++		tmp += track->cb_color_view[i] & 0xFF;
++		break;
++	case V_0280A0_ARRAY_1D_TILED_THIN1:
++	case V_0280A0_ARRAY_2D_TILED_THIN1:
++		tmp += G_028080_SLICE_MAX(track->cb_color_view[i]) * tmp;
++		break;
++	}
+ 	if ((tmp + track->cb_color_bo_offset[i]) > radeon_bo_size(track->cb_color_bo[i])) {
+ 		if (array_mode == V_0280A0_ARRAY_LINEAR_GENERAL) {
+ 			/* the initial DDX does bad things with the CB size occasionally */
+@@ -414,10 +427,13 @@ static int r600_cs_track_validate_cb(struct radeon_cs_parser *p, int i)
+ 			 * broken userspace.
+ 			 */
+ 		} else {
+-			dev_warn(p->dev, "%s offset[%d] %d %d %d %lu too big\n", __func__, i,
+-				 array_mode,
++			dev_warn(p->dev, "%s offset[%d] %d %d %d %lu too big (%d %d) (%d %d %d)\n",
++				 __func__, i, array_mode,
+ 				 track->cb_color_bo_offset[i], tmp,
+-				 radeon_bo_size(track->cb_color_bo[i]));
++				 radeon_bo_size(track->cb_color_bo[i]),
++				 pitch, height, r600_fmt_get_nblocksx(format, pitch),
++				 r600_fmt_get_nblocksy(format, height),
++				 r600_fmt_get_blocksize(format));
+ 			return -EINVAL;
+ 		}
+ 	}
+@@ -1075,6 +1091,17 @@ static int r600_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 			track->cb_color_info[tmp] = radeon_get_ib_value(p, idx);
+ 		}
+ 		break;
++	case R_028080_CB_COLOR0_VIEW:
++	case R_028084_CB_COLOR1_VIEW:
++	case R_028088_CB_COLOR2_VIEW:
++	case R_02808C_CB_COLOR3_VIEW:
++	case R_028090_CB_COLOR4_VIEW:
++	case R_028094_CB_COLOR5_VIEW:
++	case R_028098_CB_COLOR6_VIEW:
++	case R_02809C_CB_COLOR7_VIEW:
++		tmp = (reg - R_028080_CB_COLOR0_VIEW) / 4;
++		track->cb_color_view[tmp] = radeon_get_ib_value(p, idx);
++		break;
+ 	case R_028060_CB_COLOR0_SIZE:
+ 	case R_028064_CB_COLOR1_SIZE:
+ 	case R_028068_CB_COLOR2_SIZE:
+@@ -1259,7 +1286,7 @@ static int r600_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 	return 0;
+ }
+ 
+-static unsigned mip_minify(unsigned size, unsigned level)
++unsigned r600_mip_minify(unsigned size, unsigned level)
+ {
+ 	unsigned val;
+ 
+@@ -1281,22 +1308,22 @@ static void r600_texture_size(unsigned nfaces, unsigned blevel, unsigned llevel,
+ 	unsigned nlevels = llevel - blevel + 1;
+ 
+ 	*l0_size = -1;
+-	blocksize = fmt_get_blocksize(format);
++	blocksize = r600_fmt_get_blocksize(format);
+ 
+-	w0 = mip_minify(w0, 0);
+-	h0 = mip_minify(h0, 0);
+-	d0 = mip_minify(d0, 0);
++	w0 = r600_mip_minify(w0, 0);
++	h0 = r600_mip_minify(h0, 0);
++	d0 = r600_mip_minify(d0, 0);
+ 	for(i = 0, offset = 0, level = blevel; i < nlevels; i++, level++) {
+-		width = mip_minify(w0, i);
+-		nbx = fmt_get_nblocksx(format, width);
++		width = r600_mip_minify(w0, i);
++		nbx = r600_fmt_get_nblocksx(format, width);
+ 
+ 		nbx = round_up(nbx, block_align);
+ 
+-		height = mip_minify(h0, i);
+-		nby = fmt_get_nblocksy(format, height);
++		height = r600_mip_minify(h0, i);
++		nby = r600_fmt_get_nblocksy(format, height);
+ 		nby = round_up(nby, height_align);
+ 
+-		depth = mip_minify(d0, i);
++		depth = r600_mip_minify(d0, i);
+ 
+ 		size = nbx * nby * blocksize;
+ 		if (nfaces)
+@@ -1387,7 +1414,7 @@ static int r600_check_texture_resource(struct radeon_cs_parser *p,  u32 idx,
+ 		return -EINVAL;
+ 	}
+ 	format = G_038004_DATA_FORMAT(word1);
+-	if (!fmt_is_valid_texture(format, p->family)) {
++	if (!r600_fmt_is_valid_texture(format, p->family)) {
+ 		dev_warn(p->dev, "%s:%d texture invalid format %d\n",
+ 			 __func__, __LINE__, format);
+ 		return -EINVAL;
+@@ -1400,7 +1427,7 @@ static int r600_check_texture_resource(struct radeon_cs_parser *p,  u32 idx,
+ 	array_check.nbanks = track->nbanks;
+ 	array_check.npipes = track->npipes;
+ 	array_check.nsamples = 1;
+-	array_check.blocksize = fmt_get_blocksize(format);
++	array_check.blocksize = r600_fmt_get_blocksize(format);
+ 	if (r600_get_array_mode_alignment(&array_check,
+ 					  &pitch_align, &height_align, &depth_align, &base_align)) {
+ 		dev_warn(p->dev, "%s:%d tex array mode (%d) invalid\n",
+@@ -1433,6 +1460,10 @@ static int r600_check_texture_resource(struct radeon_cs_parser *p,  u32 idx,
+ 	word1 = radeon_get_ib_value(p, idx + 5);
+ 	blevel = G_038010_BASE_LEVEL(word0);
+ 	llevel = G_038014_LAST_LEVEL(word1);
++	if (blevel > llevel) {
++		dev_warn(p->dev, "texture blevel %d > llevel %d\n",
++			 blevel, llevel);
++	}
+ 	if (array == 1) {
+ 		barray = G_038014_BASE_ARRAY(word1);
+ 		larray = G_038014_LAST_ARRAY(word1);
+@@ -1444,8 +1475,10 @@ static int r600_check_texture_resource(struct radeon_cs_parser *p,  u32 idx,
+ 			  &l0_size, &mipmap_size);
+ 	/* using get ib will give us the offset into the texture bo */
+ 	if ((l0_size + word2) > radeon_bo_size(texture)) {
+-		dev_warn(p->dev, "texture bo too small (%d %d %d %d -> %d have %ld)\n",
+-			w0, h0, format, word2, l0_size, radeon_bo_size(texture));
++		dev_warn(p->dev, "texture bo too small ((%d %d) (%d %d) %d %d %d -> %d have %ld)\n",
++			 w0, h0, pitch_align, height_align,
++			 array_check.array_mode, format, word2,
++			 l0_size, radeon_bo_size(texture));
+ 		dev_warn(p->dev, "alignments %d %d %d %lld\n", pitch, pitch_align, height_align, base_align);
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/gpu/drm/radeon/r600d.h b/drivers/gpu/drm/radeon/r600d.h
+index aa9d7c3..2ba460b 100644
+--- a/drivers/gpu/drm/radeon/r600d.h
++++ b/drivers/gpu/drm/radeon/r600d.h
+@@ -78,6 +78,20 @@
+ 
+ #define CB_COLOR0_SIZE                                  0x28060
+ #define CB_COLOR0_VIEW                                  0x28080
++#define R_028080_CB_COLOR0_VIEW                      0x028080
++#define   S_028080_SLICE_START(x)                      (((x) & 0x7FF) << 0)
++#define   G_028080_SLICE_START(x)                      (((x) >> 0) & 0x7FF)
++#define   C_028080_SLICE_START                         0xFFFFF800
++#define   S_028080_SLICE_MAX(x)                        (((x) & 0x7FF) << 13)
++#define   G_028080_SLICE_MAX(x)                        (((x) >> 13) & 0x7FF)
++#define   C_028080_SLICE_MAX                           0xFF001FFF
++#define R_028084_CB_COLOR1_VIEW                      0x028084
++#define R_028088_CB_COLOR2_VIEW                      0x028088
++#define R_02808C_CB_COLOR3_VIEW                      0x02808C
++#define R_028090_CB_COLOR4_VIEW                      0x028090
++#define R_028094_CB_COLOR5_VIEW                      0x028094
++#define R_028098_CB_COLOR6_VIEW                      0x028098
++#define R_02809C_CB_COLOR7_VIEW                      0x02809C
+ #define CB_COLOR0_INFO                                  0x280a0
+ #	define CB_FORMAT(x)				((x) << 2)
+ #       define CB_ARRAY_MODE(x)                         ((x) << 8)
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 1668ec1..884e0d4 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -242,6 +242,9 @@ extern int rv6xx_get_temp(struct radeon_device *rdev);
+ extern int rv770_get_temp(struct radeon_device *rdev);
+ extern int evergreen_get_temp(struct radeon_device *rdev);
+ extern int sumo_get_temp(struct radeon_device *rdev);
++extern void evergreen_tiling_fields(unsigned tiling_flags, unsigned *bankw,
++				    unsigned *bankh, unsigned *mtaspect,
++				    unsigned *tile_split);
+ 
+ /*
+  * Fences.
+@@ -1750,6 +1753,16 @@ int r600_vram_scratch_init(struct radeon_device *rdev);
+ void r600_vram_scratch_fini(struct radeon_device *rdev);
+ 
+ /*
++ * r600 cs checking helper
++ */
++unsigned r600_mip_minify(unsigned size, unsigned level);
++bool r600_fmt_is_valid_color(u32 format);
++bool r600_fmt_is_valid_texture(u32 format, enum radeon_family family);
++int r600_fmt_get_blocksize(u32 format);
++int r600_fmt_get_nblocksx(u32 format, u32 w);
++int r600_fmt_get_nblocksy(u32 format, u32 h);
++
++/*
+  * r600 functions used by radeon_encoder.c
+  */
+ extern void r600_hdmi_enable(struct drm_encoder *encoder);
+diff --git a/drivers/gpu/drm/radeon/radeon_drv.c b/drivers/gpu/drm/radeon/radeon_drv.c
+index 713d066..498d21d 100644
+--- a/drivers/gpu/drm/radeon/radeon_drv.c
++++ b/drivers/gpu/drm/radeon/radeon_drv.c
+@@ -55,9 +55,10 @@
+  *   2.11.0 - backend map, initial compute support for the CS checker
+  *   2.12.0 - RADEON_CS_KEEP_TILING_FLAGS
+  *   2.13.0 - virtual memory support, streamout
++ *   2.14.0 - add evergreen tiling informations
+  */
+ #define KMS_DRIVER_MAJOR	2
+-#define KMS_DRIVER_MINOR	13
++#define KMS_DRIVER_MINOR	14
+ #define KMS_DRIVER_PATCHLEVEL	0
+ int radeon_driver_load_kms(struct drm_device *dev, unsigned long flags);
+ int radeon_driver_unload_kms(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/radeon/radeon_object.c b/drivers/gpu/drm/radeon/radeon_object.c
+index d45df17..342deac 100644
+--- a/drivers/gpu/drm/radeon/radeon_object.c
++++ b/drivers/gpu/drm/radeon/radeon_object.c
+@@ -445,8 +445,54 @@ static void radeon_bo_clear_surface_reg(struct radeon_bo *bo)
+ int radeon_bo_set_tiling_flags(struct radeon_bo *bo,
+ 				uint32_t tiling_flags, uint32_t pitch)
+ {
++	struct radeon_device *rdev = bo->rdev;
+ 	int r;
+ 
++	if (rdev->family >= CHIP_CEDAR) {
++		unsigned bankw, bankh, mtaspect, tilesplit, stilesplit;
++
++		bankw = (tiling_flags >> RADEON_TILING_EG_BANKW_SHIFT) & RADEON_TILING_EG_BANKW_MASK;
++		bankh = (tiling_flags >> RADEON_TILING_EG_BANKH_SHIFT) & RADEON_TILING_EG_BANKH_MASK;
++		mtaspect = (tiling_flags >> RADEON_TILING_EG_MACRO_TILE_ASPECT_SHIFT) & RADEON_TILING_EG_MACRO_TILE_ASPECT_MASK;
++		tilesplit = (tiling_flags >> RADEON_TILING_EG_TILE_SPLIT_SHIFT) & RADEON_TILING_EG_TILE_SPLIT_MASK;
++		stilesplit = (tiling_flags >> RADEON_TILING_EG_STENCIL_TILE_SPLIT_SHIFT) & RADEON_TILING_EG_STENCIL_TILE_SPLIT_MASK;
++		switch (bankw) {
++		case 0:
++		case 1:
++		case 2:
++		case 4:
++		case 8:
++			break;
++		default:
++			return -EINVAL;
++		}
++		switch (bankh) {
++		case 0:
++		case 1:
++		case 2:
++		case 4:
++		case 8:
++			break;
++		default:
++			return -EINVAL;
++		}
++		switch (mtaspect) {
++		case 0:
++		case 1:
++		case 2:
++		case 4:
++		case 8:
++			break;
++		default:
++			return -EINVAL;
++		}
++		if (tilesplit > 6) {
++			return -EINVAL;
++		}
++		if (stilesplit > 6) {
++			return -EINVAL;
++		}
++	}
+ 	r = radeon_bo_reserve(bo, false);
+ 	if (unlikely(r != 0))
+ 		return r;
+diff --git a/drivers/gpu/drm/radeon/reg_srcs/cayman b/drivers/gpu/drm/radeon/reg_srcs/cayman
+index 0eac19e..7b526d3 100644
+--- a/drivers/gpu/drm/radeon/reg_srcs/cayman
++++ b/drivers/gpu/drm/radeon/reg_srcs/cayman
+@@ -80,7 +80,6 @@ cayman 0x9400
+ 0x0002802C DB_DEPTH_CLEAR
+ 0x00028030 PA_SC_SCREEN_SCISSOR_TL
+ 0x00028034 PA_SC_SCREEN_SCISSOR_BR
+-0x0002805C DB_DEPTH_SLICE
+ 0x00028140 SQ_ALU_CONST_BUFFER_SIZE_PS_0
+ 0x00028144 SQ_ALU_CONST_BUFFER_SIZE_PS_1
+ 0x00028148 SQ_ALU_CONST_BUFFER_SIZE_PS_2
+diff --git a/drivers/gpu/drm/radeon/reg_srcs/evergreen b/drivers/gpu/drm/radeon/reg_srcs/evergreen
+index 4e3f208..7f43394 100644
+--- a/drivers/gpu/drm/radeon/reg_srcs/evergreen
++++ b/drivers/gpu/drm/radeon/reg_srcs/evergreen
+@@ -96,7 +96,6 @@ evergreen 0x9400
+ 0x0002802C DB_DEPTH_CLEAR
+ 0x00028030 PA_SC_SCREEN_SCISSOR_TL
+ 0x00028034 PA_SC_SCREEN_SCISSOR_BR
+-0x0002805C DB_DEPTH_SLICE
+ 0x00028140 SQ_ALU_CONST_BUFFER_SIZE_PS_0
+ 0x00028144 SQ_ALU_CONST_BUFFER_SIZE_PS_1
+ 0x00028148 SQ_ALU_CONST_BUFFER_SIZE_PS_2
+diff --git a/drivers/gpu/drm/radeon/reg_srcs/r600 b/drivers/gpu/drm/radeon/reg_srcs/r600
+index a1fc242..79d2455 100644
+--- a/drivers/gpu/drm/radeon/reg_srcs/r600
++++ b/drivers/gpu/drm/radeon/reg_srcs/r600
+@@ -754,14 +754,6 @@ r600 0x9400
+ 0x00028114 CB_COLOR5_MASK
+ 0x00028118 CB_COLOR6_MASK
+ 0x0002811C CB_COLOR7_MASK
+-0x00028080 CB_COLOR0_VIEW
+-0x00028084 CB_COLOR1_VIEW
+-0x00028088 CB_COLOR2_VIEW
+-0x0002808C CB_COLOR3_VIEW
+-0x00028090 CB_COLOR4_VIEW
+-0x00028094 CB_COLOR5_VIEW
+-0x00028098 CB_COLOR6_VIEW
+-0x0002809C CB_COLOR7_VIEW
+ 0x00028808 CB_COLOR_CONTROL
+ 0x0002842C CB_FOG_BLUE
+ 0x00028428 CB_FOG_GREEN
+diff --git a/include/drm/radeon_drm.h b/include/drm/radeon_drm.h
+index b55da40..cb2f0c3 100644
+--- a/include/drm/radeon_drm.h
++++ b/include/drm/radeon_drm.h
+@@ -804,13 +804,23 @@ struct drm_radeon_gem_create {
+ 	uint32_t	flags;
+ };
+ 
+-#define RADEON_TILING_MACRO       0x1
+-#define RADEON_TILING_MICRO       0x2
+-#define RADEON_TILING_SWAP_16BIT  0x4
+-#define RADEON_TILING_SWAP_32BIT  0x8
+-#define RADEON_TILING_SURFACE     0x10 /* this object requires a surface
+-					* when mapped - i.e. front buffer */
+-#define RADEON_TILING_MICRO_SQUARE 0x20
++#define RADEON_TILING_MACRO				0x1
++#define RADEON_TILING_MICRO				0x2
++#define RADEON_TILING_SWAP_16BIT			0x4
++#define RADEON_TILING_SWAP_32BIT			0x8
++/* this object requires a surface when mapped - i.e. front buffer */
++#define RADEON_TILING_SURFACE				0x10
++#define RADEON_TILING_MICRO_SQUARE			0x20
++#define RADEON_TILING_EG_BANKW_SHIFT			8
++#define RADEON_TILING_EG_BANKW_MASK			0xf
++#define RADEON_TILING_EG_BANKH_SHIFT			12
++#define RADEON_TILING_EG_BANKH_MASK			0xf
++#define RADEON_TILING_EG_MACRO_TILE_ASPECT_SHIFT	16
++#define RADEON_TILING_EG_MACRO_TILE_ASPECT_MASK		0xf
++#define RADEON_TILING_EG_TILE_SPLIT_SHIFT		24
++#define RADEON_TILING_EG_TILE_SPLIT_MASK		0xf
++#define RADEON_TILING_EG_STENCIL_TILE_SPLIT_SHIFT	28
++#define RADEON_TILING_EG_STENCIL_TILE_SPLIT_MASK	0xf
+ 
+ struct drm_radeon_gem_set_tiling {
+ 	uint32_t	handle;
+
