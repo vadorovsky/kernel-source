@@ -1,0 +1,226 @@
+From 05730b32a78dab4bed8fb7ccc64c53d9fcf31e9d Mon Sep 17 00:00:00 2001
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Wed, 31 Aug 2011 07:42:52 +0000
+Subject: vmwgfx: Switch to VGA when we drop master and vmwgfx fbdev is not
+ active
+Git-commit: 05730b32a78dab4bed8fb7ccc64c53d9fcf31e9d
+Patch-mainline: v3.2-rc1
+
+Previously this was not done when any 3D resource was active,
+since that meant disabling the fifo with all 3D state lost.
+Now, if there are still 3D resources active, we use the svga hide feature.
+
+This fixes X server VT switching with 3D enabled.
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Jakob Bornecrantz <jakob@vmware.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.c      |   54 +++++++++++++++++++++++-------
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.h      |    4 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_resource.c |    8 ++--
+ 3 files changed, 48 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+index 62d54b9..3d6a073 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -209,7 +209,14 @@ static void vmw_release_device(struct vmw_private *dev_priv)
+ 	vmw_fifo_release(dev_priv, &dev_priv->fifo);
+ }
+ 
+-int vmw_3d_resource_inc(struct vmw_private *dev_priv)
++/**
++ * Increase the 3d resource refcount.
++ * If the count was prevously zero, initialize the fifo, switching to svga
++ * mode. Note that the master holds a ref as well, and may request an
++ * explicit switch to svga mode if fb is not running, using @unhide_svga.
++ */
++int vmw_3d_resource_inc(struct vmw_private *dev_priv,
++			bool unhide_svga)
+ {
+ 	int ret = 0;
+ 
+@@ -218,19 +225,42 @@ int vmw_3d_resource_inc(struct vmw_private *dev_priv)
+ 		ret = vmw_request_device(dev_priv);
+ 		if (unlikely(ret != 0))
+ 			--dev_priv->num_3d_resources;
++	} else if (unhide_svga) {
++		mutex_lock(&dev_priv->hw_mutex);
++		vmw_write(dev_priv, SVGA_REG_ENABLE,
++			  vmw_read(dev_priv, SVGA_REG_ENABLE) &
++			  ~SVGA_REG_ENABLE_HIDE);
++		mutex_unlock(&dev_priv->hw_mutex);
+ 	}
++
+ 	mutex_unlock(&dev_priv->release_mutex);
+ 	return ret;
+ }
+ 
+-
+-void vmw_3d_resource_dec(struct vmw_private *dev_priv)
++/**
++ * Decrease the 3d resource refcount.
++ * If the count reaches zero, disable the fifo, switching to vga mode.
++ * Note that the master holds a refcount as well, and may request an
++ * explicit switch to vga mode when it releases its refcount to account
++ * for the situation of an X server vt switch to VGA with 3d resources
++ * active.
++ */
++void vmw_3d_resource_dec(struct vmw_private *dev_priv,
++			 bool hide_svga)
+ {
+ 	int32_t n3d;
+ 
+ 	mutex_lock(&dev_priv->release_mutex);
+ 	if (unlikely(--dev_priv->num_3d_resources == 0))
+ 		vmw_release_device(dev_priv);
++	else if (hide_svga) {
++		mutex_lock(&dev_priv->hw_mutex);
++		vmw_write(dev_priv, SVGA_REG_ENABLE,
++			  vmw_read(dev_priv, SVGA_REG_ENABLE) |
++			  SVGA_REG_ENABLE_HIDE);
++		mutex_unlock(&dev_priv->hw_mutex);
++	}
++
+ 	n3d = (int32_t) dev_priv->num_3d_resources;
+ 	mutex_unlock(&dev_priv->release_mutex);
+ 
+@@ -399,7 +429,7 @@ static int vmw_driver_load(struct drm_device *dev, unsigned long chipset)
+ 		goto out_no_kms;
+ 	vmw_overlay_init(dev_priv);
+ 	if (dev_priv->enable_fb) {
+-		ret = vmw_3d_resource_inc(dev_priv);
++		ret = vmw_3d_resource_inc(dev_priv, false);
+ 		if (unlikely(ret != 0))
+ 			goto out_no_fifo;
+ 		vmw_kms_save_vga(dev_priv);
+@@ -429,7 +459,7 @@ out_no_irq:
+ 	if (dev_priv->enable_fb) {
+ 		vmw_fb_close(dev_priv);
+ 		vmw_kms_restore_vga(dev_priv);
+-		vmw_3d_resource_dec(dev_priv);
++		vmw_3d_resource_dec(dev_priv, false);
+ 	}
+ out_no_fifo:
+ 	vmw_overlay_close(dev_priv);
+@@ -474,7 +504,7 @@ static int vmw_driver_unload(struct drm_device *dev)
+ 	if (dev_priv->enable_fb) {
+ 		vmw_fb_close(dev_priv);
+ 		vmw_kms_restore_vga(dev_priv);
+-		vmw_3d_resource_dec(dev_priv);
++		vmw_3d_resource_dec(dev_priv, false);
+ 	}
+ 	vmw_kms_close(dev_priv);
+ 	vmw_overlay_close(dev_priv);
+@@ -648,7 +678,7 @@ static int vmw_master_set(struct drm_device *dev,
+ 	int ret = 0;
+ 
+ 	if (!dev_priv->enable_fb) {
+-		ret = vmw_3d_resource_inc(dev_priv);
++		ret = vmw_3d_resource_inc(dev_priv, true);
+ 		if (unlikely(ret != 0))
+ 			return ret;
+ 		vmw_kms_save_vga(dev_priv);
+@@ -690,7 +720,7 @@ out_no_active_lock:
+ 		vmw_write(dev_priv, SVGA_REG_TRACES, 1);
+ 		mutex_unlock(&dev_priv->hw_mutex);
+ 		vmw_kms_restore_vga(dev_priv);
+-		vmw_3d_resource_dec(dev_priv);
++		vmw_3d_resource_dec(dev_priv, true);
+ 	}
+ 	return ret;
+ }
+@@ -728,7 +758,7 @@ static void vmw_master_drop(struct drm_device *dev,
+ 		vmw_write(dev_priv, SVGA_REG_TRACES, 1);
+ 		mutex_unlock(&dev_priv->hw_mutex);
+ 		vmw_kms_restore_vga(dev_priv);
+-		vmw_3d_resource_dec(dev_priv);
++		vmw_3d_resource_dec(dev_priv, true);
+ 	}
+ 
+ 	dev_priv->active_master = &dev_priv->fbdev_master;
+@@ -837,7 +867,7 @@ static int vmw_pm_prepare(struct device *kdev)
+ 	 */
+ 	dev_priv->suspended = true;
+ 	if (dev_priv->enable_fb)
+-		vmw_3d_resource_dec(dev_priv);
++			vmw_3d_resource_dec(dev_priv, true);
+ 
+ 	if (dev_priv->num_3d_resources != 0) {
+ 
+@@ -845,7 +875,7 @@ static int vmw_pm_prepare(struct device *kdev)
+ 			 "while 3D resources are active.\n");
+ 
+ 		if (dev_priv->enable_fb)
+-			vmw_3d_resource_inc(dev_priv);
++			vmw_3d_resource_inc(dev_priv, true);
+ 		dev_priv->suspended = false;
+ 		return -EBUSY;
+ 	}
+@@ -864,7 +894,7 @@ static void vmw_pm_complete(struct device *kdev)
+ 	 * start fifo.
+ 	 */
+ 	if (dev_priv->enable_fb)
+-		vmw_3d_resource_inc(dev_priv);
++			vmw_3d_resource_inc(dev_priv, false);
+ 
+ 	dev_priv->suspended = false;
+ }
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+index ec09a3f..95b7500 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -319,8 +319,8 @@ static inline uint32_t vmw_read(struct vmw_private *dev_priv,
+ 	return val;
+ }
+ 
+-int vmw_3d_resource_inc(struct vmw_private *dev_priv);
+-void vmw_3d_resource_dec(struct vmw_private *dev_priv);
++int vmw_3d_resource_inc(struct vmw_private *dev_priv, bool unhide_svga);
++void vmw_3d_resource_dec(struct vmw_private *dev_priv, bool hide_svga);
+ 
+ /**
+  * GMR utilities - vmwgfx_gmr.c
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+index dc8904a..4b53803 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+@@ -211,7 +211,7 @@ static void vmw_hw_context_destroy(struct vmw_resource *res)
+ 	cmd->body.cid = cpu_to_le32(res->id);
+ 
+ 	vmw_fifo_commit(dev_priv, sizeof(*cmd));
+-	vmw_3d_resource_dec(dev_priv);
++	vmw_3d_resource_dec(dev_priv, false);
+ }
+ 
+ static int vmw_context_init(struct vmw_private *dev_priv,
+@@ -248,7 +248,7 @@ static int vmw_context_init(struct vmw_private *dev_priv,
+ 	cmd->body.cid = cpu_to_le32(res->id);
+ 
+ 	vmw_fifo_commit(dev_priv, sizeof(*cmd));
+-	(void) vmw_3d_resource_inc(dev_priv);
++	(void) vmw_3d_resource_inc(dev_priv, false);
+ 	vmw_resource_activate(res, vmw_hw_context_destroy);
+ 	return 0;
+ }
+@@ -411,7 +411,7 @@ static void vmw_hw_surface_destroy(struct vmw_resource *res)
+ 	cmd->body.sid = cpu_to_le32(res->id);
+ 
+ 	vmw_fifo_commit(dev_priv, sizeof(*cmd));
+-	vmw_3d_resource_dec(dev_priv);
++	vmw_3d_resource_dec(dev_priv, false);
+ }
+ 
+ void vmw_surface_res_free(struct vmw_resource *res)
+@@ -479,7 +479,7 @@ int vmw_surface_init(struct vmw_private *dev_priv,
+ 	}
+ 
+ 	vmw_fifo_commit(dev_priv, submit_size);
+-	(void) vmw_3d_resource_inc(dev_priv);
++	(void) vmw_3d_resource_inc(dev_priv, false);
+ 	vmw_resource_activate(res, vmw_hw_surface_destroy);
+ 	return 0;
+ }
+
