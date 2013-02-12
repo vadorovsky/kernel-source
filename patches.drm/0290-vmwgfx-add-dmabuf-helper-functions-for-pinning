@@ -1,0 +1,657 @@
+From d991ef0395596c4aeabcded322011d3f5fa9e74e Mon Sep 17 00:00:00 2001
+From: Jakob Bornecrantz <jakob@vmware.com>
+Date: Tue, 4 Oct 2011 20:13:21 +0200
+Subject: vmwgfx: Add dmabuf helper functions for pinning
+Git-commit: d991ef0395596c4aeabcded322011d3f5fa9e74e
+Patch-mainline: v3.2-rc1
+
+Signed-off-by: Jakob Bornecrantz <jakob@vmware.com>
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/vmwgfx/Makefile         |    2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c  |   33 ++++
+ drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c  |  292 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.h     |   32 +++-
+ drivers/gpu/drm/vmwgfx/vmwgfx_fb.c      |   57 +------
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c     |    4 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c |   66 ++-----
+ 7 files changed, 379 insertions(+), 107 deletions(-)
+
+diff --git a/drivers/gpu/drm/vmwgfx/Makefile b/drivers/gpu/drm/vmwgfx/Makefile
+index 7d8e9d5..e13a118 100644
+--- a/drivers/gpu/drm/vmwgfx/Makefile
++++ b/drivers/gpu/drm/vmwgfx/Makefile
+@@ -5,6 +5,6 @@ vmwgfx-y := vmwgfx_execbuf.o vmwgfx_gmr.o vmwgfx_kms.o vmwgfx_drv.o \
+ 	    vmwgfx_fb.o vmwgfx_ioctl.o vmwgfx_resource.o vmwgfx_buffer.o \
+ 	    vmwgfx_fifo.o vmwgfx_irq.o vmwgfx_ldu.o vmwgfx_ttm_glue.o \
+ 	    vmwgfx_overlay.o vmwgfx_marker.o vmwgfx_gmrid_manager.o \
+-	    vmwgfx_fence.o
++	    vmwgfx_fence.o vmwgfx_dmabuf.o
+ 
+ obj-$(CONFIG_DRM_VMWGFX) := vmwgfx.o
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c b/drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c
+index 5d665ce..98a5d7e 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c
+@@ -42,6 +42,10 @@ static uint32_t sys_placement_flags = TTM_PL_FLAG_SYSTEM |
+ static uint32_t gmr_placement_flags = VMW_PL_FLAG_GMR |
+ 	TTM_PL_FLAG_CACHED;
+ 
++static uint32_t gmr_ne_placement_flags = VMW_PL_FLAG_GMR |
++	TTM_PL_FLAG_CACHED |
++	TTM_PL_FLAG_NO_EVICT;
++
+ struct ttm_placement vmw_vram_placement = {
+ 	.fpfn = 0,
+ 	.lpfn = 0,
+@@ -65,6 +69,20 @@ struct ttm_placement vmw_vram_gmr_placement = {
+ 	.busy_placement = &gmr_placement_flags
+ };
+ 
++static uint32_t vram_gmr_ne_placement_flags[] = {
++	TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED | TTM_PL_FLAG_NO_EVICT,
++	VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED | TTM_PL_FLAG_NO_EVICT
++};
++
++struct ttm_placement vmw_vram_gmr_ne_placement = {
++	.fpfn = 0,
++	.lpfn = 0,
++	.num_placement = 2,
++	.placement = vram_gmr_ne_placement_flags,
++	.num_busy_placement = 1,
++	.busy_placement = &gmr_ne_placement_flags
++};
++
+ struct ttm_placement vmw_vram_sys_placement = {
+ 	.fpfn = 0,
+ 	.lpfn = 0,
+@@ -92,6 +110,21 @@ struct ttm_placement vmw_sys_placement = {
+ 	.busy_placement = &sys_placement_flags
+ };
+ 
++static uint32_t evictable_placement_flags[] = {
++	TTM_PL_FLAG_SYSTEM | TTM_PL_FLAG_CACHED,
++	TTM_PL_FLAG_VRAM | TTM_PL_FLAG_CACHED,
++	VMW_PL_FLAG_GMR | TTM_PL_FLAG_CACHED
++};
++
++struct ttm_placement vmw_evictable_placement = {
++	.fpfn = 0,
++	.lpfn = 0,
++	.num_placement = 3,
++	.placement = evictable_placement_flags,
++	.num_busy_placement = 1,
++	.busy_placement = &sys_placement_flags
++};
++
+ struct vmw_ttm_backend {
+ 	struct ttm_backend backend;
+ 	struct page **pages;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c b/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
+new file mode 100644
+index 0000000..5668ad9
+--- /dev/null
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_dmabuf.c
+@@ -0,0 +1,292 @@
++/**************************************************************************
++ *
++ * Copyright © 2011 VMware, Inc., Palo Alto, CA., USA
++ * All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sub license, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial portions
++ * of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDERS, AUTHORS AND/OR ITS SUPPLIERS BE LIABLE FOR ANY CLAIM,
++ * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
++ * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
++ * USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ **************************************************************************/
++
++#include "ttm/ttm_placement.h"
++
++#include "drmP.h"
++#include "vmwgfx_drv.h"
++
++
++/**
++ * Validate a buffer to placement.
++ *
++ * May only be called by the current master as this function takes the
++ * its lock in write mode.
++ *
++ * Returns
++ *  -ERESTARTSYS if interrupted by a signal.
++ */
++int vmw_dmabuf_to_placement(struct vmw_private *dev_priv,
++			    struct vmw_dma_buffer *buf,
++			    struct ttm_placement *placement,
++			    bool interruptible)
++{
++	struct vmw_master *vmaster = dev_priv->active_master;
++	struct ttm_buffer_object *bo = &buf->base;
++	int ret;
++
++	ret = ttm_write_lock(&vmaster->lock, interruptible);
++	if (unlikely(ret != 0))
++		return ret;
++
++	ret = ttm_bo_reserve(bo, interruptible, false, false, 0);
++	if (unlikely(ret != 0))
++		goto err;
++
++	ret = ttm_bo_validate(bo, placement, interruptible, false, false);
++
++	ttm_bo_unreserve(bo);
++
++err:
++	ttm_write_unlock(&vmaster->lock);
++	return ret;
++}
++
++/**
++ * Move a buffer to vram or gmr.
++ *
++ * May only be called by the current master as this function takes the
++ * its lock in write mode.
++ *
++ * @dev_priv:  Driver private.
++ * @buf:  DMA buffer to move.
++ * @pin:  Pin buffer if true.
++ * @interruptible:  Use interruptible wait.
++ *
++ * Returns
++ * -ERESTARTSYS if interrupted by a signal.
++ */
++int vmw_dmabuf_to_vram_or_gmr(struct vmw_private *dev_priv,
++			      struct vmw_dma_buffer *buf,
++			      bool pin, bool interruptible)
++{
++	struct vmw_master *vmaster = dev_priv->active_master;
++	struct ttm_buffer_object *bo = &buf->base;
++	struct ttm_placement *placement;
++	int ret;
++
++	ret = ttm_write_lock(&vmaster->lock, interruptible);
++	if (unlikely(ret != 0))
++		return ret;
++
++	ret = ttm_bo_reserve(bo, interruptible, false, false, 0);
++	if (unlikely(ret != 0))
++		goto err;
++
++	/**
++	 * Put BO in VRAM if there is space, otherwise as a GMR.
++	 * If there is no space in VRAM and GMR ids are all used up,
++	 * start evicting GMRs to make room. If the DMA buffer can't be
++	 * used as a GMR, this will return -ENOMEM.
++	 */
++
++	if (pin)
++		placement = &vmw_vram_gmr_ne_placement;
++	else
++		placement = &vmw_vram_gmr_placement;
++
++	ret = ttm_bo_validate(bo, placement, interruptible, false, false);
++	if (likely(ret == 0) || ret == -ERESTARTSYS)
++		goto err_unreserve;
++
++
++	/**
++	 * If that failed, try VRAM again, this time evicting
++	 * previous contents.
++	 */
++
++	if (pin)
++		placement = &vmw_vram_ne_placement;
++	else
++		placement = &vmw_vram_placement;
++
++	ret = ttm_bo_validate(bo, placement, interruptible, false, false);
++
++err_unreserve:
++	ttm_bo_unreserve(bo);
++err:
++	ttm_write_unlock(&vmaster->lock);
++	return ret;
++}
++
++/**
++ * Move a buffer to vram.
++ *
++ * May only be called by the current master as this function takes the
++ * its lock in write mode.
++ *
++ * @dev_priv:  Driver private.
++ * @buf:  DMA buffer to move.
++ * @pin:  Pin buffer in vram if true.
++ * @interruptible:  Use interruptible wait.
++ *
++ * Returns
++ * -ERESTARTSYS if interrupted by a signal.
++ */
++int vmw_dmabuf_to_vram(struct vmw_private *dev_priv,
++		       struct vmw_dma_buffer *buf,
++		       bool pin, bool interruptible)
++{
++	struct ttm_placement *placement;
++
++	if (pin)
++		placement = &vmw_vram_ne_placement;
++	else
++		placement = &vmw_vram_placement;
++
++	return vmw_dmabuf_to_placement(dev_priv, buf,
++				       placement,
++				       interruptible);
++}
++
++/**
++ * Move a buffer to start of vram.
++ *
++ * May only be called by the current master as this function takes the
++ * its lock in write mode.
++ *
++ * @dev_priv:  Driver private.
++ * @buf:  DMA buffer to move.
++ * @pin:  Pin buffer in vram if true.
++ * @interruptible:  Use interruptible wait.
++ *
++ * Returns
++ * -ERESTARTSYS if interrupted by a signal.
++ */
++int vmw_dmabuf_to_start_of_vram(struct vmw_private *dev_priv,
++				struct vmw_dma_buffer *buf,
++				bool pin, bool interruptible)
++{
++	struct vmw_master *vmaster = dev_priv->active_master;
++	struct ttm_buffer_object *bo = &buf->base;
++	struct ttm_placement placement;
++	int ret = 0;
++
++	if (pin)
++		placement = vmw_vram_ne_placement;
++	else
++		placement = vmw_vram_placement;
++	placement.lpfn = bo->num_pages;
++
++	ret = ttm_write_lock(&vmaster->lock, interruptible);
++	if (unlikely(ret != 0))
++		return ret;
++
++	ret = ttm_bo_reserve(bo, interruptible, false, false, 0);
++	if (unlikely(ret != 0))
++		goto err_unlock;
++
++	/* Is this buffer already in vram but not at the start of it? */
++	if (bo->mem.mem_type == TTM_PL_VRAM &&
++	    bo->mem.start < bo->num_pages &&
++	    bo->mem.start > 0)
++		(void) ttm_bo_validate(bo, &vmw_sys_placement, false,
++				       false, false);
++
++	ret = ttm_bo_validate(bo, &placement, interruptible, false, false);
++
++	/* For some reason we didn't up at the start of vram */
++	WARN_ON(ret == 0 && bo->offset != 0);
++
++	ttm_bo_unreserve(bo);
++err_unlock:
++	ttm_write_unlock(&vmaster->lock);
++
++	return ret;
++}
++
++/**
++ * Unpin the buffer given buffer, does not move the buffer.
++ *
++ * May only be called by the current master as this function takes the
++ * its lock in write mode.
++ *
++ * @dev_priv:  Driver private.
++ * @buf:  DMA buffer to unpin.
++ * @interruptible:  Use interruptible wait.
++ *
++ * Returns
++ * -ERESTARTSYS if interrupted by a signal.
++ */
++int vmw_dmabuf_unpin(struct vmw_private *dev_priv,
++		     struct vmw_dma_buffer *buf,
++		     bool interruptible)
++{
++	/*
++	 * We could in theory early out if the buffer is
++	 * unpinned but we need to lock and reserve the buffer
++	 * anyways so we don't gain much by that.
++	 */
++	return vmw_dmabuf_to_placement(dev_priv, buf,
++				       &vmw_evictable_placement,
++				       interruptible);
++}
++
++/**
++ * Move a buffer to system memory, does not pin the buffer.
++ *
++ * May only be called by the current master as this function takes the
++ * its lock in write mode.
++ *
++ * @dev_priv:  Driver private.
++ * @buf:  DMA buffer to move.
++ * @interruptible:  Use interruptible wait.
++ *
++ * Returns
++ * -ERESTARTSYS if interrupted by a signal.
++ */
++int vmw_dmabuf_to_system(struct vmw_private *dev_priv,
++			 struct vmw_dma_buffer *buf,
++			 bool interruptible)
++{
++	return vmw_dmabuf_to_placement(dev_priv, buf,
++				       &vmw_sys_placement,
++				       interruptible);
++}
++
++void vmw_dmabuf_get_id_offset(struct vmw_dma_buffer *buf,
++			      uint32_t *gmrId, uint32_t *offset)
++{
++	if (buf->base.mem.mem_type == TTM_PL_VRAM) {
++		*gmrId = SVGA_GMR_FRAMEBUFFER;
++		*offset = buf->base.offset;
++	} else {
++		*gmrId = buf->base.mem.start;
++		*offset = 0;
++	}
++}
++
++void vmw_dmabuf_get_guest_ptr(struct vmw_dma_buffer *buf, SVGAGuestPtr *ptr)
++{
++	if (buf->base.mem.mem_type == TTM_PL_VRAM) {
++		ptr->gmrId = SVGA_GMR_FRAMEBUFFER;
++		ptr->offset = buf->base.offset;
++	} else {
++		ptr->gmrId = buf->base.mem.start;
++		ptr->offset = 0;
++	}
++}
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+index edd1e83..5acf1f2 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -385,10 +385,6 @@ extern uint32_t vmw_dmabuf_validate_node(struct ttm_buffer_object *bo,
+ extern void vmw_dmabuf_validate_clear(struct ttm_buffer_object *bo);
+ extern int vmw_user_dmabuf_lookup(struct ttm_object_file *tfile,
+ 				  uint32_t id, struct vmw_dma_buffer **out);
+-extern int vmw_dmabuf_to_start_of_vram(struct vmw_private *vmw_priv,
+-				       struct vmw_dma_buffer *bo);
+-extern int vmw_dmabuf_from_vram(struct vmw_private *vmw_priv,
+-				struct vmw_dma_buffer *bo);
+ extern int vmw_stream_claim_ioctl(struct drm_device *dev, void *data,
+ 				  struct drm_file *file_priv);
+ extern int vmw_stream_unref_ioctl(struct drm_device *dev, void *data,
+@@ -398,6 +394,32 @@ extern int vmw_user_stream_lookup(struct vmw_private *dev_priv,
+ 				  uint32_t *inout_id,
+ 				  struct vmw_resource **out);
+ 
++/**
++ * DMA buffer helper routines - vmwgfx_dmabuf.c
++ */
++extern int vmw_dmabuf_to_placement(struct vmw_private *vmw_priv,
++				   struct vmw_dma_buffer *bo,
++				   struct ttm_placement *placement,
++				   bool interruptible);
++extern int vmw_dmabuf_to_vram(struct vmw_private *dev_priv,
++			      struct vmw_dma_buffer *buf,
++			      bool pin, bool interruptible);
++extern int vmw_dmabuf_to_vram_or_gmr(struct vmw_private *dev_priv,
++				     struct vmw_dma_buffer *buf,
++				     bool pin, bool interruptible);
++extern int vmw_dmabuf_to_start_of_vram(struct vmw_private *vmw_priv,
++				       struct vmw_dma_buffer *bo,
++				       bool pin, bool interruptible);
++extern int vmw_dmabuf_unpin(struct vmw_private *vmw_priv,
++			    struct vmw_dma_buffer *bo,
++			    bool interruptible);
++extern int vmw_dmabuf_to_system(struct vmw_private *vmw_priv,
++				struct vmw_dma_buffer *bo,
++				bool interruptible);
++extern void vmw_dmabuf_get_id_offset(struct vmw_dma_buffer *buf,
++				     uint32_t *gmrId, uint32_t *offset);
++extern void vmw_dmabuf_get_guest_ptr(struct vmw_dma_buffer *buf,
++				     SVGAGuestPtr *ptr);
+ 
+ /**
+  * Misc Ioctl functionality - vmwgfx_ioctl.c
+@@ -440,7 +462,9 @@ extern struct ttm_placement vmw_vram_placement;
+ extern struct ttm_placement vmw_vram_ne_placement;
+ extern struct ttm_placement vmw_vram_sys_placement;
+ extern struct ttm_placement vmw_vram_gmr_placement;
++extern struct ttm_placement vmw_vram_gmr_ne_placement;
+ extern struct ttm_placement vmw_sys_placement;
++extern struct ttm_placement vmw_evictable_placement;
+ extern struct ttm_bo_driver vmw_bo_driver;
+ extern int vmw_dma_quiescent(struct drm_device *dev);
+ 
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
+index b1888e8..191f1b2 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_fb.c
+@@ -592,58 +592,6 @@ int vmw_fb_close(struct vmw_private *vmw_priv)
+ 	return 0;
+ }
+ 
+-int vmw_dmabuf_from_vram(struct vmw_private *vmw_priv,
+-			 struct vmw_dma_buffer *vmw_bo)
+-{
+-	struct ttm_buffer_object *bo = &vmw_bo->base;
+-	int ret = 0;
+-
+-	ret = ttm_bo_reserve(bo, false, false, false, 0);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+-	ret = ttm_bo_validate(bo, &vmw_sys_placement, false, false, false);
+-	ttm_bo_unreserve(bo);
+-
+-	return ret;
+-}
+-
+-int vmw_dmabuf_to_start_of_vram(struct vmw_private *vmw_priv,
+-				struct vmw_dma_buffer *vmw_bo)
+-{
+-	struct ttm_buffer_object *bo = &vmw_bo->base;
+-	struct ttm_placement ne_placement = vmw_vram_ne_placement;
+-	int ret = 0;
+-
+-	ne_placement.lpfn = bo->num_pages;
+-
+-	/* interuptable? */
+-	ret = ttm_write_lock(&vmw_priv->active_master->lock, false);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+-	ret = ttm_bo_reserve(bo, false, false, false, 0);
+-	if (unlikely(ret != 0))
+-		goto err_unlock;
+-
+-	if (bo->mem.mem_type == TTM_PL_VRAM &&
+-	    bo->mem.start < bo->num_pages &&
+-	    bo->mem.start > 0)
+-		(void) ttm_bo_validate(bo, &vmw_sys_placement, false,
+-				       false, false);
+-
+-	ret = ttm_bo_validate(bo, &ne_placement, false, false, false);
+-
+-	/* Could probably bug on */
+-	WARN_ON(bo->offset != 0);
+-
+-	ttm_bo_unreserve(bo);
+-err_unlock:
+-	ttm_write_unlock(&vmw_priv->active_master->lock);
+-
+-	return ret;
+-}
+-
+ int vmw_fb_off(struct vmw_private *vmw_priv)
+ {
+ 	struct fb_info *info;
+@@ -665,7 +613,8 @@ int vmw_fb_off(struct vmw_private *vmw_priv)
+ 	par->bo_ptr = NULL;
+ 	ttm_bo_kunmap(&par->map);
+ 
+-	vmw_dmabuf_from_vram(vmw_priv, par->vmw_bo);
++	/* move this to system instead of just unpinning it */
++	vmw_dmabuf_to_system(vmw_priv, par->vmw_bo, false);
+ 
+ 	return 0;
+ }
+@@ -691,7 +640,7 @@ int vmw_fb_on(struct vmw_private *vmw_priv)
+ 	/* Make sure that all overlays are stoped when we take over */
+ 	vmw_overlay_stop_all(vmw_priv);
+ 
+-	ret = vmw_dmabuf_to_start_of_vram(vmw_priv, par->vmw_bo);
++	ret = vmw_dmabuf_to_start_of_vram(vmw_priv, par->vmw_bo, true, false);
+ 	if (unlikely(ret != 0)) {
+ 		DRM_ERROR("could not move buffer to start of VRAM\n");
+ 		goto err_no_buffer;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index c34866a..b3d5120 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -804,7 +804,7 @@ static int vmw_framebuffer_dmabuf_pin(struct vmw_framebuffer *vfb)
+ 
+ 	vmw_overlay_pause_all(dev_priv);
+ 
+-	ret = vmw_dmabuf_to_start_of_vram(dev_priv, vfbd->buffer);
++	ret = vmw_dmabuf_to_start_of_vram(dev_priv, vfbd->buffer, true, false);
+ 
+ 	vmw_overlay_resume_all(dev_priv);
+ 
+@@ -824,7 +824,7 @@ static int vmw_framebuffer_dmabuf_unpin(struct vmw_framebuffer *vfb)
+ 		return 0;
+ 	}
+ 
+-	return vmw_dmabuf_from_vram(dev_priv, vfbd->buffer);
++	return vmw_dmabuf_unpin(dev_priv, vfbd->buffer, false);
+ }
+ 
+ static int vmw_kms_new_framebuffer_dmabuf(struct vmw_private *dev_priv,
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c b/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
+index 07ce02d..7a7abcd 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_overlay.c
+@@ -87,48 +87,6 @@ static inline void fill_flush(struct vmw_escape_video_flush *cmd,
+ }
+ 
+ /**
+- * Pin or unpin a buffer in vram.
+- *
+- * @dev_priv:  Driver private.
+- * @buf:  DMA buffer to pin or unpin.
+- * @pin:  Pin buffer in vram if true.
+- * @interruptible:  Use interruptible wait.
+- *
+- * Takes the current masters ttm lock in read.
+- *
+- * Returns
+- * -ERESTARTSYS if interrupted by a signal.
+- */
+-static int vmw_dmabuf_pin_in_vram(struct vmw_private *dev_priv,
+-				  struct vmw_dma_buffer *buf,
+-				  bool pin, bool interruptible)
+-{
+-	struct ttm_buffer_object *bo = &buf->base;
+-	struct ttm_placement *overlay_placement = &vmw_vram_placement;
+-	int ret;
+-
+-	ret = ttm_read_lock(&dev_priv->active_master->lock, interruptible);
+-	if (unlikely(ret != 0))
+-		return ret;
+-
+-	ret = ttm_bo_reserve(bo, interruptible, false, false, 0);
+-	if (unlikely(ret != 0))
+-		goto err;
+-
+-	if (pin)
+-		overlay_placement = &vmw_vram_ne_placement;
+-
+-	ret = ttm_bo_validate(bo, overlay_placement, interruptible, false, false);
+-
+-	ttm_bo_unreserve(bo);
+-
+-err:
+-	ttm_read_unlock(&dev_priv->active_master->lock);
+-
+-	return ret;
+-}
+-
+-/**
+  * Send put command to hw.
+  *
+  * Returns
+@@ -248,6 +206,21 @@ static int vmw_overlay_send_stop(struct vmw_private *dev_priv,
+ }
+ 
+ /**
++ * Move a buffer to vram, and pin it if @pin.
++ *
++ * XXX: This function is here to be changed at a later date.
++ */
++static int vmw_overlay_move_buffer(struct vmw_private *dev_priv,
++				   struct vmw_dma_buffer *buf,
++				   bool pin, bool inter)
++{
++	if (pin)
++		return vmw_dmabuf_to_vram(dev_priv, buf, true, inter);
++	else
++		return vmw_dmabuf_unpin(dev_priv, buf, inter);
++}
++
++/**
+  * Stop or pause a stream.
+  *
+  * If the stream is paused the no evict flag is removed from the buffer
+@@ -279,8 +252,8 @@ static int vmw_overlay_stop(struct vmw_private *dev_priv,
+ 			return ret;
+ 
+ 		/* We just remove the NO_EVICT flag so no -ENOMEM */
+-		ret = vmw_dmabuf_pin_in_vram(dev_priv, stream->buf, false,
+-					     interruptible);
++		ret = vmw_overlay_move_buffer(dev_priv, stream->buf, false,
++					      interruptible);
+ 		if (interruptible && ret == -ERESTARTSYS)
+ 			return ret;
+ 		else
+@@ -342,7 +315,7 @@ static int vmw_overlay_update_stream(struct vmw_private *dev_priv,
+ 	/* We don't start the old stream if we are interrupted.
+ 	 * Might return -ENOMEM if it can't fit the buffer in vram.
+ 	 */
+-	ret = vmw_dmabuf_pin_in_vram(dev_priv, buf, true, interruptible);
++	ret = vmw_overlay_move_buffer(dev_priv, buf, true, interruptible);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -351,7 +324,8 @@ static int vmw_overlay_update_stream(struct vmw_private *dev_priv,
+ 		/* This one needs to happen no matter what. We only remove
+ 		 * the NO_EVICT flag so this is safe from -ENOMEM.
+ 		 */
+-		BUG_ON(vmw_dmabuf_pin_in_vram(dev_priv, buf, false, false) != 0);
++		BUG_ON(vmw_overlay_move_buffer(dev_priv, buf, false, false)
++		       != 0);
+ 		return ret;
+ 	}
+ 
+
