@@ -1,0 +1,162 @@
+From 93504fce28b1a387ec01f81b26637d237dca2b36 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <deathsimple@vodafone.de>
+Date: Thu, 5 Jan 2012 22:11:06 -0500
+Subject: drm/radeon/kms: Add support for multi-ring sync in CS ioctl (v2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 93504fce28b1a387ec01f81b26637d237dca2b36
+Patch-mainline: v3.3-rc1
+
+Use semaphores to sync buffers across rings in the CS
+ioctl.  Add a reloc flag to allow userspace to skip
+sync for buffers.
+
+agd5f: port to latest CS ioctl changes.
+
+v2: add ring lock/unlock to make sure changes hit the ring.
+
+Signed-off-by: Christian König <deathsimple@vodafone.de>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/radeon.h       |    2 +
+ drivers/gpu/drm/radeon/radeon_cs.c    |   45 +++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/radeon/radeon_fence.c |    3 ++
+ include/drm/radeon_drm.h              |    3 ++
+ 4 files changed, 53 insertions(+), 0 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 5e35423..3483ed9 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -230,6 +230,7 @@ struct radeon_fence {
+ 	bool				signaled;
+ 	/* RB, DMA, etc. */
+ 	int				ring;
++	struct radeon_semaphore		*semaphore;
+ };
+ 
+ int radeon_fence_driver_start_ring(struct radeon_device *rdev, int ring);
+@@ -789,6 +790,7 @@ struct radeon_cs_parser {
+ 	struct radeon_cs_reloc	*relocs;
+ 	struct radeon_cs_reloc	**relocs_ptr;
+ 	struct list_head	validated;
++	bool			sync_to_ring[RADEON_NUM_RINGS];
+ 	/* indices of various chunks */
+ 	int			chunk_ib_idx;
+ 	int			chunk_relocs_idx;
+diff --git a/drivers/gpu/drm/radeon/radeon_cs.c b/drivers/gpu/drm/radeon/radeon_cs.c
+index 4d59540..17af0e8 100644
+--- a/drivers/gpu/drm/radeon/radeon_cs.c
++++ b/drivers/gpu/drm/radeon/radeon_cs.c
+@@ -84,6 +84,13 @@ int radeon_cs_parser_relocs(struct radeon_cs_parser *p)
+ 			p->relocs[i].flags = r->flags;
+ 			radeon_bo_list_add_object(&p->relocs[i].lobj,
+ 						  &p->validated);
++
++			if (p->relocs[i].robj->tbo.sync_obj && !(r->flags & RADEON_RELOC_DONT_SYNC)) {
++				struct radeon_fence *fence = p->relocs[i].robj->tbo.sync_obj;
++				if (!radeon_fence_signaled(fence)) {
++					p->sync_to_ring[fence->ring] = true;
++				}
++			}
+ 		} else
+ 			p->relocs[i].handle = 0;
+ 	}
+@@ -109,6 +116,36 @@ static int radeon_cs_get_ring(struct radeon_cs_parser *p, u32 ring, s32 priority
+ 	return 0;
+ }
+ 
++static int radeon_cs_sync_rings(struct radeon_cs_parser *p)
++{
++	int i, r;
++
++	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
++		/* no need to sync to our own or unused rings */
++		if (i == p->ring || !p->sync_to_ring[i] || !p->rdev->ring[i].ready)
++			continue;
++
++		if (!p->ib->fence->semaphore) {
++			r = radeon_semaphore_create(p->rdev, &p->ib->fence->semaphore);
++			if (r)
++				return r;
++		}
++
++		r = radeon_ring_lock(p->rdev, &p->rdev->ring[i], 3);
++		if (r)
++			return r;
++		radeon_semaphore_emit_signal(p->rdev, i, p->ib->fence->semaphore);
++		radeon_ring_unlock_commit(p->rdev, &p->rdev->ring[i]);
++
++		r = radeon_ring_lock(p->rdev, &p->rdev->ring[p->ring], 3);
++		if (r)
++			return r;
++		radeon_semaphore_emit_wait(p->rdev, p->ring, p->ib->fence->semaphore);
++		radeon_ring_unlock_commit(p->rdev, &p->rdev->ring[p->ring]);
++	}
++	return 0;
++}
++
+ int radeon_cs_parser_init(struct radeon_cs_parser *p, void *data)
+ {
+ 	struct drm_radeon_cs *cs = data;
+@@ -314,6 +351,10 @@ static int radeon_cs_ib_chunk(struct radeon_device *rdev,
+ 		DRM_ERROR("Invalid command stream !\n");
+ 		return r;
+ 	}
++	r = radeon_cs_sync_rings(parser);
++	if (r) {
++		DRM_ERROR("Failed to synchronize rings !\n");
++	}
+ 	parser->ib->vm_id = 0;
+ 	r = radeon_ib_schedule(rdev, parser->ib);
+ 	if (r) {
+@@ -384,6 +425,10 @@ static int radeon_cs_ib_vm_chunk(struct radeon_device *rdev,
+ 	if (r) {
+ 		goto out;
+ 	}
++	r = radeon_cs_sync_rings(parser);
++	if (r) {
++		DRM_ERROR("Failed to synchronize rings !\n");
++	}
+ 	parser->ib->vm_id = vm->id;
+ 	/* ib pool is bind at 0 in virtual address space to gpu_addr is the
+ 	 * offset inside the pool bo
+diff --git a/drivers/gpu/drm/radeon/radeon_fence.c b/drivers/gpu/drm/radeon/radeon_fence.c
+index ae9e3da..64ea3dd 100644
+--- a/drivers/gpu/drm/radeon/radeon_fence.c
++++ b/drivers/gpu/drm/radeon/radeon_fence.c
+@@ -153,6 +153,8 @@ static void radeon_fence_destroy(struct kref *kref)
+ 	list_del(&fence->list);
+ 	fence->emitted = false;
+ 	write_unlock_irqrestore(&fence->rdev->fence_lock, irq_flags);
++	if (fence->semaphore)
++		radeon_semaphore_free(fence->rdev, fence->semaphore);
+ 	kfree(fence);
+ }
+ 
+@@ -172,6 +174,7 @@ int radeon_fence_create(struct radeon_device *rdev,
+ 	(*fence)->signaled = false;
+ 	(*fence)->seq = 0;
+ 	(*fence)->ring = ring;
++	(*fence)->semaphore = NULL;
+ 	INIT_LIST_HEAD(&(*fence)->list);
+ 
+ 	write_lock_irqsave(&rdev->fence_lock, irq_flags);
+diff --git a/include/drm/radeon_drm.h b/include/drm/radeon_drm.h
+index d7079f4..2a807a5 100644
+--- a/include/drm/radeon_drm.h
++++ b/include/drm/radeon_drm.h
+@@ -917,6 +917,9 @@ struct drm_radeon_cs_chunk {
+ 	uint64_t		chunk_data;
+ };
+ 
++/* drm_radeon_cs_reloc.flags */
++#define RADEON_RELOC_DONT_SYNC		0x01
++
+ struct drm_radeon_cs_reloc {
+ 	uint32_t		handle;
+ 	uint32_t		read_domains;
+
