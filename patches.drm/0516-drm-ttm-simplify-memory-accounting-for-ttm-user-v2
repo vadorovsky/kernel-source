@@ -1,0 +1,344 @@
+From 57de4ba959b290f0b8cf36ecd5e7f1b29d4b8a12 Mon Sep 17 00:00:00 2001
+From: Jerome Glisse <jglisse@redhat.com>
+Date: Fri, 11 Nov 2011 15:42:57 -0500
+Subject: drm/ttm: simplify memory accounting for ttm user v2
+Git-commit: 57de4ba959b290f0b8cf36ecd5e7f1b29d4b8a12
+Patch-mainline: v3.3-rc1
+
+Provide helper function to compute the kernel memory size needed
+for each buffer object. Move all the accounting inside ttm, simplifying
+driver and avoiding code duplication accross them.
+
+v2 fix accounting of ghost object, one would have thought that i
+   would have run into the issue since a longtime but it seems
+   ghost object are rare when you have plenty of vram ;)
+
+Signed-off-by: Jerome Glisse <jglisse@redhat.com>
+Reviewed-by: Thomas Hellstrom <thellstrom@vmware.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/nouveau/nouveau_bo.c     |    6 +++-
+ drivers/gpu/drm/radeon/radeon_object.c   |    8 +++-
+ drivers/gpu/drm/ttm/ttm_bo.c             |   52 +++++++++++++++++++++++-------
+ drivers/gpu/drm/ttm/ttm_bo_util.c        |    1 +
+ drivers/gpu/drm/vmwgfx/vmwgfx_resource.c |   35 +-------------------
+ include/drm/ttm/ttm_bo_api.h             |   19 ++++++++++-
+ include/drm/ttm/ttm_bo_driver.h          |    5 ---
+ 7 files changed, 71 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index d6326af..7ac7bc3 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -93,6 +93,7 @@ nouveau_bo_new(struct drm_device *dev, int size, int align,
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+ 	struct nouveau_bo *nvbo;
++	size_t acc_size;
+ 	int ret;
+ 
+ 	nvbo = kzalloc(sizeof(struct nouveau_bo), GFP_KERNEL);
+@@ -115,9 +116,12 @@ nouveau_bo_new(struct drm_device *dev, int size, int align,
+ 	nvbo->bo.mem.num_pages = size >> PAGE_SHIFT;
+ 	nouveau_bo_placement_set(nvbo, flags, 0);
+ 
++	acc_size = ttm_bo_dma_acc_size(&dev_priv->ttm.bdev, size,
++				       sizeof(struct nouveau_bo));
++
+ 	ret = ttm_bo_init(&dev_priv->ttm.bdev, &nvbo->bo, size,
+ 			  ttm_bo_type_device, &nvbo->placement,
+-			  align >> PAGE_SHIFT, 0, false, NULL, size,
++			  align >> PAGE_SHIFT, 0, false, NULL, acc_size,
+ 			  nouveau_bo_del_ttm);
+ 	if (ret) {
+ 		/* ttm will call nouveau_bo_del_ttm if it fails.. */
+diff --git a/drivers/gpu/drm/radeon/radeon_object.c b/drivers/gpu/drm/radeon/radeon_object.c
+index 1c85152..695b480 100644
+--- a/drivers/gpu/drm/radeon/radeon_object.c
++++ b/drivers/gpu/drm/radeon/radeon_object.c
+@@ -95,6 +95,7 @@ int radeon_bo_create(struct radeon_device *rdev,
+ 	enum ttm_bo_type type;
+ 	unsigned long page_align = roundup(byte_align, PAGE_SIZE) >> PAGE_SHIFT;
+ 	unsigned long max_size = 0;
++	size_t acc_size;
+ 	int r;
+ 
+ 	size = ALIGN(size, PAGE_SIZE);
+@@ -117,6 +118,9 @@ int radeon_bo_create(struct radeon_device *rdev,
+ 		return -ENOMEM;
+ 	}
+ 
++	acc_size = ttm_bo_dma_acc_size(&rdev->mman.bdev, size,
++				       sizeof(struct radeon_bo));
++
+ retry:
+ 	bo = kzalloc(sizeof(struct radeon_bo), GFP_KERNEL);
+ 	if (bo == NULL)
+@@ -134,8 +138,8 @@ retry:
+ 	/* Kernel allocation are uninterruptible */
+ 	mutex_lock(&rdev->vram_mutex);
+ 	r = ttm_bo_init(&rdev->mman.bdev, &bo->tbo, size, type,
+-			&bo->placement, page_align, 0, !kernel, NULL, size,
+-			&radeon_ttm_bo_destroy);
++			&bo->placement, page_align, 0, !kernel, NULL,
++			acc_size, &radeon_ttm_bo_destroy);
+ 	mutex_unlock(&rdev->vram_mutex);
+ 	if (unlikely(r != 0)) {
+ 		if (r != -ERESTARTSYS) {
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index cb73527..de7ad99 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -137,6 +137,7 @@ static void ttm_bo_release_list(struct kref *list_kref)
+ 	struct ttm_buffer_object *bo =
+ 	    container_of(list_kref, struct ttm_buffer_object, list_kref);
+ 	struct ttm_bo_device *bdev = bo->bdev;
++	size_t acc_size = bo->acc_size;
+ 
+ 	BUG_ON(atomic_read(&bo->list_kref.refcount));
+ 	BUG_ON(atomic_read(&bo->kref.refcount));
+@@ -152,9 +153,9 @@ static void ttm_bo_release_list(struct kref *list_kref)
+ 	if (bo->destroy)
+ 		bo->destroy(bo);
+ 	else {
+-		ttm_mem_global_free(bdev->glob->mem_glob, bo->acc_size);
+ 		kfree(bo);
+ 	}
++	ttm_mem_global_free(bdev->glob->mem_glob, acc_size);
+ }
+ 
+ int ttm_bo_wait_unreserved(struct ttm_buffer_object *bo, bool interruptible)
+@@ -1157,6 +1158,17 @@ int ttm_bo_init(struct ttm_bo_device *bdev,
+ {
+ 	int ret = 0;
+ 	unsigned long num_pages;
++	struct ttm_mem_global *mem_glob = bdev->glob->mem_glob;
++
++	ret = ttm_mem_global_alloc(mem_glob, acc_size, false, false);
++	if (ret) {
++		printk(KERN_ERR TTM_PFX "Out of kernel memory.\n");
++		if (destroy)
++			(*destroy)(bo);
++		else
++			kfree(bo);
++		return -ENOMEM;
++	}
+ 
+ 	size += buffer_start & ~PAGE_MASK;
+ 	num_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+@@ -1227,14 +1239,34 @@ out_err:
+ }
+ EXPORT_SYMBOL(ttm_bo_init);
+ 
+-static inline size_t ttm_bo_size(struct ttm_bo_global *glob,
+-				 unsigned long num_pages)
++size_t ttm_bo_acc_size(struct ttm_bo_device *bdev,
++		       unsigned long bo_size,
++		       unsigned struct_size)
+ {
+-	size_t page_array_size = (num_pages * sizeof(void *) + PAGE_SIZE - 1) &
+-	    PAGE_MASK;
++	unsigned npages = (PAGE_ALIGN(bo_size)) >> PAGE_SHIFT;
++	size_t size = 0;
+ 
+-	return glob->ttm_bo_size + 2 * page_array_size;
++	size += ttm_round_pot(struct_size);
++	size += PAGE_ALIGN(npages * sizeof(void *));
++	size += ttm_round_pot(sizeof(struct ttm_tt));
++	return size;
+ }
++EXPORT_SYMBOL(ttm_bo_acc_size);
++
++size_t ttm_bo_dma_acc_size(struct ttm_bo_device *bdev,
++			   unsigned long bo_size,
++			   unsigned struct_size)
++{
++	unsigned npages = (PAGE_ALIGN(bo_size)) >> PAGE_SHIFT;
++	size_t size = 0;
++
++	size += ttm_round_pot(struct_size);
++	size += PAGE_ALIGN(npages * sizeof(void *));
++	size += PAGE_ALIGN(npages * sizeof(dma_addr_t));
++	size += ttm_round_pot(sizeof(struct ttm_dma_tt));
++	return size;
++}
++EXPORT_SYMBOL(ttm_bo_dma_acc_size);
+ 
+ int ttm_bo_create(struct ttm_bo_device *bdev,
+ 			unsigned long size,
+@@ -1248,10 +1280,10 @@ int ttm_bo_create(struct ttm_bo_device *bdev,
+ {
+ 	struct ttm_buffer_object *bo;
+ 	struct ttm_mem_global *mem_glob = bdev->glob->mem_glob;
++	size_t acc_size;
+ 	int ret;
+ 
+-	size_t acc_size =
+-	    ttm_bo_size(bdev->glob, (size + PAGE_SIZE - 1) >> PAGE_SHIFT);
++	acc_size = ttm_bo_acc_size(bdev, size, sizeof(struct ttm_buffer_object));
+ 	ret = ttm_mem_global_alloc(mem_glob, acc_size, false, false);
+ 	if (unlikely(ret != 0))
+ 		return ret;
+@@ -1437,10 +1469,6 @@ int ttm_bo_global_init(struct drm_global_reference *ref)
+ 		goto out_no_shrink;
+ 	}
+ 
+-	glob->ttm_bo_extra_size = ttm_round_pot(sizeof(struct ttm_tt));
+-	glob->ttm_bo_size = glob->ttm_bo_extra_size +
+-		ttm_round_pot(sizeof(struct ttm_buffer_object));
+-
+ 	atomic_set(&glob->bo_count, 0);
+ 
+ 	ret = kobject_init_and_add(
+diff --git a/drivers/gpu/drm/ttm/ttm_bo_util.c b/drivers/gpu/drm/ttm/ttm_bo_util.c
+index 60f204d..f8187ea 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo_util.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_util.c
+@@ -445,6 +445,7 @@ static int ttm_buffer_object_transfer(struct ttm_buffer_object *bo,
+ 	kref_init(&fbo->list_kref);
+ 	kref_init(&fbo->kref);
+ 	fbo->destroy = &ttm_transfered_destroy;
++	fbo->acc_size = 0;
+ 
+ 	*new_obj = fbo;
+ 	return 0;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+index 86c5e4c..2eb84a5 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+@@ -1517,29 +1517,10 @@ out_bad_surface:
+ /**
+  * Buffer management.
+  */
+-
+-static size_t vmw_dmabuf_acc_size(struct ttm_bo_global *glob,
+-				  unsigned long num_pages)
+-{
+-	static size_t bo_user_size = ~0;
+-
+-	size_t page_array_size =
+-	    (num_pages * sizeof(void *) + PAGE_SIZE - 1) & PAGE_MASK;
+-
+-	if (unlikely(bo_user_size == ~0)) {
+-		bo_user_size = glob->ttm_bo_extra_size +
+-		    ttm_round_pot(sizeof(struct vmw_dma_buffer));
+-	}
+-
+-	return bo_user_size + page_array_size;
+-}
+-
+ void vmw_dmabuf_bo_free(struct ttm_buffer_object *bo)
+ {
+ 	struct vmw_dma_buffer *vmw_bo = vmw_dma_buffer(bo);
+-	struct ttm_bo_global *glob = bo->glob;
+ 
+-	ttm_mem_global_free(glob->mem_glob, bo->acc_size);
+ 	kfree(vmw_bo);
+ }
+ 
+@@ -1550,24 +1531,12 @@ int vmw_dmabuf_init(struct vmw_private *dev_priv,
+ 		    void (*bo_free) (struct ttm_buffer_object *bo))
+ {
+ 	struct ttm_bo_device *bdev = &dev_priv->bdev;
+-	struct ttm_mem_global *mem_glob = bdev->glob->mem_glob;
+ 	size_t acc_size;
+ 	int ret;
+ 
+ 	BUG_ON(!bo_free);
+ 
+-	acc_size =
+-	    vmw_dmabuf_acc_size(bdev->glob,
+-				(size + PAGE_SIZE - 1) >> PAGE_SHIFT);
+-
+-	ret = ttm_mem_global_alloc(mem_glob, acc_size, false, false);
+-	if (unlikely(ret != 0)) {
+-		/* we must free the bo here as
+-		 * ttm_buffer_object_init does so as well */
+-		bo_free(&vmw_bo->base);
+-		return ret;
+-	}
+-
++	acc_size = ttm_bo_acc_size(bdev, size, sizeof(struct vmw_dma_buffer));
+ 	memset(vmw_bo, 0, sizeof(*vmw_bo));
+ 
+ 	INIT_LIST_HEAD(&vmw_bo->validate_list);
+@@ -1582,9 +1551,7 @@ int vmw_dmabuf_init(struct vmw_private *dev_priv,
+ static void vmw_user_dmabuf_destroy(struct ttm_buffer_object *bo)
+ {
+ 	struct vmw_user_dma_buffer *vmw_user_bo = vmw_user_dma_buffer(bo);
+-	struct ttm_bo_global *glob = bo->glob;
+ 
+-	ttm_mem_global_free(glob->mem_glob, bo->acc_size);
+ 	kfree(vmw_user_bo);
+ }
+ 
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index 8d95a42..974c8f8 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -429,9 +429,9 @@ extern void ttm_bo_unlock_delayed_workqueue(struct ttm_bo_device *bdev,
+  * -EBUSY if the buffer is busy and no_wait is true.
+  * -ERESTARTSYS if interrupted by a signal.
+  */
+-
+ extern int
+ ttm_bo_synccpu_write_grab(struct ttm_buffer_object *bo, bool no_wait);
++
+ /**
+  * ttm_bo_synccpu_write_release:
+  *
+@@ -442,6 +442,22 @@ ttm_bo_synccpu_write_grab(struct ttm_buffer_object *bo, bool no_wait);
+ extern void ttm_bo_synccpu_write_release(struct ttm_buffer_object *bo);
+ 
+ /**
++ * ttm_bo_acc_size
++ *
++ * @bdev: Pointer to a ttm_bo_device struct.
++ * @bo_size: size of the buffer object in byte.
++ * @struct_size: size of the structure holding buffer object datas
++ *
++ * Returns size to account for a buffer object
++ */
++size_t ttm_bo_acc_size(struct ttm_bo_device *bdev,
++		       unsigned long bo_size,
++		       unsigned struct_size);
++size_t ttm_bo_dma_acc_size(struct ttm_bo_device *bdev,
++			   unsigned long bo_size,
++			   unsigned struct_size);
++
++/**
+  * ttm_bo_init
+  *
+  * @bdev: Pointer to a ttm_bo_device struct.
+@@ -488,6 +504,7 @@ extern int ttm_bo_init(struct ttm_bo_device *bdev,
+ 			struct file *persistent_swap_storage,
+ 			size_t acc_size,
+ 			void (*destroy) (struct ttm_buffer_object *));
++
+ /**
+  * ttm_bo_synccpu_object_init
+  *
+diff --git a/include/drm/ttm/ttm_bo_driver.h b/include/drm/ttm/ttm_bo_driver.h
+index b2a0848..2be8891 100644
+--- a/include/drm/ttm/ttm_bo_driver.h
++++ b/include/drm/ttm/ttm_bo_driver.h
+@@ -469,9 +469,6 @@ struct ttm_bo_global_ref {
+  * @dummy_read_page: Pointer to a dummy page used for mapping requests
+  * of unpopulated pages.
+  * @shrink: A shrink callback object used for buffer object swap.
+- * @ttm_bo_extra_size: Extra size (sizeof(struct ttm_buffer_object) excluded)
+- * used by a buffer object. This is excluding page arrays and backing pages.
+- * @ttm_bo_size: This is @ttm_bo_extra_size + sizeof(struct ttm_buffer_object).
+  * @device_list_mutex: Mutex protecting the device list.
+  * This mutex is held while traversing the device list for pm options.
+  * @lru_lock: Spinlock protecting the bo subsystem lru lists.
+@@ -489,8 +486,6 @@ struct ttm_bo_global {
+ 	struct ttm_mem_global *mem_glob;
+ 	struct page *dummy_read_page;
+ 	struct ttm_mem_shrink shrink;
+-	size_t ttm_bo_extra_size;
+-	size_t ttm_bo_size;
+ 	struct mutex device_list_mutex;
+ 	spinlock_t lru_lock;
+ 
+
