@@ -1,0 +1,1932 @@
+From a0b25635515ef5049f93b032a1e37f18b16e0f6f Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Mon, 21 Nov 2011 16:41:48 +1000
+Subject: drm/nouveau/gpio: reimplement as nouveau_gpio.c, fixing a number of
+ issues
+Git-commit: a0b25635515ef5049f93b032a1e37f18b16e0f6f
+Patch-mainline: v3.3-rc1
+
+- moves out of nouveau_bios.c and demagics the logical state definitions
+- simplifies chipset-specific driver interface
+- makes most of gpio irq handling common, will use for nv4x hpd later
+- api extended to allow both direct gpio access, and access using the
+  logical function states
+- api extended to allow for future use of gpio extender chips
+- pre-nv50 was handled very badly, the main issue being that all GPIOs
+  were being treated as output-only.
+- fixes nvd0 so gpio changes actually stick, magic reg needs bashing
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/nouveau/Makefile            |    2 +-
+ drivers/gpu/drm/nouveau/nouveau_bios.c      |  206 +--------------
+ drivers/gpu/drm/nouveau/nouveau_bios.h      |   17 --
+ drivers/gpu/drm/nouveau/nouveau_connector.c |   24 +-
+ drivers/gpu/drm/nouveau/nouveau_dp.c        |    7 +-
+ drivers/gpu/drm/nouveau/nouveau_drv.h       |   45 ++--
+ drivers/gpu/drm/nouveau/nouveau_gpio.c      |  400 +++++++++++++++++++++++++++
+ drivers/gpu/drm/nouveau/nouveau_gpio.h      |   71 +++++
+ drivers/gpu/drm/nouveau/nouveau_pm.c        |   43 ++--
+ drivers/gpu/drm/nouveau/nouveau_state.c     |   64 ++---
+ drivers/gpu/drm/nouveau/nouveau_volt.c      |    9 +-
+ drivers/gpu/drm/nouveau/nv04_dac.c          |   14 +-
+ drivers/gpu/drm/nouveau/nv10_gpio.c         |   92 +++----
+ drivers/gpu/drm/nouveau/nv17_tv.c           |   20 +-
+ drivers/gpu/drm/nouveau/nv50_display.c      |    9 +-
+ drivers/gpu/drm/nouveau/nv50_gpio.c         |  272 +++----------------
+ 16 files changed, 651 insertions(+), 644 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/Makefile b/drivers/gpu/drm/nouveau/Makefile
+index c152a03..9f27e3d 100644
+--- a/drivers/gpu/drm/nouveau/Makefile
++++ b/drivers/gpu/drm/nouveau/Makefile
+@@ -11,7 +11,7 @@ nouveau-y := nouveau_drv.o nouveau_state.o nouveau_channel.o nouveau_mem.o \
+              nouveau_display.o nouveau_connector.o nouveau_fbcon.o \
+              nouveau_hdmi.o nouveau_dp.o nouveau_ramht.o \
+ 	     nouveau_pm.o nouveau_volt.o nouveau_perf.o nouveau_temp.o \
+-	     nouveau_mm.o nouveau_vm.o nouveau_mxm.o \
++	     nouveau_mm.o nouveau_vm.o nouveau_mxm.o nouveau_gpio.o \
+              nv04_timer.o \
+              nv04_mc.o nv40_mc.o nv50_mc.o \
+              nv04_fb.o nv10_fb.o nv30_fb.o nv40_fb.o nv50_fb.o nvc0_fb.o \
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bios.c b/drivers/gpu/drm/nouveau/nouveau_bios.c
+index f8df372..e5cbead 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bios.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bios.c
+@@ -27,6 +27,7 @@
+ #include "nouveau_drv.h"
+ #include "nouveau_hw.h"
+ #include "nouveau_encoder.h"
++#include "nouveau_gpio.h"
+ 
+ #include <linux/io-mapping.h>
+ 
+@@ -3124,49 +3125,6 @@ init_8d(struct nvbios *bios, uint16_t offset, struct init_exec *iexec)
+ 	return 1;
+ }
+ 
+-static void
+-init_gpio_unknv50(struct nvbios *bios, struct dcb_gpio_entry *gpio)
+-{
+-	const uint32_t nv50_gpio_ctl[2] = { 0xe100, 0xe28c };
+-	u32 r, s, v;
+-
+-	/* Not a clue, needs de-magicing */
+-	r = nv50_gpio_ctl[gpio->line >> 4];
+-	s = (gpio->line & 0x0f);
+-	v = bios_rd32(bios, r) & ~(0x00010001 << s);
+-	switch ((gpio->entry & 0x06000000) >> 25) {
+-	case 1:
+-		v |= (0x00000001 << s);
+-		break;
+-	case 2:
+-		v |= (0x00010000 << s);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	bios_wr32(bios, r, v);
+-}
+-
+-static void
+-init_gpio_unknvd0(struct nvbios *bios, struct dcb_gpio_entry *gpio)
+-{
+-	u32 v, i;
+-
+-	v  = bios_rd32(bios, 0x00d610 + (gpio->line * 4));
+-	v &= 0xffffff00;
+-	v |= (gpio->entry & 0x00ff0000) >> 16;
+-	bios_wr32(bios, 0x00d610 + (gpio->line * 4), v);
+-
+-	i = (gpio->entry & 0x1f000000) >> 24;
+-	if (i) {
+-		v  = bios_rd32(bios, 0x00d640 + ((i - 1) * 4));
+-		v &= 0xffffff00;
+-		v |= gpio->line;
+-		bios_wr32(bios, 0x00d640 + ((i - 1) * 4), v);
+-	}
+-}
+-
+ static int
+ init_gpio(struct nvbios *bios, uint16_t offset, struct init_exec *iexec)
+ {
+@@ -3179,35 +3137,8 @@ init_gpio(struct nvbios *bios, uint16_t offset, struct init_exec *iexec)
+ 	 * each GPIO according to various values listed in each entry
+ 	 */
+ 
+-	struct drm_nouveau_private *dev_priv = bios->dev->dev_private;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+-	int i;
+-
+-	if (dev_priv->card_type < NV_50) {
+-		NV_ERROR(bios->dev, "INIT_GPIO on unsupported chipset\n");
+-		return 1;
+-	}
+-
+-	if (!iexec->execute)
+-		return 1;
+-
+-	for (i = 0; i < bios->dcb.gpio.entries; i++) {
+-		struct dcb_gpio_entry *gpio = &bios->dcb.gpio.entry[i];
+-
+-		BIOSLOG(bios, "0x%04X: Entry: 0x%08X\n", offset, gpio->entry);
+-
+-		BIOSLOG(bios, "0x%04X: set gpio 0x%02x, state %d\n",
+-			offset, gpio->tag, gpio->state_default);
+-
+-		if (!bios->execute)
+-			continue;
+-
+-		pgpio->set(bios->dev, gpio->tag, gpio->state_default);
+-		if (dev_priv->card_type < NV_D0)
+-			init_gpio_unknv50(bios, gpio);
+-		else
+-			init_gpio_unknvd0(bios, gpio);
+-	}
++	if (iexec->execute && bios->execute)
++		nouveau_gpio_reset(bios->dev);
+ 
+ 	return 1;
+ }
+@@ -5643,132 +5574,6 @@ static uint16_t findstr(uint8_t *data, int n, const uint8_t *str, int len)
+ 	return 0;
+ }
+ 
+-static struct dcb_gpio_entry *
+-new_gpio_entry(struct nvbios *bios)
+-{
+-	struct drm_device *dev = bios->dev;
+-	struct dcb_gpio_table *gpio = &bios->dcb.gpio;
+-
+-	if (gpio->entries >= DCB_MAX_NUM_GPIO_ENTRIES) {
+-		NV_ERROR(dev, "exceeded maximum number of gpio entries!!\n");
+-		return NULL;
+-	}
+-
+-	return &gpio->entry[gpio->entries++];
+-}
+-
+-struct dcb_gpio_entry *
+-nouveau_bios_gpio_entry(struct drm_device *dev, enum dcb_gpio_tag tag)
+-{
+-	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nvbios *bios = &dev_priv->vbios;
+-	int i;
+-
+-	for (i = 0; i < bios->dcb.gpio.entries; i++) {
+-		if (bios->dcb.gpio.entry[i].tag != tag)
+-			continue;
+-
+-		return &bios->dcb.gpio.entry[i];
+-	}
+-
+-	return NULL;
+-}
+-
+-static void
+-parse_dcb_gpio_table(struct nvbios *bios)
+-{
+-	struct drm_device *dev = bios->dev;
+-	struct dcb_gpio_entry *e;
+-	u8 headerlen, entries, recordlen;
+-	u8 *dcb, *gpio = NULL, *entry;
+-	int i;
+-
+-	dcb = ROMPTR(dev, bios->data[0x36]);
+-	if (dcb[0] >= 0x30) {
+-		gpio = ROMPTR(dev, dcb[10]);
+-		if (!gpio)
+-			goto no_table;
+-
+-		headerlen = gpio[1];
+-		entries   = gpio[2];
+-		recordlen = gpio[3];
+-	} else
+-	if (dcb[0] >= 0x22 && dcb[-1] >= 0x13) {
+-		gpio = ROMPTR(dev, dcb[-15]);
+-		if (!gpio)
+-			goto no_table;
+-
+-		headerlen = 3;
+-		entries   = gpio[2];
+-		recordlen = gpio[1];
+-	} else
+-	if (dcb[0] >= 0x22) {
+-		/* No GPIO table present, parse the TVDAC GPIO data. */
+-		uint8_t *tvdac_gpio = &dcb[-5];
+-
+-		if (tvdac_gpio[0] & 1) {
+-			e = new_gpio_entry(bios);
+-			e->tag = DCB_GPIO_TVDAC0;
+-			e->line = tvdac_gpio[1] >> 4;
+-			e->state[0] = !!(tvdac_gpio[0] & 2);
+-			e->state[1] = !e->state[0];
+-		}
+-
+-		goto no_table;
+-	} else {
+-		NV_DEBUG(dev, "no/unknown gpio table on DCB 0x%02x\n", dcb[0]);
+-		goto no_table;
+-	}
+-
+-	entry = gpio + headerlen;
+-	for (i = 0; i < entries; i++, entry += recordlen) {
+-		e = new_gpio_entry(bios);
+-		if (!e)
+-			break;
+-
+-		if (gpio[0] < 0x40) {
+-			e->entry = ROM16(entry[0]);
+-			e->tag = (e->entry & 0x07e0) >> 5;
+-			if (e->tag == 0x3f) {
+-				bios->dcb.gpio.entries--;
+-				continue;
+-			}
+-
+-			e->line = (e->entry & 0x001f);
+-			e->state[0] = ((e->entry & 0xf800) >> 11) != 4;
+-			e->state[1] = !e->state[0];
+-		} else {
+-			e->entry = ROM32(entry[0]);
+-			e->tag = (e->entry & 0x0000ff00) >> 8;
+-			if (e->tag == 0xff) {
+-				bios->dcb.gpio.entries--;
+-				continue;
+-			}
+-
+-			e->line = (e->entry & 0x0000001f) >> 0;
+-			if (gpio[0] == 0x40) {
+-				e->state_default = (e->entry & 0x01000000) >> 24;
+-				e->state[0] = (e->entry & 0x18000000) >> 27;
+-				e->state[1] = (e->entry & 0x60000000) >> 29;
+-			} else {
+-				e->state_default = (e->entry & 0x00000080) >> 7;
+-				e->state[0] = (entry[4] >> 4) & 3;
+-				e->state[1] = (entry[4] >> 6) & 3;
+-			}
+-		}
+-	}
+-
+-no_table:
+-	/* Apple iMac G4 NV18 */
+-	if (nv_match_device(dev, 0x0189, 0x10de, 0x0010)) {
+-		e = new_gpio_entry(bios);
+-		if (e) {
+-			e->tag = DCB_GPIO_TVDAC0;
+-			e->line = 4;
+-		}
+-	}
+-}
+-
+ void *
+ dcb_table(struct drm_device *dev)
+ {
+@@ -6366,9 +6171,6 @@ parse_dcb_table(struct drm_device *dev, struct nvbios *bios)
+ 	NV_TRACE(dev, "DCB version %d.%d\n", dcbt[0] >> 4, dcbt[0] & 0xf);
+ 
+ 	dcb->version = dcbt[0];
+-	if (dcb->version >= 0x30)
+-		dcb->gpio_table_ptr = ROM16(dcbt[10]);
+-
+ 	dcb_outp_foreach(dev, NULL, parse_dcb_entry);
+ 
+ 	/*
+@@ -6393,8 +6195,6 @@ parse_dcb_table(struct drm_device *dev, struct nvbios *bios)
+ 		}
+ 	}
+ 	dcb_fake_connectors(bios);
+-
+-	parse_dcb_gpio_table(bios);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bios.h b/drivers/gpu/drm/nouveau/nouveau_bios.h
+index 32b911d..1e382ad 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bios.h
++++ b/drivers/gpu/drm/nouveau/nouveau_bios.h
+@@ -61,19 +61,6 @@ enum dcb_gpio_tag {
+ 	DCB_GPIO_UNUSED = 0xff
+ };
+ 
+-struct dcb_gpio_entry {
+-	enum dcb_gpio_tag tag;
+-	int line;
+-	uint32_t entry;
+-	uint8_t state_default;
+-	uint8_t state[2];
+-};
+-
+-struct dcb_gpio_table {
+-	int entries;
+-	struct dcb_gpio_entry entry[DCB_MAX_NUM_GPIO_ENTRIES];
+-};
+-
+ enum dcb_connector_type {
+ 	DCB_CONNECTOR_VGA = 0x00,
+ 	DCB_CONNECTOR_TV_0 = 0x10,
+@@ -142,12 +129,8 @@ struct dcb_entry {
+ 
+ struct dcb_table {
+ 	uint8_t version;
+-
+ 	int entries;
+ 	struct dcb_entry entry[DCB_MAX_NUM_ENTRIES];
+-
+-	uint16_t gpio_table_ptr;
+-	struct dcb_gpio_table gpio;
+ };
+ 
+ enum nouveau_or {
+diff --git a/drivers/gpu/drm/nouveau/nouveau_connector.c b/drivers/gpu/drm/nouveau/nouveau_connector.c
+index df99c7f..f3ce34b 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_connector.c
++++ b/drivers/gpu/drm/nouveau/nouveau_connector.c
+@@ -35,6 +35,7 @@
+ #include "nouveau_encoder.h"
+ #include "nouveau_crtc.h"
+ #include "nouveau_connector.h"
++#include "nouveau_gpio.h"
+ #include "nouveau_hw.h"
+ 
+ static void nouveau_connector_hotplug(void *, int);
+@@ -83,7 +84,6 @@ nouveau_connector_destroy(struct drm_connector *connector)
+ {
+ 	struct nouveau_connector *nv_connector = nouveau_connector(connector);
+ 	struct drm_nouveau_private *dev_priv;
+-	struct nouveau_gpio_engine *pgpio;
+ 	struct drm_device *dev;
+ 
+ 	if (!nv_connector)
+@@ -93,10 +93,9 @@ nouveau_connector_destroy(struct drm_connector *connector)
+ 	dev_priv = dev->dev_private;
+ 	NV_DEBUG_KMS(dev, "\n");
+ 
+-	pgpio = &dev_priv->engine.gpio;
+-	if (pgpio->irq_unregister) {
+-		pgpio->irq_unregister(dev, nv_connector->hpd,
+-				      nouveau_connector_hotplug, connector);
++	if (nv_connector->hpd != DCB_GPIO_UNUSED) {
++		nouveau_gpio_isr_del(dev, 0, nv_connector->hpd, 0xff,
++				     nouveau_connector_hotplug, connector);
+ 	}
+ 
+ 	kfree(nv_connector->edid);
+@@ -876,7 +875,6 @@ nouveau_connector_create(struct drm_device *dev, int index)
+ 	const struct drm_connector_funcs *funcs = &nouveau_connector_funcs;
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+ 	struct nouveau_display_engine *disp = &dev_priv->engine.display;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+ 	struct nouveau_connector *nv_connector = NULL;
+ 	struct drm_connector *connector;
+ 	int type, ret = 0;
+@@ -1050,13 +1048,13 @@ nouveau_connector_create(struct drm_device *dev, int index)
+ 		break;
+ 	}
+ 
+-	if (nv_connector->hpd != DCB_GPIO_UNUSED && pgpio->irq_register) {
+-		pgpio->irq_register(dev, nv_connector->hpd,
+-				    nouveau_connector_hotplug, connector);
+-
+-		connector->polled = DRM_CONNECTOR_POLL_HPD;
+-	} else {
+-		connector->polled = DRM_CONNECTOR_POLL_CONNECT;
++	connector->polled = DRM_CONNECTOR_POLL_CONNECT;
++	if (nv_connector->hpd != DCB_GPIO_UNUSED) {
++		ret = nouveau_gpio_isr_add(dev, 0, nv_connector->hpd, 0xff,
++					   nouveau_connector_hotplug,
++					   connector);
++		if (ret == 0)
++			connector->polled = DRM_CONNECTOR_POLL_HPD;
+ 	}
+ 
+ 	drm_sysfs_connector_add(connector);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_dp.c b/drivers/gpu/drm/nouveau/nouveau_dp.c
+index 02b00c8..9b93b70 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_dp.c
++++ b/drivers/gpu/drm/nouveau/nouveau_dp.c
+@@ -29,6 +29,7 @@
+ #include "nouveau_connector.h"
+ #include "nouveau_encoder.h"
+ #include "nouveau_crtc.h"
++#include "nouveau_gpio.h"
+ 
+ /******************************************************************************
+  * aux channel util functions
+@@ -556,8 +557,6 @@ dp_link_train_eq(struct drm_device *dev, struct dp_state *dp)
+ bool
+ nouveau_dp_link_train(struct drm_encoder *encoder, u32 datarate)
+ {
+-	struct drm_nouveau_private *dev_priv = encoder->dev->dev_private;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+ 	struct nouveau_encoder *nv_encoder = nouveau_encoder(encoder);
+ 	struct nouveau_crtc *nv_crtc = nouveau_crtc(encoder->crtc);
+ 	struct nouveau_connector *nv_connector =
+@@ -587,7 +586,7 @@ nouveau_dp_link_train(struct drm_encoder *encoder, u32 datarate)
+ 	 * we take during link training (DP_SET_POWER is one), we need
+ 	 * to ignore them for the moment to avoid races.
+ 	 */
+-	pgpio->irq_enable(dev, nv_connector->hpd, false);
++	nouveau_gpio_irq(dev, 0, nv_connector->hpd, 0xff, false);
+ 
+ 	/* enable down-spreading, if possible */
+ 	if (dp.table[1] >= 16) {
+@@ -636,7 +635,7 @@ nouveau_dp_link_train(struct drm_encoder *encoder, u32 datarate)
+ 	nouveau_bios_run_init_table(dev, ROM16(dp.entry[8]), dp.dcb, dp.crtc);
+ 
+ 	/* re-enable hotplug detect */
+-	pgpio->irq_enable(dev, nv_connector->hpd, true);
++	nouveau_gpio_irq(dev, 0, nv_connector->hpd, 0xff, true);
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drv.h b/drivers/gpu/drm/nouveau/nouveau_drv.h
+index 909b991..0af52582 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drv.h
++++ b/drivers/gpu/drm/nouveau/nouveau_drv.h
+@@ -408,19 +408,13 @@ struct nouveau_display_engine {
+ };
+ 
+ struct nouveau_gpio_engine {
+-	void *priv;
+-
+-	int  (*init)(struct drm_device *);
+-	void (*takedown)(struct drm_device *);
+-
+-	int  (*get)(struct drm_device *, enum dcb_gpio_tag);
+-	int  (*set)(struct drm_device *, enum dcb_gpio_tag, int state);
+-
+-	int  (*irq_register)(struct drm_device *, enum dcb_gpio_tag,
+-			     void (*)(void *, int), void *);
+-	void (*irq_unregister)(struct drm_device *, enum dcb_gpio_tag,
+-			       void (*)(void *, int), void *);
+-	bool (*irq_enable)(struct drm_device *, enum dcb_gpio_tag, bool on);
++	spinlock_t lock;
++	struct list_head isr;
++	int (*init)(struct drm_device *);
++	void (*fini)(struct drm_device *);
++	int (*drive)(struct drm_device *, int line, int dir, int out);
++	int (*sense)(struct drm_device *, int line);
++	void (*irq_enable)(struct drm_device *, int line, bool);
+ };
+ 
+ struct nouveau_pm_voltage_level {
+@@ -1091,8 +1085,6 @@ extern int nouveau_run_vbios_init(struct drm_device *);
+ extern void nouveau_bios_run_init_table(struct drm_device *, uint16_t table,
+ 					struct dcb_entry *, int crtc);
+ extern void nouveau_bios_init_exec(struct drm_device *, uint16_t table);
+-extern struct dcb_gpio_entry *nouveau_bios_gpio_entry(struct drm_device *,
+-						      enum dcb_gpio_tag);
+ extern struct dcb_connector_table_entry *
+ nouveau_bios_connector_entry(struct drm_device *, int index);
+ extern u32 get_pll_register(struct drm_device *, enum pll_types);
+@@ -1476,23 +1468,22 @@ int nouveau_display_dumb_destroy(struct drm_file *, struct drm_device *,
+ 				 uint32_t handle);
+ 
+ /* nv10_gpio.c */
+-int nv10_gpio_get(struct drm_device *dev, enum dcb_gpio_tag tag);
+-int nv10_gpio_set(struct drm_device *dev, enum dcb_gpio_tag tag, int state);
++int nv10_gpio_init(struct drm_device *dev);
++void nv10_gpio_fini(struct drm_device *dev);
++int nv10_gpio_drive(struct drm_device *dev, int line, int dir, int out);
++int nv10_gpio_sense(struct drm_device *dev, int line);
++void nv10_gpio_irq_enable(struct drm_device *, int line, bool on);
+ 
+ /* nv50_gpio.c */
+ int nv50_gpio_init(struct drm_device *dev);
+ void nv50_gpio_fini(struct drm_device *dev);
+-int nv50_gpio_get(struct drm_device *dev, enum dcb_gpio_tag tag);
+-int nv50_gpio_set(struct drm_device *dev, enum dcb_gpio_tag tag, int state);
+-int nvd0_gpio_get(struct drm_device *dev, enum dcb_gpio_tag tag);
+-int nvd0_gpio_set(struct drm_device *dev, enum dcb_gpio_tag tag, int state);
+-int  nv50_gpio_irq_register(struct drm_device *, enum dcb_gpio_tag,
+-			    void (*)(void *, int), void *);
+-void nv50_gpio_irq_unregister(struct drm_device *, enum dcb_gpio_tag,
+-			      void (*)(void *, int), void *);
+-bool nv50_gpio_irq_enable(struct drm_device *, enum dcb_gpio_tag, bool on);
++int nv50_gpio_drive(struct drm_device *dev, int line, int dir, int out);
++int nv50_gpio_sense(struct drm_device *dev, int line);
++void nv50_gpio_irq_enable(struct drm_device *, int line, bool on);
++int nvd0_gpio_drive(struct drm_device *dev, int line, int dir, int out);
++int nvd0_gpio_sense(struct drm_device *dev, int line);
+ 
+-/* nv50_calc. */
++/* nv50_calc.c */
+ int nv50_calc_pll(struct drm_device *, struct pll_lims *, int clk,
+ 		  int *N1, int *M1, int *N2, int *M2, int *P);
+ int nva3_calc_pll(struct drm_device *, struct pll_lims *,
+diff --git a/drivers/gpu/drm/nouveau/nouveau_gpio.c b/drivers/gpu/drm/nouveau/nouveau_gpio.c
+new file mode 100644
+index 0000000..a580cc6
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nouveau_gpio.c
+@@ -0,0 +1,400 @@
++/*
++ * Copyright 2011 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * Authors: Ben Skeggs
++ */
++
++#include "drmP.h"
++#include "nouveau_drv.h"
++#include "nouveau_i2c.h"
++#include "nouveau_gpio.h"
++
++static u8 *
++dcb_gpio_table(struct drm_device *dev)
++{
++	u8 *dcb = dcb_table(dev);
++	if (dcb) {
++		if (dcb[0] >= 0x30 && dcb[1] >= 0x0c)
++			return ROMPTR(dev, dcb[0x0a]);
++		if (dcb[0] >= 0x22 && dcb[-1] >= 0x13)
++			return ROMPTR(dev, dcb[-15]);
++	}
++	return NULL;
++}
++
++static u8 *
++dcb_gpio_entry(struct drm_device *dev, int idx, int ent, u8 *version)
++{
++	u8 *table = dcb_gpio_table(dev);
++	if (table) {
++		*version = table[0];
++		if (*version < 0x30 && ent < table[2])
++			return table + 3 + (ent * table[1]);
++		else if (ent < table[2])
++			return table + table[1] + (ent * table[3]);
++	}
++	return NULL;
++}
++
++int
++nouveau_gpio_drive(struct drm_device *dev, int idx, int line, int dir, int out)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++
++	return pgpio->drive ? pgpio->drive(dev, line, dir, out) : -ENODEV;
++}
++
++int
++nouveau_gpio_sense(struct drm_device *dev, int idx, int line)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++
++	return pgpio->sense ? pgpio->sense(dev, line) : -ENODEV;
++}
++
++int
++nouveau_gpio_find(struct drm_device *dev, int idx, u8 func, u8 line,
++		  struct gpio_func *gpio)
++{
++	u8 *table, *entry, version;
++	int i = -1;
++
++	if (line == 0xff && func == 0xff)
++		return -EINVAL;
++
++	while ((entry = dcb_gpio_entry(dev, idx, ++i, &version))) {
++		if (version < 0x40) {
++			u16 data = ROM16(entry[0]);
++			*gpio = (struct gpio_func) {
++				.line = (data & 0x001f) >> 0,
++				.func = (data & 0x07e0) >> 5,
++				.log[0] = (data & 0x1800) >> 11,
++				.log[1] = (data & 0x6000) >> 13,
++			};
++		} else
++		if (version < 0x41) {
++			*gpio = (struct gpio_func) {
++				.line = entry[0] & 0x1f,
++				.func = entry[1],
++				.log[0] = (entry[3] & 0x18) >> 3,
++				.log[1] = (entry[3] & 0x60) >> 5,
++			};
++		} else {
++			*gpio = (struct gpio_func) {
++				.line = entry[0] & 0x3f,
++				.func = entry[1],
++				.log[0] = (entry[4] & 0x30) >> 4,
++				.log[1] = (entry[4] & 0xc0) >> 6,
++			};
++		}
++
++		if ((line == 0xff || line == gpio->line) &&
++		    (func == 0xff || func == gpio->func))
++			return 0;
++	}
++
++	/* DCB 2.2, fixed TVDAC GPIO data */
++	if ((table = dcb_table(dev)) && table[0] >= 0x22) {
++		if (func == DCB_GPIO_TVDAC0) {
++			*gpio = (struct gpio_func) {
++				.func = DCB_GPIO_TVDAC0,
++				.line = table[-4] >> 4,
++				.log[0] = !!(table[-5] & 2),
++				.log[1] =  !(table[-5] & 2),
++			};
++			return 0;
++		}
++	}
++
++	/* Apple iMac G4 NV18 */
++	if (nv_match_device(dev, 0x0189, 0x10de, 0x0010)) {
++		if (func == DCB_GPIO_TVDAC0) {
++			*gpio = (struct gpio_func) {
++				.func = DCB_GPIO_TVDAC0,
++				.line = 4,
++				.log[0] = 0,
++				.log[1] = 1,
++			};
++			return 0;
++		}
++	}
++
++	return -EINVAL;
++}
++
++int
++nouveau_gpio_set(struct drm_device *dev, int idx, u8 tag, u8 line, int state)
++{
++	struct gpio_func gpio;
++	int ret;
++
++	ret = nouveau_gpio_find(dev, idx, tag, line, &gpio);
++	if (ret == 0) {
++		int dir = !!(gpio.log[state] & 0x02);
++		int out = !!(gpio.log[state] & 0x01);
++		ret = nouveau_gpio_drive(dev, idx, gpio.line, dir, out);
++	}
++
++	return ret;
++}
++
++int
++nouveau_gpio_get(struct drm_device *dev, int idx, u8 tag, u8 line)
++{
++	struct gpio_func gpio;
++	int ret;
++
++	ret = nouveau_gpio_find(dev, idx, tag, line, &gpio);
++	if (ret == 0) {
++		ret = nouveau_gpio_sense(dev, idx, gpio.line);
++		if (ret >= 0)
++			ret = (ret == (gpio.log[1] & 1));
++	}
++
++	return ret;
++}
++
++int
++nouveau_gpio_irq(struct drm_device *dev, int idx, u8 tag, u8 line, bool on)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++	struct gpio_func gpio;
++	int ret;
++
++	ret = nouveau_gpio_find(dev, idx, tag, line, &gpio);
++	if (ret == 0) {
++		if (idx == 0 && pgpio->irq_enable)
++			pgpio->irq_enable(dev, gpio.line, on);
++		else
++			ret = -ENODEV;
++	}
++
++	return ret;
++}
++
++struct gpio_isr {
++	struct drm_device *dev;
++	struct list_head head;
++	struct work_struct work;
++	int idx;
++	struct gpio_func func;
++	void (*handler)(void *, int);
++	void *data;
++	bool inhibit;
++};
++
++static void
++nouveau_gpio_isr_bh(struct work_struct *work)
++{
++	struct gpio_isr *isr = container_of(work, struct gpio_isr, work);
++	struct drm_device *dev = isr->dev;
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++	unsigned long flags;
++	int state;
++
++	state = nouveau_gpio_get(dev, isr->idx, isr->func.func, isr->func.line);
++	if (state >= 0)
++		isr->handler(isr->data, state);
++
++	spin_lock_irqsave(&pgpio->lock, flags);
++	isr->inhibit = false;
++	spin_unlock_irqrestore(&pgpio->lock, flags);
++}
++
++void
++nouveau_gpio_isr(struct drm_device *dev, int idx, u32 line_mask)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++	struct gpio_isr *isr;
++
++	if (idx != 0)
++		return;
++
++	spin_lock(&pgpio->lock);
++	list_for_each_entry(isr, &pgpio->isr, head) {
++		if (line_mask & (1 << isr->func.line)) {
++			if (isr->inhibit)
++				continue;
++			isr->inhibit = true;
++			schedule_work(&isr->work);
++		}
++	}
++	spin_unlock(&pgpio->lock);
++}
++
++int
++nouveau_gpio_isr_add(struct drm_device *dev, int idx, u8 tag, u8 line,
++		     void (*handler)(void *, int), void *data)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++	struct gpio_isr *isr;
++	unsigned long flags;
++	int ret;
++
++	isr = kzalloc(sizeof(*isr), GFP_KERNEL);
++	if (!isr)
++		return -ENOMEM;
++
++	ret = nouveau_gpio_find(dev, idx, tag, line, &isr->func);
++	if (ret) {
++		kfree(isr);
++		return ret;
++	}
++
++	INIT_WORK(&isr->work, nouveau_gpio_isr_bh);
++	isr->dev = dev;
++	isr->handler = handler;
++	isr->data = data;
++	isr->idx = idx;
++
++	spin_lock_irqsave(&pgpio->lock, flags);
++	list_add(&isr->head, &pgpio->isr);
++	spin_unlock_irqrestore(&pgpio->lock, flags);
++	return 0;
++}
++
++void
++nouveau_gpio_isr_del(struct drm_device *dev, int idx, u8 tag, u8 line,
++		     void (*handler)(void *, int), void *data)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++	struct gpio_isr *isr, *tmp;
++	struct gpio_func func;
++	unsigned long flags;
++	LIST_HEAD(tofree);
++	int ret;
++
++	ret = nouveau_gpio_find(dev, idx, tag, line, &func);
++	if (ret == 0) {
++		spin_lock_irqsave(&pgpio->lock, flags);
++		list_for_each_entry_safe(isr, tmp, &pgpio->isr, head) {
++			if (memcmp(&isr->func, &func, sizeof(func)) ||
++			    isr->idx != idx ||
++			    isr->handler != handler || isr->data != data)
++				continue;
++			list_move(&isr->head, &tofree);
++		}
++		spin_unlock_irqrestore(&pgpio->lock, flags);
++
++		list_for_each_entry_safe(isr, tmp, &tofree, head) {
++			flush_work_sync(&isr->work);
++			kfree(isr);
++		}
++	}
++}
++
++int
++nouveau_gpio_create(struct drm_device *dev)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++
++	INIT_LIST_HEAD(&pgpio->isr);
++	spin_lock_init(&pgpio->lock);
++
++	return nouveau_gpio_init(dev);
++}
++
++void
++nouveau_gpio_destroy(struct drm_device *dev)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++
++	nouveau_gpio_fini(dev);
++	BUG_ON(!list_empty(&pgpio->isr));
++}
++
++int
++nouveau_gpio_init(struct drm_device *dev)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++	int ret = 0;
++
++	if (pgpio->init)
++		ret = pgpio->init(dev);
++
++	return ret;
++}
++
++void
++nouveau_gpio_fini(struct drm_device *dev)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++
++	if (pgpio->fini)
++		pgpio->fini(dev);
++}
++
++void
++nouveau_gpio_reset(struct drm_device *dev)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	u8 *entry, version;
++	int ent = -1;
++
++	while ((entry = dcb_gpio_entry(dev, 0, ++ent, &version))) {
++		u8 func = 0xff, line, defs, unk0, unk1;
++		if (version >= 0x41) {
++			defs = !!(entry[0] & 0x80);
++			line = entry[0] & 0x3f;
++			func = entry[1];
++			unk0 = entry[2];
++			unk1 = entry[3] & 0x1f;
++		} else
++		if (version >= 0x40) {
++			line = entry[0] & 0x1f;
++			func = entry[1];
++			defs = !!(entry[3] & 0x01);
++			unk0 = !!(entry[3] & 0x02);
++			unk1 = !!(entry[3] & 0x04);
++		} else {
++			break;
++		}
++
++		if (func == 0xff)
++			continue;
++
++		nouveau_gpio_func_set(dev, func, defs);
++
++		if (dev_priv->card_type >= NV_D0) {
++			nv_mask(dev, 0x00d610 + (line * 4), 0xff, unk0);
++			if (unk1--)
++				nv_mask(dev, 0x00d640 + (unk1 * 4), 0xff, line);
++		} else
++		if (dev_priv->card_type >= NV_50) {
++			static const u32 regs[] = { 0xe100, 0xe28c };
++			u32 val = (unk1 << 16) | unk0;
++			u32 reg = regs[line >> 4]; line &= 0x0f;
++
++			nv_mask(dev, reg, 0x00010001 << line, val << line);
++		}
++	}
++}
+diff --git a/drivers/gpu/drm/nouveau/nouveau_gpio.h b/drivers/gpu/drm/nouveau/nouveau_gpio.h
+new file mode 100644
+index 0000000..64c5cb0
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nouveau_gpio.h
+@@ -0,0 +1,71 @@
++/*
++ * Copyright 2011 Red Hat Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#ifndef __NOUVEAU_GPIO_H__
++#define __NOUVEAU_GPIO_H__
++
++struct gpio_func {
++	u8 func;
++	u8 line;
++	u8 log[2];
++};
++
++/* nouveau_gpio.c */
++int  nouveau_gpio_create(struct drm_device *);
++void nouveau_gpio_destroy(struct drm_device *);
++int  nouveau_gpio_init(struct drm_device *);
++void nouveau_gpio_fini(struct drm_device *);
++void nouveau_gpio_reset(struct drm_device *);
++int  nouveau_gpio_drive(struct drm_device *, int idx, int line,
++			int dir, int out);
++int  nouveau_gpio_sense(struct drm_device *, int idx, int line);
++int  nouveau_gpio_find(struct drm_device *, int idx, u8 tag, u8 line,
++		       struct gpio_func *);
++int  nouveau_gpio_set(struct drm_device *, int idx, u8 tag, u8 line, int state);
++int  nouveau_gpio_get(struct drm_device *, int idx, u8 tag, u8 line);
++int  nouveau_gpio_irq(struct drm_device *, int idx, u8 tag, u8 line, bool on);
++void nouveau_gpio_isr(struct drm_device *, int idx, u32 mask);
++int  nouveau_gpio_isr_add(struct drm_device *, int idx, u8 tag, u8 line,
++			  void (*)(void *, int state), void *data);
++void nouveau_gpio_isr_del(struct drm_device *, int idx, u8 tag, u8 line,
++			  void (*)(void *, int state), void *data);
++
++static inline bool
++nouveau_gpio_func_valid(struct drm_device *dev, u8 tag)
++{
++	struct gpio_func func;
++	return (nouveau_gpio_find(dev, 0, tag, 0xff, &func)) == 0;
++}
++
++static inline int
++nouveau_gpio_func_set(struct drm_device *dev, u8 tag, int state)
++{
++	return nouveau_gpio_set(dev, 0, tag, 0xff, state);
++}
++
++static inline int
++nouveau_gpio_func_get(struct drm_device *dev, u8 tag)
++{
++	return nouveau_gpio_get(dev, 0, tag, 0xff);
++}
++
++#endif
+diff --git a/drivers/gpu/drm/nouveau/nouveau_pm.c b/drivers/gpu/drm/nouveau/nouveau_pm.c
+index 788ba33..aba3362 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_pm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_pm.c
+@@ -26,6 +26,7 @@
+ 
+ #include "nouveau_drv.h"
+ #include "nouveau_pm.h"
++#include "nouveau_gpio.h"
+ 
+ #ifdef CONFIG_ACPI
+ #include <linux/acpi.h>
+@@ -38,27 +39,25 @@ static int
+ nouveau_pwmfan_get(struct drm_device *dev)
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+ 	struct nouveau_pm_engine *pm = &dev_priv->engine.pm;
+-	struct dcb_gpio_entry *gpio = NULL;
++	struct gpio_func gpio;
+ 	u32 divs, duty;
+ 	int ret;
+ 
+ 	if (!pm->pwm_get)
+ 		return -ENODEV;
+ 
+-	gpio = nouveau_bios_gpio_entry(dev, DCB_GPIO_PWM_FAN);
+-	if (gpio) {
+-		ret = pm->pwm_get(dev, gpio->line, &divs, &duty);
++	ret = nouveau_gpio_find(dev, 0, DCB_GPIO_PWM_FAN, 0xff, &gpio);
++	if (ret == 0) {
++		ret = pm->pwm_get(dev, gpio.line, &divs, &duty);
+ 		if (ret == 0) {
+ 			divs = max(divs, duty);
+-			if (dev_priv->card_type <= NV_40 ||
+-			    (gpio->state[0] & 1))
++			if (dev_priv->card_type <= NV_40 || (gpio.log[0] & 1))
+ 				duty = divs - duty;
+ 			return (duty * 100) / divs;
+ 		}
+ 
+-		return pgpio->get(dev, gpio->tag) * 100;
++		return nouveau_gpio_func_get(dev, gpio.func) * 100;
+ 	}
+ 
+ 	return -ENODEV;
+@@ -69,14 +68,15 @@ nouveau_pwmfan_set(struct drm_device *dev, int percent)
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+ 	struct nouveau_pm_engine *pm = &dev_priv->engine.pm;
+-	struct dcb_gpio_entry *gpio;
++	struct gpio_func gpio;
+ 	u32 divs, duty;
++	int ret;
+ 
+ 	if (!pm->pwm_set)
+ 		return -ENODEV;
+ 
+-	gpio = nouveau_bios_gpio_entry(dev, DCB_GPIO_PWM_FAN);
+-	if (gpio) {
++	ret = nouveau_gpio_find(dev, 0, DCB_GPIO_PWM_FAN, 0xff, &gpio);
++	if (ret == 0) {
+ 		divs = pm->pwm_divisor;
+ 		if (pm->fan.pwm_freq) {
+ 			/*XXX: PNVIO clock more than likely... */
+@@ -86,11 +86,10 @@ nouveau_pwmfan_set(struct drm_device *dev, int percent)
+ 		}
+ 
+ 		duty = ((divs * percent) + 99) / 100;
+-		if (dev_priv->card_type <= NV_40 ||
+-		    (gpio->state[0] & 1))
++		if (dev_priv->card_type <= NV_40 || (gpio.log[0] & 1))
+ 			duty = divs - duty;
+ 
+-		return pm->pwm_set(dev, gpio->line, divs, duty);
++		return pm->pwm_set(dev, gpio.line, divs, duty);
+ 	}
+ 
+ 	return -ENODEV;
+@@ -472,24 +471,24 @@ nouveau_hwmon_show_fan0_input(struct device *d, struct device_attribute *attr,
+ 	struct drm_device *dev = dev_get_drvdata(d);
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+ 	struct nouveau_timer_engine *ptimer = &dev_priv->engine.timer;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+-	struct dcb_gpio_entry *gpio;
++	struct gpio_func gpio;
+ 	u32 cycles, cur, prev;
+ 	u64 start;
++	int ret;
+ 
+-	gpio = nouveau_bios_gpio_entry(dev, DCB_GPIO_FAN_SENSE);
+-	if (!gpio)
+-		return -ENODEV;
++	ret = nouveau_gpio_find(dev, 0, DCB_GPIO_FAN_SENSE, 0xff, &gpio);
++	if (ret)
++		return ret;
+ 
+ 	/* Monitor the GPIO input 0x3b for 250ms.
+ 	 * When the fan spins, it changes the value of GPIO FAN_SENSE.
+ 	 * We get 4 changes (0 -> 1 -> 0 -> 1 -> [...]) per complete rotation.
+ 	 */
+ 	start = ptimer->read(dev);
+-	prev = pgpio->get(dev, DCB_GPIO_FAN_SENSE);
++	prev = nouveau_gpio_sense(dev, 0, gpio.line);
+ 	cycles = 0;
+ 	do {
+-		cur = pgpio->get(dev, DCB_GPIO_FAN_SENSE);
++		cur = nouveau_gpio_sense(dev, 0, gpio.line);
+ 		if (prev != cur) {
+ 			cycles++;
+ 			prev = cur;
+@@ -701,7 +700,7 @@ nouveau_hwmon_init(struct drm_device *dev)
+ 	}
+ 
+ 	/* if the card can read the fan rpm */
+-	if (nouveau_bios_gpio_entry(dev, DCB_GPIO_FAN_SENSE)) {
++	if (nouveau_gpio_func_valid(dev, DCB_GPIO_FAN_SENSE)) {
+ 		ret = sysfs_create_group(&dev->pdev->dev.kobj,
+ 					 &hwmon_fan_rpm_attrgroup);
+ 		if (ret)
+diff --git a/drivers/gpu/drm/nouveau/nouveau_state.c b/drivers/gpu/drm/nouveau/nouveau_state.c
+index 5d8ad4e..c4edba6 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_state.c
++++ b/drivers/gpu/drm/nouveau/nouveau_state.c
+@@ -36,6 +36,7 @@
+ #include "nouveau_drm.h"
+ #include "nouveau_fbcon.h"
+ #include "nouveau_ramht.h"
++#include "nouveau_gpio.h"
+ #include "nouveau_pm.h"
+ #include "nv50_display.h"
+ 
+@@ -83,11 +84,6 @@ static int nouveau_init_engine_ptrs(struct drm_device *dev)
+ 		engine->display.destroy		= nv04_display_destroy;
+ 		engine->display.init		= nv04_display_init;
+ 		engine->display.fini		= nv04_display_fini;
+-		engine->gpio.init		= nouveau_stub_init;
+-		engine->gpio.takedown		= nouveau_stub_takedown;
+-		engine->gpio.get		= NULL;
+-		engine->gpio.set		= NULL;
+-		engine->gpio.irq_enable		= NULL;
+ 		engine->pm.clocks_get		= nv04_pm_clocks_get;
+ 		engine->pm.clocks_pre		= nv04_pm_clocks_pre;
+ 		engine->pm.clocks_set		= nv04_pm_clocks_set;
+@@ -133,11 +129,8 @@ static int nouveau_init_engine_ptrs(struct drm_device *dev)
+ 		engine->display.destroy		= nv04_display_destroy;
+ 		engine->display.init		= nv04_display_init;
+ 		engine->display.fini		= nv04_display_fini;
+-		engine->gpio.init		= nouveau_stub_init;
+-		engine->gpio.takedown		= nouveau_stub_takedown;
+-		engine->gpio.get		= nv10_gpio_get;
+-		engine->gpio.set		= nv10_gpio_set;
+-		engine->gpio.irq_enable		= NULL;
++		engine->gpio.drive		= nv10_gpio_drive;
++		engine->gpio.sense		= nv10_gpio_sense;
+ 		engine->pm.clocks_get		= nv04_pm_clocks_get;
+ 		engine->pm.clocks_pre		= nv04_pm_clocks_pre;
+ 		engine->pm.clocks_set		= nv04_pm_clocks_set;
+@@ -183,11 +176,8 @@ static int nouveau_init_engine_ptrs(struct drm_device *dev)
+ 		engine->display.destroy		= nv04_display_destroy;
+ 		engine->display.init		= nv04_display_init;
+ 		engine->display.fini		= nv04_display_fini;
+-		engine->gpio.init		= nouveau_stub_init;
+-		engine->gpio.takedown		= nouveau_stub_takedown;
+-		engine->gpio.get		= nv10_gpio_get;
+-		engine->gpio.set		= nv10_gpio_set;
+-		engine->gpio.irq_enable		= NULL;
++		engine->gpio.drive		= nv10_gpio_drive;
++		engine->gpio.sense		= nv10_gpio_sense;
+ 		engine->pm.clocks_get		= nv04_pm_clocks_get;
+ 		engine->pm.clocks_pre		= nv04_pm_clocks_pre;
+ 		engine->pm.clocks_set		= nv04_pm_clocks_set;
+@@ -233,11 +223,8 @@ static int nouveau_init_engine_ptrs(struct drm_device *dev)
+ 		engine->display.destroy		= nv04_display_destroy;
+ 		engine->display.init		= nv04_display_init;
+ 		engine->display.fini		= nv04_display_fini;
+-		engine->gpio.init		= nouveau_stub_init;
+-		engine->gpio.takedown		= nouveau_stub_takedown;
+-		engine->gpio.get		= nv10_gpio_get;
+-		engine->gpio.set		= nv10_gpio_set;
+-		engine->gpio.irq_enable		= NULL;
++		engine->gpio.drive		= nv10_gpio_drive;
++		engine->gpio.sense		= nv10_gpio_sense;
+ 		engine->pm.clocks_get		= nv04_pm_clocks_get;
+ 		engine->pm.clocks_pre		= nv04_pm_clocks_pre;
+ 		engine->pm.clocks_set		= nv04_pm_clocks_set;
+@@ -286,11 +273,8 @@ static int nouveau_init_engine_ptrs(struct drm_device *dev)
+ 		engine->display.destroy		= nv04_display_destroy;
+ 		engine->display.init		= nv04_display_init;
+ 		engine->display.fini		= nv04_display_fini;
+-		engine->gpio.init		= nouveau_stub_init;
+-		engine->gpio.takedown		= nouveau_stub_takedown;
+-		engine->gpio.get		= nv10_gpio_get;
+-		engine->gpio.set		= nv10_gpio_set;
+-		engine->gpio.irq_enable		= NULL;
++		engine->gpio.drive		= nv10_gpio_drive;
++		engine->gpio.sense		= nv10_gpio_sense;
+ 		engine->pm.clocks_get		= nv40_pm_clocks_get;
+ 		engine->pm.clocks_pre		= nv40_pm_clocks_pre;
+ 		engine->pm.clocks_set		= nv40_pm_clocks_set;
+@@ -345,11 +329,9 @@ static int nouveau_init_engine_ptrs(struct drm_device *dev)
+ 		engine->display.init		= nv50_display_init;
+ 		engine->display.fini		= nv50_display_fini;
+ 		engine->gpio.init		= nv50_gpio_init;
+-		engine->gpio.takedown		= nv50_gpio_fini;
+-		engine->gpio.get		= nv50_gpio_get;
+-		engine->gpio.set		= nv50_gpio_set;
+-		engine->gpio.irq_register	= nv50_gpio_irq_register;
+-		engine->gpio.irq_unregister	= nv50_gpio_irq_unregister;
++		engine->gpio.fini		= nv50_gpio_fini;
++		engine->gpio.drive		= nv50_gpio_drive;
++		engine->gpio.sense		= nv50_gpio_sense;
+ 		engine->gpio.irq_enable		= nv50_gpio_irq_enable;
+ 		switch (dev_priv->chipset) {
+ 		case 0x84:
+@@ -421,11 +403,9 @@ static int nouveau_init_engine_ptrs(struct drm_device *dev)
+ 		engine->display.init		= nv50_display_init;
+ 		engine->display.fini		= nv50_display_fini;
+ 		engine->gpio.init		= nv50_gpio_init;
+-		engine->gpio.takedown		= nouveau_stub_takedown;
+-		engine->gpio.get		= nv50_gpio_get;
+-		engine->gpio.set		= nv50_gpio_set;
+-		engine->gpio.irq_register	= nv50_gpio_irq_register;
+-		engine->gpio.irq_unregister	= nv50_gpio_irq_unregister;
++		engine->gpio.fini		= nv50_gpio_fini;
++		engine->gpio.drive		= nv50_gpio_drive;
++		engine->gpio.sense		= nv50_gpio_sense;
+ 		engine->gpio.irq_enable		= nv50_gpio_irq_enable;
+ 		engine->vram.init		= nvc0_vram_init;
+ 		engine->vram.takedown		= nv50_vram_fini;
+@@ -474,11 +454,9 @@ static int nouveau_init_engine_ptrs(struct drm_device *dev)
+ 		engine->display.init		= nvd0_display_init;
+ 		engine->display.fini		= nvd0_display_fini;
+ 		engine->gpio.init		= nv50_gpio_init;
+-		engine->gpio.takedown		= nouveau_stub_takedown;
+-		engine->gpio.get		= nvd0_gpio_get;
+-		engine->gpio.set		= nvd0_gpio_set;
+-		engine->gpio.irq_register	= nv50_gpio_irq_register;
+-		engine->gpio.irq_unregister	= nv50_gpio_irq_unregister;
++		engine->gpio.fini		= nv50_gpio_fini;
++		engine->gpio.drive		= nvd0_gpio_drive;
++		engine->gpio.sense		= nvd0_gpio_sense;
+ 		engine->gpio.irq_enable		= nv50_gpio_irq_enable;
+ 		engine->vram.init		= nvc0_vram_init;
+ 		engine->vram.takedown		= nv50_vram_fini;
+@@ -630,7 +608,7 @@ nouveau_card_init(struct drm_device *dev)
+ 		goto out_gart;
+ 
+ 	/* PGPIO */
+-	ret = engine->gpio.init(dev);
++	ret = nouveau_gpio_create(dev);
+ 	if (ret)
+ 		goto out_mc;
+ 
+@@ -798,7 +776,7 @@ out_engine:
+ out_timer:
+ 	engine->timer.takedown(dev);
+ out_gpio:
+-	engine->gpio.takedown(dev);
++	nouveau_gpio_destroy(dev);
+ out_mc:
+ 	engine->mc.takedown(dev);
+ out_gart:
+@@ -851,7 +829,7 @@ static void nouveau_card_takedown(struct drm_device *dev)
+ 	}
+ 	engine->fb.takedown(dev);
+ 	engine->timer.takedown(dev);
+-	engine->gpio.takedown(dev);
++	nouveau_gpio_destroy(dev);
+ 	engine->mc.takedown(dev);
+ 	engine->display.late_takedown(dev);
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_volt.c b/drivers/gpu/drm/nouveau/nouveau_volt.c
+index ac15b46..b010cb9 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_volt.c
++++ b/drivers/gpu/drm/nouveau/nouveau_volt.c
+@@ -26,6 +26,7 @@
+ 
+ #include "nouveau_drv.h"
+ #include "nouveau_pm.h"
++#include "nouveau_gpio.h"
+ 
+ static const enum dcb_gpio_tag vidtag[] = { 0x04, 0x05, 0x06, 0x1a, 0x73 };
+ static int nr_vidtag = sizeof(vidtag) / sizeof(vidtag[0]);
+@@ -34,7 +35,6 @@ int
+ nouveau_voltage_gpio_get(struct drm_device *dev)
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *gpio = &dev_priv->engine.gpio;
+ 	struct nouveau_pm_voltage *volt = &dev_priv->engine.pm.voltage;
+ 	u8 vid = 0;
+ 	int i;
+@@ -43,7 +43,7 @@ nouveau_voltage_gpio_get(struct drm_device *dev)
+ 		if (!(volt->vid_mask & (1 << i)))
+ 			continue;
+ 
+-		vid |= gpio->get(dev, vidtag[i]) << i;
++		vid |= nouveau_gpio_func_get(dev, vidtag[i]) << i;
+ 	}
+ 
+ 	return nouveau_volt_lvl_lookup(dev, vid);
+@@ -53,7 +53,6 @@ int
+ nouveau_voltage_gpio_set(struct drm_device *dev, int voltage)
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *gpio = &dev_priv->engine.gpio;
+ 	struct nouveau_pm_voltage *volt = &dev_priv->engine.pm.voltage;
+ 	int vid, i;
+ 
+@@ -65,7 +64,7 @@ nouveau_voltage_gpio_set(struct drm_device *dev, int voltage)
+ 		if (!(volt->vid_mask & (1 << i)))
+ 			continue;
+ 
+-		gpio->set(dev, vidtag[i], !!(vid & (1 << i)));
++		nouveau_gpio_func_set(dev, vidtag[i], !!(vid & (1 << i)));
+ 	}
+ 
+ 	return 0;
+@@ -194,7 +193,7 @@ nouveau_volt_init(struct drm_device *dev)
+ 			return;
+ 		}
+ 
+-		if (!nouveau_bios_gpio_entry(dev, vidtag[i])) {
++		if (!nouveau_gpio_func_valid(dev, vidtag[i])) {
+ 			NV_DEBUG(dev, "vid bit %d has no gpio tag\n", i);
+ 			return;
+ 		}
+diff --git a/drivers/gpu/drm/nouveau/nv04_dac.c b/drivers/gpu/drm/nouveau/nv04_dac.c
+index e000455..8300266 100644
+--- a/drivers/gpu/drm/nouveau/nv04_dac.c
++++ b/drivers/gpu/drm/nouveau/nv04_dac.c
+@@ -32,6 +32,7 @@
+ #include "nouveau_connector.h"
+ #include "nouveau_crtc.h"
+ #include "nouveau_hw.h"
++#include "nouveau_gpio.h"
+ #include "nvreg.h"
+ 
+ int nv04_dac_output_offset(struct drm_encoder *encoder)
+@@ -220,7 +221,6 @@ uint32_t nv17_dac_sample_load(struct drm_encoder *encoder)
+ {
+ 	struct drm_device *dev = encoder->dev;
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *gpio = &dev_priv->engine.gpio;
+ 	struct dcb_entry *dcb = nouveau_encoder(encoder)->dcb;
+ 	uint32_t sample, testval, regoffset = nv04_dac_output_offset(encoder);
+ 	uint32_t saved_powerctrl_2 = 0, saved_powerctrl_4 = 0, saved_routput,
+@@ -252,11 +252,11 @@ uint32_t nv17_dac_sample_load(struct drm_encoder *encoder)
+ 		nvWriteMC(dev, NV_PBUS_POWERCTRL_4, saved_powerctrl_4 & 0xffffffcf);
+ 	}
+ 
+-	saved_gpio1 = gpio->get(dev, DCB_GPIO_TVDAC1);
+-	saved_gpio0 = gpio->get(dev, DCB_GPIO_TVDAC0);
++	saved_gpio1 = nouveau_gpio_func_get(dev, DCB_GPIO_TVDAC1);
++	saved_gpio0 = nouveau_gpio_func_get(dev, DCB_GPIO_TVDAC0);
+ 
+-	gpio->set(dev, DCB_GPIO_TVDAC1, dcb->type == OUTPUT_TV);
+-	gpio->set(dev, DCB_GPIO_TVDAC0, dcb->type == OUTPUT_TV);
++	nouveau_gpio_func_set(dev, DCB_GPIO_TVDAC1, dcb->type == OUTPUT_TV);
++	nouveau_gpio_func_set(dev, DCB_GPIO_TVDAC0, dcb->type == OUTPUT_TV);
+ 
+ 	msleep(4);
+ 
+@@ -306,8 +306,8 @@ uint32_t nv17_dac_sample_load(struct drm_encoder *encoder)
+ 		nvWriteMC(dev, NV_PBUS_POWERCTRL_4, saved_powerctrl_4);
+ 	nvWriteMC(dev, NV_PBUS_POWERCTRL_2, saved_powerctrl_2);
+ 
+-	gpio->set(dev, DCB_GPIO_TVDAC1, saved_gpio1);
+-	gpio->set(dev, DCB_GPIO_TVDAC0, saved_gpio0);
++	nouveau_gpio_func_set(dev, DCB_GPIO_TVDAC1, saved_gpio1);
++	nouveau_gpio_func_set(dev, DCB_GPIO_TVDAC0, saved_gpio0);
+ 
+ 	return sample;
+ }
+diff --git a/drivers/gpu/drm/nouveau/nv10_gpio.c b/drivers/gpu/drm/nouveau/nv10_gpio.c
+index 748c9f7..419d649 100644
+--- a/drivers/gpu/drm/nouveau/nv10_gpio.c
++++ b/drivers/gpu/drm/nouveau/nv10_gpio.c
+@@ -28,65 +28,55 @@
+ #include "nouveau_drv.h"
+ #include "nouveau_hw.h"
+ 
+-static bool
+-get_gpio_location(struct dcb_gpio_entry *ent, uint32_t *reg, uint32_t *shift,
+-		  uint32_t *mask)
+-{
+-	if (ent->line < 2) {
+-		*reg = NV_PCRTC_GPIO;
+-		*shift = ent->line * 16;
+-		*mask = 0x11;
+-
+-	} else if (ent->line < 10) {
+-		*reg = NV_PCRTC_GPIO_EXT;
+-		*shift = (ent->line - 2) * 4;
+-		*mask = 0x3;
+-
+-	} else if (ent->line < 14) {
+-		*reg = NV_PCRTC_850;
+-		*shift = (ent->line - 10) * 4;
+-		*mask = 0x3;
+-
+-	} else {
+-		return false;
+-	}
+-
+-	return true;
+-}
+-
+ int
+-nv10_gpio_get(struct drm_device *dev, enum dcb_gpio_tag tag)
++nv10_gpio_sense(struct drm_device *dev, int line)
+ {
+-	struct dcb_gpio_entry *ent = nouveau_bios_gpio_entry(dev, tag);
+-	uint32_t reg, shift, mask, value;
+-
+-	if (!ent)
+-		return -ENODEV;
+-
+-	if (!get_gpio_location(ent, &reg, &shift, &mask))
+-		return -ENODEV;
+-
+-	value = NVReadCRTC(dev, 0, reg) >> shift;
++	if (line < 2) {
++		line = line * 16;
++		line = NVReadCRTC(dev, 0, NV_PCRTC_GPIO) >> line;
++		return !!(line & 0x0100);
++	} else
++	if (line < 10) {
++		line = (line - 2) * 4;
++		line = NVReadCRTC(dev, 0, NV_PCRTC_GPIO_EXT) >> line;
++		return !!(line & 0x04);
++	} else
++	if (line < 14) {
++		line = (line - 10) * 4;
++		line = NVReadCRTC(dev, 0, NV_PCRTC_850) >> line;
++		return !!(line & 0x04);
++	}
+ 
+-	return (value & 1) == ent->state[1];
++	return -EINVAL;
+ }
+ 
+ int
+-nv10_gpio_set(struct drm_device *dev, enum dcb_gpio_tag tag, int state)
++nv10_gpio_drive(struct drm_device *dev, int line, int dir, int out)
+ {
+-	struct dcb_gpio_entry *ent = nouveau_bios_gpio_entry(dev, tag);
+-	uint32_t reg, shift, mask, value;
+-
+-	if (!ent)
+-		return -ENODEV;
++	u32 reg, mask, data;
+ 
+-	if (!get_gpio_location(ent, &reg, &shift, &mask))
+-		return -ENODEV;
+-
+-	value = ent->state[state & 1] << shift;
+-	mask = ~(mask << shift);
+-
+-	NVWriteCRTC(dev, 0, reg, value | (NVReadCRTC(dev, 0, reg) & mask));
++	if (line < 2) {
++		line = line * 16;
++		reg  = NV_PCRTC_GPIO;
++		mask = 0x00000011;
++		data = (dir << 4) | out;
++	} else
++	if (line < 10) {
++		line = (line - 2) * 4;
++		reg  = NV_PCRTC_GPIO_EXT;
++		mask = 0x00000003 << ((line - 2) * 4);
++		data = (dir << 1) | out;
++	} else
++	if (line < 14) {
++		line = (line - 10) * 4;
++		reg  = NV_PCRTC_850;
++		mask = 0x00000003;
++		data = (dir << 1) | out;
++	} else {
++		return -EINVAL;
++	}
+ 
++	mask = NVReadCRTC(dev, 0, reg) & ~(mask << line);
++	NVWriteCRTC(dev, 0, reg, mask | (data << line));
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/nouveau/nv17_tv.c b/drivers/gpu/drm/nouveau/nv17_tv.c
+index 3900ceb..696d7e7 100644
+--- a/drivers/gpu/drm/nouveau/nv17_tv.c
++++ b/drivers/gpu/drm/nouveau/nv17_tv.c
+@@ -30,6 +30,7 @@
+ #include "nouveau_encoder.h"
+ #include "nouveau_connector.h"
+ #include "nouveau_crtc.h"
++#include "nouveau_gpio.h"
+ #include "nouveau_hw.h"
+ #include "nv17_tv.h"
+ 
+@@ -37,7 +38,6 @@ static uint32_t nv42_tv_sample_load(struct drm_encoder *encoder)
+ {
+ 	struct drm_device *dev = encoder->dev;
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *gpio = &dev_priv->engine.gpio;
+ 	uint32_t testval, regoffset = nv04_dac_output_offset(encoder);
+ 	uint32_t gpio0, gpio1, fp_htotal, fp_hsync_start, fp_hsync_end,
+ 		fp_control, test_ctrl, dacclk, ctv_14, ctv_1c, ctv_6c;
+@@ -53,8 +53,8 @@ static uint32_t nv42_tv_sample_load(struct drm_encoder *encoder)
+ 	head = (dacclk & 0x100) >> 8;
+ 
+ 	/* Save the previous state. */
+-	gpio1 = gpio->get(dev, DCB_GPIO_TVDAC1);
+-	gpio0 = gpio->get(dev, DCB_GPIO_TVDAC0);
++	gpio1 = nouveau_gpio_func_get(dev, DCB_GPIO_TVDAC1);
++	gpio0 = nouveau_gpio_func_get(dev, DCB_GPIO_TVDAC0);
+ 	fp_htotal = NVReadRAMDAC(dev, head, NV_PRAMDAC_FP_HTOTAL);
+ 	fp_hsync_start = NVReadRAMDAC(dev, head, NV_PRAMDAC_FP_HSYNC_START);
+ 	fp_hsync_end = NVReadRAMDAC(dev, head, NV_PRAMDAC_FP_HSYNC_END);
+@@ -65,8 +65,8 @@ static uint32_t nv42_tv_sample_load(struct drm_encoder *encoder)
+ 	ctv_6c = NVReadRAMDAC(dev, head, 0x680c6c);
+ 
+ 	/* Prepare the DAC for load detection.  */
+-	gpio->set(dev, DCB_GPIO_TVDAC1, true);
+-	gpio->set(dev, DCB_GPIO_TVDAC0, true);
++	nouveau_gpio_func_set(dev, DCB_GPIO_TVDAC1, true);
++	nouveau_gpio_func_set(dev, DCB_GPIO_TVDAC0, true);
+ 
+ 	NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_HTOTAL, 1343);
+ 	NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_HSYNC_START, 1047);
+@@ -111,8 +111,8 @@ static uint32_t nv42_tv_sample_load(struct drm_encoder *encoder)
+ 	NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_HSYNC_END, fp_hsync_end);
+ 	NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_HSYNC_START, fp_hsync_start);
+ 	NVWriteRAMDAC(dev, head, NV_PRAMDAC_FP_HTOTAL, fp_htotal);
+-	gpio->set(dev, DCB_GPIO_TVDAC1, gpio1);
+-	gpio->set(dev, DCB_GPIO_TVDAC0, gpio0);
++	nouveau_gpio_func_set(dev, DCB_GPIO_TVDAC1, gpio1);
++	nouveau_gpio_func_set(dev, DCB_GPIO_TVDAC0, gpio0);
+ 
+ 	return sample;
+ }
+@@ -357,8 +357,6 @@ static bool nv17_tv_mode_fixup(struct drm_encoder *encoder,
+ static void  nv17_tv_dpms(struct drm_encoder *encoder, int mode)
+ {
+ 	struct drm_device *dev = encoder->dev;
+-	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *gpio = &dev_priv->engine.gpio;
+ 	struct nv17_tv_state *regs = &to_tv_enc(encoder)->state;
+ 	struct nv17_tv_norm_params *tv_norm = get_tv_norm(encoder);
+ 
+@@ -383,8 +381,8 @@ static void  nv17_tv_dpms(struct drm_encoder *encoder, int mode)
+ 
+ 	nv_load_ptv(dev, regs, 200);
+ 
+-	gpio->set(dev, DCB_GPIO_TVDAC1, mode == DRM_MODE_DPMS_ON);
+-	gpio->set(dev, DCB_GPIO_TVDAC0, mode == DRM_MODE_DPMS_ON);
++	nouveau_gpio_func_set(dev, DCB_GPIO_TVDAC1, mode == DRM_MODE_DPMS_ON);
++	nouveau_gpio_func_set(dev, DCB_GPIO_TVDAC0, mode == DRM_MODE_DPMS_ON);
+ 
+ 	nv04_dac_update_dacclk(encoder, mode == DRM_MODE_DPMS_ON);
+ }
+diff --git a/drivers/gpu/drm/nouveau/nv50_display.c b/drivers/gpu/drm/nouveau/nv50_display.c
+index 9708b94..f408e10 100644
+--- a/drivers/gpu/drm/nouveau/nv50_display.c
++++ b/drivers/gpu/drm/nouveau/nv50_display.c
+@@ -32,6 +32,7 @@
+ #include "nouveau_fb.h"
+ #include "nouveau_fbcon.h"
+ #include "nouveau_ramht.h"
++#include "nouveau_gpio.h"
+ #include "drm_crtc_helper.h"
+ 
+ static void nv50_display_isr(struct drm_device *);
+@@ -140,8 +141,6 @@ nv50_display_sync(struct drm_device *dev)
+ int
+ nv50_display_init(struct drm_device *dev)
+ {
+-	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+ 	struct drm_connector *connector;
+ 	struct nouveau_channel *evo;
+ 	int ret, i;
+@@ -240,11 +239,7 @@ nv50_display_init(struct drm_device *dev)
+ 	/* enable hotplug interrupts */
+ 	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
+ 		struct nouveau_connector *conn = nouveau_connector(connector);
+-
+-		if (conn->hpd == DCB_GPIO_UNUSED)
+-			continue;
+-
+-		pgpio->irq_enable(dev, conn->hpd, true);
++		nouveau_gpio_irq(dev, 0, conn->hpd, 0xff, true);
+ 	}
+ 
+ 	ret = nv50_evo_init(dev);
+diff --git a/drivers/gpu/drm/nouveau/nv50_gpio.c b/drivers/gpu/drm/nouveau/nv50_gpio.c
+index 793a5cc..f429e6a 100644
+--- a/drivers/gpu/drm/nouveau/nv50_gpio.c
++++ b/drivers/gpu/drm/nouveau/nv50_gpio.c
+@@ -25,229 +25,95 @@
+ #include "drmP.h"
+ #include "nouveau_drv.h"
+ #include "nouveau_hw.h"
++#include "nouveau_gpio.h"
+ 
+ #include "nv50_display.h"
+ 
+-static void nv50_gpio_isr(struct drm_device *dev);
+-static void nv50_gpio_isr_bh(struct work_struct *work);
+-
+-struct nv50_gpio_priv {
+-	struct list_head handlers;
+-	spinlock_t lock;
+-};
+-
+-struct nv50_gpio_handler {
+-	struct drm_device *dev;
+-	struct list_head head;
+-	struct work_struct work;
+-	bool inhibit;
+-
+-	struct dcb_gpio_entry *gpio;
+-
+-	void (*handler)(void *data, int state);
+-	void *data;
+-};
+-
+ static int
+-nv50_gpio_location(struct dcb_gpio_entry *gpio, uint32_t *reg, uint32_t *shift)
++nv50_gpio_location(int line, u32 *reg, u32 *shift)
+ {
+ 	const uint32_t nv50_gpio_reg[4] = { 0xe104, 0xe108, 0xe280, 0xe284 };
+ 
+-	if (gpio->line >= 32)
++	if (line >= 32)
+ 		return -EINVAL;
+ 
+-	*reg = nv50_gpio_reg[gpio->line >> 3];
+-	*shift = (gpio->line & 7) << 2;
++	*reg = nv50_gpio_reg[line >> 3];
++	*shift = (line & 7) << 2;
+ 	return 0;
+ }
+ 
+ int
+-nv50_gpio_get(struct drm_device *dev, enum dcb_gpio_tag tag)
++nv50_gpio_drive(struct drm_device *dev, int line, int dir, int out)
+ {
+-	struct dcb_gpio_entry *gpio;
+-	uint32_t r, s, v;
+-
+-	gpio = nouveau_bios_gpio_entry(dev, tag);
+-	if (!gpio)
+-		return -ENOENT;
++	u32 reg, shift;
+ 
+-	if (nv50_gpio_location(gpio, &r, &s))
++	if (nv50_gpio_location(line, &reg, &shift))
+ 		return -EINVAL;
+ 
+-	v = nv_rd32(dev, r) >> (s + 2);
+-	return ((v & 1) == (gpio->state[1] & 1));
++	nv_mask(dev, reg, 7 << shift, (((dir ^ 1) << 1) | out) << shift);
++	return 0;
+ }
+ 
+ int
+-nv50_gpio_set(struct drm_device *dev, enum dcb_gpio_tag tag, int state)
++nv50_gpio_sense(struct drm_device *dev, int line)
+ {
+-	struct dcb_gpio_entry *gpio;
+-	uint32_t r, s, v;
+-
+-	gpio = nouveau_bios_gpio_entry(dev, tag);
+-	if (!gpio)
+-		return -ENOENT;
++	u32 reg, shift;
+ 
+-	if (nv50_gpio_location(gpio, &r, &s))
++	if (nv50_gpio_location(line, &reg, &shift))
+ 		return -EINVAL;
+ 
+-	v  = nv_rd32(dev, r) & ~(0x3 << s);
+-	v |= (gpio->state[state] ^ 2) << s;
+-	nv_wr32(dev, r, v);
+-	return 0;
++	return !!(nv_rd32(dev, reg) & (4 << shift));
+ }
+ 
+-int
+-nvd0_gpio_get(struct drm_device *dev, enum dcb_gpio_tag tag)
++void
++nv50_gpio_irq_enable(struct drm_device *dev, int line, bool on)
+ {
+-	struct dcb_gpio_entry *gpio;
+-	u32 v;
+-
+-	gpio = nouveau_bios_gpio_entry(dev, tag);
+-	if (!gpio)
+-		return -ENOENT;
++	u32 reg  = line < 16 ? 0xe050 : 0xe070;
++	u32 mask = 0x00010001 << (line & 0xf);
+ 
+-	v  = nv_rd32(dev, 0x00d610 + (gpio->line * 4));
+-	v &= 0x00004000;
+-	return (!!v == (gpio->state[1] & 1));
++	nv_wr32(dev, reg + 4, mask);
++	nv_mask(dev, reg + 0, mask, on ? mask : 0);
+ }
+ 
+ int
+-nvd0_gpio_set(struct drm_device *dev, enum dcb_gpio_tag tag, int state)
++nvd0_gpio_drive(struct drm_device *dev, int line, int dir, int out)
+ {
+-	struct dcb_gpio_entry *gpio;
+-	u32 v;
+-
+-	gpio = nouveau_bios_gpio_entry(dev, tag);
+-	if (!gpio)
+-		return -ENOENT;
+-
+-	v = gpio->state[state] ^ 2;
+-
+-	nv_mask(dev, 0x00d610 + (gpio->line * 4), 0x00003000, v << 12);
++	u32 data = ((dir ^ 1) << 13) | (out << 12);
++	nv_mask(dev, 0x00d610 + (line * 4), 0x00003000, data);
++	nv_mask(dev, 0x00d604, 0x00000001, 0x00000001); /* update? */
+ 	return 0;
+ }
+ 
+ int
+-nv50_gpio_irq_register(struct drm_device *dev, enum dcb_gpio_tag tag,
+-		       void (*handler)(void *, int), void *data)
++nvd0_gpio_sense(struct drm_device *dev, int line)
+ {
+-	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+-	struct nv50_gpio_priv *priv = pgpio->priv;
+-	struct nv50_gpio_handler *gpioh;
+-	struct dcb_gpio_entry *gpio;
+-	unsigned long flags;
+-
+-	gpio = nouveau_bios_gpio_entry(dev, tag);
+-	if (!gpio)
+-		return -ENOENT;
+-
+-	gpioh = kzalloc(sizeof(*gpioh), GFP_KERNEL);
+-	if (!gpioh)
+-		return -ENOMEM;
+-
+-	INIT_WORK(&gpioh->work, nv50_gpio_isr_bh);
+-	gpioh->dev  = dev;
+-	gpioh->gpio = gpio;
+-	gpioh->handler = handler;
+-	gpioh->data = data;
+-
+-	spin_lock_irqsave(&priv->lock, flags);
+-	list_add(&gpioh->head, &priv->handlers);
+-	spin_unlock_irqrestore(&priv->lock, flags);
+-	return 0;
++	return !!(nv_rd32(dev, 0x00d610 + (line * 4)) & 0x00004000);
+ }
+ 
+-void
+-nv50_gpio_irq_unregister(struct drm_device *dev, enum dcb_gpio_tag tag,
+-			 void (*handler)(void *, int), void *data)
+-{
+-	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+-	struct nv50_gpio_priv *priv = pgpio->priv;
+-	struct nv50_gpio_handler *gpioh, *tmp;
+-	struct dcb_gpio_entry *gpio;
+-	LIST_HEAD(tofree);
+-	unsigned long flags;
+-
+-	gpio = nouveau_bios_gpio_entry(dev, tag);
+-	if (!gpio)
+-		return;
+-
+-	spin_lock_irqsave(&priv->lock, flags);
+-	list_for_each_entry_safe(gpioh, tmp, &priv->handlers, head) {
+-		if (gpioh->gpio != gpio ||
+-		    gpioh->handler != handler ||
+-		    gpioh->data != data)
+-			continue;
+-		list_move(&gpioh->head, &tofree);
+-	}
+-	spin_unlock_irqrestore(&priv->lock, flags);
+-
+-	list_for_each_entry_safe(gpioh, tmp, &tofree, head) {
+-		flush_work_sync(&gpioh->work);
+-		kfree(gpioh);
+-	}
+-}
+-
+-bool
+-nv50_gpio_irq_enable(struct drm_device *dev, enum dcb_gpio_tag tag, bool on)
+-{
+-	struct dcb_gpio_entry *gpio;
+-	u32 reg, mask;
+-
+-	gpio = nouveau_bios_gpio_entry(dev, tag);
+-	if (!gpio)
+-		return false;
+-
+-	reg  = gpio->line < 16 ? 0xe050 : 0xe070;
+-	mask = 0x00010001 << (gpio->line & 0xf);
+-
+-	nv_wr32(dev, reg + 4, mask);
+-	reg = nv_mask(dev, reg + 0, mask, on ? mask : 0);
+-	return (reg & mask) == mask;
+-}
+-
+-static int
+-nv50_gpio_create(struct drm_device *dev)
++static void
++nv50_gpio_isr(struct drm_device *dev)
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+-	struct nv50_gpio_priv *priv;
+-
+-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+-	if (!priv)
+-		return -ENOMEM;
++	u32 intr0, intr1 = 0;
++	u32 hi, lo;
+ 
+-	INIT_LIST_HEAD(&priv->handlers);
+-	spin_lock_init(&priv->lock);
+-	pgpio->priv = priv;
+-	return 0;
+-}
++	intr0 = nv_rd32(dev, 0xe054) & nv_rd32(dev, 0xe050);
++	if (dev_priv->chipset >= 0x90)
++		intr1 = nv_rd32(dev, 0xe074) & nv_rd32(dev, 0xe070);
+ 
+-static void
+-nv50_gpio_destroy(struct drm_device *dev)
+-{
+-	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
++	hi = (intr0 & 0x0000ffff) | (intr1 << 16);
++	lo = (intr0 >> 16) | (intr1 & 0xffff0000);
++	nouveau_gpio_isr(dev, 0, hi | lo);
+ 
+-	kfree(pgpio->priv);
+-	pgpio->priv = NULL;
++	nv_wr32(dev, 0xe054, intr0);
++	if (dev_priv->chipset >= 0x90)
++		nv_wr32(dev, 0xe074, intr1);
+ }
+ 
+ int
+ nv50_gpio_init(struct drm_device *dev)
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+-	int ret;
+-
+-	if (!pgpio->priv) {
+-		ret = nv50_gpio_create(dev);
+-		if (ret)
+-			return ret;
+-	}
+ 
+ 	/* disable, and ack any pending gpio interrupts */
+ 	nv_wr32(dev, 0xe050, 0x00000000);
+@@ -270,64 +136,4 @@ nv50_gpio_fini(struct drm_device *dev)
+ 	if (dev_priv->chipset >= 0x90)
+ 		nv_wr32(dev, 0xe070, 0x00000000);
+ 	nouveau_irq_unregister(dev, 21);
+-
+-	nv50_gpio_destroy(dev);
+-}
+-
+-static void
+-nv50_gpio_isr_bh(struct work_struct *work)
+-{
+-	struct nv50_gpio_handler *gpioh =
+-		container_of(work, struct nv50_gpio_handler, work);
+-	struct drm_nouveau_private *dev_priv = gpioh->dev->dev_private;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+-	struct nv50_gpio_priv *priv = pgpio->priv;
+-	unsigned long flags;
+-	int state;
+-
+-	state = pgpio->get(gpioh->dev, gpioh->gpio->tag);
+-	if (state < 0)
+-		return;
+-
+-	gpioh->handler(gpioh->data, state);
+-
+-	spin_lock_irqsave(&priv->lock, flags);
+-	gpioh->inhibit = false;
+-	spin_unlock_irqrestore(&priv->lock, flags);
+-}
+-
+-static void
+-nv50_gpio_isr(struct drm_device *dev)
+-{
+-	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_gpio_engine *pgpio = &dev_priv->engine.gpio;
+-	struct nv50_gpio_priv *priv = pgpio->priv;
+-	struct nv50_gpio_handler *gpioh;
+-	u32 intr0, intr1 = 0;
+-	u32 hi, lo, ch;
+-
+-	intr0 = nv_rd32(dev, 0xe054) & nv_rd32(dev, 0xe050);
+-	if (dev_priv->chipset >= 0x90)
+-		intr1 = nv_rd32(dev, 0xe074) & nv_rd32(dev, 0xe070);
+-
+-	hi = (intr0 & 0x0000ffff) | (intr1 << 16);
+-	lo = (intr0 >> 16) | (intr1 & 0xffff0000);
+-	ch = hi | lo;
+-
+-	nv_wr32(dev, 0xe054, intr0);
+-	if (dev_priv->chipset >= 0x90)
+-		nv_wr32(dev, 0xe074, intr1);
+-
+-	spin_lock(&priv->lock);
+-	list_for_each_entry(gpioh, &priv->handlers, head) {
+-		if (!(ch & (1 << gpioh->gpio->line)))
+-			continue;
+-
+-		if (gpioh->inhibit)
+-			continue;
+-		gpioh->inhibit = true;
+-
+-		schedule_work(&gpioh->work);
+-	}
+-	spin_unlock(&priv->lock);
+ }
+
