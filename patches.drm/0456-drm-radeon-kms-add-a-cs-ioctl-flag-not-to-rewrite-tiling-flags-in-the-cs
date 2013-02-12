@@ -1,0 +1,453 @@
+From e70f224c1938af208b64b02c5cec27889fefcaec Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <maraeo@gmail.com>
+Date: Tue, 25 Oct 2011 01:38:45 +0200
+Subject: drm/radeon/kms: add a CS ioctl flag not to rewrite tiling flags in
+ the CS
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: e70f224c1938af208b64b02c5cec27889fefcaec
+Patch-mainline: v3.2-rc3
+
+This adds a new optional chunk to the CS ioctl that specifies optional flags
+to the CS parser. Why this is useful is explained below. Note that some regs
+no longer need the NOP relocation packet if this feature is enabled.
+Tested on r300g and r600g with this flag disabled and enabled.
+
+Assume there are two contexts sharing the same mipmapped tiled texture.
+One context wants to render into the first mipmap and the other one
+wants to render into the last mipmap. As you probably know, the hardware
+has a MACRO_SWITCH feature, which turns off macro tiling for small mipmaps,
+but that only applies to samplers.
+(at least on r300-r500, though later hardware likely behaves the same)
+
+So we want to just re-set the tiling flags before rendering (writing
+packets), right? ... No. The contexts run in parallel, so they may
+set the tiling flags simultaneously and then fire their command streams
+also simultaneously. The last one setting the flags wins, the other one
+loses.
+
+Another problem is when one context wants to render into the first and
+the last mipmap in one CS. Impossible. It must flush before changing
+tiling flags and do the rendering into the smaller mipmaps in another CS.
+
+Yet another problem is that writing copy_blit in userspace would be a mess
+involving re-setting tiling flags to please the kernel, and causing races
+with other contexts at the same time.
+
+The only way out of this is to send tiling flags with each CS, ideally
+with each relocation. But we already do that through the registers.
+So let's just use what we have in the registers.
+
+Signed-off-by: Marek Olšák <maraeo@gmail.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/evergreen_cs.c |   92 ++++++++++++++++++---------------
+ drivers/gpu/drm/radeon/r300.c         |   92 ++++++++++++++++++---------------
+ drivers/gpu/drm/radeon/r600_cs.c      |   26 ++++++----
+ drivers/gpu/drm/radeon/radeon.h       |    3 +-
+ drivers/gpu/drm/radeon/radeon_cs.c    |   11 ++++-
+ drivers/gpu/drm/radeon/radeon_drv.c   |    3 +-
+ include/drm/radeon_drm.h              |    4 ++
+ 7 files changed, 134 insertions(+), 97 deletions(-)
+
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/evergreen_cs.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/evergreen_cs.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/evergreen_cs.c
+@@ -480,21 +480,23 @@ static int evergreen_cs_check_reg(struct
+ 		}
+ 		break;
+ 	case DB_Z_INFO:
+-		r = evergreen_cs_packet_next_reloc(p, &reloc);
+-		if (r) {
+-			dev_warn(p->dev, "bad SET_CONTEXT_REG "
+-					"0x%04X\n", reg);
+-			return -EINVAL;
+-		}
+ 		track->db_z_info = radeon_get_ib_value(p, idx);
+-		ib[idx] &= ~Z_ARRAY_MODE(0xf);
+-		track->db_z_info &= ~Z_ARRAY_MODE(0xf);
+-		if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
+-			ib[idx] |= Z_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
+-			track->db_z_info |= Z_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
+-		} else {
+-			ib[idx] |= Z_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
+-			track->db_z_info |= Z_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
++		if (!p->keep_tiling_flags) {
++			r = evergreen_cs_packet_next_reloc(p, &reloc);
++			if (r) {
++				dev_warn(p->dev, "bad SET_CONTEXT_REG "
++						"0x%04X\n", reg);
++				return -EINVAL;
++			}
++			ib[idx] &= ~Z_ARRAY_MODE(0xf);
++			track->db_z_info &= ~Z_ARRAY_MODE(0xf);
++			if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
++				ib[idx] |= Z_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
++				track->db_z_info |= Z_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
++			} else {
++				ib[idx] |= Z_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
++				track->db_z_info |= Z_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
++			}
+ 		}
+ 		break;
+ 	case DB_STENCIL_INFO:
+@@ -607,40 +609,44 @@ static int evergreen_cs_check_reg(struct
+ 	case CB_COLOR5_INFO:
+ 	case CB_COLOR6_INFO:
+ 	case CB_COLOR7_INFO:
+-		r = evergreen_cs_packet_next_reloc(p, &reloc);
+-		if (r) {
+-			dev_warn(p->dev, "bad SET_CONTEXT_REG "
+-					"0x%04X\n", reg);
+-			return -EINVAL;
+-		}
+ 		tmp = (reg - CB_COLOR0_INFO) / 0x3c;
+ 		track->cb_color_info[tmp] = radeon_get_ib_value(p, idx);
+-		if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
+-			ib[idx] |= CB_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
+-			track->cb_color_info[tmp] |= CB_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
+-		} else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO) {
+-			ib[idx] |= CB_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
+-			track->cb_color_info[tmp] |= CB_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
++		if (!p->keep_tiling_flags) {
++			r = evergreen_cs_packet_next_reloc(p, &reloc);
++			if (r) {
++				dev_warn(p->dev, "bad SET_CONTEXT_REG "
++						"0x%04X\n", reg);
++				return -EINVAL;
++			}
++			if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
++				ib[idx] |= CB_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
++				track->cb_color_info[tmp] |= CB_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
++			} else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO) {
++				ib[idx] |= CB_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
++				track->cb_color_info[tmp] |= CB_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
++			}
+ 		}
+ 		break;
+ 	case CB_COLOR8_INFO:
+ 	case CB_COLOR9_INFO:
+ 	case CB_COLOR10_INFO:
+ 	case CB_COLOR11_INFO:
+-		r = evergreen_cs_packet_next_reloc(p, &reloc);
+-		if (r) {
+-			dev_warn(p->dev, "bad SET_CONTEXT_REG "
+-					"0x%04X\n", reg);
+-			return -EINVAL;
+-		}
+ 		tmp = ((reg - CB_COLOR8_INFO) / 0x1c) + 8;
+ 		track->cb_color_info[tmp] = radeon_get_ib_value(p, idx);
+-		if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
+-			ib[idx] |= CB_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
+-			track->cb_color_info[tmp] |= CB_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
+-		} else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO) {
+-			ib[idx] |= CB_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
+-			track->cb_color_info[tmp] |= CB_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
++		if (!p->keep_tiling_flags) {
++			r = evergreen_cs_packet_next_reloc(p, &reloc);
++			if (r) {
++				dev_warn(p->dev, "bad SET_CONTEXT_REG "
++						"0x%04X\n", reg);
++				return -EINVAL;
++			}
++			if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO) {
++				ib[idx] |= CB_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
++				track->cb_color_info[tmp] |= CB_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
++			} else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO) {
++				ib[idx] |= CB_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
++				track->cb_color_info[tmp] |= CB_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
++			}
+ 		}
+ 		break;
+ 	case CB_COLOR0_PITCH:
+@@ -1311,10 +1317,12 @@ static int evergreen_packet3_check(struc
+ 					return -EINVAL;
+ 				}
+ 				ib[idx+1+(i*8)+2] += (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
+-				if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO)
+-					ib[idx+1+(i*8)+1] |= TEX_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
+-				else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO)
+-					ib[idx+1+(i*8)+1] |= TEX_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
++				if (!p->keep_tiling_flags) {
++					if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO)
++						ib[idx+1+(i*8)+1] |= TEX_ARRAY_MODE(ARRAY_2D_TILED_THIN1);
++					else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO)
++						ib[idx+1+(i*8)+1] |= TEX_ARRAY_MODE(ARRAY_1D_TILED_THIN1);
++				}
+ 				texture = reloc->robj;
+ 				/* tex mip base */
+ 				r = evergreen_cs_packet_next_reloc(p, &reloc);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r300.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/r300.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r300.c
+@@ -701,16 +701,21 @@ static int r300_packet0_check(struct rad
+ 			return r;
+ 		}
+ 
+-		if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO)
+-			tile_flags |= R300_TXO_MACRO_TILE;
+-		if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO)
+-			tile_flags |= R300_TXO_MICRO_TILE;
+-		else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO_SQUARE)
+-			tile_flags |= R300_TXO_MICRO_TILE_SQUARE;
+-
+-		tmp = idx_value + ((u32)reloc->lobj.gpu_offset);
+-		tmp |= tile_flags;
+-		ib[idx] = tmp;
++		if (p->keep_tiling_flags) {
++			ib[idx] = (idx_value & 31) | /* keep the 1st 5 bits */
++				  ((idx_value & ~31) + (u32)reloc->lobj.gpu_offset);
++		} else {
++			if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO)
++				tile_flags |= R300_TXO_MACRO_TILE;
++			if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO)
++				tile_flags |= R300_TXO_MICRO_TILE;
++			else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO_SQUARE)
++				tile_flags |= R300_TXO_MICRO_TILE_SQUARE;
++
++			tmp = idx_value + ((u32)reloc->lobj.gpu_offset);
++			tmp |= tile_flags;
++			ib[idx] = tmp;
++		}
+ 		track->textures[i].robj = reloc->robj;
+ 		track->tex_dirty = true;
+ 		break;
+@@ -760,24 +765,26 @@ static int r300_packet0_check(struct rad
+ 		/* RB3D_COLORPITCH1 */
+ 		/* RB3D_COLORPITCH2 */
+ 		/* RB3D_COLORPITCH3 */
+-		r = r100_cs_packet_next_reloc(p, &reloc);
+-		if (r) {
+-			DRM_ERROR("No reloc for ib[%d]=0x%04X\n",
+-				  idx, reg);
+-			r100_cs_dump_packet(p, pkt);
+-			return r;
+-		}
++		if (!p->keep_tiling_flags) {
++			r = r100_cs_packet_next_reloc(p, &reloc);
++			if (r) {
++				DRM_ERROR("No reloc for ib[%d]=0x%04X\n",
++					  idx, reg);
++				r100_cs_dump_packet(p, pkt);
++				return r;
++			}
+ 
+-		if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO)
+-			tile_flags |= R300_COLOR_TILE_ENABLE;
+-		if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO)
+-			tile_flags |= R300_COLOR_MICROTILE_ENABLE;
+-		else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO_SQUARE)
+-			tile_flags |= R300_COLOR_MICROTILE_SQUARE_ENABLE;
+-
+-		tmp = idx_value & ~(0x7 << 16);
+-		tmp |= tile_flags;
+-		ib[idx] = tmp;
++			if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO)
++				tile_flags |= R300_COLOR_TILE_ENABLE;
++			if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO)
++				tile_flags |= R300_COLOR_MICROTILE_ENABLE;
++			else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO_SQUARE)
++				tile_flags |= R300_COLOR_MICROTILE_SQUARE_ENABLE;
++
++			tmp = idx_value & ~(0x7 << 16);
++			tmp |= tile_flags;
++			ib[idx] = tmp;
++		}
+ 		i = (reg - 0x4E38) >> 2;
+ 		track->cb[i].pitch = idx_value & 0x3FFE;
+ 		switch (((idx_value >> 21) & 0xF)) {
+@@ -843,25 +850,26 @@ static int r300_packet0_check(struct rad
+ 		break;
+ 	case 0x4F24:
+ 		/* ZB_DEPTHPITCH */
+-		r = r100_cs_packet_next_reloc(p, &reloc);
+-		if (r) {
+-			DRM_ERROR("No reloc for ib[%d]=0x%04X\n",
+-				  idx, reg);
+-			r100_cs_dump_packet(p, pkt);
+-			return r;
+-		}
+-
+-		if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO)
+-			tile_flags |= R300_DEPTHMACROTILE_ENABLE;
+-		if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO)
+-			tile_flags |= R300_DEPTHMICROTILE_TILED;
+-		else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO_SQUARE)
+-			tile_flags |= R300_DEPTHMICROTILE_TILED_SQUARE;
+-
+-		tmp = idx_value & ~(0x7 << 16);
+-		tmp |= tile_flags;
+-		ib[idx] = tmp;
++		if (!p->keep_tiling_flags) {
++			r = r100_cs_packet_next_reloc(p, &reloc);
++			if (r) {
++				DRM_ERROR("No reloc for ib[%d]=0x%04X\n",
++					  idx, reg);
++				r100_cs_dump_packet(p, pkt);
++				return r;
++			}
+ 
++			if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO)
++				tile_flags |= R300_DEPTHMACROTILE_ENABLE;
++			if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO)
++				tile_flags |= R300_DEPTHMICROTILE_TILED;
++			else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO_SQUARE)
++				tile_flags |= R300_DEPTHMICROTILE_TILED_SQUARE;
++
++			tmp = idx_value & ~(0x7 << 16);
++			tmp |= tile_flags;
++			ib[idx] = tmp;
++		}
+ 		track->zb.pitch = idx_value & 0x3FFC;
+ 		track->zb_dirty = true;
+ 		break;
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r600_cs.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/r600_cs.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r600_cs.c
+@@ -941,7 +941,8 @@ static int r600_cs_check_reg(struct rade
+ 		track->db_depth_control = radeon_get_ib_value(p, idx);
+ 		break;
+ 	case R_028010_DB_DEPTH_INFO:
+-		if (r600_cs_packet_next_is_pkt3_nop(p)) {
++		if (!p->keep_tiling_flags &&
++		    r600_cs_packet_next_is_pkt3_nop(p)) {
+ 			r = r600_cs_packet_next_reloc(p, &reloc);
+ 			if (r) {
+ 				dev_warn(p->dev, "bad SET_CONTEXT_REG "
+@@ -992,7 +993,8 @@ static int r600_cs_check_reg(struct rade
+ 	case R_0280B4_CB_COLOR5_INFO:
+ 	case R_0280B8_CB_COLOR6_INFO:
+ 	case R_0280BC_CB_COLOR7_INFO:
+-		if (r600_cs_packet_next_is_pkt3_nop(p)) {
++		if (!p->keep_tiling_flags &&
++		     r600_cs_packet_next_is_pkt3_nop(p)) {
+ 			r = r600_cs_packet_next_reloc(p, &reloc);
+ 			if (r) {
+ 				dev_err(p->dev, "bad SET_CONTEXT_REG 0x%04X\n", reg);
+@@ -1291,10 +1293,12 @@ static int r600_check_texture_resource(s
+ 	mip_offset <<= 8;
+ 
+ 	word0 = radeon_get_ib_value(p, idx + 0);
+-	if (tiling_flags & RADEON_TILING_MACRO)
+-		word0 |= S_038000_TILE_MODE(V_038000_ARRAY_2D_TILED_THIN1);
+-	else if (tiling_flags & RADEON_TILING_MICRO)
+-		word0 |= S_038000_TILE_MODE(V_038000_ARRAY_1D_TILED_THIN1);
++	if (!p->keep_tiling_flags) {
++		if (tiling_flags & RADEON_TILING_MACRO)
++			word0 |= S_038000_TILE_MODE(V_038000_ARRAY_2D_TILED_THIN1);
++		else if (tiling_flags & RADEON_TILING_MICRO)
++			word0 |= S_038000_TILE_MODE(V_038000_ARRAY_1D_TILED_THIN1);
++	}
+ 	word1 = radeon_get_ib_value(p, idx + 1);
+ 	w0 = G_038000_TEX_WIDTH(word0) + 1;
+ 	h0 = G_038004_TEX_HEIGHT(word1) + 1;
+@@ -1621,10 +1625,12 @@ static int r600_packet3_check(struct rad
+ 					return -EINVAL;
+ 				}
+ 				base_offset = (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
+-				if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO)
+-					ib[idx+1+(i*7)+0] |= S_038000_TILE_MODE(V_038000_ARRAY_2D_TILED_THIN1);
+-				else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO)
+-					ib[idx+1+(i*7)+0] |= S_038000_TILE_MODE(V_038000_ARRAY_1D_TILED_THIN1);
++				if (!p->keep_tiling_flags) {
++					if (reloc->lobj.tiling_flags & RADEON_TILING_MACRO)
++						ib[idx+1+(i*7)+0] |= S_038000_TILE_MODE(V_038000_ARRAY_2D_TILED_THIN1);
++					else if (reloc->lobj.tiling_flags & RADEON_TILING_MICRO)
++						ib[idx+1+(i*7)+0] |= S_038000_TILE_MODE(V_038000_ARRAY_1D_TILED_THIN1);
++				}
+ 				texture = reloc->robj;
+ 				/* tex mip base */
+ 				r = r600_cs_packet_next_reloc(p, &reloc);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon.h
+@@ -611,7 +611,8 @@ struct radeon_cs_parser {
+ 	struct radeon_ib	*ib;
+ 	void			*track;
+ 	unsigned		family;
+-	int parser_error;
++	int			parser_error;
++	bool			keep_tiling_flags;
+ };
+ 
+ extern int radeon_cs_update_pages(struct radeon_cs_parser *p, int pg_idx);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_cs.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_cs.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_cs.c
+@@ -93,7 +93,7 @@ int radeon_cs_parser_init(struct radeon_
+ {
+ 	struct drm_radeon_cs *cs = data;
+ 	uint64_t *chunk_array_ptr;
+-	unsigned size, i;
++	unsigned size, i, flags = 0;
+ 
+ 	if (!cs->num_chunks) {
+ 		return 0;
+@@ -140,6 +140,10 @@ int radeon_cs_parser_init(struct radeon_
+ 			if (p->chunks[i].length_dw == 0)
+ 				return -EINVAL;
+ 		}
++		if (p->chunks[i].chunk_id == RADEON_CHUNK_ID_FLAGS &&
++		    !p->chunks[i].length_dw) {
++			return -EINVAL;
++		}
+ 
+ 		p->chunks[i].length_dw = user_chunk.length_dw;
+ 		p->chunks[i].user_ptr = (void __user *)(unsigned long)user_chunk.chunk_data;
+@@ -155,6 +159,9 @@ int radeon_cs_parser_init(struct radeon_
+ 					       p->chunks[i].user_ptr, size)) {
+ 				return -EFAULT;
+ 			}
++			if (p->chunks[i].chunk_id == RADEON_CHUNK_ID_FLAGS) {
++				flags = p->chunks[i].kdata[0];
++			}
+ 		} else {
+ 			p->chunks[i].kpage[0] = kmalloc(PAGE_SIZE, GFP_KERNEL);
+ 			p->chunks[i].kpage[1] = kmalloc(PAGE_SIZE, GFP_KERNEL);
+@@ -174,6 +181,8 @@ int radeon_cs_parser_init(struct radeon_
+ 			  p->chunks[p->chunk_ib_idx].length_dw);
+ 		return -EINVAL;
+ 	}
++
++	p->keep_tiling_flags = (flags & RADEON_CS_KEEP_TILING_FLAGS) != 0;
+ 	return 0;
+ }
+ 
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_drv.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_drv.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_drv.c
+@@ -56,9 +56,10 @@
+  *   2.9.0 - r600 tiling (s3tc,rgtc) working, SET_PREDICATION packet 3 on r600 + eg, backend query
+  *   2.10.0 - fusion 2D tiling
+  *   2.11.0 - backend map, initial compute support for the CS checker
++ *   2.12.0 - RADEON_CS_KEEP_TILING_FLAGS
+  */
+ #define KMS_DRIVER_MAJOR	2
+-#define KMS_DRIVER_MINOR	11
++#define KMS_DRIVER_MINOR	12
+ #define KMS_DRIVER_PATCHLEVEL	0
+ int radeon_driver_load_kms(struct drm_device *dev, unsigned long flags);
+ int radeon_driver_unload_kms(struct drm_device *dev);
+Index: linux-3.0-SLE11-SP3/include/drm/radeon_drm.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/include/drm/radeon_drm.h
++++ linux-3.0-SLE11-SP3/include/drm/radeon_drm.h
+@@ -874,6 +874,10 @@ struct drm_radeon_gem_pwrite {
+ 
+ #define RADEON_CHUNK_ID_RELOCS	0x01
+ #define RADEON_CHUNK_ID_IB	0x02
++#define RADEON_CHUNK_ID_FLAGS	0x03
++
++/* The first dword of RADEON_CHUNK_ID_FLAGS is a uint32 of these flags: */
++#define RADEON_CS_KEEP_TILING_FLAGS 0x01
+ 
+ struct drm_radeon_cs_chunk {
+ 	uint32_t		chunk_id;
