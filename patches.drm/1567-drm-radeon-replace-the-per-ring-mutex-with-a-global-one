@@ -1,0 +1,261 @@
+From d6999bc7b5f4b4554ebba5b48377903fa20198db Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <deathsimple@vodafone.de>
+Date: Wed, 9 May 2012 15:34:45 +0200
+Subject: drm/radeon: replace the per ring mutex with a global one
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: d6999bc7b5f4b4554ebba5b48377903fa20198db
+Patch-mainline: v3.5-rc1
+
+A single global mutex for ring submissions seems sufficient.
+
+Signed-off-by: Christian König <deathsimple@vodafone.de>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/radeon.h           |    3 +-
+ drivers/gpu/drm/radeon/radeon_device.c    |    3 +-
+ drivers/gpu/drm/radeon/radeon_pm.c        |   10 +-----
+ drivers/gpu/drm/radeon/radeon_ring.c      |   28 +++++++++++-------
+ drivers/gpu/drm/radeon/radeon_semaphore.c |   42 +++++++++++++----------------
+ 5 files changed, 41 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 82ffa6a..e99ea81 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -676,7 +676,6 @@ struct radeon_ring {
+ 	uint64_t		gpu_addr;
+ 	uint32_t		align_mask;
+ 	uint32_t		ptr_mask;
+-	struct mutex		mutex;
+ 	bool			ready;
+ 	u32			ptr_reg_shift;
+ 	u32			ptr_reg_mask;
+@@ -815,6 +814,7 @@ int radeon_ring_alloc(struct radeon_device *rdev, struct radeon_ring *cp, unsign
+ int radeon_ring_lock(struct radeon_device *rdev, struct radeon_ring *cp, unsigned ndw);
+ void radeon_ring_commit(struct radeon_device *rdev, struct radeon_ring *cp);
+ void radeon_ring_unlock_commit(struct radeon_device *rdev, struct radeon_ring *cp);
++void radeon_ring_undo(struct radeon_ring *ring);
+ void radeon_ring_unlock_undo(struct radeon_device *rdev, struct radeon_ring *cp);
+ int radeon_ring_test(struct radeon_device *rdev, struct radeon_ring *cp);
+ void radeon_ring_force_activity(struct radeon_device *rdev, struct radeon_ring *ring);
+@@ -1534,6 +1534,7 @@ struct radeon_device {
+ 	rwlock_t			fence_lock;
+ 	struct radeon_fence_driver	fence_drv[RADEON_NUM_RINGS];
+ 	struct radeon_semaphore_driver	semaphore_drv;
++	struct mutex			ring_lock;
+ 	struct radeon_ring		ring[RADEON_NUM_RINGS];
+ 	struct radeon_ib_pool		ib_pool;
+ 	struct radeon_irq		irq;
+diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
+index ff28210..3f6ff2a 100644
+--- a/drivers/gpu/drm/radeon/radeon_device.c
++++ b/drivers/gpu/drm/radeon/radeon_device.c
+@@ -724,8 +724,7 @@ int radeon_device_init(struct radeon_device *rdev,
+ 	 * can recall function without having locking issues */
+ 	radeon_mutex_init(&rdev->cs_mutex);
+ 	radeon_mutex_init(&rdev->ib_pool.mutex);
+-	for (i = 0; i < RADEON_NUM_RINGS; ++i)
+-		mutex_init(&rdev->ring[i].mutex);
++	mutex_init(&rdev->ring_lock);
+ 	mutex_init(&rdev->dc_hw_i2c_mutex);
+ 	if (rdev->family >= CHIP_R600)
+ 		spin_lock_init(&rdev->ih.lock);
+diff --git a/drivers/gpu/drm/radeon/radeon_pm.c b/drivers/gpu/drm/radeon/radeon_pm.c
+index caa55d6..7c38745 100644
+--- a/drivers/gpu/drm/radeon/radeon_pm.c
++++ b/drivers/gpu/drm/radeon/radeon_pm.c
+@@ -252,10 +252,7 @@ static void radeon_pm_set_clocks(struct radeon_device *rdev)
+ 
+ 	mutex_lock(&rdev->ddev->struct_mutex);
+ 	mutex_lock(&rdev->vram_mutex);
+-	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
+-		if (rdev->ring[i].ring_obj)
+-			mutex_lock(&rdev->ring[i].mutex);
+-	}
++	mutex_lock(&rdev->ring_lock);
+ 
+ 	/* gui idle int has issues on older chips it seems */
+ 	if (rdev->family >= CHIP_R600) {
+@@ -311,10 +308,7 @@ static void radeon_pm_set_clocks(struct radeon_device *rdev)
+ 
+ 	rdev->pm.dynpm_planned_action = DYNPM_ACTION_NONE;
+ 
+-	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
+-		if (rdev->ring[i].ring_obj)
+-			mutex_unlock(&rdev->ring[i].mutex);
+-	}
++	mutex_unlock(&rdev->ring_lock);
+ 	mutex_unlock(&rdev->vram_mutex);
+ 	mutex_unlock(&rdev->ddev->struct_mutex);
+ }
+diff --git a/drivers/gpu/drm/radeon/radeon_ring.c b/drivers/gpu/drm/radeon/radeon_ring.c
+index 2eb4c6e..a4d60ae 100644
+--- a/drivers/gpu/drm/radeon/radeon_ring.c
++++ b/drivers/gpu/drm/radeon/radeon_ring.c
+@@ -346,9 +346,9 @@ int radeon_ring_alloc(struct radeon_device *rdev, struct radeon_ring *ring, unsi
+ 		if (ndw < ring->ring_free_dw) {
+ 			break;
+ 		}
+-		mutex_unlock(&ring->mutex);
++		mutex_unlock(&rdev->ring_lock);
+ 		r = radeon_fence_wait_next(rdev, radeon_ring_index(rdev, ring));
+-		mutex_lock(&ring->mutex);
++		mutex_lock(&rdev->ring_lock);
+ 		if (r)
+ 			return r;
+ 	}
+@@ -361,10 +361,10 @@ int radeon_ring_lock(struct radeon_device *rdev, struct radeon_ring *ring, unsig
+ {
+ 	int r;
+ 
+-	mutex_lock(&ring->mutex);
++	mutex_lock(&rdev->ring_lock);
+ 	r = radeon_ring_alloc(rdev, ring, ndw);
+ 	if (r) {
+-		mutex_unlock(&ring->mutex);
++		mutex_unlock(&rdev->ring_lock);
+ 		return r;
+ 	}
+ 	return 0;
+@@ -389,20 +389,25 @@ void radeon_ring_commit(struct radeon_device *rdev, struct radeon_ring *ring)
+ void radeon_ring_unlock_commit(struct radeon_device *rdev, struct radeon_ring *ring)
+ {
+ 	radeon_ring_commit(rdev, ring);
+-	mutex_unlock(&ring->mutex);
++	mutex_unlock(&rdev->ring_lock);
+ }
+ 
+-void radeon_ring_unlock_undo(struct radeon_device *rdev, struct radeon_ring *ring)
++void radeon_ring_undo(struct radeon_ring *ring)
+ {
+ 	ring->wptr = ring->wptr_old;
+-	mutex_unlock(&ring->mutex);
++}
++
++void radeon_ring_unlock_undo(struct radeon_device *rdev, struct radeon_ring *ring)
++{
++	radeon_ring_undo(ring);
++	mutex_unlock(&rdev->ring_lock);
+ }
+ 
+ void radeon_ring_force_activity(struct radeon_device *rdev, struct radeon_ring *ring)
+ {
+ 	int r;
+ 
+-	mutex_lock(&ring->mutex);
++	mutex_lock(&rdev->ring_lock);
+ 	radeon_ring_free_size(rdev, ring);
+ 	if (ring->rptr == ring->wptr) {
+ 		r = radeon_ring_alloc(rdev, ring, 1);
+@@ -411,7 +416,7 @@ void radeon_ring_force_activity(struct radeon_device *rdev, struct radeon_ring *
+ 			radeon_ring_commit(rdev, ring);
+ 		}
+ 	}
+-	mutex_unlock(&ring->mutex);
++	mutex_unlock(&rdev->ring_lock);
+ }
+ 
+ void radeon_ring_lockup_update(struct radeon_ring *ring)
+@@ -520,11 +525,12 @@ void radeon_ring_fini(struct radeon_device *rdev, struct radeon_ring *ring)
+ 	int r;
+ 	struct radeon_bo *ring_obj;
+ 
+-	mutex_lock(&ring->mutex);
++	mutex_lock(&rdev->ring_lock);
+ 	ring_obj = ring->ring_obj;
++	ring->ready = false;
+ 	ring->ring = NULL;
+ 	ring->ring_obj = NULL;
+-	mutex_unlock(&ring->mutex);
++	mutex_unlock(&rdev->ring_lock);
+ 
+ 	if (ring_obj) {
+ 		r = radeon_bo_reserve(ring_obj, false);
+diff --git a/drivers/gpu/drm/radeon/radeon_semaphore.c b/drivers/gpu/drm/radeon/radeon_semaphore.c
+index 930a08a..c5b3d8e 100644
+--- a/drivers/gpu/drm/radeon/radeon_semaphore.c
++++ b/drivers/gpu/drm/radeon/radeon_semaphore.c
+@@ -39,7 +39,6 @@ static int radeon_semaphore_add_bo(struct radeon_device *rdev)
+ 	uint32_t *cpu_ptr;
+ 	int r, i;
+ 
+-
+ 	bo = kmalloc(sizeof(struct radeon_semaphore_bo), GFP_KERNEL);
+ 	if (bo == NULL) {
+ 		return -ENOMEM;
+@@ -154,13 +153,17 @@ int radeon_semaphore_sync_rings(struct radeon_device *rdev,
+ 				bool sync_to[RADEON_NUM_RINGS],
+ 				int dst_ring)
+ {
+-	int i, r;
++	int i = 0, r;
+ 
+-	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
+-		unsigned num_ops = i == dst_ring ? RADEON_NUM_RINGS : 1;
++	mutex_lock(&rdev->ring_lock);
++	r = radeon_ring_alloc(rdev, &rdev->ring[dst_ring], RADEON_NUM_RINGS * 8);
++	if (r) {
++		goto error;
++	}
+ 
+-		/* don't lock unused rings */
+-		if (!sync_to[i] && i != dst_ring)
++	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
++		/* no need to sync to our own or unused rings */
++		if (!sync_to[i] || i == dst_ring)
+ 			continue;
+ 
+ 		/* prevent GPU deadlocks */
+@@ -170,38 +173,31 @@ int radeon_semaphore_sync_rings(struct radeon_device *rdev,
+ 			goto error;
+ 		}
+ 
+-                r = radeon_ring_lock(rdev, &rdev->ring[i], num_ops * 8);
+-                if (r)
++		r = radeon_ring_alloc(rdev, &rdev->ring[i], 8);
++		if (r) {
+ 			goto error;
+-	}
+-
+-	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
+-		/* no need to sync to our own or unused rings */
+-		if (!sync_to[i] || i == dst_ring)
+-                        continue;
++		}
+ 
+ 		radeon_semaphore_emit_signal(rdev, i, semaphore);
+ 		radeon_semaphore_emit_wait(rdev, dst_ring, semaphore);
+-	}
+ 
+-	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
+-
+-		/* don't unlock unused rings */
+-		if (!sync_to[i] && i != dst_ring)
+-			continue;
+-
+-		radeon_ring_unlock_commit(rdev, &rdev->ring[i]);
++		radeon_ring_commit(rdev, &rdev->ring[i]);
+ 	}
+ 
++	radeon_ring_commit(rdev, &rdev->ring[dst_ring]);
++	mutex_unlock(&rdev->ring_lock);
++
+ 	return 0;
+ 
+ error:
+ 	/* unlock all locks taken so far */
+ 	for (--i; i >= 0; --i) {
+ 		if (sync_to[i] || i == dst_ring) {
+-			radeon_ring_unlock_undo(rdev, &rdev->ring[i]);
++			radeon_ring_undo(&rdev->ring[i]);
+ 		}
+ 	}
++	radeon_ring_undo(&rdev->ring[dst_ring]);
++	mutex_unlock(&rdev->ring_lock);
+ 	return r;
+ }
+ 
+
