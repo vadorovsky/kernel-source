@@ -1,0 +1,240 @@
+From c6105f249a637e1bb2b04b1cad7feaf507d06e8c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <deathsimple@vodafone.de>
+Date: Thu, 5 Jul 2012 14:32:00 +0200
+Subject: drm/radeon: remove vm_manager start/suspend
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: c6105f249a637e1bb2b04b1cad7feaf507d06e8c
+Patch-mainline: v3.6-rc1
+
+Just restore the page table instead. Addressing three
+problem with this change:
+
+1. Calling vm_manager_suspend in the suspend path is
+   problematic cause it wants to wait for the VM use
+   to end, which in case of a lockup never happens.
+
+2. In case of a locked up memory controller
+   unbinding the VM seems to make it even more
+   unstable, creating an unrecoverable lockup
+   in the end.
+
+3. If we want to backup/restore the leftover ring
+   content we must not unbind VMs in between.
+
+Signed-off-by: Christian König <deathsimple@vodafone.de>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/ni.c          |   12 ++---
+ drivers/gpu/drm/radeon/radeon.h      |    2 -
+ drivers/gpu/drm/radeon/radeon_gart.c |   83 +++++++++++++++++++++-------------
+ drivers/gpu/drm/radeon/si.c          |   12 ++---
+ 4 files changed, 59 insertions(+), 50 deletions(-)
+
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/ni.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/ni.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/ni.c
+@@ -1280,9 +1280,11 @@ static int cayman_startup(struct radeon_
+ 	if (r)
+ 		return r;
+ 
+-	r = radeon_vm_manager_start(rdev);
+-	if (r)
++	r = radeon_vm_manager_init(rdev);
++	if (r) {
++		dev_err(rdev->dev, "vm manager initialization failed (%d).\n", r);
+ 		return r;
++	}
+ 
+ 	r = r600_audio_init(rdev);
+ 	if (r)
+@@ -1315,7 +1317,6 @@ int cayman_resume(struct radeon_device *
+ int cayman_suspend(struct radeon_device *rdev)
+ {
+ 	r600_audio_fini(rdev);
+-	radeon_vm_manager_suspend(rdev);
+ 	cayman_cp_enable(rdev, false);
+ 	rdev->ring[RADEON_RING_TYPE_GFX_INDEX].ready = false;
+ 	evergreen_irq_suspend(rdev);
+@@ -1392,11 +1393,6 @@ int cayman_init(struct radeon_device *rd
+ 		return r;
+ 
+ 	rdev->accel_working = true;
+-	r = radeon_vm_manager_init(rdev);
+-	if (r) {
+-		dev_err(rdev->dev, "vm manager initialization failed (%d).\n", r);
+-	}
+-
+ 	r = cayman_startup(rdev);
+ 	if (r) {
+ 		dev_err(rdev->dev, "disabling GPU acceleration\n");
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon.h
+@@ -1759,8 +1759,6 @@ extern void radeon_ttm_set_active_vram_s
+  */
+ int radeon_vm_manager_init(struct radeon_device *rdev);
+ void radeon_vm_manager_fini(struct radeon_device *rdev);
+-int radeon_vm_manager_start(struct radeon_device *rdev);
+-int radeon_vm_manager_suspend(struct radeon_device *rdev);
+ int radeon_vm_init(struct radeon_device *rdev, struct radeon_vm *vm);
+ void radeon_vm_fini(struct radeon_device *rdev, struct radeon_vm *vm);
+ int radeon_vm_bind(struct radeon_device *rdev, struct radeon_vm *vm);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_gart.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_gart.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_gart.c
+@@ -284,26 +284,55 @@ void radeon_gart_fini(struct radeon_devi
+  */
+ int radeon_vm_manager_init(struct radeon_device *rdev)
+ {
++	struct radeon_vm *vm;
++	struct radeon_bo_va *bo_va;
+ 	int r;
+ 
+-	rdev->vm_manager.enabled = false;
++	if (!rdev->vm_manager.enabled) {
++		/* mark first vm as always in use, it's the system one */
++		r = radeon_sa_bo_manager_init(rdev, &rdev->vm_manager.sa_manager,
++					      rdev->vm_manager.max_pfn * 8,
++					      RADEON_GEM_DOMAIN_VRAM);
++		if (r) {
++			dev_err(rdev->dev, "failed to allocate vm bo (%dKB)\n",
++				(rdev->vm_manager.max_pfn * 8) >> 10);
++			return r;
++		}
+ 
+-	/* mark first vm as always in use, it's the system one */
+-	/* allocate enough for 2 full VM pts */
+-	r = radeon_sa_bo_manager_init(rdev, &rdev->vm_manager.sa_manager,
+-				      rdev->vm_manager.max_pfn * 8 * 2,
+-				      RADEON_GEM_DOMAIN_VRAM);
+-	if (r) {
+-		dev_err(rdev->dev, "failed to allocate vm bo (%dKB)\n",
+-			(rdev->vm_manager.max_pfn * 8) >> 10);
+-		return r;
++		r = rdev->vm_manager.funcs->init(rdev);
++		if (r)
++			return r;
++	
++		rdev->vm_manager.enabled = true;
++
++		r = radeon_sa_bo_manager_start(rdev, &rdev->vm_manager.sa_manager);
++		if (r)
++			return r;
+ 	}
+ 
+-	r = rdev->vm_manager.funcs->init(rdev);
+-	if (r == 0)
+-		rdev->vm_manager.enabled = true;
++	/* restore page table */
++	list_for_each_entry(vm, &rdev->vm_manager.lru_vm, list) {
++		if (vm->id == -1)
++			continue;
++
++		list_for_each_entry(bo_va, &vm->va, vm_list) {
++			struct ttm_mem_reg *mem = NULL;
++			if (bo_va->valid)
++				mem = &bo_va->bo->tbo.mem;
++
++			bo_va->valid = false;
++			r = radeon_vm_bo_update_pte(rdev, vm, bo_va->bo, mem);
++			if (r) {
++				DRM_ERROR("Failed to update pte for vm %d!\n", vm->id);
++			}
++		}
+ 
+-	return r;
++		r = rdev->vm_manager.funcs->bind(rdev, vm, vm->id);
++		if (r) {
++			DRM_ERROR("Failed to bind vm %d!\n", vm->id);
++		}
++	}
++	return 0;
+ }
+ 
+ /* global mutex must be lock */
+@@ -348,26 +377,11 @@ static void radeon_vm_unbind_locked(stru
+ 
+ void radeon_vm_manager_fini(struct radeon_device *rdev)
+ {
+-	if (rdev->vm_manager.sa_manager.bo == NULL)
+-		return;
+-	radeon_vm_manager_suspend(rdev);
+-	rdev->vm_manager.funcs->fini(rdev);
+-	radeon_sa_bo_manager_fini(rdev, &rdev->vm_manager.sa_manager);
+-	rdev->vm_manager.enabled = false;
+-}
+-
+-int radeon_vm_manager_start(struct radeon_device *rdev)
+-{
+-	if (rdev->vm_manager.sa_manager.bo == NULL) {
+-		return -EINVAL;
+-	}
+-	return radeon_sa_bo_manager_start(rdev, &rdev->vm_manager.sa_manager);
+-}
+-
+-int radeon_vm_manager_suspend(struct radeon_device *rdev)
+-{
+ 	struct radeon_vm *vm, *tmp;
+ 
++	if (!rdev->vm_manager.enabled)
++		return;
++
+ 	mutex_lock(&rdev->vm_manager.lock);
+ 	/* unbind all active vm */
+ 	list_for_each_entry_safe(vm, tmp, &rdev->vm_manager.lru_vm, list) {
+@@ -375,7 +389,10 @@ int radeon_vm_manager_suspend(struct rad
+ 	}
+ 	rdev->vm_manager.funcs->fini(rdev);
+ 	mutex_unlock(&rdev->vm_manager.lock);
+-	return radeon_sa_bo_manager_suspend(rdev, &rdev->vm_manager.sa_manager);
++
++	radeon_sa_bo_manager_suspend(rdev, &rdev->vm_manager.sa_manager);
++	radeon_sa_bo_manager_fini(rdev, &rdev->vm_manager.sa_manager);
++	rdev->vm_manager.enabled = false;
+ }
+ 
+ /* global mutex must be locked */
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/si.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/si.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/si.c
+@@ -3777,9 +3777,11 @@ static int si_startup(struct radeon_devi
+ 		return r;
+ 	}
+ 
+-	r = radeon_vm_manager_start(rdev);
+-	if (r)
++	r = radeon_vm_manager_init(rdev);
++	if (r) {
++		dev_err(rdev->dev, "vm manager initialization failed (%d).\n", r);
+ 		return r;
++	}
+ 
+ 	return 0;
+ }
+@@ -3809,7 +3811,6 @@ int si_resume(struct radeon_device *rdev
+ 
+ int si_suspend(struct radeon_device *rdev)
+ {
+-	radeon_vm_manager_suspend(rdev);
+ 	si_cp_enable(rdev, false);
+ 	rdev->ring[RADEON_RING_TYPE_GFX_INDEX].ready = false;
+ 	rdev->ring[CAYMAN_RING_TYPE_CP1_INDEX].ready = false;
+@@ -3899,11 +3900,6 @@ int si_init(struct radeon_device *rdev)
+ 		return r;
+ 
+ 	rdev->accel_working = true;
+-	r = radeon_vm_manager_init(rdev);
+-	if (r) {
+-		dev_err(rdev->dev, "vm manager initialization failed (%d).\n", r);
+-	}
+-
+ 	r = si_startup(rdev);
+ 	if (r) {
+ 		dev_err(rdev->dev, "disabling GPU acceleration\n");
