@@ -1,0 +1,381 @@
+From 5ab432ef4997ce32c9406721b37ef6e97e57dae1 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Sat, 30 Jun 2012 08:59:56 +0200
+Subject: drm/i915/hdmi: convert to encoder->disable/enable
+Git-commit: 5ab432ef4997ce32c9406721b37ef6e97e57dae1
+Patch-mainline: v3.7-rc1
+
+I've picked hdmi as the first encoder to convert because it's rather
+simple:
+- no cloning possible
+- no differences between prepare/commit and dpms off/on switching.
+
+A few changes are required to do so:
+- Split up the dpms code into an enable/disable function and wire it
+  up with the intel encoder.
+- Noop out the existing encoder prepare/commit functions used by the
+  crtc helper - our crtc enable/disable code now calls back into the
+  encoder enable/disable code at the right spot.
+- Create new helper functions to handle dpms changes.
+- Add intel_encoder->connectors_active to better track dpms state. Atm
+  this is unused, but it will be useful to correctly disable the
+  entire display pipe for cloned configurations. Also note that for
+  now this is only useful in the dpms code - thanks to the crtc
+  helper's dpms confusion across a modeset operation we can't (yet)
+  rely on this having a sensible value in all circumstances.
+- Rip out the encoder helper dpms callback, if this is still getting
+  called somewhere we have a bug. The slight issue with that is that
+  the crtc helper abuses dpms off to disable unused functions. Hence
+  we also need to implement a default encoder disable function to do
+  just that with the new encoder->disable callback.
+- Note that we drop the cpt modeset verification in the commit
+  callback, too. The right place to do this would be in the crtc's
+  enable function, _after_ all the encoders are set up. But because
+  not all encoders are converted yet, we can't do that. Hence disable
+  this check temporarily as a minor concession to bisectability.
+
+v2: Squash the dpms mode to only the supported values -
+connector->dpms is for internal tracking only, we can hence avoid
+needless state-changes a bit whithout causing harm.
+
+v3: Apply bikeshed to disable|enable_ddi, suggested by Paulo Zanoni.
+
+Reviewed-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-Off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/intel_ddi.c     |   30 +++++---
+ drivers/gpu/drm/i915/intel_display.c |   49 ++++++++++++++
+ drivers/gpu/drm/i915/intel_drv.h     |    8 ++-
+ drivers/gpu/drm/i915/intel_hdmi.c    |  122 +++++++++++++++++++++++-----------
+ 4 files changed, 158 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_ddi.c b/drivers/gpu/drm/i915/intel_ddi.c
+index 170e386..38a7006 100644
+--- a/drivers/gpu/drm/i915/intel_ddi.c
++++ b/drivers/gpu/drm/i915/intel_ddi.c
+@@ -757,26 +757,34 @@ void intel_ddi_mode_set(struct drm_encoder *encoder,
+ 	intel_hdmi->set_infoframes(encoder, adjusted_mode);
+ }
+ 
+-void intel_ddi_dpms(struct drm_encoder *encoder, int mode)
++void intel_enable_ddi(struct intel_encoder *encoder)
+ {
+-	struct drm_device *dev = encoder->dev;
++	struct drm_device *dev = encoder->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(encoder);
++	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(&encoder->base);
+ 	int port = intel_hdmi->ddi_port;
+ 	u32 temp;
+ 
+ 	temp = I915_READ(DDI_BUF_CTL(port));
+-
+-	if (mode != DRM_MODE_DPMS_ON) {
+-		temp &= ~DDI_BUF_CTL_ENABLE;
+-	} else {
+-		temp |= DDI_BUF_CTL_ENABLE;
+-	}
++	temp |= DDI_BUF_CTL_ENABLE;
+ 
+ 	/* Enable DDI_BUF_CTL. In HDMI/DVI mode, the port width,
+ 	 * and swing/emphasis values are ignored so nothing special needs
+ 	 * to be done besides enabling the port.
+ 	 */
+-	I915_WRITE(DDI_BUF_CTL(port),
+-			temp);
++	I915_WRITE(DDI_BUF_CTL(port), temp);
++}
++
++void intel_disable_ddi(struct intel_encoder *encoder)
++{
++	struct drm_device *dev = encoder->base.dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(&encoder->base);
++	int port = intel_hdmi->ddi_port;
++	u32 temp;
++
++	temp = I915_READ(DDI_BUF_CTL(port));
++	temp &= ~DDI_BUF_CTL_ENABLE;
++
++	I915_WRITE(DDI_BUF_CTL(port), temp);
+ }
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 82aaded..cbd356f 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -3554,6 +3554,17 @@ void intel_encoder_commit(struct drm_encoder *encoder)
+ 		intel_cpt_verify_modeset(dev, intel_crtc->pipe);
+ }
+ 
++void intel_encoder_noop(struct drm_encoder *encoder)
++{
++}
++
++void intel_encoder_disable(struct drm_encoder *encoder)
++{
++	struct intel_encoder *intel_encoder = to_intel_encoder(encoder);
++
++	intel_encoder->disable(intel_encoder);
++}
++
+ void intel_encoder_destroy(struct drm_encoder *encoder)
+ {
+ 	struct intel_encoder *intel_encoder = to_intel_encoder(encoder);
+@@ -3562,6 +3573,44 @@ void intel_encoder_destroy(struct drm_encoder *encoder)
+ 	kfree(intel_encoder);
+ }
+ 
++/* Simple dpms helper for encodres with just one connector, no cloning and only
++ * one kind of off state. It clamps all !ON modes to fully OFF and changes the
++ * state of the entire output pipe. */
++void intel_encoder_dpms(struct intel_encoder *encoder, int mode)
++{
++	if (mode == DRM_MODE_DPMS_ON) {
++		encoder->connectors_active = true;
++
++		intel_crtc_dpms(encoder->base.crtc, DRM_MODE_DPMS_ON);
++	} else {
++		encoder->connectors_active = false;
++
++		intel_crtc_dpms(encoder->base.crtc, DRM_MODE_DPMS_OFF);
++	}
++}
++
++/* Even simpler default implementation, if there's really no special case to
++ * consider. */
++void intel_connector_dpms(struct drm_connector *connector, int mode)
++{
++	struct intel_encoder *encoder = intel_attached_encoder(connector);
++
++	/* All the simple cases only support two dpms states. */
++	if (mode != DRM_MODE_DPMS_ON)
++		mode = DRM_MODE_DPMS_OFF;
++
++	if (mode == connector->dpms)
++		return;
++
++	connector->dpms = mode;
++
++	/* Only need to change hw state when actually enabled */
++	if (encoder->base.crtc)
++		intel_encoder_dpms(encoder, mode);
++	else
++		encoder->connectors_active = false;
++}
++
+ static bool intel_crtc_mode_fixup(struct drm_crtc *crtc,
+ 				  const struct drm_display_mode *mode,
+ 				  struct drm_display_mode *adjusted_mode)
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 9a5adcc..759dcba 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -140,6 +140,7 @@ struct intel_encoder {
+ 	 * simple flag is enough to compute the possible_clones mask.
+ 	 */
+ 	bool cloneable;
++	bool connectors_active;
+ 	void (*hot_plug)(struct intel_encoder *);
+ 	void (*enable)(struct intel_encoder *);
+ 	void (*disable)(struct intel_encoder *);
+@@ -412,7 +413,11 @@ extern enum drm_connector_status intel_panel_detect(struct drm_device *dev);
+ extern void intel_crtc_load_lut(struct drm_crtc *crtc);
+ extern void intel_encoder_prepare(struct drm_encoder *encoder);
+ extern void intel_encoder_commit(struct drm_encoder *encoder);
++extern void intel_encoder_noop(struct drm_encoder *encoder);
++extern void intel_encoder_disable(struct drm_encoder *encoder);
+ extern void intel_encoder_destroy(struct drm_encoder *encoder);
++extern void intel_encoder_dpms(struct intel_encoder *encoder, int mode);
++extern void intel_connector_dpms(struct drm_connector *, int mode);
+ 
+ static inline struct intel_encoder *intel_attached_encoder(struct drm_connector *connector)
+ {
+@@ -519,7 +524,8 @@ extern void intel_disable_gt_powersave(struct drm_device *dev);
+ extern void gen6_gt_check_fifodbg(struct drm_i915_private *dev_priv);
+ extern void ironlake_teardown_rc6(struct drm_device *dev);
+ 
+-extern void intel_ddi_dpms(struct drm_encoder *encoder, int mode);
++extern void intel_enable_ddi(struct intel_encoder *encoder);
++extern void intel_disable_ddi(struct intel_encoder *encoder);
+ extern void intel_ddi_mode_set(struct drm_encoder *encoder,
+ 				struct drm_display_mode *mode,
+ 				struct drm_display_mode *adjusted_mode);
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index e4c37bb..acddaaa 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -601,11 +601,57 @@ static void intel_hdmi_mode_set(struct drm_encoder *encoder,
+ 	intel_hdmi->set_infoframes(encoder, adjusted_mode);
+ }
+ 
+-static void intel_hdmi_dpms(struct drm_encoder *encoder, int mode)
++static void intel_enable_hdmi(struct intel_encoder *encoder)
+ {
+-	struct drm_device *dev = encoder->dev;
++	struct drm_device *dev = encoder->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(encoder);
++	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(&encoder->base);
++	u32 temp;
++	u32 enable_bits = SDVO_ENABLE;
++
++	if (intel_hdmi->has_audio)
++		enable_bits |= SDVO_AUDIO_ENABLE;
++
++	temp = I915_READ(intel_hdmi->sdvox_reg);
++
++	/* HW workaround for IBX, we need to move the port to transcoder A
++	 * before disabling it. */
++	if (HAS_PCH_IBX(dev)) {
++		struct drm_crtc *crtc = encoder->base.crtc;
++		int pipe = crtc ? to_intel_crtc(crtc)->pipe : -1;
++
++		/* Restore the transcoder select bit. */
++		if (pipe == PIPE_B)
++			enable_bits |= SDVO_PIPE_B_SELECT;
++	}
++
++	/* HW workaround, need to toggle enable bit off and on for 12bpc, but
++	 * we do this anyway which shows more stable in testing.
++	 */
++	if (HAS_PCH_SPLIT(dev)) {
++		I915_WRITE(intel_hdmi->sdvox_reg, temp & ~SDVO_ENABLE);
++		POSTING_READ(intel_hdmi->sdvox_reg);
++	}
++
++	temp |= enable_bits;
++
++	I915_WRITE(intel_hdmi->sdvox_reg, temp);
++	POSTING_READ(intel_hdmi->sdvox_reg);
++
++	/* HW workaround, need to write this twice for issue that may result
++	 * in first write getting masked.
++	 */
++	if (HAS_PCH_SPLIT(dev)) {
++		I915_WRITE(intel_hdmi->sdvox_reg, temp);
++		POSTING_READ(intel_hdmi->sdvox_reg);
++	}
++}
++
++static void intel_disable_hdmi(struct intel_encoder *encoder)
++{
++	struct drm_device *dev = encoder->base.dev;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(&encoder->base);
+ 	u32 temp;
+ 	u32 enable_bits = SDVO_ENABLE;
+ 
+@@ -617,30 +663,24 @@ static void intel_hdmi_dpms(struct drm_encoder *encoder, int mode)
+ 	/* HW workaround for IBX, we need to move the port to transcoder A
+ 	 * before disabling it. */
+ 	if (HAS_PCH_IBX(dev)) {
+-		struct drm_crtc *crtc = encoder->crtc;
++		struct drm_crtc *crtc = encoder->base.crtc;
+ 		int pipe = crtc ? to_intel_crtc(crtc)->pipe : -1;
+ 
+-		if (mode != DRM_MODE_DPMS_ON) {
+-			if (temp & SDVO_PIPE_B_SELECT) {
+-				temp &= ~SDVO_PIPE_B_SELECT;
+-				I915_WRITE(intel_hdmi->sdvox_reg, temp);
+-				POSTING_READ(intel_hdmi->sdvox_reg);
++		if (temp & SDVO_PIPE_B_SELECT) {
++			temp &= ~SDVO_PIPE_B_SELECT;
++			I915_WRITE(intel_hdmi->sdvox_reg, temp);
++			POSTING_READ(intel_hdmi->sdvox_reg);
+ 
+-				/* Again we need to write this twice. */
+-				I915_WRITE(intel_hdmi->sdvox_reg, temp);
+-				POSTING_READ(intel_hdmi->sdvox_reg);
++			/* Again we need to write this twice. */
++			I915_WRITE(intel_hdmi->sdvox_reg, temp);
++			POSTING_READ(intel_hdmi->sdvox_reg);
+ 
+-				/* Transcoder selection bits only update
+-				 * effectively on vblank. */
+-				if (crtc)
+-					intel_wait_for_vblank(dev, pipe);
+-				else
+-					msleep(50);
+-			}
+-		} else {
+-			/* Restore the transcoder select bit. */
+-			if (pipe == PIPE_B)
+-				enable_bits |= SDVO_PIPE_B_SELECT;
++			/* Transcoder selection bits only update
++			 * effectively on vblank. */
++			if (crtc)
++				intel_wait_for_vblank(dev, pipe);
++			else
++				msleep(50);
+ 		}
+ 	}
+ 
+@@ -652,11 +692,7 @@ static void intel_hdmi_dpms(struct drm_encoder *encoder, int mode)
+ 		POSTING_READ(intel_hdmi->sdvox_reg);
+ 	}
+ 
+-	if (mode != DRM_MODE_DPMS_ON) {
+-		temp &= ~enable_bits;
+-	} else {
+-		temp |= enable_bits;
+-	}
++	temp &= ~enable_bits;
+ 
+ 	I915_WRITE(intel_hdmi->sdvox_reg, temp);
+ 	POSTING_READ(intel_hdmi->sdvox_reg);
+@@ -849,23 +885,23 @@ static void intel_hdmi_destroy(struct drm_connector *connector)
+ }
+ 
+ static const struct drm_encoder_helper_funcs intel_hdmi_helper_funcs_hsw = {
+-	.dpms = intel_ddi_dpms,
+ 	.mode_fixup = intel_hdmi_mode_fixup,
+-	.prepare = intel_encoder_prepare,
++	.prepare = intel_encoder_noop,
+ 	.mode_set = intel_ddi_mode_set,
+-	.commit = intel_encoder_commit,
++	.commit = intel_encoder_noop,
++	.disable = intel_encoder_disable,
+ };
+ 
+ static const struct drm_encoder_helper_funcs intel_hdmi_helper_funcs = {
+-	.dpms = intel_hdmi_dpms,
+ 	.mode_fixup = intel_hdmi_mode_fixup,
+-	.prepare = intel_encoder_prepare,
++	.prepare = intel_encoder_noop,
+ 	.mode_set = intel_hdmi_mode_set,
+-	.commit = intel_encoder_commit,
++	.commit = intel_encoder_noop,
++	.disable = intel_encoder_disable,
+ };
+ 
+ static const struct drm_connector_funcs intel_hdmi_connector_funcs = {
+-	.dpms = drm_helper_connector_dpms,
++	.dpms = intel_connector_dpms,
+ 	.detect = intel_hdmi_detect,
+ 	.fill_modes = drm_helper_probe_single_connector_modes,
+ 	.set_property = intel_hdmi_set_property,
+@@ -964,10 +1000,18 @@ void intel_hdmi_init(struct drm_device *dev, int sdvox_reg, enum port port)
+ 		intel_hdmi->set_infoframes = cpt_set_infoframes;
+ 	}
+ 
+-	if (IS_HASWELL(dev))
+-		drm_encoder_helper_add(&intel_encoder->base, &intel_hdmi_helper_funcs_hsw);
+-	else
+-		drm_encoder_helper_add(&intel_encoder->base, &intel_hdmi_helper_funcs);
++	if (IS_HASWELL(dev)) {
++		intel_encoder->enable = intel_enable_ddi;
++		intel_encoder->disable = intel_disable_ddi;
++		drm_encoder_helper_add(&intel_encoder->base,
++				       &intel_hdmi_helper_funcs_hsw);
++	} else {
++		intel_encoder->enable = intel_enable_hdmi;
++		intel_encoder->disable = intel_disable_hdmi;
++		drm_encoder_helper_add(&intel_encoder->base,
++				       &intel_hdmi_helper_funcs);
++	}
++
+ 
+ 	intel_hdmi_add_properties(intel_hdmi, connector);
+ 
+
