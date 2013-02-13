@@ -1,0 +1,497 @@
+From 9d7730914f4cd496e356acfab95b41075aa8eae8 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 27 Nov 2012 16:22:52 +0000
+Subject: drm/i915: Preallocate next seqno before touching the ring
+Git-commit: 9d7730914f4cd496e356acfab95b41075aa8eae8
+Patch-mainline: v3.8-rc2
+
+Based on the work by Mika Kuoppala, we realised that we need to handle
+seqno wraparound prior to committing our changes to the ring. The most
+obvious point then is to grab the seqno inside intel_ring_begin(), and
+then to reuse that seqno for all ring operations until the next request.
+As intel_ring_begin() can fail, the callers must already be prepared to
+handle such failure and so we can safely add further checks.
+
+This patch looks like it should be split up into the interface
+changes and the tweaks to move seqno wrapping from the execbuffer into
+the core seqno increment. However, I found no easy way to break it into
+incremental steps without introducing further broken behaviour.
+
+v2: Mika found a silly mistake and a subtle error in the existing code;
+inside i915_gem_retire_requests() we were resetting the sync_seqno of
+the target ring based on the seqno from this ring - which are only
+related by the order of their allocation, not retirement. Hence we were
+applying the optimisation that the rings were synchronised too early,
+fortunately the only real casualty there is the handling of seqno
+wrapping.
+
+v3: Do not forget to reset the sync_seqno upon module reinitialisation,
+ala resume.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Cc: Mika Kuoppala <mika.kuoppala@intel.com>
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=863861
+Reviewed-by: Mika Kuoppala <mika.kuoppala@intel.com> [v2]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    5 +-
+ drivers/gpu/drm/i915/i915_gem.c            |   74 ++++++++++++++++++----------
+ drivers/gpu/drm/i915/i915_gem_context.c    |    3 +-
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   30 ++---------
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |   49 ++++++++++---------
+ drivers/gpu/drm/i915/intel_ringbuffer.h    |   10 +++-
+ 6 files changed, 89 insertions(+), 82 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 47c62f5..45491c1 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1417,8 +1417,7 @@ int __must_check i915_mutex_lock_interruptible(struct drm_device *dev);
+ int i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 			 struct intel_ring_buffer *to);
+ void i915_gem_object_move_to_active(struct drm_i915_gem_object *obj,
+-				    struct intel_ring_buffer *ring,
+-				    u32 seqno);
++				    struct intel_ring_buffer *ring);
+ 
+ int i915_gem_dumb_create(struct drm_file *file_priv,
+ 			 struct drm_device *dev,
+@@ -1436,7 +1435,7 @@ i915_seqno_passed(uint32_t seq1, uint32_t seq2)
+ 	return (int32_t)(seq1 - seq2) >= 0;
+ }
+ 
+-u32 i915_gem_next_request_seqno(struct intel_ring_buffer *ring);
++extern int i915_gem_get_seqno(struct drm_device *dev, u32 *seqno);
+ 
+ int __must_check i915_gem_object_get_fence(struct drm_i915_gem_object *obj);
+ int __must_check i915_gem_object_put_fence(struct drm_i915_gem_object *obj);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 9be450e..3b9b250 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1857,11 +1857,11 @@ i915_gem_object_get_pages(struct drm_i915_gem_object *obj)
+ 
+ void
+ i915_gem_object_move_to_active(struct drm_i915_gem_object *obj,
+-			       struct intel_ring_buffer *ring,
+-			       u32 seqno)
++			       struct intel_ring_buffer *ring)
+ {
+ 	struct drm_device *dev = obj->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	u32 seqno = intel_ring_get_seqno(ring);
+ 
+ 	BUG_ON(ring == NULL);
+ 	obj->ring = ring;
+@@ -1922,26 +1922,54 @@ i915_gem_object_move_to_inactive(struct drm_i915_gem_object *obj)
+ 	WARN_ON(i915_verify_lists(dev));
+ }
+ 
+-static u32
+-i915_gem_get_seqno(struct drm_device *dev)
++static int
++i915_gem_handle_seqno_wrap(struct drm_device *dev)
+ {
+-	drm_i915_private_t *dev_priv = dev->dev_private;
+-	u32 seqno = dev_priv->next_seqno;
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_ring_buffer *ring;
++	int ret, i, j;
+ 
+-	/* reserve 0 for non-seqno */
+-	if (++dev_priv->next_seqno == 0)
+-		dev_priv->next_seqno = 1;
++	/* The hardware uses various monotonic 32-bit counters, if we
++	 * detect that they will wraparound we need to idle the GPU
++	 * and reset those counters.
++	 */
++	ret = 0;
++	for_each_ring(ring, dev_priv, i) {
++		for (j = 0; j < ARRAY_SIZE(ring->sync_seqno); j++)
++			ret |= ring->sync_seqno[j] != 0;
++	}
++	if (ret == 0)
++		return ret;
+ 
+-	return seqno;
++	ret = i915_gpu_idle(dev);
++	if (ret)
++		return ret;
++
++	i915_gem_retire_requests(dev);
++	for_each_ring(ring, dev_priv, i) {
++		for (j = 0; j < ARRAY_SIZE(ring->sync_seqno); j++)
++			ring->sync_seqno[j] = 0;
++	}
++
++	return 0;
+ }
+ 
+-u32
+-i915_gem_next_request_seqno(struct intel_ring_buffer *ring)
++int
++i915_gem_get_seqno(struct drm_device *dev, u32 *seqno)
+ {
+-	if (ring->outstanding_lazy_request == 0)
+-		ring->outstanding_lazy_request = i915_gem_get_seqno(ring->dev);
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/* reserve 0 for non-seqno */
++	if (dev_priv->next_seqno == 0) {
++		int ret = i915_gem_handle_seqno_wrap(dev);
++		if (ret)
++			return ret;
+ 
+-	return ring->outstanding_lazy_request;
++		dev_priv->next_seqno = 1;
++	}
++
++	*seqno = dev_priv->next_seqno++;
++	return 0;
+ }
+ 
+ int
+@@ -1952,7 +1980,6 @@ i915_add_request(struct intel_ring_buffer *ring,
+ 	drm_i915_private_t *dev_priv = ring->dev->dev_private;
+ 	struct drm_i915_gem_request *request;
+ 	u32 request_ring_position;
+-	u32 seqno;
+ 	int was_empty;
+ 	int ret;
+ 
+@@ -1971,7 +1998,6 @@ i915_add_request(struct intel_ring_buffer *ring,
+ 	if (request == NULL)
+ 		return -ENOMEM;
+ 
+-	seqno = i915_gem_next_request_seqno(ring);
+ 
+ 	/* Record the position of the start of the request so that
+ 	 * should we detect the updated seqno part-way through the
+@@ -1980,15 +2006,13 @@ i915_add_request(struct intel_ring_buffer *ring,
+ 	 */
+ 	request_ring_position = intel_ring_get_tail(ring);
+ 
+-	ret = ring->add_request(ring, &seqno);
++	ret = ring->add_request(ring);
+ 	if (ret) {
+ 		kfree(request);
+ 		return ret;
+ 	}
+ 
+-	trace_i915_gem_request_add(ring, seqno);
+-
+-	request->seqno = seqno;
++	request->seqno = intel_ring_get_seqno(ring);
+ 	request->ring = ring;
+ 	request->tail = request_ring_position;
+ 	request->emitted_jiffies = jiffies;
+@@ -2006,6 +2030,7 @@ i915_add_request(struct intel_ring_buffer *ring,
+ 		spin_unlock(&file_priv->mm.lock);
+ 	}
+ 
++	trace_i915_gem_request_add(ring, request->seqno);
+ 	ring->outstanding_lazy_request = 0;
+ 
+ 	if (!dev_priv->mm.suspended) {
+@@ -2022,7 +2047,7 @@ i915_add_request(struct intel_ring_buffer *ring,
+ 	}
+ 
+ 	if (out_seqno)
+-		*out_seqno = seqno;
++		*out_seqno = request->seqno;
+ 	return 0;
+ }
+ 
+@@ -2120,7 +2145,6 @@ void
+ i915_gem_retire_requests_ring(struct intel_ring_buffer *ring)
+ {
+ 	uint32_t seqno;
+-	int i;
+ 
+ 	if (list_empty(&ring->request_list))
+ 		return;
+@@ -2129,10 +2153,6 @@ i915_gem_retire_requests_ring(struct intel_ring_buffer *ring)
+ 
+ 	seqno = ring->get_seqno(ring, true);
+ 
+-	for (i = 0; i < ARRAY_SIZE(ring->sync_seqno); i++)
+-		if (seqno >= ring->sync_seqno[i])
+-			ring->sync_seqno[i] = 0;
+-
+ 	while (!list_empty(&ring->request_list)) {
+ 		struct drm_i915_gem_request *request;
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_context.c b/drivers/gpu/drm/i915/i915_gem_context.c
+index 0e510df..a3f06bc 100644
+--- a/drivers/gpu/drm/i915/i915_gem_context.c
++++ b/drivers/gpu/drm/i915/i915_gem_context.c
+@@ -410,9 +410,8 @@ static int do_switch(struct i915_hw_context *to)
+ 	 * MI_SET_CONTEXT instead of when the next seqno has completed.
+ 	 */
+ 	if (from_obj != NULL) {
+-		u32 seqno = i915_gem_next_request_seqno(ring);
+ 		from_obj->base.read_domains = I915_GEM_DOMAIN_INSTRUCTION;
+-		i915_gem_object_move_to_active(from_obj, ring, seqno);
++		i915_gem_object_move_to_active(from_obj, ring);
+ 		/* As long as MI_SET_CONTEXT is serializing, ie. it flushes the
+ 		 * whole damn pipeline, we don't need to explicitly mark the
+ 		 * object dirty. The only exception is that the context must be
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 48e4317..ee8f97f 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -713,8 +713,7 @@ validate_exec_list(struct drm_i915_gem_exec_object2 *exec,
+ 
+ static void
+ i915_gem_execbuffer_move_to_active(struct list_head *objects,
+-				   struct intel_ring_buffer *ring,
+-				   u32 seqno)
++				   struct intel_ring_buffer *ring)
+ {
+ 	struct drm_i915_gem_object *obj;
+ 
+@@ -726,10 +725,10 @@ i915_gem_execbuffer_move_to_active(struct list_head *objects,
+ 		obj->base.write_domain = obj->base.pending_write_domain;
+ 		obj->fenced_gpu_access = obj->pending_fenced_gpu_access;
+ 
+-		i915_gem_object_move_to_active(obj, ring, seqno);
++		i915_gem_object_move_to_active(obj, ring);
+ 		if (obj->base.write_domain) {
+ 			obj->dirty = 1;
+-			obj->last_write_seqno = seqno;
++			obj->last_write_seqno = intel_ring_get_seqno(ring);
+ 			if (obj->pin_count) /* check for potential scanout */
+ 				intel_mark_fb_busy(obj);
+ 		}
+@@ -789,7 +788,6 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	struct intel_ring_buffer *ring;
+ 	u32 ctx_id = i915_execbuffer2_get_context_id(*args);
+ 	u32 exec_start, exec_len;
+-	u32 seqno;
+ 	u32 mask;
+ 	u32 flags;
+ 	int ret, mode, i;
+@@ -994,22 +992,6 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto err;
+ 
+-	seqno = i915_gem_next_request_seqno(ring);
+-	for (i = 0; i < ARRAY_SIZE(ring->sync_seqno); i++) {
+-		if (seqno < ring->sync_seqno[i]) {
+-			/* The GPU can not handle its semaphore value wrapping,
+-			 * so every billion or so execbuffers, we need to stall
+-			 * the GPU in order to reset the counters.
+-			 */
+-			ret = i915_gpu_idle(dev);
+-			if (ret)
+-				goto err;
+-			i915_gem_retire_requests(dev);
+-
+-			BUG_ON(ring->sync_seqno[i]);
+-		}
+-	}
+-
+ 	ret = i915_switch_context(ring, file, ctx_id);
+ 	if (ret)
+ 		goto err;
+@@ -1035,8 +1017,6 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 			goto err;
+ 	}
+ 
+-	trace_i915_gem_ring_dispatch(ring, seqno, flags);
+-
+ 	exec_start = batch_obj->gtt_offset + args->batch_start_offset;
+ 	exec_len = args->batch_len;
+ 	if (cliprects) {
+@@ -1060,7 +1040,9 @@ i915_gem_do_execbuffer(struct drm_device *dev, void *data,
+ 			goto err;
+ 	}
+ 
+-	i915_gem_execbuffer_move_to_active(&objects, ring, seqno);
++	trace_i915_gem_ring_dispatch(ring, intel_ring_get_seqno(ring), flags);
++
++	i915_gem_execbuffer_move_to_active(&objects, ring);
+ 	i915_gem_execbuffer_retire_commands(dev, file, ring);
+ 
+ err:
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 987eb5f..e4682cd 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -555,12 +555,11 @@ static void render_ring_cleanup(struct intel_ring_buffer *ring)
+ 
+ static void
+ update_mboxes(struct intel_ring_buffer *ring,
+-	    u32 seqno,
+-	    u32 mmio_offset)
++	      u32 mmio_offset)
+ {
+ 	intel_ring_emit(ring, MI_LOAD_REGISTER_IMM(1));
+ 	intel_ring_emit(ring, mmio_offset);
+-	intel_ring_emit(ring, seqno);
++	intel_ring_emit(ring, ring->outstanding_lazy_request);
+ }
+ 
+ /**
+@@ -573,8 +572,7 @@ update_mboxes(struct intel_ring_buffer *ring,
+  * This acts like a signal in the canonical semaphore.
+  */
+ static int
+-gen6_add_request(struct intel_ring_buffer *ring,
+-		 u32 *seqno)
++gen6_add_request(struct intel_ring_buffer *ring)
+ {
+ 	u32 mbox1_reg;
+ 	u32 mbox2_reg;
+@@ -587,13 +585,11 @@ gen6_add_request(struct intel_ring_buffer *ring,
+ 	mbox1_reg = ring->signal_mbox[0];
+ 	mbox2_reg = ring->signal_mbox[1];
+ 
+-	*seqno = i915_gem_next_request_seqno(ring);
+-
+-	update_mboxes(ring, *seqno, mbox1_reg);
+-	update_mboxes(ring, *seqno, mbox2_reg);
++	update_mboxes(ring, mbox1_reg);
++	update_mboxes(ring, mbox2_reg);
+ 	intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
+ 	intel_ring_emit(ring, I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
+-	intel_ring_emit(ring, *seqno);
++	intel_ring_emit(ring, ring->outstanding_lazy_request);
+ 	intel_ring_emit(ring, MI_USER_INTERRUPT);
+ 	intel_ring_advance(ring);
+ 
+@@ -650,10 +646,8 @@ do {									\
+ } while (0)
+ 
+ static int
+-pc_render_add_request(struct intel_ring_buffer *ring,
+-		      u32 *result)
++pc_render_add_request(struct intel_ring_buffer *ring)
+ {
+-	u32 seqno = i915_gem_next_request_seqno(ring);
+ 	struct pipe_control *pc = ring->private;
+ 	u32 scratch_addr = pc->gtt_offset + 128;
+ 	int ret;
+@@ -674,7 +668,7 @@ pc_render_add_request(struct intel_ring_buffer *ring,
+ 			PIPE_CONTROL_WRITE_FLUSH |
+ 			PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE);
+ 	intel_ring_emit(ring, pc->gtt_offset | PIPE_CONTROL_GLOBAL_GTT);
+-	intel_ring_emit(ring, seqno);
++	intel_ring_emit(ring, ring->outstanding_lazy_request);
+ 	intel_ring_emit(ring, 0);
+ 	PIPE_CONTROL_FLUSH(ring, scratch_addr);
+ 	scratch_addr += 128; /* write to separate cachelines */
+@@ -693,11 +687,10 @@ pc_render_add_request(struct intel_ring_buffer *ring,
+ 			PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE |
+ 			PIPE_CONTROL_NOTIFY);
+ 	intel_ring_emit(ring, pc->gtt_offset | PIPE_CONTROL_GLOBAL_GTT);
+-	intel_ring_emit(ring, seqno);
++	intel_ring_emit(ring, ring->outstanding_lazy_request);
+ 	intel_ring_emit(ring, 0);
+ 	intel_ring_advance(ring);
+ 
+-	*result = seqno;
+ 	return 0;
+ }
+ 
+@@ -885,25 +878,20 @@ bsd_ring_flush(struct intel_ring_buffer *ring,
+ }
+ 
+ static int
+-i9xx_add_request(struct intel_ring_buffer *ring,
+-		 u32 *result)
++i9xx_add_request(struct intel_ring_buffer *ring)
+ {
+-	u32 seqno;
+ 	int ret;
+ 
+ 	ret = intel_ring_begin(ring, 4);
+ 	if (ret)
+ 		return ret;
+ 
+-	seqno = i915_gem_next_request_seqno(ring);
+-
+ 	intel_ring_emit(ring, MI_STORE_DWORD_INDEX);
+ 	intel_ring_emit(ring, I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT);
+-	intel_ring_emit(ring, seqno);
++	intel_ring_emit(ring, ring->outstanding_lazy_request);
+ 	intel_ring_emit(ring, MI_USER_INTERRUPT);
+ 	intel_ring_advance(ring);
+ 
+-	*result = seqno;
+ 	return 0;
+ }
+ 
+@@ -1110,6 +1098,7 @@ static int intel_init_ring_buffer(struct drm_device *dev,
+ 	INIT_LIST_HEAD(&ring->active_list);
+ 	INIT_LIST_HEAD(&ring->request_list);
+ 	ring->size = 32 * PAGE_SIZE;
++	memset(ring->sync_seqno, 0, sizeof(ring->sync_seqno));
+ 
+ 	init_waitqueue_head(&ring->irq_queue);
+ 
+@@ -1338,6 +1327,15 @@ int intel_wait_ring_buffer(struct intel_ring_buffer *ring, int n)
+ 	return -EBUSY;
+ }
+ 
++static int
++intel_ring_alloc_seqno(struct intel_ring_buffer *ring)
++{
++	if (ring->outstanding_lazy_request)
++		return 0;
++
++	return i915_gem_get_seqno(ring->dev, &ring->outstanding_lazy_request);
++}
++
+ int intel_ring_begin(struct intel_ring_buffer *ring,
+ 		     int num_dwords)
+ {
+@@ -1349,6 +1347,11 @@ int intel_ring_begin(struct intel_ring_buffer *ring,
+ 	if (ret)
+ 		return ret;
+ 
++	/* Preallocate the olr before touching the ring */
++	ret = intel_ring_alloc_seqno(ring);
++	if (ret)
++		return ret;
++
+ 	if (unlikely(ring->tail + n > ring->effective_size)) {
+ 		ret = intel_wrap_ring_buffer(ring);
+ 		if (unlikely(ret))
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 5af65b8..0e61302 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -70,8 +70,7 @@ struct  intel_ring_buffer {
+ 	int __must_check (*flush)(struct intel_ring_buffer *ring,
+ 				  u32	invalidate_domains,
+ 				  u32	flush_domains);
+-	int		(*add_request)(struct intel_ring_buffer *ring,
+-				       u32 *seqno);
++	int		(*add_request)(struct intel_ring_buffer *ring);
+ 	/* Some chipsets are not quite as coherent as advertised and need
+ 	 * an expensive kick to force a true read of the up-to-date seqno.
+ 	 * However, the up-to-date seqno is not always required and the last
+@@ -205,7 +204,6 @@ static inline void intel_ring_emit(struct intel_ring_buffer *ring,
+ 
+ void intel_ring_advance(struct intel_ring_buffer *ring);
+ 
+-u32 intel_ring_get_seqno(struct intel_ring_buffer *ring);
+ int intel_ring_flush_all_caches(struct intel_ring_buffer *ring);
+ int intel_ring_invalidate_all_caches(struct intel_ring_buffer *ring);
+ 
+@@ -221,6 +219,12 @@ static inline u32 intel_ring_get_tail(struct intel_ring_buffer *ring)
+ 	return ring->tail;
+ }
+ 
++static inline u32 intel_ring_get_seqno(struct intel_ring_buffer *ring)
++{
++	BUG_ON(ring->outstanding_lazy_request == 0);
++	return ring->outstanding_lazy_request;
++}
++
+ static inline void i915_trace_irq_get(struct intel_ring_buffer *ring, u32 seqno)
+ {
+ 	if (ring->trace_irq_seqno == 0 && ring->irq_get(ring))
+
