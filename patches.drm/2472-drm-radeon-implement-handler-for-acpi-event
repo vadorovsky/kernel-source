@@ -1,0 +1,325 @@
+From fda4b25c55a59ba12378e4b9e4553f6ea57d802d Mon Sep 17 00:00:00 2001
+From: Luca Tettamanti <kronos.it@gmail.com>
+Date: Mon, 30 Jul 2012 21:20:35 +0200
+Subject: drm/radeon: implement handler for ACPI event
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: fda4b25c55a59ba12378e4b9e4553f6ea57d802d
+Patch-mainline: v3.7-rc1
+
+Set up an handler for ACPI events and respond to brightness change
+requests from the system BIOS.
+v2: fix notification when using device-specific command codes
+(tested by Pali Rohár <pali.rohar@gmail.com>); cache the encoder
+controlling the backlight during the initialization to avoid searching
+it every time (suggested by Alex Deucher).
+v3: whitespace fixes (Alex Deucher).
+
+Signed-off-by: Luca Tettamanti <kronos.it@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/atombios_encoders.c |    2 +-
+ drivers/gpu/drm/radeon/radeon.h            |    1 +
+ drivers/gpu/drm/radeon/radeon_acpi.c       |  132 +++++++++++++++++++++++++++-
+ drivers/gpu/drm/radeon/radeon_acpi.h       |    6 ++
+ drivers/gpu/drm/radeon/radeon_kms.c        |   16 +++-
+ drivers/gpu/drm/radeon/radeon_mode.h       |    2 +
+ drivers/gpu/drm/radeon/radeon_pm.c         |    4 +-
+ 7 files changed, 152 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/atombios_encoders.c b/drivers/gpu/drm/radeon/atombios_encoders.c
+index f3645e1..370b2c4 100644
+--- a/drivers/gpu/drm/radeon/atombios_encoders.c
++++ b/drivers/gpu/drm/radeon/atombios_encoders.c
+@@ -72,7 +72,7 @@ radeon_atom_set_backlight_level_to_reg(struct radeon_device *rdev,
+ 		WREG32(RADEON_BIOS_2_SCRATCH, bios_2_scratch);
+ }
+ 
+-static void
++void
+ atombios_set_panel_brightness(struct radeon_encoder *radeon_encoder)
+ {
+ 	struct drm_encoder *encoder = &radeon_encoder->base;
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 763f333..dea5f08 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -1461,6 +1461,7 @@ struct radeon_atif {
+ 	struct radeon_atif_notifications notifications;
+ 	struct radeon_atif_functions functions;
+ 	struct radeon_atif_notification_cfg notification_cfg;
++	struct radeon_encoder *backlight_ctl;
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/radeon/radeon_acpi.c b/drivers/gpu/drm/radeon/radeon_acpi.c
+index 0454ecc..b052a55 100644
+--- a/drivers/gpu/drm/radeon/radeon_acpi.c
++++ b/drivers/gpu/drm/radeon/radeon_acpi.c
+@@ -26,6 +26,7 @@
+ #include <linux/slab.h>
+ #include <acpi/acpi_drivers.h>
+ #include <acpi/acpi_bus.h>
++#include <acpi/video.h>
+ 
+ #include "drmP.h"
+ #include "drm.h"
+@@ -33,6 +34,7 @@
+ #include "drm_crtc_helper.h"
+ #include "radeon.h"
+ #include "radeon_acpi.h"
++#include "atom.h"
+ 
+ #include <linux/vga_switcheroo.h>
+ 
+@@ -44,10 +46,22 @@ struct atif_verify_interface {
+ } __packed;
+ 
+ struct atif_system_params {
+-	u16 size;
+-	u32 valid_mask;
+-	u32 flags;
+-	u8 command_code;
++	u16 size;		/* structure size in bytes (includes size field) */
++	u32 valid_mask;		/* valid flags mask */
++	u32 flags;		/* flags */
++	u8 command_code;	/* notify command code */
++} __packed;
++
++struct atif_sbios_requests {
++	u16 size;		/* structure size in bytes (includes size field) */
++	u32 pending;		/* pending sbios requests */
++	u8 panel_exp_mode;	/* panel expansion mode */
++	u8 thermal_gfx;		/* thermal state: target gfx controller */
++	u8 thermal_state;	/* thermal state: state id (0: exit state, non-0: state) */
++	u8 forced_power_gfx;	/* forced power state: target gfx controller */
++	u8 forced_power_state;	/* forced power state: state id */
++	u8 system_power_src;	/* system power source */
++	u8 backlight_level;	/* panel backlight level (0-255) */
+ } __packed;
+ 
+ #define ATIF_NOTIFY_MASK	0x3
+@@ -180,6 +194,8 @@ static int radeon_atif_get_notification_params(acpi_handle handle,
+ 	size = min(sizeof(params), size);
+ 	memcpy(&params, info->buffer.pointer, size);
+ 
++	DRM_DEBUG_DRIVER("SYSTEM_PARAMS: mask = %#x, flags = %#x\n",
++			params.flags, params.valid_mask);
+ 	params.flags = params.flags & params.valid_mask;
+ 
+ 	if ((params.flags & ATIF_NOTIFY_MASK) == ATIF_NOTIFY_NONE) {
+@@ -198,10 +214,91 @@ static int radeon_atif_get_notification_params(acpi_handle handle,
+ 	}
+ 
+ out:
++	DRM_DEBUG_DRIVER("Notification %s, command code = %#x\n",
++			(n->enabled ? "enabled" : "disabled"),
++			n->command_code);
+ 	kfree(info);
+ 	return err;
+ }
+ 
++static int radeon_atif_get_sbios_requests(acpi_handle handle,
++		struct atif_sbios_requests *req)
++{
++	union acpi_object *info;
++	size_t size;
++	int count = 0;
++
++	info = radeon_atif_call(handle, ATIF_FUNCTION_GET_SYSTEM_BIOS_REQUESTS, NULL);
++	if (!info)
++		return -EIO;
++
++	size = *(u16 *)info->buffer.pointer;
++	if (size < 0xd) {
++		count = -EINVAL;
++		goto out;
++	}
++	memset(req, 0, sizeof(*req));
++
++	size = min(sizeof(*req), size);
++	memcpy(req, info->buffer.pointer, size);
++	DRM_DEBUG_DRIVER("SBIOS pending requests: %#x\n", req->pending);
++
++	count = hweight32(req->pending);
++
++out:
++	kfree(info);
++	return count;
++}
++
++int radeon_atif_handler(struct radeon_device *rdev,
++		struct acpi_bus_event *event)
++{
++	struct radeon_atif *atif = &rdev->atif;
++	struct atif_sbios_requests req;
++	acpi_handle handle;
++	int count;
++
++	DRM_DEBUG_DRIVER("event, device_class = %s, type = %#x\n",
++			event->device_class, event->type);
++
++	if (strcmp(event->device_class, ACPI_VIDEO_CLASS) != 0)
++		return NOTIFY_DONE;
++
++	if (!atif->notification_cfg.enabled ||
++			event->type != atif->notification_cfg.command_code)
++		/* Not our event */
++		return NOTIFY_DONE;
++
++	/* Check pending SBIOS requests */
++	handle = DEVICE_ACPI_HANDLE(&rdev->pdev->dev);
++	count = radeon_atif_get_sbios_requests(handle, &req);
++
++	if (count <= 0)
++		return NOTIFY_DONE;
++
++	DRM_DEBUG_DRIVER("ATIF: %d pending SBIOS requests\n", count);
++
++	if (req.pending & ATIF_PANEL_BRIGHTNESS_CHANGE_REQUEST) {
++		struct radeon_encoder *enc = atif->backlight_ctl;
++
++		if (enc) {
++			struct radeon_encoder_atom_dig *dig = enc->enc_priv;
++			dig->backlight_level = req.backlight_level;
++
++			DRM_DEBUG_DRIVER("Changing brightness to %d\n",
++					req.backlight_level);
++
++			atombios_set_panel_brightness(enc);
++
++			backlight_force_update(dig->bl_dev,
++					BACKLIGHT_UPDATE_HOTKEY);
++		}
++	}
++	/* TODO: check other events */
++
++	return NOTIFY_OK;
++}
++
+ /* Call all ACPI methods here */
+ int radeon_acpi_init(struct radeon_device *rdev)
+ {
+@@ -223,6 +320,33 @@ int radeon_acpi_init(struct radeon_device *rdev)
+ 		goto out;
+ 	}
+ 
++	if (atif->notifications.brightness_change) {
++		struct drm_encoder *tmp;
++		struct radeon_encoder *target = NULL;
++
++		/* Find the encoder controlling the brightness */
++		list_for_each_entry(tmp, &rdev->ddev->mode_config.encoder_list,
++				head) {
++			struct radeon_encoder *enc = to_radeon_encoder(tmp);
++			struct radeon_encoder_atom_dig *dig = enc->enc_priv;
++
++			if ((enc->devices & (ATOM_DEVICE_LCD_SUPPORT)) &&
++					dig->bl_dev != NULL) {
++				target = enc;
++				break;
++			}
++		}
++
++		atif->backlight_ctl = target;
++		if (!target) {
++			/* Brightness change notification is enabled, but we
++			 * didn't find a backlight controller, this should
++			 * never happen.
++			 */
++			DRM_ERROR("Cannot find a backlight controller\n");
++		}
++	}
++
+ 	if (atif->functions.sbios_requests && !atif->functions.system_params) {
+ 		/* XXX check this workraround, if sbios request function is
+ 		 * present we have to see how it's configured in the system
+diff --git a/drivers/gpu/drm/radeon/radeon_acpi.h b/drivers/gpu/drm/radeon/radeon_acpi.h
+index 642aa47..be4af76 100644
+--- a/drivers/gpu/drm/radeon/radeon_acpi.h
++++ b/drivers/gpu/drm/radeon/radeon_acpi.h
+@@ -24,6 +24,12 @@
+ #ifndef RADEON_ACPI_H
+ #define RADEON_ACPI_H
+ 
++struct radeon_device;
++struct acpi_bus_event;
++
++int radeon_atif_handler(struct radeon_device *rdev,
++		struct acpi_bus_event *event);
++
+ /* AMD hw uses four ACPI control methods:
+  * 1. ATIF
+  * ARG0: (ACPI_INTEGER) function code
+diff --git a/drivers/gpu/drm/radeon/radeon_kms.c b/drivers/gpu/drm/radeon/radeon_kms.c
+index 414b4ac..8c24718 100644
+--- a/drivers/gpu/drm/radeon/radeon_kms.c
++++ b/drivers/gpu/drm/radeon/radeon_kms.c
+@@ -103,11 +103,6 @@ int radeon_driver_load_kms(struct drm_device *dev, unsigned long flags)
+ 		goto out;
+ 	}
+ 
+-	/* Call ACPI methods */
+-	acpi_status = radeon_acpi_init(rdev);
+-	if (acpi_status)
+-		dev_dbg(&dev->pdev->dev, "Error during ACPI methods call\n");
+-
+ 	/* Again modeset_init should fail only on fatal error
+ 	 * otherwise it should provide enough functionalities
+ 	 * for shadowfb to run
+@@ -115,6 +110,17 @@ int radeon_driver_load_kms(struct drm_device *dev, unsigned long flags)
+ 	r = radeon_modeset_init(rdev);
+ 	if (r)
+ 		dev_err(&dev->pdev->dev, "Fatal error during modeset init\n");
++
++	/* Call ACPI methods: require modeset init
++	 * but failure is not fatal
++	 */
++	if (!r) {
++		acpi_status = radeon_acpi_init(rdev);
++		if (acpi_status)
++		dev_dbg(&dev->pdev->dev,
++				"Error during ACPI methods call\n");
++	}
++
+ out:
+ 	if (r)
+ 		radeon_driver_unload_kms(dev);
+diff --git a/drivers/gpu/drm/radeon/radeon_mode.h b/drivers/gpu/drm/radeon/radeon_mode.h
+index 5005057..1f411c2 100644
+--- a/drivers/gpu/drm/radeon/radeon_mode.h
++++ b/drivers/gpu/drm/radeon/radeon_mode.h
+@@ -698,6 +698,8 @@ void radeon_panel_mode_fixup(struct drm_encoder *encoder,
+ 			     struct drm_display_mode *adjusted_mode);
+ void atom_rv515_force_tv_scaler(struct radeon_device *rdev, struct radeon_crtc *radeon_crtc);
+ 
++void atombios_set_panel_brightness(struct radeon_encoder *radeon_encoder);
++
+ /* legacy tv */
+ void radeon_legacy_tv_adjust_crtc_reg(struct drm_encoder *encoder,
+ 				      uint32_t *h_total_disp, uint32_t *h_sync_strt_wid,
+diff --git a/drivers/gpu/drm/radeon/radeon_pm.c b/drivers/gpu/drm/radeon/radeon_pm.c
+index 2c2c901..14e544e 100644
+--- a/drivers/gpu/drm/radeon/radeon_pm.c
++++ b/drivers/gpu/drm/radeon/radeon_pm.c
+@@ -22,6 +22,7 @@
+  */
+ #include "drmP.h"
+ #include "radeon.h"
++#include "radeon_acpi.h"
+ #include "avivod.h"
+ #include "atom.h"
+ #ifdef CONFIG_ACPI
+@@ -94,7 +95,8 @@ static int radeon_acpi_event(struct notifier_block *nb,
+ 		}
+ 	}
+ 
+-	return NOTIFY_OK;
++	/* Check for pending SBIOS requests */
++	return radeon_atif_handler(rdev, entry);
+ }
+ #endif
+ 
+
