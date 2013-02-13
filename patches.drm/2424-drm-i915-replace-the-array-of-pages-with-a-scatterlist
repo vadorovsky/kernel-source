@@ -1,0 +1,1051 @@
+From 9da3da660d8c19a54f6e93361d147509be3fff84 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 1 Jun 2012 15:20:22 +0100
+Subject: drm/i915: Replace the array of pages with a scatterlist
+Git-commit: 9da3da660d8c19a54f6e93361d147509be3fff84
+Patch-mainline: v3.7-rc3
+
+Rather than have multiple data structures for describing our page layout
+in conjunction with the array of pages, we can migrate all users over to
+a scatterlist.
+
+One major advantage, other than unifying the page tracking structures,
+this offers is that we replace the vmalloc'ed array (which can be up to
+a megabyte in size) with a chain of individual pages which helps reduce
+memory pressure.
+
+The disadvantage is that we then do not have a simple array to iterate,
+or to access randomly. The common case for this is in the relocation
+processing, which will typically fit within a single scatterlist page
+and so be almost the same cost as the simple array. For iterating over
+the array, the extra function call could be optimised away, but in
+reality is an insignificant cost of either binding the pages, or
+performing the pwrite/pread.
+
+v2: Fix drm_clflush_sg() to not invoke wbinvd as well! And fix the
+trivial compile error from rebasing.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/char/agp/intel-gtt.c               |   51 +++++-------
+ drivers/gpu/drm/drm_cache.c                |   25 ++++++
+ drivers/gpu/drm/i915/i915_drv.h            |   18 +++--
+ drivers/gpu/drm/i915/i915_gem.c            |   79 ++++++++++++------
+ drivers/gpu/drm/i915/i915_gem_dmabuf.c     |   99 +++++++++++++++--------
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    3 +-
+ drivers/gpu/drm/i915/i915_gem_gtt.c        |  123 ++++++----------------------
+ drivers/gpu/drm/i915/i915_gem_tiling.c     |   16 ++--
+ drivers/gpu/drm/i915/i915_irq.c            |   25 +++---
+ drivers/gpu/drm/i915/intel_ringbuffer.c    |    9 +-
+ include/drm/drmP.h                         |    1 +
+ include/drm/intel-gtt.h                    |   10 +--
+ 12 files changed, 239 insertions(+), 220 deletions(-)
+
+Index: linux-3.0-SLE11-SP3/drivers/char/agp/intel-gtt.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/char/agp/intel-gtt.c
++++ linux-3.0-SLE11-SP3/drivers/char/agp/intel-gtt.c
+@@ -84,40 +84,33 @@ static struct _intel_private {
+ #define IS_IRONLAKE	intel_private.driver->is_ironlake
+ #define HAS_PGTBL_EN	intel_private.driver->has_pgtbl_enable
+ 
+-int intel_gtt_map_memory(struct page **pages, unsigned int num_entries,
+-			 struct scatterlist **sg_list, int *num_sg)
++static int intel_gtt_map_memory(struct page **pages,
++				unsigned int num_entries,
++				struct sg_table *st)
+ {
+-	struct sg_table st;
+ 	struct scatterlist *sg;
+ 	int i;
+ 
+-	if (*sg_list)
+-		return 0; /* already mapped (for e.g. resume */
+-
+ 	DBG("try mapping %lu pages\n", (unsigned long)num_entries);
+ 
+-	if (sg_alloc_table(&st, num_entries, GFP_KERNEL))
++	if (sg_alloc_table(st, num_entries, GFP_KERNEL))
+ 		goto err;
+ 
+-	*sg_list = sg = st.sgl;
+-
+-	for (i = 0 ; i < num_entries; i++, sg = sg_next(sg))
++	for_each_sg(st->sgl, sg, num_entries, i)
+ 		sg_set_page(sg, pages[i], PAGE_SIZE, 0);
+ 
+-	*num_sg = pci_map_sg(intel_private.pcidev, *sg_list,
+-				 num_entries, PCI_DMA_BIDIRECTIONAL);
+-	if (unlikely(!*num_sg))
++	if (!pci_map_sg(intel_private.pcidev,
++			st->sgl, st->nents, PCI_DMA_BIDIRECTIONAL))
+ 		goto err;
+ 
+ 	return 0;
+ 
+ err:
+-	sg_free_table(&st);
++	sg_free_table(st);
+ 	return -ENOMEM;
+ }
+-EXPORT_SYMBOL(intel_gtt_map_memory);
+ 
+-void intel_gtt_unmap_memory(struct scatterlist *sg_list, int num_sg)
++static void intel_gtt_unmap_memory(struct scatterlist *sg_list, int num_sg)
+ {
+ 	struct sg_table st;
+ 	DBG("try unmapping %lu pages\n", (unsigned long)mem->page_count);
+@@ -130,7 +123,6 @@ void intel_gtt_unmap_memory(struct scatt
+ 
+ 	sg_free_table(&st);
+ }
+-EXPORT_SYMBOL(intel_gtt_unmap_memory);
+ 
+ static void intel_fake_agp_enable(struct agp_bridge_data *bridge, u32 mode)
+ {
+@@ -879,8 +871,7 @@ static bool i830_check_flags(unsigned in
+ 	return false;
+ }
+ 
+-void intel_gtt_insert_sg_entries(struct scatterlist *sg_list,
+-				 unsigned int sg_len,
++void intel_gtt_insert_sg_entries(struct sg_table *st,
+ 				 unsigned int pg_start,
+ 				 unsigned int flags)
+ {
+@@ -892,12 +883,11 @@ void intel_gtt_insert_sg_entries(struct
+ 
+ 	/* sg may merge pages, but we have to separate
+ 	 * per-page addr for GTT */
+-	for_each_sg(sg_list, sg, sg_len, i) {
++	for_each_sg(st->sgl, sg, st->nents, i) {
+ 		len = sg_dma_len(sg) >> PAGE_SHIFT;
+ 		for (m = 0; m < len; m++) {
+ 			dma_addr_t addr = sg_dma_address(sg) + (m << PAGE_SHIFT);
+-			intel_private.driver->write_entry(addr,
+-							  j, flags);
++			intel_private.driver->write_entry(addr, j, flags);
+ 			j++;
+ 		}
+ 	}
+@@ -905,8 +895,10 @@ void intel_gtt_insert_sg_entries(struct
+ }
+ EXPORT_SYMBOL(intel_gtt_insert_sg_entries);
+ 
+-void intel_gtt_insert_pages(unsigned int first_entry, unsigned int num_entries,
+-			    struct page **pages, unsigned int flags)
++static void intel_gtt_insert_pages(unsigned int first_entry,
++				   unsigned int num_entries,
++				   struct page **pages,
++				   unsigned int flags)
+ {
+ 	int i, j;
+ 
+@@ -917,7 +909,6 @@ void intel_gtt_insert_pages(unsigned int
+ 	}
+ 	readl(intel_private.gtt+j-1);
+ }
+-EXPORT_SYMBOL(intel_gtt_insert_pages);
+ 
+ static int intel_fake_agp_insert_entries(struct agp_memory *mem,
+ 					 off_t pg_start, int type)
+@@ -953,13 +944,15 @@ static int intel_fake_agp_insert_entries
+ 		global_cache_flush();
+ 
+ 	if (intel_private.base.needs_dmar) {
+-		ret = intel_gtt_map_memory(mem->pages, mem->page_count,
+-					   &mem->sg_list, &mem->num_sg);
++		struct sg_table st;
++
++		ret = intel_gtt_map_memory(mem->pages, mem->page_count, &st);
+ 		if (ret != 0)
+ 			return ret;
+ 
+-		intel_gtt_insert_sg_entries(mem->sg_list, mem->num_sg,
+-					    pg_start, type);
++		intel_gtt_insert_sg_entries(&st, pg_start, type);
++		mem->sg_list = st.sgl;
++		mem->num_sg = st.nents;
+ 	} else
+ 		intel_gtt_insert_pages(pg_start, mem->page_count, mem->pages,
+ 				       type);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/drm_cache.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/drm_cache.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/drm_cache.c
+@@ -100,6 +100,31 @@ drm_clflush_pages(struct page *pages[],
+ EXPORT_SYMBOL(drm_clflush_pages);
+ 
+ void
++drm_clflush_sg(struct sg_table *st)
++{
++#if defined(CONFIG_X86)
++	if (cpu_has_clflush) {
++		struct scatterlist *sg;
++		int i;
++
++		mb();
++		for_each_sg(st->sgl, sg, st->nents, i)
++			drm_clflush_page(sg_page(sg));
++		mb();
++
++		return;
++	}
++
++	if (on_each_cpu(drm_clflush_ipi_handler, NULL, 1) != 0)
++		printk(KERN_ERR "Timed out waiting for cache flush.\n");
++#else
++	printk(KERN_ERR "Architecture has no drm_cache.c support\n");
++	WARN_ON_ONCE(1);
++#endif
++}
++EXPORT_SYMBOL(drm_clflush_sg);
++
++void
+ drm_clflush_virt_range(char *addr, unsigned long length)
+ {
+ #if defined(CONFIG_X86)
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_drv.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/i915_drv.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_drv.h
+@@ -1007,16 +1007,11 @@ struct drm_i915_gem_object {
+ 
+ 	unsigned int has_aliasing_ppgtt_mapping:1;
+ 	unsigned int has_global_gtt_mapping:1;
++	unsigned int has_dma_mapping:1;
+ 
+-	struct page **pages;
++	struct sg_table *pages;
+ 	int pages_pin_count;
+ 
+-	/**
+-	 * DMAR support
+-	 */
+-	struct scatterlist *sg_list;
+-	int num_sg;
+-
+ 	/* prime dma-buf support */
+ 	struct sg_table *sg_table;
+ 	void *dma_buf_vmapping;
+@@ -1343,6 +1338,15 @@ void i915_gem_release_mmap(struct drm_i9
+ void i915_gem_lastclose(struct drm_device *dev);
+ 
+ int __must_check i915_gem_object_get_pages(struct drm_i915_gem_object *obj);
++static inline struct page *i915_gem_object_get_page(struct drm_i915_gem_object *obj, int n)
++{
++	struct scatterlist *sg = obj->pages->sgl;
++	while (n >= SG_MAX_SINGLE_ALLOC) {
++		sg = sg_chain_ptr(sg + SG_MAX_SINGLE_ALLOC - 1);
++		n -= SG_MAX_SINGLE_ALLOC - 1;
++	}
++	return sg_page(sg+n);
++}
+ static inline void i915_gem_object_pin_pages(struct drm_i915_gem_object *obj)
+ {
+ 	BUG_ON(obj->pages == NULL);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/i915_gem.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem.c
+@@ -411,6 +411,8 @@ i915_gem_shmem_pread(struct drm_device *
+ 	int hit_slowpath = 0;
+ 	int prefaulted = 0;
+ 	int needs_clflush = 0;
++	struct scatterlist *sg;
++	int i;
+ 
+ 	user_data = (char __user *) (uintptr_t) args->data_ptr;
+ 	remain = args->size;
+@@ -439,9 +441,15 @@ i915_gem_shmem_pread(struct drm_device *
+ 
+ 	offset = args->offset;
+ 
+-	while (remain > 0) {
++	for_each_sg(obj->pages->sgl, sg, obj->pages->nents, i) {
+ 		struct page *page;
+ 
++		if (i < offset >> PAGE_SHIFT)
++			continue;
++
++		if (remain <= 0)
++			break;
++
+ 		/* Operation in this page
+ 		 *
+ 		 * shmem_page_offset = offset within page in shmem file
+@@ -452,7 +460,7 @@ i915_gem_shmem_pread(struct drm_device *
+ 		if ((shmem_page_offset + page_length) > PAGE_SIZE)
+ 			page_length = PAGE_SIZE - shmem_page_offset;
+ 
+-		page = obj->pages[offset >> PAGE_SHIFT];
++		page = sg_page(sg);
+ 		page_do_bit17_swizzling = obj_do_bit17_swizzling &&
+ 			(page_to_phys(page) & (1 << 17)) != 0;
+ 
+@@ -731,6 +739,8 @@ i915_gem_shmem_pwrite(struct drm_device
+ 	int hit_slowpath = 0;
+ 	int needs_clflush_after = 0;
+ 	int needs_clflush_before = 0;
++	int i;
++	struct scatterlist *sg;
+ 
+ 	user_data = (char __user *) (uintptr_t) args->data_ptr;
+ 	remain = args->size;
+@@ -765,10 +775,16 @@ i915_gem_shmem_pwrite(struct drm_device
+ 	offset = args->offset;
+ 	obj->dirty = 1;
+ 
+-	while (remain > 0) {
++	for_each_sg(obj->pages->sgl, sg, obj->pages->nents, i) {
+ 		struct page *page;
+ 		int partial_cacheline_write;
+ 
++		if (i < offset >> PAGE_SHIFT)
++			continue;
++
++		if (remain <= 0)
++			break;
++
+ 		/* Operation in this page
+ 		 *
+ 		 * shmem_page_offset = offset within page in shmem file
+@@ -787,7 +803,7 @@ i915_gem_shmem_pwrite(struct drm_device
+ 			((shmem_page_offset | page_length)
+ 				& (boot_cpu_data.x86_clflush_size - 1));
+ 
+-		page = obj->pages[offset >> PAGE_SHIFT];
++		page = sg_page(sg);
+ 		page_do_bit17_swizzling = obj_do_bit17_swizzling &&
+ 			(page_to_phys(page) & (1 << 17)) != 0;
+ 
+@@ -1640,6 +1656,7 @@ static void
+ i915_gem_object_put_pages_gtt(struct drm_i915_gem_object *obj)
+ {
+ 	int page_count = obj->base.size / PAGE_SIZE;
++	struct scatterlist *sg;
+ 	int ret, i;
+ 
+ 	BUG_ON(obj->madv == __I915_MADV_PURGED);
+@@ -1660,19 +1677,21 @@ i915_gem_object_put_pages_gtt(struct drm
+ 	if (obj->madv == I915_MADV_DONTNEED)
+ 		obj->dirty = 0;
+ 
+-	for (i = 0; i < page_count; i++) {
++	for_each_sg(obj->pages->sgl, sg, page_count, i) {
++		struct page *page = sg_page(sg);
++
+ 		if (obj->dirty)
+-			set_page_dirty(obj->pages[i]);
++			set_page_dirty(page);
+ 
+ 		if (obj->madv == I915_MADV_WILLNEED)
+-			mark_page_accessed(obj->pages[i]);
++			mark_page_accessed(page);
+ 
+-		page_cache_release(obj->pages[i]);
++		page_cache_release(page);
+ 	}
+ 	obj->dirty = 0;
+ 
+-	drm_free_large(obj->pages);
+-	obj->pages = NULL;
++	sg_free_table(obj->pages);
++	kfree(obj->pages);
+ }
+ 
+ static int
+@@ -1689,6 +1708,7 @@ i915_gem_object_put_pages(struct drm_i91
+ 		return -EBUSY;
+ 
+ 	ops->put_pages(obj);
++	obj->pages = NULL;
+ 
+ 	list_del(&obj->gtt_list);
+ 	if (i915_gem_object_is_purgeable(obj))
+@@ -1746,6 +1766,8 @@ i915_gem_object_get_pages_gtt(struct drm
+ 	struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
+ 	int page_count, i;
+ 	struct address_space *mapping;
++	struct sg_table *st;
++	struct scatterlist *sg;
+ 	struct page *page;
+ 	gfp_t gfp;
+ 
+@@ -1756,20 +1778,27 @@ i915_gem_object_get_pages_gtt(struct drm
+ 	BUG_ON(obj->base.read_domains & I915_GEM_GPU_DOMAINS);
+ 	BUG_ON(obj->base.write_domain & I915_GEM_GPU_DOMAINS);
+ 
+-	/* Get the list of pages out of our struct file.  They'll be pinned
+-	 * at this point until we release them.
+-	 */
++	st = kmalloc(sizeof(*st), GFP_KERNEL);
++	if (st == NULL)
++		return -ENOMEM;
++
+ 	page_count = obj->base.size / PAGE_SIZE;
+-	obj->pages = drm_malloc_ab(page_count, sizeof(struct page *));
+-	if (obj->pages == NULL)
++	if (sg_alloc_table(st, page_count, GFP_KERNEL)) {
++		sg_free_table(st);
++		kfree(st);
+ 		return -ENOMEM;
++	}
+ 
+-	/* Fail silently without starting the shrinker */
++	/* Get the list of pages out of our struct file.  They'll be pinned
++	 * at this point until we release them.
++	 *
++	 * Fail silently without starting the shrinker
++	 */
+ 	mapping = obj->base.filp->f_path.dentry->d_inode->i_mapping;
+ 	gfp = mapping_gfp_mask(mapping);
+ 	gfp |= __GFP_NORETRY | __GFP_NOWARN | __GFP_NO_KSWAPD;
+ 	gfp &= ~(__GFP_IO | __GFP_WAIT);
+-	for (i = 0; i < page_count; i++) {
++	for_each_sg(st->sgl, sg, page_count, i) {
+ 		page = shmem_read_mapping_page_gfp(mapping, i, gfp);
+ 		if (IS_ERR(page)) {
+ 			i915_gem_purge(dev_priv, page_count);
+@@ -1792,20 +1821,20 @@ i915_gem_object_get_pages_gtt(struct drm
+ 			gfp &= ~(__GFP_IO | __GFP_WAIT);
+ 		}
+ 
+-		obj->pages[i] = page;
++		sg_set_page(sg, page, PAGE_SIZE, 0);
+ 	}
+ 
+ 	if (i915_gem_object_needs_bit17_swizzle(obj))
+ 		i915_gem_object_do_bit_17_swizzle(obj);
+ 
++	obj->pages = st;
+ 	return 0;
+ 
+ err_pages:
+-	while (i--)
+-		page_cache_release(obj->pages[i]);
+-
+-	drm_free_large(obj->pages);
+-	obj->pages = NULL;
++	for_each_sg(st->sgl, sg, i, page_count)
++		page_cache_release(sg_page(sg));
++	sg_free_table(st);
++	kfree(st);
+ 	return PTR_ERR(page);
+ }
+ 
+@@ -2988,7 +3017,7 @@ i915_gem_clflush_object(struct drm_i915_
+ 
+ 	trace_i915_gem_object_clflush(obj);
+ 
+-	drm_clflush_pages(obj->pages, obj->base.size / PAGE_SIZE);
++	drm_clflush_sg(obj->pages);
+ }
+ 
+ /** Flushes the GTT write domain for the object if it's dirty. */
+@@ -3739,6 +3768,8 @@ void i915_gem_free_object(struct drm_gem
+ 	i915_gem_object_put_pages(obj);
+ 	i915_gem_object_free_mmap_offset(obj);
+ 
++	BUG_ON(obj->pages);
++
+ 	drm_gem_object_release(&obj->base);
+ 	i915_gem_info_remove_obj(dev_priv, obj->base.size);
+ 
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem_dmabuf.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/i915_gem_dmabuf.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem_dmabuf.c
+@@ -28,33 +28,57 @@
+ #include <linux/dma-buf.h>
+ 
+ static struct sg_table *i915_gem_map_dma_buf(struct dma_buf_attachment *attachment,
+-				      enum dma_data_direction dir)
++					     enum dma_data_direction dir)
+ {
+ 	struct drm_i915_gem_object *obj = attachment->dmabuf->priv;
+-	struct drm_device *dev = obj->base.dev;
+-	int npages = obj->base.size / PAGE_SIZE;
+-	struct sg_table *sg;
+-	int ret;
+-	int nents;
++	struct sg_table *st;
++	struct scatterlist *src, *dst;
++	int ret, i;
+ 
+-	ret = i915_mutex_lock_interruptible(dev);
++	ret = i915_mutex_lock_interruptible(obj->base.dev);
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
+ 	ret = i915_gem_object_get_pages(obj);
+ 	if (ret) {
+-		sg = ERR_PTR(ret);
++		st = ERR_PTR(ret);
++		goto out;
++	}
++
++	/* Copy sg so that we make an independent mapping */
++	st = kmalloc(sizeof(struct sg_table), GFP_KERNEL);
++	if (st == NULL) {
++		st = ERR_PTR(-ENOMEM);
++		goto out;
++	}
++
++	ret = sg_alloc_table(st, obj->pages->nents, GFP_KERNEL);
++	if (ret) {
++		kfree(st);
++		st = ERR_PTR(ret);
++		goto out;
++	}
++
++	src = obj->pages->sgl;
++	dst = st->sgl;
++	for (i = 0; i < obj->pages->nents; i++) {
++		sg_set_page(dst, sg_page(src), PAGE_SIZE, 0);
++		dst = sg_next(dst);
++		src = sg_next(src);
++	}
++
++	if (!dma_map_sg(attachment->dev, st->sgl, st->nents, dir)) {
++		sg_free_table(st);
++		kfree(st);
++		st = ERR_PTR(-ENOMEM);
+ 		goto out;
+ 	}
+ 
+-	/* link the pages into an SG then map the sg */
+-	sg = drm_prime_pages_to_sg(obj->pages, npages);
+-	nents = dma_map_sg(attachment->dev, sg->sgl, sg->nents, dir);
+ 	i915_gem_object_pin_pages(obj);
+ 
+ out:
+-	mutex_unlock(&dev->struct_mutex);
+-	return sg;
++	mutex_unlock(&obj->base.dev->struct_mutex);
++	return st;
+ }
+ 
+ static void i915_gem_unmap_dma_buf(struct dma_buf_attachment *attachment,
+@@ -80,7 +104,9 @@ static void *i915_gem_dmabuf_vmap(struct
+ {
+ 	struct drm_i915_gem_object *obj = dma_buf->priv;
+ 	struct drm_device *dev = obj->base.dev;
+-	int ret;
++	struct scatterlist *sg;
++	struct page **pages;
++	int ret, i;
+ 
+ 	ret = i915_mutex_lock_interruptible(dev);
+ 	if (ret)
+@@ -92,22 +118,33 @@ static void *i915_gem_dmabuf_vmap(struct
+ 	}
+ 
+ 	ret = i915_gem_object_get_pages(obj);
+-	if (ret) {
+-		mutex_unlock(&dev->struct_mutex);
+-		return ERR_PTR(ret);
+-	}
++	if (ret)
++		goto error;
+ 
+-	obj->dma_buf_vmapping = vmap(obj->pages, obj->base.size / PAGE_SIZE, 0, PAGE_KERNEL);
+-	if (!obj->dma_buf_vmapping) {
+-		DRM_ERROR("failed to vmap object\n");
+-		goto out_unlock;
+-	}
++	ret = -ENOMEM;
++
++	pages = drm_malloc_ab(obj->pages->nents, sizeof(struct page *));
++	if (pages == NULL)
++		goto error;
++
++	for_each_sg(obj->pages->sgl, sg, obj->pages->nents, i)
++		pages[i] = sg_page(sg);
++
++	obj->dma_buf_vmapping = vmap(pages, obj->pages->nents, 0, PAGE_KERNEL);
++	drm_free_large(pages);
++
++	if (!obj->dma_buf_vmapping)
++		goto error;
+ 
+ 	obj->vmapping_count = 1;
+ 	i915_gem_object_pin_pages(obj);
+ out_unlock:
+ 	mutex_unlock(&dev->struct_mutex);
+ 	return obj->dma_buf_vmapping;
++
++error:
++	mutex_unlock(&dev->struct_mutex);
++	return ERR_PTR(ret);
+ }
+ 
+ static void i915_gem_dmabuf_vunmap(struct dma_buf *dma_buf, void *vaddr)
+@@ -184,22 +221,19 @@ static const struct dma_buf_ops i915_dma
+ };
+ 
+ struct dma_buf *i915_gem_prime_export(struct drm_device *dev,
+-				struct drm_gem_object *gem_obj, int flags)
++				      struct drm_gem_object *gem_obj, int flags)
+ {
+ 	struct drm_i915_gem_object *obj = to_intel_bo(gem_obj);
+ 
+-	return dma_buf_export(obj, &i915_dmabuf_ops,
+-						  obj->base.size, 0600);
++	return dma_buf_export(obj, &i915_dmabuf_ops, obj->base.size, 0600);
+ }
+ 
+ struct drm_gem_object *i915_gem_prime_import(struct drm_device *dev,
+-				struct dma_buf *dma_buf)
++					     struct dma_buf *dma_buf)
+ {
+ 	struct dma_buf_attachment *attach;
+ 	struct sg_table *sg;
+ 	struct drm_i915_gem_object *obj;
+-	int npages;
+-	int size;
+ 	int ret;
+ 
+ 	/* is this one of own objects? */
+@@ -223,21 +257,19 @@ struct drm_gem_object *i915_gem_prime_im
+ 		goto fail_detach;
+ 	}
+ 
+-	size = dma_buf->size;
+-	npages = size / PAGE_SIZE;
+-
+ 	obj = kzalloc(sizeof(*obj), GFP_KERNEL);
+ 	if (obj == NULL) {
+ 		ret = -ENOMEM;
+ 		goto fail_unmap;
+ 	}
+ 
+-	ret = drm_gem_private_object_init(dev, &obj->base, size);
++	ret = drm_gem_private_object_init(dev, &obj->base, dma_buf->size);
+ 	if (ret) {
+ 		kfree(obj);
+ 		goto fail_unmap;
+ 	}
+ 
++	obj->has_dma_mapping = true;
+ 	obj->sg_table = sg;
+ 	obj->base.import_attach = attach;
+ 
+@@ -249,3 +281,4 @@ fail_detach:
+ 	dma_buf_detach(dma_buf, attach);
+ 	return ERR_PTR(ret);
+ }
++
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -210,7 +210,8 @@ i915_gem_execbuffer_relocate_entry(struc
+ 		if (ret)
+ 			return ret;
+ 
+-		vaddr = kmap_atomic(obj->pages[reloc->offset >> PAGE_SHIFT]);
++		vaddr = kmap_atomic(i915_gem_object_get_page(obj,
++							     reloc->offset >> PAGE_SHIFT));
+ 		*(uint32_t *)(vaddr + page_offset) = reloc->delta;
+ 		kunmap_atomic(vaddr);
+ 	} else {
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem_gtt.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -167,8 +167,7 @@ void i915_gem_cleanup_aliasing_ppgtt(str
+ }
+ 
+ static void i915_ppgtt_insert_sg_entries(struct i915_hw_ppgtt *ppgtt,
+-					 struct scatterlist *sg_list,
+-					 unsigned sg_len,
++					 const struct sg_table *pages,
+ 					 unsigned first_entry,
+ 					 uint32_t pte_flags)
+ {
+@@ -180,12 +179,12 @@ static void i915_ppgtt_insert_sg_entries
+ 	struct scatterlist *sg;
+ 
+ 	/* init sg walking */
+-	sg = sg_list;
++	sg = pages->sgl;
+ 	i = 0;
+ 	segment_len = sg_dma_len(sg) >> PAGE_SHIFT;
+ 	m = 0;
+ 
+-	while (i < sg_len) {
++	while (i < pages->nents) {
+ 		pt_vaddr = kmap_atomic(ppgtt->pt_pages[act_pd]);
+ 
+ 		for (j = first_pte; j < I915_PPGTT_PT_ENTRIES; j++) {
+@@ -194,13 +193,11 @@ static void i915_ppgtt_insert_sg_entries
+ 			pt_vaddr[j] = pte | pte_flags;
+ 
+ 			/* grab the next page */
+-			m++;
+-			if (m == segment_len) {
+-				sg = sg_next(sg);
+-				i++;
+-				if (i == sg_len)
++			if (++m == segment_len) {
++				if (++i == pages->nents)
+ 					break;
+ 
++				sg = sg_next(sg);
+ 				segment_len = sg_dma_len(sg) >> PAGE_SHIFT;
+ 				m = 0;
+ 			}
+@@ -213,44 +210,10 @@ static void i915_ppgtt_insert_sg_entries
+ 	}
+ }
+ 
+-static void i915_ppgtt_insert_pages(struct i915_hw_ppgtt *ppgtt,
+-				    unsigned first_entry, unsigned num_entries,
+-				    struct page **pages, uint32_t pte_flags)
+-{
+-	uint32_t *pt_vaddr, pte;
+-	unsigned act_pd = first_entry / I915_PPGTT_PT_ENTRIES;
+-	unsigned first_pte = first_entry % I915_PPGTT_PT_ENTRIES;
+-	unsigned last_pte, i;
+-	dma_addr_t page_addr;
+-
+-	while (num_entries) {
+-		last_pte = first_pte + num_entries;
+-		last_pte = min_t(unsigned, last_pte, I915_PPGTT_PT_ENTRIES);
+-
+-		pt_vaddr = kmap_atomic(ppgtt->pt_pages[act_pd]);
+-
+-		for (i = first_pte; i < last_pte; i++) {
+-			page_addr = page_to_phys(*pages);
+-			pte = GEN6_PTE_ADDR_ENCODE(page_addr);
+-			pt_vaddr[i] = pte | pte_flags;
+-
+-			pages++;
+-		}
+-
+-		kunmap_atomic(pt_vaddr);
+-
+-		num_entries -= last_pte - first_pte;
+-		first_pte = 0;
+-		act_pd++;
+-	}
+-}
+-
+ void i915_ppgtt_bind_object(struct i915_hw_ppgtt *ppgtt,
+ 			    struct drm_i915_gem_object *obj,
+ 			    enum i915_cache_level cache_level)
+ {
+-	struct drm_device *dev = obj->base.dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	uint32_t pte_flags = GEN6_PTE_VALID;
+ 
+ 	switch (cache_level) {
+@@ -261,7 +224,7 @@ void i915_ppgtt_bind_object(struct i915_
+ 		pte_flags |= GEN6_PTE_CACHE_LLC;
+ 		break;
+ 	case I915_CACHE_NONE:
+-		if (IS_HASWELL(dev))
++		if (IS_HASWELL(obj->base.dev))
+ 			pte_flags |= HSW_PTE_UNCACHED;
+ 		else
+ 			pte_flags |= GEN6_PTE_UNCACHED;
+@@ -270,26 +233,10 @@ void i915_ppgtt_bind_object(struct i915_
+ 		BUG();
+ 	}
+ 
+-	if (obj->sg_table) {
+-		i915_ppgtt_insert_sg_entries(ppgtt,
+-					     obj->sg_table->sgl,
+-					     obj->sg_table->nents,
+-					     obj->gtt_space->start >> PAGE_SHIFT,
+-					     pte_flags);
+-	} else if (dev_priv->mm.gtt->needs_dmar) {
+-		BUG_ON(!obj->sg_list);
+-
+-		i915_ppgtt_insert_sg_entries(ppgtt,
+-					     obj->sg_list,
+-					     obj->num_sg,
+-					     obj->gtt_space->start >> PAGE_SHIFT,
+-					     pte_flags);
+-	} else
+-		i915_ppgtt_insert_pages(ppgtt,
+-					obj->gtt_space->start >> PAGE_SHIFT,
+-					obj->base.size >> PAGE_SHIFT,
+-					obj->pages,
+-					pte_flags);
++	i915_ppgtt_insert_sg_entries(ppgtt,
++				     obj->sg_table ?: obj->pages,
++				     obj->gtt_space->start >> PAGE_SHIFT,
++				     pte_flags);
+ }
+ 
+ void i915_ppgtt_unbind_object(struct i915_hw_ppgtt *ppgtt,
+@@ -361,44 +308,26 @@ void i915_gem_restore_gtt_mappings(struc
+ 
+ int i915_gem_gtt_prepare_object(struct drm_i915_gem_object *obj)
+ {
+-	struct drm_device *dev = obj->base.dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-
+-	/* don't map imported dma buf objects */
+-	if (dev_priv->mm.gtt->needs_dmar && !obj->sg_table)
+-		return intel_gtt_map_memory(obj->pages,
+-					    obj->base.size >> PAGE_SHIFT,
+-					    &obj->sg_list,
+-					    &obj->num_sg);
+-	else
++	if (obj->has_dma_mapping)
+ 		return 0;
++
++	if (!dma_map_sg(&obj->base.dev->pdev->dev,
++			obj->pages->sgl, obj->pages->nents,
++			PCI_DMA_BIDIRECTIONAL))
++		return -ENOSPC;
++
++	return 0;
+ }
+ 
+ void i915_gem_gtt_bind_object(struct drm_i915_gem_object *obj,
+ 			      enum i915_cache_level cache_level)
+ {
+ 	struct drm_device *dev = obj->base.dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	unsigned int agp_type = cache_level_to_agp_type(dev, cache_level);
+ 
+-	if (obj->sg_table) {
+-		intel_gtt_insert_sg_entries(obj->sg_table->sgl,
+-					    obj->sg_table->nents,
+-					    obj->gtt_space->start >> PAGE_SHIFT,
+-					    agp_type);
+-	} else if (dev_priv->mm.gtt->needs_dmar) {
+-		BUG_ON(!obj->sg_list);
+-
+-		intel_gtt_insert_sg_entries(obj->sg_list,
+-					    obj->num_sg,
+-					    obj->gtt_space->start >> PAGE_SHIFT,
+-					    agp_type);
+-	} else
+-		intel_gtt_insert_pages(obj->gtt_space->start >> PAGE_SHIFT,
+-				       obj->base.size >> PAGE_SHIFT,
+-				       obj->pages,
+-				       agp_type);
+-
++	intel_gtt_insert_sg_entries(obj->sg_table ?: obj->pages,
++				    obj->gtt_space->start >> PAGE_SHIFT,
++				    agp_type);
+ 	obj->has_global_gtt_mapping = 1;
+ }
+ 
+@@ -418,10 +347,10 @@ void i915_gem_gtt_finish_object(struct d
+ 
+ 	interruptible = do_idling(dev_priv);
+ 
+-	if (obj->sg_list) {
+-		intel_gtt_unmap_memory(obj->sg_list, obj->num_sg);
+-		obj->sg_list = NULL;
+-	}
++	if (!obj->has_dma_mapping)
++		dma_unmap_sg(&dev->pdev->dev,
++			     obj->pages->sgl, obj->pages->nents,
++			     PCI_DMA_BIDIRECTIONAL);
+ 
+ 	undo_idling(dev_priv, interruptible);
+ }
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem_tiling.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/i915_gem_tiling.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem_tiling.c
+@@ -470,18 +470,20 @@ i915_gem_swizzle_page(struct page *page)
+ void
+ i915_gem_object_do_bit_17_swizzle(struct drm_i915_gem_object *obj)
+ {
++	struct scatterlist *sg;
+ 	int page_count = obj->base.size >> PAGE_SHIFT;
+ 	int i;
+ 
+ 	if (obj->bit_17 == NULL)
+ 		return;
+ 
+-	for (i = 0; i < page_count; i++) {
+-		char new_bit_17 = page_to_phys(obj->pages[i]) >> 17;
++	for_each_sg(obj->pages->sgl, sg, page_count, i) {
++		struct page *page = sg_page(sg);
++		char new_bit_17 = page_to_phys(page) >> 17;
+ 		if ((new_bit_17 & 0x1) !=
+ 		    (test_bit(i, obj->bit_17) != 0)) {
+-			i915_gem_swizzle_page(obj->pages[i]);
+-			set_page_dirty(obj->pages[i]);
++			i915_gem_swizzle_page(page);
++			set_page_dirty(page);
+ 		}
+ 	}
+ }
+@@ -489,6 +491,7 @@ i915_gem_object_do_bit_17_swizzle(struct
+ void
+ i915_gem_object_save_bit_17_swizzle(struct drm_i915_gem_object *obj)
+ {
++	struct scatterlist *sg;
+ 	int page_count = obj->base.size >> PAGE_SHIFT;
+ 	int i;
+ 
+@@ -502,8 +505,9 @@ i915_gem_object_save_bit_17_swizzle(stru
+ 		}
+ 	}
+ 
+-	for (i = 0; i < page_count; i++) {
+-		if (page_to_phys(obj->pages[i]) & (1 << 17))
++	for_each_sg(obj->pages->sgl, sg, page_count, i) {
++		struct page *page = sg_page(sg);
++		if (page_to_phys(page) & (1 << 17))
+ 			__set_bit(i, obj->bit_17);
+ 		else
+ 			__clear_bit(i, obj->bit_17);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_irq.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/i915_irq.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_irq.c
+@@ -888,20 +888,20 @@ i915_error_object_create(struct drm_i915
+ 			 struct drm_i915_gem_object *src)
+ {
+ 	struct drm_i915_error_object *dst;
+-	int page, page_count;
++	int i, count;
+ 	u32 reloc_offset;
+ 
+ 	if (src == NULL || src->pages == NULL)
+ 		return NULL;
+ 
+-	page_count = src->base.size / PAGE_SIZE;
++	count = src->base.size / PAGE_SIZE;
+ 
+-	dst = kmalloc(sizeof(*dst) + page_count * sizeof(u32 *), GFP_ATOMIC);
++	dst = kmalloc(sizeof(*dst) + count * sizeof(u32 *), GFP_ATOMIC);
+ 	if (dst == NULL)
+ 		return NULL;
+ 
+ 	reloc_offset = src->gtt_offset;
+-	for (page = 0; page < page_count; page++) {
++	for (i = 0; i < count; i++) {
+ 		unsigned long flags;
+ 		void *d;
+ 
+@@ -924,30 +924,33 @@ i915_error_object_create(struct drm_i915
+ 			memcpy_fromio(d, s, PAGE_SIZE);
+ 			io_mapping_unmap_atomic(s);
+ 		} else {
++			struct page *page;
+ 			void *s;
+ 
+-			drm_clflush_pages(&src->pages[page], 1);
++			page = i915_gem_object_get_page(src, i);
+ 
+-			s = kmap_atomic(src->pages[page]);
++			drm_clflush_pages(&page, 1);
++
++			s = kmap_atomic(page);
+ 			memcpy(d, s, PAGE_SIZE);
+ 			kunmap_atomic(s);
+ 
+-			drm_clflush_pages(&src->pages[page], 1);
++			drm_clflush_pages(&page, 1);
+ 		}
+ 		local_irq_restore(flags);
+ 
+-		dst->pages[page] = d;
++		dst->pages[i] = d;
+ 
+ 		reloc_offset += PAGE_SIZE;
+ 	}
+-	dst->page_count = page_count;
++	dst->page_count = count;
+ 	dst->gtt_offset = src->gtt_offset;
+ 
+ 	return dst;
+ 
+ unwind:
+-	while (page--)
+-		kfree(dst->pages[page]);
++	while (i--)
++		kfree(dst->pages[i]);
+ 	kfree(dst);
+ 	return NULL;
+ }
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_ringbuffer.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -464,7 +464,7 @@ init_pipe_control(struct intel_ring_buff
+ 		goto err_unref;
+ 
+ 	pc->gtt_offset = obj->gtt_offset;
+-	pc->cpu_page =  kmap(obj->pages[0]);
++	pc->cpu_page =  kmap(sg_page(obj->pages->sgl));
+ 	if (pc->cpu_page == NULL)
+ 		goto err_unpin;
+ 
+@@ -491,7 +491,8 @@ cleanup_pipe_control(struct intel_ring_b
+ 		return;
+ 
+ 	obj = pc->obj;
+-	kunmap(obj->pages[0]);
++
++	kunmap(sg_page(obj->pages->sgl));
+ 	i915_gem_object_unpin(obj);
+ 	drm_gem_object_unreference(&obj->base);
+ 
+@@ -1027,7 +1028,7 @@ static void cleanup_status_page(struct i
+ 	if (obj == NULL)
+ 		return;
+ 
+-	kunmap(obj->pages[0]);
++	kunmap(sg_page(obj->pages->sgl));
+ 	i915_gem_object_unpin(obj);
+ 	drm_gem_object_unreference(&obj->base);
+ 	ring->status_page.obj = NULL;
+@@ -1054,7 +1055,7 @@ static int init_status_page(struct intel
+ 	}
+ 
+ 	ring->status_page.gfx_addr = obj->gtt_offset;
+-	ring->status_page.page_addr = kmap(obj->pages[0]);
++	ring->status_page.page_addr = kmap(sg_page(obj->pages->sgl));
+ 	if (ring->status_page.page_addr == NULL) {
+ 		ret = -ENOMEM;
+ 		goto err_unpin;
+Index: linux-3.0-SLE11-SP3/include/drm/drmP.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/include/drm/drmP.h
++++ linux-3.0-SLE11-SP3/include/drm/drmP.h
+@@ -1367,6 +1367,7 @@ extern int drm_remove_magic(struct drm_m
+ 
+ /* Cache management (drm_cache.c) */
+ void drm_clflush_pages(struct page *pages[], unsigned long num_pages);
++void drm_clflush_sg(struct sg_table *st);
+ void drm_clflush_virt_range(char *addr, unsigned long length);
+ 
+ 				/* Locking IOCTL support (drm_lock.h) */
+Index: linux-3.0-SLE11-SP3/include/drm/intel-gtt.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/include/drm/intel-gtt.h
++++ linux-3.0-SLE11-SP3/include/drm/intel-gtt.h
+@@ -30,16 +30,10 @@ void intel_gmch_remove(void);
+ bool intel_enable_gtt(void);
+ 
+ void intel_gtt_chipset_flush(void);
+-void intel_gtt_unmap_memory(struct scatterlist *sg_list, int num_sg);
+-void intel_gtt_clear_range(unsigned int first_entry, unsigned int num_entries);
+-int intel_gtt_map_memory(struct page **pages, unsigned int num_entries,
+-			 struct scatterlist **sg_list, int *num_sg);
+-void intel_gtt_insert_sg_entries(struct scatterlist *sg_list,
+-				 unsigned int sg_len,
++void intel_gtt_insert_sg_entries(struct sg_table *st,
+ 				 unsigned int pg_start,
+ 				 unsigned int flags);
+-void intel_gtt_insert_pages(unsigned int first_entry, unsigned int num_entries,
+-			    struct page **pages, unsigned int flags);
++void intel_gtt_clear_range(unsigned int first_entry, unsigned int num_entries);
+ 
+ /* Special gtt memory types */
+ #define AGP_DCACHE_MEMORY	1
