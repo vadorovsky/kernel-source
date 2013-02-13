@@ -1,0 +1,772 @@
+From bc9e7b9a61e9e92ddb58920cb2cb5c2e2825ca8a Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Thu, 19 Jul 2012 17:54:21 +1000
+Subject: drm/nouveau: move some more code around to more appropriate places
+Git-commit: bc9e7b9a61e9e92ddb58920cb2cb5c2e2825ca8a
+Patch-mainline: v3.7-rc3
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/nouveau/nouveau_bo.c  |  111 +++++++++++-
+ drivers/gpu/drm/nouveau/nouveau_drv.h |    6 -
+ drivers/gpu/drm/nouveau/nouveau_mem.c |  332 ---------------------------------
+ drivers/gpu/drm/nouveau/nouveau_ttm.c |  229 ++++++++++++++++++++++-
+ 4 files changed, 336 insertions(+), 342 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index 9f5696a..c3e66ae0 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -36,10 +36,115 @@
+ #include <core/mm.h>
+ #include "nouveau_fence.h"
+ #include <core/ramht.h>
++#include <engine/fifo.h>
+ 
+ #include <linux/log2.h>
+ #include <linux/slab.h>
+ 
++/*
++ * NV10-NV40 tiling helpers
++ */
++
++static void
++nv10_bo_update_tile_region(struct drm_device *dev,
++			    struct nouveau_tile_reg *tilereg, uint32_t addr,
++			    uint32_t size, uint32_t pitch, uint32_t flags)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	int i = tilereg - dev_priv->tile.reg, j;
++	struct nouveau_fb_tile *tile = nvfb_tile(dev, i);
++	unsigned long save;
++
++	nouveau_fence_unref(&tilereg->fence);
++
++	if (tile->pitch)
++		nvfb_tile_fini(dev, i);
++
++	if (pitch)
++		nvfb_tile_init(dev, i, addr, size, pitch, flags);
++
++	spin_lock_irqsave(&dev_priv->context_switch_lock, save);
++	nv_wr32(dev, NV03_PFIFO_CACHES, 0);
++	nv04_fifo_cache_pull(dev, false);
++
++	nouveau_wait_for_idle(dev);
++
++	nvfb_tile_prog(dev, i);
++	for (j = 0; j < NVOBJ_ENGINE_NR; j++) {
++		if (dev_priv->eng[j] && dev_priv->eng[j]->set_tile_region)
++			dev_priv->eng[j]->set_tile_region(dev, i);
++	}
++
++	nv04_fifo_cache_pull(dev, true);
++	nv_wr32(dev, NV03_PFIFO_CACHES, 1);
++	spin_unlock_irqrestore(&dev_priv->context_switch_lock, save);
++}
++
++static struct nouveau_tile_reg *
++nv10_bo_get_tile_region(struct drm_device *dev, int i)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct nouveau_tile_reg *tile = &dev_priv->tile.reg[i];
++
++	spin_lock(&dev_priv->tile.lock);
++
++	if (!tile->used &&
++	    (!tile->fence || nouveau_fence_done(tile->fence)))
++		tile->used = true;
++	else
++		tile = NULL;
++
++	spin_unlock(&dev_priv->tile.lock);
++	return tile;
++}
++
++static void
++nv10_bo_put_tile_region(struct drm_device *dev, struct nouveau_tile_reg *tile,
++			 struct nouveau_fence *fence)
++{
++	struct drm_nouveau_private *dev_priv = dev->dev_private;
++
++	if (tile) {
++		spin_lock(&dev_priv->tile.lock);
++		if (fence) {
++			/* Mark it as pending. */
++			tile->fence = fence;
++			nouveau_fence_ref(fence);
++		}
++
++		tile->used = false;
++		spin_unlock(&dev_priv->tile.lock);
++	}
++}
++
++static struct nouveau_tile_reg *
++nv10_bo_set_tiling(struct drm_device *dev, uint32_t addr, uint32_t size,
++		    uint32_t pitch, uint32_t flags)
++{
++	struct nouveau_tile_reg *tile, *found = NULL;
++	int i;
++
++	for (i = 0; i < nvfb_tile_nr(dev); i++) {
++		tile = nv10_bo_get_tile_region(dev, i);
++
++		if (pitch && !found) {
++			found = tile;
++			continue;
++
++		} else if (tile && nvfb_tile(dev, i)->pitch) {
++			/* Kill an unused tile region. */
++			nv10_bo_update_tile_region(dev, tile, 0, 0, 0, 0);
++		}
++
++		nv10_bo_put_tile_region(dev, tile, NULL);
++	}
++
++	if (found)
++		nv10_bo_update_tile_region(dev, found, addr, size,
++					    pitch, flags);
++	return found;
++}
++
+ static void
+ nouveau_bo_del_ttm(struct ttm_buffer_object *bo)
+ {
+@@ -50,7 +155,7 @@ nouveau_bo_del_ttm(struct ttm_buffer_object *bo)
+ 	if (unlikely(nvbo->gem))
+ 		DRM_ERROR("bo %p still attached to GEM object\n", bo);
+ 
+-	nv10_mem_put_tile_region(dev, nvbo->tile, NULL);
++	nv10_bo_put_tile_region(dev, nvbo->tile, NULL);
+ 	kfree(nvbo);
+ }
+ 
+@@ -1075,7 +1180,7 @@ nouveau_bo_vm_bind(struct ttm_buffer_object *bo, struct ttm_mem_reg *new_mem,
+ 		return 0;
+ 
+ 	if (dev_priv->card_type >= NV_10) {
+-		*new_tile = nv10_mem_set_tiling(dev, offset, new_mem->size,
++		*new_tile = nv10_bo_set_tiling(dev, offset, new_mem->size,
+ 						nvbo->tile_mode,
+ 						nvbo->tile_flags);
+ 	}
+@@ -1091,7 +1196,7 @@ nouveau_bo_vm_cleanup(struct ttm_buffer_object *bo,
+ 	struct drm_nouveau_private *dev_priv = nouveau_bdev(bo->bdev);
+ 	struct drm_device *dev = dev_priv->dev;
+ 
+-	nv10_mem_put_tile_region(dev, *old_tile, bo->sync_obj);
++	nv10_bo_put_tile_region(dev, *old_tile, bo->sync_obj);
+ 	*old_tile = new_tile;
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drv.h b/drivers/gpu/drm/nouveau/nouveau_drv.h
+index 42ea8ad..08ce60b 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drv.h
++++ b/drivers/gpu/drm/nouveau/nouveau_drv.h
+@@ -596,12 +596,6 @@ extern int  nouveau_mem_timing_calc(struct drm_device *, u32 freq,
+ extern void nouveau_mem_timing_read(struct drm_device *,
+ 				    struct nouveau_pm_memtiming *);
+ extern int nouveau_mem_vbios_type(struct drm_device *);
+-extern struct nouveau_tile_reg *nv10_mem_set_tiling(
+-	struct drm_device *dev, uint32_t addr, uint32_t size,
+-	uint32_t pitch, uint32_t flags);
+-extern void nv10_mem_put_tile_region(struct drm_device *dev,
+-				     struct nouveau_tile_reg *tile,
+-				     struct nouveau_fence *fence);
+ extern const struct ttm_mem_type_manager_func nouveau_vram_manager;
+ extern const struct ttm_mem_type_manager_func nouveau_gart_manager;
+ extern const struct ttm_mem_type_manager_func nv04_gart_manager;
+diff --git a/drivers/gpu/drm/nouveau/nouveau_mem.c b/drivers/gpu/drm/nouveau/nouveau_mem.c
+index 48131ce..73176bc 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_mem.c
++++ b/drivers/gpu/drm/nouveau/nouveau_mem.c
+@@ -42,110 +42,6 @@
+ #include "nouveau_fence.h"
+ 
+ /*
+- * NV10-NV40 tiling helpers
+- */
+-
+-static void
+-nv10_mem_update_tile_region(struct drm_device *dev,
+-			    struct nouveau_tile_reg *tilereg, uint32_t addr,
+-			    uint32_t size, uint32_t pitch, uint32_t flags)
+-{
+-	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	int i = tilereg - dev_priv->tile.reg, j;
+-	struct nouveau_fb_tile *tile = nvfb_tile(dev, i);
+-	unsigned long save;
+-
+-	nouveau_fence_unref(&tilereg->fence);
+-
+-	if (tile->pitch)
+-		nvfb_tile_fini(dev, i);
+-
+-	if (pitch)
+-		nvfb_tile_init(dev, i, addr, size, pitch, flags);
+-
+-	spin_lock_irqsave(&dev_priv->context_switch_lock, save);
+-	nv_wr32(dev, NV03_PFIFO_CACHES, 0);
+-	nv04_fifo_cache_pull(dev, false);
+-
+-	nouveau_wait_for_idle(dev);
+-
+-	nvfb_tile_prog(dev, i);
+-	for (j = 0; j < NVOBJ_ENGINE_NR; j++) {
+-		if (dev_priv->eng[j] && dev_priv->eng[j]->set_tile_region)
+-			dev_priv->eng[j]->set_tile_region(dev, i);
+-	}
+-
+-	nv04_fifo_cache_pull(dev, true);
+-	nv_wr32(dev, NV03_PFIFO_CACHES, 1);
+-	spin_unlock_irqrestore(&dev_priv->context_switch_lock, save);
+-}
+-
+-static struct nouveau_tile_reg *
+-nv10_mem_get_tile_region(struct drm_device *dev, int i)
+-{
+-	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-	struct nouveau_tile_reg *tile = &dev_priv->tile.reg[i];
+-
+-	spin_lock(&dev_priv->tile.lock);
+-
+-	if (!tile->used &&
+-	    (!tile->fence || nouveau_fence_done(tile->fence)))
+-		tile->used = true;
+-	else
+-		tile = NULL;
+-
+-	spin_unlock(&dev_priv->tile.lock);
+-	return tile;
+-}
+-
+-void
+-nv10_mem_put_tile_region(struct drm_device *dev, struct nouveau_tile_reg *tile,
+-			 struct nouveau_fence *fence)
+-{
+-	struct drm_nouveau_private *dev_priv = dev->dev_private;
+-
+-	if (tile) {
+-		spin_lock(&dev_priv->tile.lock);
+-		if (fence) {
+-			/* Mark it as pending. */
+-			tile->fence = fence;
+-			nouveau_fence_ref(fence);
+-		}
+-
+-		tile->used = false;
+-		spin_unlock(&dev_priv->tile.lock);
+-	}
+-}
+-
+-struct nouveau_tile_reg *
+-nv10_mem_set_tiling(struct drm_device *dev, uint32_t addr, uint32_t size,
+-		    uint32_t pitch, uint32_t flags)
+-{
+-	struct nouveau_tile_reg *tile, *found = NULL;
+-	int i;
+-
+-	for (i = 0; i < nvfb_tile_nr(dev); i++) {
+-		tile = nv10_mem_get_tile_region(dev, i);
+-
+-		if (pitch && !found) {
+-			found = tile;
+-			continue;
+-
+-		} else if (tile && nvfb_tile(dev, i)->pitch) {
+-			/* Kill an unused tile region. */
+-			nv10_mem_update_tile_region(dev, tile, 0, 0, 0, 0);
+-		}
+-
+-		nv10_mem_put_tile_region(dev, tile, NULL);
+-	}
+-
+-	if (found)
+-		nv10_mem_update_tile_region(dev, found, addr, size,
+-					    pitch, flags);
+-	return found;
+-}
+-
+-/*
+  * Cleanup everything
+  */
+ void
+@@ -897,231 +793,3 @@ nouveau_mem_vbios_type(struct drm_device *dev)
+ 	}
+ 	return NV_MEM_TYPE_UNKNOWN;
+ }
+-
+-static int
+-nouveau_vram_manager_init(struct ttm_mem_type_manager *man, unsigned long psize)
+-{
+-	/* nothing to do */
+-	return 0;
+-}
+-
+-static int
+-nouveau_vram_manager_fini(struct ttm_mem_type_manager *man)
+-{
+-	/* nothing to do */
+-	return 0;
+-}
+-
+-static inline void
+-nouveau_mem_node_cleanup(struct nouveau_mem *node)
+-{
+-	if (node->vma[0].node) {
+-		nouveau_vm_unmap(&node->vma[0]);
+-		nouveau_vm_put(&node->vma[0]);
+-	}
+-
+-	if (node->vma[1].node) {
+-		nouveau_vm_unmap(&node->vma[1]);
+-		nouveau_vm_put(&node->vma[1]);
+-	}
+-}
+-
+-static void
+-nouveau_vram_manager_del(struct ttm_mem_type_manager *man,
+-			 struct ttm_mem_reg *mem)
+-{
+-	struct drm_nouveau_private *dev_priv = nouveau_bdev(man->bdev);
+-	struct drm_device *dev = dev_priv->dev;
+-
+-	nouveau_mem_node_cleanup(mem->mm_node);
+-	nvfb_vram_put(dev, (struct nouveau_mem **)&mem->mm_node);
+-}
+-
+-static int
+-nouveau_vram_manager_new(struct ttm_mem_type_manager *man,
+-			 struct ttm_buffer_object *bo,
+-			 struct ttm_placement *placement,
+-			 struct ttm_mem_reg *mem)
+-{
+-	struct drm_nouveau_private *dev_priv = nouveau_bdev(man->bdev);
+-	struct drm_device *dev = dev_priv->dev;
+-	struct nouveau_bo *nvbo = nouveau_bo(bo);
+-	struct nouveau_mem *node;
+-	u32 size_nc = 0;
+-	int ret;
+-
+-	if (nvbo->tile_flags & NOUVEAU_GEM_TILE_NONCONTIG)
+-		size_nc = 1 << nvbo->page_shift;
+-
+-	ret = nvfb_vram_get(dev, mem->num_pages << PAGE_SHIFT,
+-			mem->page_alignment << PAGE_SHIFT, size_nc,
+-			(nvbo->tile_flags >> 8) & 0x3ff, &node);
+-	if (ret) {
+-		mem->mm_node = NULL;
+-		return (ret == -ENOSPC) ? 0 : ret;
+-	}
+-
+-	node->page_shift = nvbo->page_shift;
+-
+-	mem->mm_node = node;
+-	mem->start   = node->offset >> PAGE_SHIFT;
+-	return 0;
+-}
+-
+-void
+-nouveau_vram_manager_debug(struct ttm_mem_type_manager *man, const char *prefix)
+-{
+-	struct nouveau_mm *mm = man->priv;
+-	struct nouveau_mm_node *r;
+-	u32 total = 0, free = 0;
+-
+-	mutex_lock(&mm->mutex);
+-	list_for_each_entry(r, &mm->nodes, nl_entry) {
+-		printk(KERN_DEBUG "%s %d: 0x%010llx 0x%010llx\n",
+-		       prefix, r->type, ((u64)r->offset << 12),
+-		       (((u64)r->offset + r->length) << 12));
+-
+-		total += r->length;
+-		if (!r->type)
+-			free += r->length;
+-	}
+-	mutex_unlock(&mm->mutex);
+-
+-	printk(KERN_DEBUG "%s  total: 0x%010llx free: 0x%010llx\n",
+-	       prefix, (u64)total << 12, (u64)free << 12);
+-	printk(KERN_DEBUG "%s  block: 0x%08x\n",
+-	       prefix, mm->block_size << 12);
+-}
+-
+-const struct ttm_mem_type_manager_func nouveau_vram_manager = {
+-	nouveau_vram_manager_init,
+-	nouveau_vram_manager_fini,
+-	nouveau_vram_manager_new,
+-	nouveau_vram_manager_del,
+-	nouveau_vram_manager_debug
+-};
+-
+-static int
+-nouveau_gart_manager_init(struct ttm_mem_type_manager *man, unsigned long psize)
+-{
+-	return 0;
+-}
+-
+-static int
+-nouveau_gart_manager_fini(struct ttm_mem_type_manager *man)
+-{
+-	return 0;
+-}
+-
+-static void
+-nouveau_gart_manager_del(struct ttm_mem_type_manager *man,
+-			 struct ttm_mem_reg *mem)
+-{
+-	nouveau_mem_node_cleanup(mem->mm_node);
+-	kfree(mem->mm_node);
+-	mem->mm_node = NULL;
+-}
+-
+-static int
+-nouveau_gart_manager_new(struct ttm_mem_type_manager *man,
+-			 struct ttm_buffer_object *bo,
+-			 struct ttm_placement *placement,
+-			 struct ttm_mem_reg *mem)
+-{
+-	struct drm_nouveau_private *dev_priv = nouveau_bdev(bo->bdev);
+-	struct nouveau_mem *node;
+-
+-	if (unlikely((mem->num_pages << PAGE_SHIFT) >=
+-		     dev_priv->gart_info.aper_size))
+-		return -ENOMEM;
+-
+-	node = kzalloc(sizeof(*node), GFP_KERNEL);
+-	if (!node)
+-		return -ENOMEM;
+-	node->page_shift = 12;
+-
+-	mem->mm_node = node;
+-	mem->start   = 0;
+-	return 0;
+-}
+-
+-void
+-nouveau_gart_manager_debug(struct ttm_mem_type_manager *man, const char *prefix)
+-{
+-}
+-
+-const struct ttm_mem_type_manager_func nouveau_gart_manager = {
+-	nouveau_gart_manager_init,
+-	nouveau_gart_manager_fini,
+-	nouveau_gart_manager_new,
+-	nouveau_gart_manager_del,
+-	nouveau_gart_manager_debug
+-};
+-
+-static int
+-nv04_gart_manager_init(struct ttm_mem_type_manager *man, unsigned long psize)
+-{
+-	struct drm_nouveau_private *dev_priv = nouveau_bdev(man->bdev);
+-	struct drm_device *dev = dev_priv->dev;
+-	man->priv = nv04vm_ref(dev);
+-	return (man->priv != NULL) ? 0 : -ENODEV;
+-}
+-
+-static int
+-nv04_gart_manager_fini(struct ttm_mem_type_manager *man)
+-{
+-	struct nouveau_vm *vm = man->priv;
+-	nouveau_vm_ref(NULL, &vm, NULL);
+-	man->priv = NULL;
+-	return 0;
+-}
+-
+-static void
+-nv04_gart_manager_del(struct ttm_mem_type_manager *man, struct ttm_mem_reg *mem)
+-{
+-	struct nouveau_mem *node = mem->mm_node;
+-	if (node->vma[0].node)
+-		nouveau_vm_put(&node->vma[0]);
+-	kfree(mem->mm_node);
+-	mem->mm_node = NULL;
+-}
+-
+-static int
+-nv04_gart_manager_new(struct ttm_mem_type_manager *man,
+-		      struct ttm_buffer_object *bo,
+-		      struct ttm_placement *placement,
+-		      struct ttm_mem_reg *mem)
+-{
+-	struct nouveau_mem *node;
+-	int ret;
+-
+-	node = kzalloc(sizeof(*node), GFP_KERNEL);
+-	if (!node)
+-		return -ENOMEM;
+-
+-	node->page_shift = 12;
+-
+-	ret = nouveau_vm_get(man->priv, mem->num_pages << 12, node->page_shift,
+-			     NV_MEM_ACCESS_RW, &node->vma[0]);
+-	if (ret) {
+-		kfree(node);
+-		return ret;
+-	}
+-
+-	mem->mm_node = node;
+-	mem->start   = node->vma[0].offset >> PAGE_SHIFT;
+-	return 0;
+-}
+-
+-void
+-nv04_gart_manager_debug(struct ttm_mem_type_manager *man, const char *prefix)
+-{
+-}
+-
+-const struct ttm_mem_type_manager_func nv04_gart_manager = {
+-	nv04_gart_manager_init,
+-	nv04_gart_manager_fini,
+-	nv04_gart_manager_new,
+-	nv04_gart_manager_del,
+-	nv04_gart_manager_debug
+-};
+diff --git a/drivers/gpu/drm/nouveau/nouveau_ttm.c b/drivers/gpu/drm/nouveau/nouveau_ttm.c
+index bd35f93..e729535 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_ttm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_ttm.c
+@@ -28,6 +28,234 @@
+ 
+ #include "nouveau_drv.h"
+ 
++static int
++nouveau_vram_manager_init(struct ttm_mem_type_manager *man, unsigned long psize)
++{
++	/* nothing to do */
++	return 0;
++}
++
++static int
++nouveau_vram_manager_fini(struct ttm_mem_type_manager *man)
++{
++	/* nothing to do */
++	return 0;
++}
++
++static inline void
++nouveau_mem_node_cleanup(struct nouveau_mem *node)
++{
++	if (node->vma[0].node) {
++		nouveau_vm_unmap(&node->vma[0]);
++		nouveau_vm_put(&node->vma[0]);
++	}
++
++	if (node->vma[1].node) {
++		nouveau_vm_unmap(&node->vma[1]);
++		nouveau_vm_put(&node->vma[1]);
++	}
++}
++
++static void
++nouveau_vram_manager_del(struct ttm_mem_type_manager *man,
++			 struct ttm_mem_reg *mem)
++{
++	struct drm_nouveau_private *dev_priv = nouveau_bdev(man->bdev);
++	struct drm_device *dev = dev_priv->dev;
++
++	nouveau_mem_node_cleanup(mem->mm_node);
++	nvfb_vram_put(dev, (struct nouveau_mem **)&mem->mm_node);
++}
++
++static int
++nouveau_vram_manager_new(struct ttm_mem_type_manager *man,
++			 struct ttm_buffer_object *bo,
++			 struct ttm_placement *placement,
++			 struct ttm_mem_reg *mem)
++{
++	struct drm_nouveau_private *dev_priv = nouveau_bdev(man->bdev);
++	struct drm_device *dev = dev_priv->dev;
++	struct nouveau_bo *nvbo = nouveau_bo(bo);
++	struct nouveau_mem *node;
++	u32 size_nc = 0;
++	int ret;
++
++	if (nvbo->tile_flags & NOUVEAU_GEM_TILE_NONCONTIG)
++		size_nc = 1 << nvbo->page_shift;
++
++	ret = nvfb_vram_get(dev, mem->num_pages << PAGE_SHIFT,
++			mem->page_alignment << PAGE_SHIFT, size_nc,
++			(nvbo->tile_flags >> 8) & 0x3ff, &node);
++	if (ret) {
++		mem->mm_node = NULL;
++		return (ret == -ENOSPC) ? 0 : ret;
++	}
++
++	node->page_shift = nvbo->page_shift;
++
++	mem->mm_node = node;
++	mem->start   = node->offset >> PAGE_SHIFT;
++	return 0;
++}
++
++void
++nouveau_vram_manager_debug(struct ttm_mem_type_manager *man, const char *prefix)
++{
++	struct nouveau_mm *mm = man->priv;
++	struct nouveau_mm_node *r;
++	u32 total = 0, free = 0;
++
++	mutex_lock(&mm->mutex);
++	list_for_each_entry(r, &mm->nodes, nl_entry) {
++		printk(KERN_DEBUG "%s %d: 0x%010llx 0x%010llx\n",
++		       prefix, r->type, ((u64)r->offset << 12),
++		       (((u64)r->offset + r->length) << 12));
++
++		total += r->length;
++		if (!r->type)
++			free += r->length;
++	}
++	mutex_unlock(&mm->mutex);
++
++	printk(KERN_DEBUG "%s  total: 0x%010llx free: 0x%010llx\n",
++	       prefix, (u64)total << 12, (u64)free << 12);
++	printk(KERN_DEBUG "%s  block: 0x%08x\n",
++	       prefix, mm->block_size << 12);
++}
++
++const struct ttm_mem_type_manager_func nouveau_vram_manager = {
++	nouveau_vram_manager_init,
++	nouveau_vram_manager_fini,
++	nouveau_vram_manager_new,
++	nouveau_vram_manager_del,
++	nouveau_vram_manager_debug
++};
++
++static int
++nouveau_gart_manager_init(struct ttm_mem_type_manager *man, unsigned long psize)
++{
++	return 0;
++}
++
++static int
++nouveau_gart_manager_fini(struct ttm_mem_type_manager *man)
++{
++	return 0;
++}
++
++static void
++nouveau_gart_manager_del(struct ttm_mem_type_manager *man,
++			 struct ttm_mem_reg *mem)
++{
++	nouveau_mem_node_cleanup(mem->mm_node);
++	kfree(mem->mm_node);
++	mem->mm_node = NULL;
++}
++
++static int
++nouveau_gart_manager_new(struct ttm_mem_type_manager *man,
++			 struct ttm_buffer_object *bo,
++			 struct ttm_placement *placement,
++			 struct ttm_mem_reg *mem)
++{
++	struct drm_nouveau_private *dev_priv = nouveau_bdev(bo->bdev);
++	struct nouveau_mem *node;
++
++	if (unlikely((mem->num_pages << PAGE_SHIFT) >=
++		     dev_priv->gart_info.aper_size))
++		return -ENOMEM;
++
++	node = kzalloc(sizeof(*node), GFP_KERNEL);
++	if (!node)
++		return -ENOMEM;
++	node->page_shift = 12;
++
++	mem->mm_node = node;
++	mem->start   = 0;
++	return 0;
++}
++
++void
++nouveau_gart_manager_debug(struct ttm_mem_type_manager *man, const char *prefix)
++{
++}
++
++const struct ttm_mem_type_manager_func nouveau_gart_manager = {
++	nouveau_gart_manager_init,
++	nouveau_gart_manager_fini,
++	nouveau_gart_manager_new,
++	nouveau_gart_manager_del,
++	nouveau_gart_manager_debug
++};
++
++static int
++nv04_gart_manager_init(struct ttm_mem_type_manager *man, unsigned long psize)
++{
++	struct drm_nouveau_private *dev_priv = nouveau_bdev(man->bdev);
++	struct drm_device *dev = dev_priv->dev;
++	man->priv = nv04vm_ref(dev);
++	return (man->priv != NULL) ? 0 : -ENODEV;
++}
++
++static int
++nv04_gart_manager_fini(struct ttm_mem_type_manager *man)
++{
++	struct nouveau_vm *vm = man->priv;
++	nouveau_vm_ref(NULL, &vm, NULL);
++	man->priv = NULL;
++	return 0;
++}
++
++static void
++nv04_gart_manager_del(struct ttm_mem_type_manager *man, struct ttm_mem_reg *mem)
++{
++	struct nouveau_mem *node = mem->mm_node;
++	if (node->vma[0].node)
++		nouveau_vm_put(&node->vma[0]);
++	kfree(mem->mm_node);
++	mem->mm_node = NULL;
++}
++
++static int
++nv04_gart_manager_new(struct ttm_mem_type_manager *man,
++		      struct ttm_buffer_object *bo,
++		      struct ttm_placement *placement,
++		      struct ttm_mem_reg *mem)
++{
++	struct nouveau_mem *node;
++	int ret;
++
++	node = kzalloc(sizeof(*node), GFP_KERNEL);
++	if (!node)
++		return -ENOMEM;
++
++	node->page_shift = 12;
++
++	ret = nouveau_vm_get(man->priv, mem->num_pages << 12, node->page_shift,
++			     NV_MEM_ACCESS_RW, &node->vma[0]);
++	if (ret) {
++		kfree(node);
++		return ret;
++	}
++
++	mem->mm_node = node;
++	mem->start   = node->vma[0].offset >> PAGE_SHIFT;
++	return 0;
++}
++
++void
++nv04_gart_manager_debug(struct ttm_mem_type_manager *man, const char *prefix)
++{
++}
++
++const struct ttm_mem_type_manager_func nv04_gart_manager = {
++	nv04_gart_manager_init,
++	nv04_gart_manager_fini,
++	nv04_gart_manager_new,
++	nv04_gart_manager_del,
++	nv04_gart_manager_debug
++};
++
+ int
+ nouveau_ttm_mmap(struct file *filp, struct vm_area_struct *vma)
+ {
+@@ -100,4 +328,3 @@ nouveau_ttm_global_release(struct drm_nouveau_private *dev_priv)
+ 	drm_global_item_unref(&dev_priv->ttm.mem_global_ref);
+ 	dev_priv->ttm.mem_global_ref.release = NULL;
+ }
+-
+
