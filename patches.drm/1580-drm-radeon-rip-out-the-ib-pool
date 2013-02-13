@@ -1,0 +1,493 @@
+From c507f7ef305e1c030b9f09fd0e5f3cb9cad995f0 Mon Sep 17 00:00:00 2001
+From: Jerome Glisse <jglisse@redhat.com>
+Date: Wed, 9 May 2012 15:34:58 +0200
+Subject: drm/radeon: rip out the ib pool
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: c507f7ef305e1c030b9f09fd0e5f3cb9cad995f0
+Patch-mainline: v3.5-rc1
+
+It isn't necessary any more and the suballocator seems to perform
+even better.
+
+Signed-off-by: Christian König <deathsimple@vodafone.de>
+Signed-off-by: Jerome Glisse <jglisse@redhat.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/radeon.h           |   17 +--
+ drivers/gpu/drm/radeon/radeon_device.c    |    1 -
+ drivers/gpu/drm/radeon/radeon_gart.c      |   12 +-
+ drivers/gpu/drm/radeon/radeon_ring.c      |  241 ++++++++---------------------
+ drivers/gpu/drm/radeon/radeon_semaphore.c |    2 +-
+ 5 files changed, 71 insertions(+), 202 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 45164e1..6170307 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -625,7 +625,6 @@ void radeon_irq_kms_pflip_irq_put(struct radeon_device *rdev, int crtc);
+ 
+ struct radeon_ib {
+ 	struct radeon_sa_bo	*sa_bo;
+-	unsigned		idx;
+ 	uint32_t		length_dw;
+ 	uint64_t		gpu_addr;
+ 	uint32_t		*ptr;
+@@ -634,18 +633,6 @@ struct radeon_ib {
+ 	bool			is_const_ib;
+ };
+ 
+-/*
+- * locking -
+- * mutex protects scheduled_ibs, ready, alloc_bm
+- */
+-struct radeon_ib_pool {
+-	struct radeon_mutex		mutex;
+-	struct radeon_sa_manager	sa_manager;
+-	struct radeon_ib		ibs[RADEON_IB_POOL_SIZE];
+-	bool				ready;
+-	unsigned			head_id;
+-};
+-
+ struct radeon_ring {
+ 	struct radeon_bo	*ring_obj;
+ 	volatile uint32_t	*ring;
+@@ -787,7 +774,6 @@ struct si_rlc {
+ int radeon_ib_get(struct radeon_device *rdev, int ring,
+ 		  struct radeon_ib **ib, unsigned size);
+ void radeon_ib_free(struct radeon_device *rdev, struct radeon_ib **ib);
+-bool radeon_ib_try_free(struct radeon_device *rdev, struct radeon_ib *ib);
+ int radeon_ib_schedule(struct radeon_device *rdev, struct radeon_ib *ib);
+ int radeon_ib_pool_init(struct radeon_device *rdev);
+ void radeon_ib_pool_fini(struct radeon_device *rdev);
+@@ -1522,7 +1508,8 @@ struct radeon_device {
+ 	wait_queue_head_t		fence_queue;
+ 	struct mutex			ring_lock;
+ 	struct radeon_ring		ring[RADEON_NUM_RINGS];
+-	struct radeon_ib_pool		ib_pool;
++	bool				ib_pool_ready;
++	struct radeon_sa_manager	ring_tmp_bo;
+ 	struct radeon_irq		irq;
+ 	struct radeon_asic		*asic;
+ 	struct radeon_gem		gem;
+diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
+index 48876c1..e1bc7e9 100644
+--- a/drivers/gpu/drm/radeon/radeon_device.c
++++ b/drivers/gpu/drm/radeon/radeon_device.c
+@@ -724,7 +724,6 @@ int radeon_device_init(struct radeon_device *rdev,
+ 	/* mutex initialization are all done here so we
+ 	 * can recall function without having locking issues */
+ 	radeon_mutex_init(&rdev->cs_mutex);
+-	radeon_mutex_init(&rdev->ib_pool.mutex);
+ 	mutex_init(&rdev->ring_lock);
+ 	mutex_init(&rdev->dc_hw_i2c_mutex);
+ 	if (rdev->family >= CHIP_R600)
+diff --git a/drivers/gpu/drm/radeon/radeon_gart.c b/drivers/gpu/drm/radeon/radeon_gart.c
+index 53dba8e..8e9ef34 100644
+--- a/drivers/gpu/drm/radeon/radeon_gart.c
++++ b/drivers/gpu/drm/radeon/radeon_gart.c
+@@ -432,8 +432,8 @@ retry_id:
+ 	rdev->vm_manager.use_bitmap |= 1 << id;
+ 	vm->id = id;
+ 	list_add_tail(&vm->list, &rdev->vm_manager.lru_vm);
+-	return radeon_vm_bo_update_pte(rdev, vm, rdev->ib_pool.sa_manager.bo,
+-				       &rdev->ib_pool.sa_manager.bo->tbo.mem);
++	return radeon_vm_bo_update_pte(rdev, vm, rdev->ring_tmp_bo.bo,
++				       &rdev->ring_tmp_bo.bo->tbo.mem);
+ }
+ 
+ /* object have to be reserved */
+@@ -631,7 +631,7 @@ int radeon_vm_init(struct radeon_device *rdev, struct radeon_vm *vm)
+ 	/* map the ib pool buffer at 0 in virtual address space, set
+ 	 * read only
+ 	 */
+-	r = radeon_vm_bo_add(rdev, vm, rdev->ib_pool.sa_manager.bo, 0,
++	r = radeon_vm_bo_add(rdev, vm, rdev->ring_tmp_bo.bo, 0,
+ 			     RADEON_VM_PAGE_READABLE | RADEON_VM_PAGE_SNOOPED);
+ 	return r;
+ }
+@@ -648,12 +648,12 @@ void radeon_vm_fini(struct radeon_device *rdev, struct radeon_vm *vm)
+ 	radeon_mutex_unlock(&rdev->cs_mutex);
+ 
+ 	/* remove all bo */
+-	r = radeon_bo_reserve(rdev->ib_pool.sa_manager.bo, false);
++	r = radeon_bo_reserve(rdev->ring_tmp_bo.bo, false);
+ 	if (!r) {
+-		bo_va = radeon_bo_va(rdev->ib_pool.sa_manager.bo, vm);
++		bo_va = radeon_bo_va(rdev->ring_tmp_bo.bo, vm);
+ 		list_del_init(&bo_va->bo_list);
+ 		list_del_init(&bo_va->vm_list);
+-		radeon_bo_unreserve(rdev->ib_pool.sa_manager.bo);
++		radeon_bo_unreserve(rdev->ring_tmp_bo.bo);
+ 		kfree(bo_va);
+ 	}
+ 	if (!list_empty(&vm->va)) {
+diff --git a/drivers/gpu/drm/radeon/radeon_ring.c b/drivers/gpu/drm/radeon/radeon_ring.c
+index e074ff5..b3d6942 100644
+--- a/drivers/gpu/drm/radeon/radeon_ring.c
++++ b/drivers/gpu/drm/radeon/radeon_ring.c
+@@ -24,6 +24,7 @@
+  * Authors: Dave Airlie
+  *          Alex Deucher
+  *          Jerome Glisse
++ *          Christian König
+  */
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
+@@ -33,8 +34,10 @@
+ #include "radeon.h"
+ #include "atom.h"
+ 
+-int radeon_debugfs_ib_init(struct radeon_device *rdev);
+-int radeon_debugfs_ring_init(struct radeon_device *rdev, struct radeon_ring *ring);
++/*
++ * IB.
++ */
++int radeon_debugfs_sa_init(struct radeon_device *rdev);
+ 
+ u32 radeon_get_ib_value(struct radeon_cs_parser *p, int idx)
+ {
+@@ -61,106 +64,37 @@ u32 radeon_get_ib_value(struct radeon_cs_parser *p, int idx)
+ 	return idx_value;
+ }
+ 
+-void radeon_ring_write(struct radeon_ring *ring, uint32_t v)
+-{
+-#if DRM_DEBUG_CODE
+-	if (ring->count_dw <= 0) {
+-		DRM_ERROR("radeon: writting more dword to ring than expected !\n");
+-	}
+-#endif
+-	ring->ring[ring->wptr++] = v;
+-	ring->wptr &= ring->ptr_mask;
+-	ring->count_dw--;
+-	ring->ring_free_dw--;
+-}
+-
+-/*
+- * IB.
+- */
+-bool radeon_ib_try_free(struct radeon_device *rdev, struct radeon_ib *ib)
+-{
+-	bool done = false;
+-
+-	/* only free ib which have been emited */
+-	if (ib->fence && ib->fence->seq < RADEON_FENCE_NOTEMITED_SEQ) {
+-		if (radeon_fence_signaled(ib->fence)) {
+-			radeon_fence_unref(&ib->fence);
+-			radeon_sa_bo_free(rdev, &ib->sa_bo, NULL);
+-			done = true;
+-		}
+-	}
+-	return done;
+-}
+-
+ int radeon_ib_get(struct radeon_device *rdev, int ring,
+ 		  struct radeon_ib **ib, unsigned size)
+ {
+-	struct radeon_fence *fence;
+-	unsigned cretry = 0;
+-	int r = 0, i, idx;
+-
+-	*ib = NULL;
+-	/* align size on 256 bytes */
+-	size = ALIGN(size, 256);
+-
+-	r = radeon_fence_create(rdev, &fence, ring);
+-	if (r) {
+-		dev_err(rdev->dev, "failed to create fence for new IB\n");
+-		return r;
+-	}
++	int r;
+ 
+-	radeon_mutex_lock(&rdev->ib_pool.mutex);
+-	idx = rdev->ib_pool.head_id;
+-retry:
+-	if (cretry > 5) {
+-		dev_err(rdev->dev, "failed to get an ib after 5 retry\n");
+-		radeon_mutex_unlock(&rdev->ib_pool.mutex);
+-		radeon_fence_unref(&fence);
++	*ib = kmalloc(sizeof(struct radeon_ib), GFP_KERNEL);
++	if (*ib == NULL) {
+ 		return -ENOMEM;
+ 	}
+-	cretry++;
+-	for (i = 0; i < RADEON_IB_POOL_SIZE; i++) {
+-		radeon_ib_try_free(rdev, &rdev->ib_pool.ibs[idx]);
+-		if (rdev->ib_pool.ibs[idx].fence == NULL) {
+-			r = radeon_sa_bo_new(rdev, &rdev->ib_pool.sa_manager,
+-					     &rdev->ib_pool.ibs[idx].sa_bo,
+-					     size, 256, false);
+-			if (!r) {
+-				*ib = &rdev->ib_pool.ibs[idx];
+-				(*ib)->ptr = radeon_sa_bo_cpu_addr((*ib)->sa_bo);
+-				(*ib)->gpu_addr = radeon_sa_bo_gpu_addr((*ib)->sa_bo);
+-				(*ib)->fence = fence;
+-				(*ib)->vm_id = 0;
+-				(*ib)->is_const_ib = false;
+-				/* ib are most likely to be allocated in a ring fashion
+-				 * thus rdev->ib_pool.head_id should be the id of the
+-				 * oldest ib
+-				 */
+-				rdev->ib_pool.head_id = (1 + idx);
+-				rdev->ib_pool.head_id &= (RADEON_IB_POOL_SIZE - 1);
+-				radeon_mutex_unlock(&rdev->ib_pool.mutex);
+-				return 0;
+-			}
+-		}
+-		idx = (idx + 1) & (RADEON_IB_POOL_SIZE - 1);
++	r = radeon_sa_bo_new(rdev, &rdev->ring_tmp_bo, &(*ib)->sa_bo, size, 256, true);
++	if (r) {
++		dev_err(rdev->dev, "failed to get a new IB (%d)\n", r);
++		kfree(*ib);
++		*ib = NULL;
++		return r;
+ 	}
+-	/* this should be rare event, ie all ib scheduled none signaled yet.
+-	 */
+-	for (i = 0; i < RADEON_IB_POOL_SIZE; i++) {
+-		struct radeon_fence *fence = rdev->ib_pool.ibs[idx].fence;
+-		if (fence && fence->seq < RADEON_FENCE_NOTEMITED_SEQ) {
+-			r = radeon_fence_wait(fence, false);
+-			if (!r) {
+-				goto retry;
+-			}
+-			/* an error happened */
+-			break;
+-		}
+-		idx = (idx + 1) & (RADEON_IB_POOL_SIZE - 1);
++	r = radeon_fence_create(rdev, &(*ib)->fence, ring);
++	if (r) {
++		dev_err(rdev->dev, "failed to create fence for new IB (%d)\n", r);
++		radeon_sa_bo_free(rdev, &(*ib)->sa_bo, NULL);
++		kfree(*ib);
++		*ib = NULL;
++		return r;
+ 	}
+-	radeon_mutex_unlock(&rdev->ib_pool.mutex);
+-	radeon_fence_unref(&fence);
+-	return r;
++
++	(*ib)->ptr = radeon_sa_bo_cpu_addr((*ib)->sa_bo);
++	(*ib)->gpu_addr = radeon_sa_bo_gpu_addr((*ib)->sa_bo);
++	(*ib)->vm_id = 0;
++	(*ib)->is_const_ib = false;
++
++	return 0;
+ }
+ 
+ void radeon_ib_free(struct radeon_device *rdev, struct radeon_ib **ib)
+@@ -171,12 +105,9 @@ void radeon_ib_free(struct radeon_device *rdev, struct radeon_ib **ib)
+ 	if (tmp == NULL) {
+ 		return;
+ 	}
+-	radeon_mutex_lock(&rdev->ib_pool.mutex);
+-	if (tmp->fence && tmp->fence->seq == RADEON_FENCE_NOTEMITED_SEQ) {
+-		radeon_sa_bo_free(rdev, &tmp->sa_bo, NULL);
+-		radeon_fence_unref(&tmp->fence);
+-	}
+-	radeon_mutex_unlock(&rdev->ib_pool.mutex);
++	radeon_sa_bo_free(rdev, &tmp->sa_bo, tmp->fence);
++	radeon_fence_unref(&tmp->fence);
++	kfree(tmp);
+ }
+ 
+ int radeon_ib_schedule(struct radeon_device *rdev, struct radeon_ib *ib)
+@@ -186,14 +117,14 @@ int radeon_ib_schedule(struct radeon_device *rdev, struct radeon_ib *ib)
+ 
+ 	if (!ib->length_dw || !ring->ready) {
+ 		/* TODO: Nothings in the ib we should report. */
+-		DRM_ERROR("radeon: couldn't schedule IB(%u).\n", ib->idx);
++		dev_err(rdev->dev, "couldn't schedule ib\n");
+ 		return -EINVAL;
+ 	}
+ 
+ 	/* 64 dwords should be enough for fence too */
+ 	r = radeon_ring_lock(rdev, ring, 64);
+ 	if (r) {
+-		DRM_ERROR("radeon: scheduling IB failed (%d).\n", r);
++		dev_err(rdev->dev, "scheduling IB failed (%d).\n", r);
+ 		return r;
+ 	}
+ 	radeon_ring_ib_execute(rdev, ib->fence->ring, ib);
+@@ -204,63 +135,40 @@ int radeon_ib_schedule(struct radeon_device *rdev, struct radeon_ib *ib)
+ 
+ int radeon_ib_pool_init(struct radeon_device *rdev)
+ {
+-	int i, r;
++	int r;
+ 
+-	radeon_mutex_lock(&rdev->ib_pool.mutex);
+-	if (rdev->ib_pool.ready) {
+-		radeon_mutex_unlock(&rdev->ib_pool.mutex);
++	if (rdev->ib_pool_ready) {
+ 		return 0;
+ 	}
+-
+-	r = radeon_sa_bo_manager_init(rdev, &rdev->ib_pool.sa_manager,
++	r = radeon_sa_bo_manager_init(rdev, &rdev->ring_tmp_bo,
+ 				      RADEON_IB_POOL_SIZE*64*1024,
+ 				      RADEON_GEM_DOMAIN_GTT);
+ 	if (r) {
+-		radeon_mutex_unlock(&rdev->ib_pool.mutex);
+ 		return r;
+ 	}
+-
+-	for (i = 0; i < RADEON_IB_POOL_SIZE; i++) {
+-		rdev->ib_pool.ibs[i].fence = NULL;
+-		rdev->ib_pool.ibs[i].idx = i;
+-		rdev->ib_pool.ibs[i].length_dw = 0;
+-		rdev->ib_pool.ibs[i].sa_bo = NULL;
++	rdev->ib_pool_ready = true;
++	if (radeon_debugfs_sa_init(rdev)) {
++		dev_err(rdev->dev, "failed to register debugfs file for SA\n");
+ 	}
+-	rdev->ib_pool.head_id = 0;
+-	rdev->ib_pool.ready = true;
+-	DRM_INFO("radeon: ib pool ready.\n");
+-
+-	if (radeon_debugfs_ib_init(rdev)) {
+-		DRM_ERROR("Failed to register debugfs file for IB !\n");
+-	}
+-	radeon_mutex_unlock(&rdev->ib_pool.mutex);
+ 	return 0;
+ }
+ 
+ void radeon_ib_pool_fini(struct radeon_device *rdev)
+ {
+-	unsigned i;
+-
+-	radeon_mutex_lock(&rdev->ib_pool.mutex);
+-	if (rdev->ib_pool.ready) {
+-		for (i = 0; i < RADEON_IB_POOL_SIZE; i++) {
+-			radeon_sa_bo_free(rdev, &rdev->ib_pool.ibs[i].sa_bo, NULL);
+-			radeon_fence_unref(&rdev->ib_pool.ibs[i].fence);
+-		}
+-		radeon_sa_bo_manager_fini(rdev, &rdev->ib_pool.sa_manager);
+-		rdev->ib_pool.ready = false;
++	if (rdev->ib_pool_ready) {
++		radeon_sa_bo_manager_fini(rdev, &rdev->ring_tmp_bo);
++		rdev->ib_pool_ready = false;
+ 	}
+-	radeon_mutex_unlock(&rdev->ib_pool.mutex);
+ }
+ 
+ int radeon_ib_pool_start(struct radeon_device *rdev)
+ {
+-	return radeon_sa_bo_manager_start(rdev, &rdev->ib_pool.sa_manager);
++	return radeon_sa_bo_manager_start(rdev, &rdev->ring_tmp_bo);
+ }
+ 
+ int radeon_ib_pool_suspend(struct radeon_device *rdev)
+ {
+-	return radeon_sa_bo_manager_suspend(rdev, &rdev->ib_pool.sa_manager);
++	return radeon_sa_bo_manager_suspend(rdev, &rdev->ring_tmp_bo);
+ }
+ 
+ int radeon_ib_ring_tests(struct radeon_device *rdev)
+@@ -296,6 +204,21 @@ int radeon_ib_ring_tests(struct radeon_device *rdev)
+ /*
+  * Ring.
+  */
++int radeon_debugfs_ring_init(struct radeon_device *rdev, struct radeon_ring *ring);
++
++void radeon_ring_write(struct radeon_ring *ring, uint32_t v)
++{
++#if DRM_DEBUG_CODE
++	if (ring->count_dw <= 0) {
++		DRM_ERROR("radeon: writting more dword to ring than expected !\n");
++	}
++#endif
++	ring->ring[ring->wptr++] = v;
++	ring->wptr &= ring->ptr_mask;
++	ring->count_dw--;
++	ring->ring_free_dw--;
++}
++
+ int radeon_ring_index(struct radeon_device *rdev, struct radeon_ring *ring)
+ {
+ 	/* r1xx-r5xx only has CP ring */
+@@ -575,37 +498,13 @@ static struct drm_info_list radeon_debugfs_ring_info_list[] = {
+ 	{"radeon_ring_cp2", radeon_debugfs_ring_info, 0, &cayman_ring_type_cp2_index},
+ };
+ 
+-static int radeon_debugfs_ib_info(struct seq_file *m, void *data)
+-{
+-	struct drm_info_node *node = (struct drm_info_node *) m->private;
+-	struct drm_device *dev = node->minor->dev;
+-	struct radeon_device *rdev = dev->dev_private;
+-	struct radeon_ib *ib = &rdev->ib_pool.ibs[*((unsigned*)node->info_ent->data)];
+-	unsigned i;
+-
+-	if (ib == NULL) {
+-		return 0;
+-	}
+-	seq_printf(m, "IB %04u\n", ib->idx);
+-	seq_printf(m, "IB fence %p\n", ib->fence);
+-	seq_printf(m, "IB size %05u dwords\n", ib->length_dw);
+-	for (i = 0; i < ib->length_dw; i++) {
+-		seq_printf(m, "[%05u]=0x%08X\n", i, ib->ptr[i]);
+-	}
+-	return 0;
+-}
+-
+-static struct drm_info_list radeon_debugfs_ib_list[RADEON_IB_POOL_SIZE];
+-static char radeon_debugfs_ib_names[RADEON_IB_POOL_SIZE][32];
+-static unsigned radeon_debugfs_ib_idx[RADEON_IB_POOL_SIZE];
+-
+ static int radeon_debugfs_sa_info(struct seq_file *m, void *data)
+ {
+ 	struct drm_info_node *node = (struct drm_info_node *) m->private;
+ 	struct drm_device *dev = node->minor->dev;
+ 	struct radeon_device *rdev = dev->dev_private;
+ 
+-	radeon_sa_bo_dump_debug_info(&rdev->ib_pool.sa_manager, m);
++	radeon_sa_bo_dump_debug_info(&rdev->ring_tmp_bo, m);
+ 
+ 	return 0;
+ 
+@@ -637,26 +536,10 @@ int radeon_debugfs_ring_init(struct radeon_device *rdev, struct radeon_ring *rin
+ 	return 0;
+ }
+ 
+-int radeon_debugfs_ib_init(struct radeon_device *rdev)
++int radeon_debugfs_sa_init(struct radeon_device *rdev)
+ {
+ #if defined(CONFIG_DEBUG_FS)
+-	unsigned i;
+-	int r;
+-
+-	r = radeon_debugfs_add_files(rdev, radeon_debugfs_sa_list, 1);
+-	if (r)
+-		return r;
+-
+-	for (i = 0; i < RADEON_IB_POOL_SIZE; i++) {
+-		sprintf(radeon_debugfs_ib_names[i], "radeon_ib_%04u", i);
+-		radeon_debugfs_ib_idx[i] = i;
+-		radeon_debugfs_ib_list[i].name = radeon_debugfs_ib_names[i];
+-		radeon_debugfs_ib_list[i].show = &radeon_debugfs_ib_info;
+-		radeon_debugfs_ib_list[i].driver_features = 0;
+-		radeon_debugfs_ib_list[i].data = &radeon_debugfs_ib_idx[i];
+-	}
+-	return radeon_debugfs_add_files(rdev, radeon_debugfs_ib_list,
+-					RADEON_IB_POOL_SIZE);
++	return radeon_debugfs_add_files(rdev, radeon_debugfs_sa_list, 1);
+ #else
+ 	return 0;
+ #endif
+diff --git a/drivers/gpu/drm/radeon/radeon_semaphore.c b/drivers/gpu/drm/radeon/radeon_semaphore.c
+index 1bc5513..e2ace5d 100644
+--- a/drivers/gpu/drm/radeon/radeon_semaphore.c
++++ b/drivers/gpu/drm/radeon/radeon_semaphore.c
+@@ -41,7 +41,7 @@ int radeon_semaphore_create(struct radeon_device *rdev,
+ 	if (*semaphore == NULL) {
+ 		return -ENOMEM;
+ 	}
+-	r = radeon_sa_bo_new(rdev, &rdev->ib_pool.sa_manager,
++	r = radeon_sa_bo_new(rdev, &rdev->ring_tmp_bo,
+ 			     &(*semaphore)->sa_bo, 8, 8, true);
+ 	if (r) {
+ 		kfree(*semaphore);
+
