@@ -1,0 +1,436 @@
+From 496734bf0391f38c196e16dbbfaaeda8e6ec5845 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Wed, 11 Jul 2012 16:28:19 +1000
+Subject: drm/nouveau/core: add support for reverse mm allocations
+Git-commit: 496734bf0391f38c196e16dbbfaaeda8e6ec5845
+Patch-mainline: v3.7-rc3
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/nouveau/core/core/mm.c             |  173 ++++++++++++++------
+ drivers/gpu/drm/nouveau/core/include/core/mm.h     |   34 +---
+ drivers/gpu/drm/nouveau/core/subdev/fb/nv50_vram.c |   18 ++-
+ drivers/gpu/drm/nouveau/core/subdev/fb/nvc0_vram.c |   13 +-
+ drivers/gpu/drm/nouveau/core/subdev/vm/base.c      |    9 +-
+ 5 files changed, 154 insertions(+), 93 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/core/core/mm.c b/drivers/gpu/drm/nouveau/core/core/mm.c
+index bf8d4a5..bfddf87 100644
+--- a/drivers/gpu/drm/nouveau/core/core/mm.c
++++ b/drivers/gpu/drm/nouveau/core/core/mm.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright 2010 Red Hat Inc.
++ * Copyright 2012 Red Hat Inc.
+  *
+  * Permission is hereby granted, free of charge, to any person obtaining a
+  * copy of this software and associated documentation files (the "Software"),
+@@ -22,19 +22,52 @@
+  * Authors: Ben Skeggs
+  */
+ 
+-#include <core/os.h>
+-#include <core/mm.h>
++#include "core/os.h"
++#include "core/mm.h"
+ 
+-static inline void
+-region_put(struct nouveau_mm *mm, struct nouveau_mm_node *a)
++#define node(root, dir) ((root)->nl_entry.dir == &mm->nodes) ? NULL : \
++	list_entry((root)->nl_entry.dir, struct nouveau_mm_node, nl_entry)
++
++void
++nouveau_mm_free(struct nouveau_mm *mm, struct nouveau_mm_node **pthis)
+ {
+-	list_del(&a->nl_entry);
+-	list_del(&a->fl_entry);
+-	kfree(a);
++	struct nouveau_mm_node *this = *pthis;
++
++	if (this) {
++		struct nouveau_mm_node *prev = node(this, prev);
++		struct nouveau_mm_node *next = node(this, next);
++
++		if (prev && prev->type == 0) {
++			prev->length += this->length;
++			list_del(&this->nl_entry);
++			kfree(this); this = prev;
++		}
++
++		if (next && next->type == 0) {
++			next->offset  = this->offset;
++			next->length += this->length;
++			if (this->type == 0)
++				list_del(&this->fl_entry);
++			list_del(&this->nl_entry);
++			kfree(this); this = NULL;
++		}
++
++		if (this && this->type != 0) {
++			list_for_each_entry(prev, &mm->free, fl_entry) {
++				if (this->offset < prev->offset)
++					break;
++			}
++
++			list_add_tail(&this->fl_entry, &prev->fl_entry);
++			this->type = 0;
++		}
++	}
++
++	*pthis = NULL;
+ }
+ 
+ static struct nouveau_mm_node *
+-region_split(struct nouveau_mm *mm, struct nouveau_mm_node *a, u32 size)
++region_head(struct nouveau_mm *mm, struct nouveau_mm_node *a, u32 size)
+ {
+ 	struct nouveau_mm_node *b;
+ 
+@@ -56,38 +89,12 @@ region_split(struct nouveau_mm *mm, struct nouveau_mm_node *a, u32 size)
+ 	return b;
+ }
+ 
+-#define node(root, dir) ((root)->nl_entry.dir == &mm->nodes) ? NULL : \
+-	list_entry((root)->nl_entry.dir, struct nouveau_mm_node, nl_entry)
+-
+-void
+-nouveau_mm_put(struct nouveau_mm *mm, struct nouveau_mm_node *this)
+-{
+-	struct nouveau_mm_node *prev = node(this, prev);
+-	struct nouveau_mm_node *next = node(this, next);
+-
+-	list_add(&this->fl_entry, &mm->free);
+-	this->type = 0;
+-
+-	if (prev && prev->type == 0) {
+-		prev->length += this->length;
+-		region_put(mm, this);
+-		this = prev;
+-	}
+-
+-	if (next && next->type == 0) {
+-		next->offset  = this->offset;
+-		next->length += this->length;
+-		region_put(mm, this);
+-	}
+-}
+-
+ int
+-nouveau_mm_get(struct nouveau_mm *mm, int type, u32 size, u32 size_nc,
+-	       u32 align, struct nouveau_mm_node **pnode)
++nouveau_mm_head(struct nouveau_mm *mm, u8 type, u32 size_max, u32 size_min,
++		u32 align, struct nouveau_mm_node **pnode)
+ {
+ 	struct nouveau_mm_node *prev, *this, *next;
+-	u32 min = size_nc ? size_nc : size;
+-	u32 align_mask = align - 1;
++	u32 mask = align - 1;
+ 	u32 splitoff;
+ 	u32 s, e;
+ 
+@@ -103,16 +110,86 @@ nouveau_mm_get(struct nouveau_mm *mm, int type, u32 size, u32 size_nc,
+ 		if (next && next->type != type)
+ 			e = rounddown(e, mm->block_size);
+ 
+-		s  = (s + align_mask) & ~align_mask;
+-		e &= ~align_mask;
+-		if (s > e || e - s < min)
++		s  = (s + mask) & ~mask;
++		e &= ~mask;
++		if (s > e || e - s < size_min)
+ 			continue;
+ 
+ 		splitoff = s - this->offset;
+-		if (splitoff && !region_split(mm, this, splitoff))
++		if (splitoff && !region_head(mm, this, splitoff))
++			return -ENOMEM;
++
++		this = region_head(mm, this, min(size_max, e - s));
++		if (!this)
++			return -ENOMEM;
++
++		this->type = type;
++		list_del(&this->fl_entry);
++		*pnode = this;
++		return 0;
++	}
++
++	return -ENOSPC;
++}
++
++static struct nouveau_mm_node *
++region_tail(struct nouveau_mm *mm, struct nouveau_mm_node *a, u32 size)
++{
++	struct nouveau_mm_node *b;
++
++	if (a->length == size)
++		return a;
++
++	b = kmalloc(sizeof(*b), GFP_KERNEL);
++	if (unlikely(b == NULL))
++		return NULL;
++
++	a->length -= size;
++	b->offset  = a->offset + a->length;
++	b->length  = size;
++	b->type    = a->type;
++
++	list_add(&b->nl_entry, &a->nl_entry);
++	if (b->type == 0)
++		list_add(&b->fl_entry, &a->fl_entry);
++	return b;
++}
++
++int
++nouveau_mm_tail(struct nouveau_mm *mm, u8 type, u32 size_max, u32 size_min,
++		u32 align, struct nouveau_mm_node **pnode)
++{
++	struct nouveau_mm_node *prev, *this, *next;
++	u32 mask = align - 1;
++
++	list_for_each_entry_reverse(this, &mm->free, fl_entry) {
++		u32 e = this->offset + this->length;
++		u32 s = this->offset;
++		u32 c = 0, a;
++
++		prev = node(this, prev);
++		if (prev && prev->type != type)
++			s = roundup(s, mm->block_size);
++
++		next = node(this, next);
++		if (next && next->type != type) {
++			e = rounddown(e, mm->block_size);
++			c = next->offset - e;
++		}
++
++		s = (s + mask) & ~mask;
++		a = e - s;
++		if (s > e || a < size_min)
++			continue;
++
++		a  = min(a, size_max);
++		s  = (e - a) & ~mask;
++		c += (e - s) - a;
++
++		if (c && !region_tail(mm, this, c))
+ 			return -ENOMEM;
+ 
+-		this = region_split(mm, this, min(size, e - s));
++		this = region_tail(mm, this, a);
+ 		if (!this)
+ 			return -ENOMEM;
+ 
+@@ -147,6 +224,7 @@ nouveau_mm_init(struct nouveau_mm *mm, u32 offset, u32 length, u32 block)
+ 	list_add_tail(&node->nl_entry, &mm->nodes);
+ 	list_add_tail(&node->fl_entry, &mm->free);
+ 	mm->heap_nodes++;
++	mm->heap_size += length;
+ 	return 0;
+ }
+ 
+@@ -158,15 +236,8 @@ nouveau_mm_fini(struct nouveau_mm *mm)
+ 	int nodes = 0;
+ 
+ 	list_for_each_entry(node, &mm->nodes, nl_entry) {
+-		if (nodes++ == mm->heap_nodes) {
+-			printk(KERN_ERR "nouveau_mm in use at destroy time!\n");
+-			list_for_each_entry(node, &mm->nodes, nl_entry) {
+-				printk(KERN_ERR "0x%02x: 0x%08x 0x%08x\n",
+-				       node->type, node->offset, node->length);
+-			}
+-			WARN_ON(1);
++		if (nodes++ == mm->heap_nodes)
+ 			return -EBUSY;
+-		}
+ 	}
+ 
+ 	kfree(heap);
+diff --git a/drivers/gpu/drm/nouveau/core/include/core/mm.h b/drivers/gpu/drm/nouveau/core/include/core/mm.h
+index b4fd73b..9ee9bf4 100644
+--- a/drivers/gpu/drm/nouveau/core/include/core/mm.h
++++ b/drivers/gpu/drm/nouveau/core/include/core/mm.h
+@@ -1,27 +1,3 @@
+-/*
+- * Copyright 2010 Red Hat Inc.
+- *
+- * Permission is hereby granted, free of charge, to any person obtaining a
+- * copy of this software and associated documentation files (the "Software"),
+- * to deal in the Software without restriction, including without limitation
+- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+- * and/or sell copies of the Software, and to permit persons to whom the
+- * Software is furnished to do so, subject to the following conditions:
+- *
+- * The above copyright notice and this permission notice shall be included in
+- * all copies or substantial portions of the Software.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+- * THE COPYRIGHT HOLDER(S) OR AUTHOR(S) BE LIABLE FOR ANY CLAIM, DAMAGES OR
+- * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+- * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+- * OTHER DEALINGS IN THE SOFTWARE.
+- *
+- * Authors: Ben Skeggs
+- */
+-
+ #ifndef __NOUVEAU_MM_H__
+ #define __NOUVEAU_MM_H__
+ 
+@@ -43,13 +19,15 @@ struct nouveau_mm {
+ 
+ 	u32 block_size;
+ 	int heap_nodes;
++	u32 heap_size;
+ };
+ 
+ int  nouveau_mm_init(struct nouveau_mm *, u32 offset, u32 length, u32 block);
+ int  nouveau_mm_fini(struct nouveau_mm *);
+-int  nouveau_mm_pre(struct nouveau_mm *);
+-int  nouveau_mm_get(struct nouveau_mm *, int type, u32 size, u32 size_nc,
+-		    u32 align, struct nouveau_mm_node **);
+-void nouveau_mm_put(struct nouveau_mm *, struct nouveau_mm_node *);
++int  nouveau_mm_head(struct nouveau_mm *, u8 type, u32 size_max, u32 size_min,
++		     u32 align, struct nouveau_mm_node **);
++int  nouveau_mm_tail(struct nouveau_mm *, u8 type, u32 size_max, u32 size_min,
++		     u32 align, struct nouveau_mm_node **);
++void nouveau_mm_free(struct nouveau_mm *, struct nouveau_mm_node **);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/nouveau/core/subdev/fb/nv50_vram.c b/drivers/gpu/drm/nouveau/core/subdev/fb/nv50_vram.c
+index 029274b..84b99b6 100644
+--- a/drivers/gpu/drm/nouveau/core/subdev/fb/nv50_vram.c
++++ b/drivers/gpu/drm/nouveau/core/subdev/fb/nv50_vram.c
+@@ -65,7 +65,7 @@ nv50_vram_del(struct drm_device *dev, struct nouveau_mem **pmem)
+ 		this = list_first_entry(&mem->regions, struct nouveau_mm_node, rl_entry);
+ 
+ 		list_del(&this->rl_entry);
+-		nouveau_mm_put(mm, this);
++		nouveau_mm_free(mm, &this);
+ 	}
+ 
+ 	if (mem->tag) {
+@@ -78,7 +78,7 @@ nv50_vram_del(struct drm_device *dev, struct nouveau_mem **pmem)
+ }
+ 
+ int
+-nv50_vram_new(struct drm_device *dev, u64 size, u32 align, u32 size_nc,
++nv50_vram_new(struct drm_device *dev, u64 size, u32 align, u32 ncmin,
+ 	      u32 memtype, struct nouveau_mem **pmem)
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+@@ -87,13 +87,14 @@ nv50_vram_new(struct drm_device *dev, u64 size, u32 align, u32 size_nc,
+ 	struct nouveau_mem *mem;
+ 	int comp = (memtype & 0x300) >> 8;
+ 	int type = (memtype & 0x07f);
++	int back = (memtype & 0x800);
+ 	int ret;
+ 
+-	if (!types[type])
+-		return -EINVAL;
+ 	size >>= 12;
+ 	align >>= 12;
+-	size_nc >>= 12;
++	ncmin >>= 12;
++	if (!ncmin)
++		ncmin = size;
+ 
+ 	mem = kzalloc(sizeof(*mem), GFP_KERNEL);
+ 	if (!mem)
+@@ -119,8 +120,13 @@ nv50_vram_new(struct drm_device *dev, u64 size, u32 align, u32 size_nc,
+ 	mem->memtype = (comp << 7) | type;
+ 	mem->size = size;
+ 
++	type = types[type];
+ 	do {
+-		ret = nouveau_mm_get(mm, types[type], size, size_nc, align, &r);
++		if (back)
++			ret = nouveau_mm_tail(mm, type, size, ncmin, align, &r);
++		else
++			ret = nouveau_mm_head(mm, type, size, ncmin, align, &r);
++
+ 		if (ret) {
+ 			mutex_unlock(&mm->mutex);
+ 			nv50_vram_del(dev, &mem);
+diff --git a/drivers/gpu/drm/nouveau/core/subdev/fb/nvc0_vram.c b/drivers/gpu/drm/nouveau/core/subdev/fb/nvc0_vram.c
+index 8bb86e5..f363234 100644
+--- a/drivers/gpu/drm/nouveau/core/subdev/fb/nvc0_vram.c
++++ b/drivers/gpu/drm/nouveau/core/subdev/fb/nvc0_vram.c
+@@ -58,17 +58,21 @@ nvc0_vram_flags_valid(struct drm_device *dev, u32 tile_flags)
+ 
+ int
+ nvc0_vram_new(struct drm_device *dev, u64 size, u32 align, u32 ncmin,
+-	      u32 type, struct nouveau_mem **pmem)
++	      u32 memtype, struct nouveau_mem **pmem)
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+ 	struct nouveau_mm *mm = &dev_priv->engine.vram.mm;
+ 	struct nouveau_mm_node *r;
+ 	struct nouveau_mem *mem;
++	int type = (memtype & 0x0ff);
++	int back = (memtype & 0x800);
+ 	int ret;
+ 
+ 	size  >>= 12;
+ 	align >>= 12;
+ 	ncmin >>= 12;
++	if (!ncmin)
++		ncmin = size;
+ 
+ 	mem = kzalloc(sizeof(*mem), GFP_KERNEL);
+ 	if (!mem)
+@@ -76,12 +80,15 @@ nvc0_vram_new(struct drm_device *dev, u64 size, u32 align, u32 ncmin,
+ 
+ 	INIT_LIST_HEAD(&mem->regions);
+ 	mem->dev = dev_priv->dev;
+-	mem->memtype = (type & 0xff);
++	mem->memtype = type;
+ 	mem->size = size;
+ 
+ 	mutex_lock(&mm->mutex);
+ 	do {
+-		ret = nouveau_mm_get(mm, 1, size, ncmin, align, &r);
++		if (back)
++			ret = nouveau_mm_tail(mm, 1, size, ncmin, align, &r);
++		else
++			ret = nouveau_mm_head(mm, 1, size, ncmin, align, &r);
+ 		if (ret) {
+ 			mutex_unlock(&mm->mutex);
+ 			nv50_vram_del(dev, &mem);
+diff --git a/drivers/gpu/drm/nouveau/core/subdev/vm/base.c b/drivers/gpu/drm/nouveau/core/subdev/vm/base.c
+index 3d11a4a..9fb858a 100644
+--- a/drivers/gpu/drm/nouveau/core/subdev/vm/base.c
++++ b/drivers/gpu/drm/nouveau/core/subdev/vm/base.c
+@@ -282,7 +282,8 @@ nouveau_vm_get(struct nouveau_vm *vm, u64 size, u32 page_shift,
+ 	int ret;
+ 
+ 	mutex_lock(&vm->mm.mutex);
+-	ret = nouveau_mm_get(&vm->mm, page_shift, msize, 0, align, &vma->node);
++	ret = nouveau_mm_head(&vm->mm, page_shift, msize, msize, align,
++			     &vma->node);
+ 	if (unlikely(ret != 0)) {
+ 		mutex_unlock(&vm->mm.mutex);
+ 		return ret;
+@@ -303,9 +304,8 @@ nouveau_vm_get(struct nouveau_vm *vm, u64 size, u32 page_shift,
+ 		if (ret) {
+ 			if (pde != fpde)
+ 				nouveau_vm_unmap_pgt(vm, big, fpde, pde - 1);
+-			nouveau_mm_put(&vm->mm, vma->node);
++			nouveau_mm_free(&vm->mm, &vma->node);
+ 			mutex_unlock(&vm->mm.mutex);
+-			vma->node = NULL;
+ 			return ret;
+ 		}
+ 	}
+@@ -330,8 +330,7 @@ nouveau_vm_put(struct nouveau_vma *vma)
+ 
+ 	mutex_lock(&vm->mm.mutex);
+ 	nouveau_vm_unmap_pgt(vm, vma->node->type != vm->spg_shift, fpde, lpde);
+-	nouveau_mm_put(&vm->mm, vma->node);
+-	vma->node = NULL;
++	nouveau_mm_free(&vm->mm, &vma->node);
+ 	mutex_unlock(&vm->mm.mutex);
+ }
+ 
+
