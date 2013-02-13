@@ -1,0 +1,252 @@
+From 2911a35b2e4eb87ec48d03aeb11f019e51ae3c0d Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <ben@bwidawsk.net>
+Date: Thu, 5 Apr 2012 14:47:36 -0700
+Subject: drm/i915: use semaphores for the display plane
+Git-commit: 2911a35b2e4eb87ec48d03aeb11f019e51ae3c0d
+Patch-mainline: v3.6-rc1
+
+In theory this will have performance and power improvements. Performance
+because we don't need to stall when the scanout BO is busy, and power
+because we don't have to stall when the BO is busy (and the ring can
+even go to sleep if the HW supports it).
+
+v2:
+squash 2 patches into 1 (me)
+un-inline the enable_semaphores function (Daniel)
+remove comment about SNB hangs from i915_gem_object_sync (Chris)
+rename intel_enable_semaphores to i915_semaphore_is_enabled (me)
+removed page flip comment; "no why" (Chris)
+
+To address other comments from Daniel (irc):
+update the comment to say 'vt-d is crap, don't enable semaphores'
+  - I think you misinterpreted Chris' comment, it already exists.
+checking out whether we can pageflip on the render ring on ivb (didn't
+work on early silicon)
+  - We don't want to enable workarounds for early silicon unless we have
+    to.
+  - I can't find any references in the docs about this.
+optionally use it if the fb is already busy on the render ring
+  - This should be how the code already worked, unless I am
+    misunderstanding your meaning.
+
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.c            |   15 +++++++
+ drivers/gpu/drm/i915/i915_drv.h            |    4 ++
+ drivers/gpu/drm/i915/i915_gem.c            |   51 ++++++++++++++++++++---
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   60 +---------------------------
+ 4 files changed, 64 insertions(+), 66 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index c33b0a4..96f8efc 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -394,6 +394,21 @@ void intel_detect_pch(struct drm_device *dev)
+ 	}
+ }
+ 
++bool i915_semaphore_is_enabled(struct drm_device *dev)
++{
++	if (INTEL_INFO(dev)->gen < 6)
++		return 0;
++
++	if (i915_semaphores >= 0)
++		return i915_semaphores;
++
++	/* Enable semaphores on SNB when IO remapping is off */
++	if (INTEL_INFO(dev)->gen == 6)
++		return !intel_iommu_enabled;
++
++	return 1;
++}
++
+ void __gen6_gt_force_wake_get(struct drm_i915_private *dev_priv)
+ {
+ 	int count;
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 9bc64d2..7dcdccb 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -38,6 +38,7 @@
+ #include <linux/i2c-algo-bit.h>
+ #include <drm/intel-gtt.h>
+ #include <linux/backlight.h>
++#include <linux/intel-iommu.h>
+ 
+ /* General customization:
+  */
+@@ -1230,6 +1231,8 @@ void i915_gem_lastclose(struct drm_device *dev);
+ 
+ int __must_check i915_mutex_lock_interruptible(struct drm_device *dev);
+ int __must_check i915_gem_object_wait_rendering(struct drm_i915_gem_object *obj);
++int i915_gem_object_sync(struct drm_i915_gem_object *obj,
++			 struct intel_ring_buffer *to);
+ void i915_gem_object_move_to_active(struct drm_i915_gem_object *obj,
+ 				    struct intel_ring_buffer *ring,
+ 				    u32 seqno);
+@@ -1439,6 +1442,7 @@ extern void gen6_set_rps(struct drm_device *dev, u8 val);
+ extern void intel_detect_pch(struct drm_device *dev);
+ extern int intel_trans_dp_port_sel(struct drm_crtc *crtc);
+ 
++extern bool i915_semaphore_is_enabled(struct drm_device *dev);
+ extern void __gen6_gt_force_wake_get(struct drm_i915_private *dev_priv);
+ extern void __gen6_gt_force_wake_mt_get(struct drm_i915_private *dev_priv);
+ extern void __gen6_gt_force_wake_put(struct drm_i915_private *dev_priv);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index ad71751..d75a657 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1953,6 +1953,48 @@ i915_gem_object_wait_rendering(struct drm_i915_gem_object *obj)
+ 	return 0;
+ }
+ 
++int
++i915_gem_object_sync(struct drm_i915_gem_object *obj,
++		     struct intel_ring_buffer *to)
++{
++	struct intel_ring_buffer *from = obj->ring;
++	u32 seqno;
++	int ret, idx;
++
++	if (from == NULL || to == from)
++		return 0;
++
++	if (!i915_semaphore_is_enabled(obj->base.dev))
++		return i915_gem_object_wait_rendering(obj);
++
++	idx = intel_ring_sync_index(from, to);
++
++	seqno = obj->last_rendering_seqno;
++	if (seqno <= from->sync_seqno[idx])
++		return 0;
++
++	if (seqno == from->outstanding_lazy_request) {
++		struct drm_i915_gem_request *request;
++
++		request = kzalloc(sizeof(*request), GFP_KERNEL);
++		if (request == NULL)
++			return -ENOMEM;
++
++		ret = i915_add_request(from, NULL, request);
++		if (ret) {
++			kfree(request);
++			return ret;
++		}
++
++		seqno = request->seqno;
++	}
++
++	from->sync_seqno[idx] = seqno;
++
++	return to->sync_to(to, from, seqno - 1);
++
++}
++
+ static void i915_gem_object_finish_gtt(struct drm_i915_gem_object *obj)
+ {
+ 	u32 old_write_domain, old_read_domains;
+@@ -2926,11 +2968,6 @@ int i915_gem_object_set_cache_level(struct drm_i915_gem_object *obj,
+  * Prepare buffer for display plane (scanout, cursors, etc).
+  * Can be called from an uninterruptible phase (modesetting) and allows
+  * any flushes to be pipelined (for pageflips).
+- *
+- * For the display plane, we want to be in the GTT but out of any write
+- * domains. So in many ways this looks like set_to_gtt_domain() apart from the
+- * ability to pipeline the waits, pinning and any additional subtleties
+- * that may differentiate the display plane from ordinary buffers.
+  */
+ int
+ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+@@ -2945,8 +2982,8 @@ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+ 		return ret;
+ 
+ 	if (pipelined != obj->ring) {
+-		ret = i915_gem_object_wait_rendering(obj);
+-		if (ret == -ERESTARTSYS)
++		ret = i915_gem_object_sync(obj, pipelined);
++		if (ret)
+ 			return ret;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 56d1001..2a24d0c 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -835,64 +835,6 @@ i915_gem_execbuffer_flush(struct drm_device *dev,
+ 	return 0;
+ }
+ 
+-static bool
+-intel_enable_semaphores(struct drm_device *dev)
+-{
+-	if (INTEL_INFO(dev)->gen < 6)
+-		return 0;
+-
+-	if (i915_semaphores >= 0)
+-		return i915_semaphores;
+-
+-	/* Disable semaphores on SNB */
+-	if (INTEL_INFO(dev)->gen == 6)
+-		return 0;
+-
+-	return 1;
+-}
+-
+-static int
+-i915_gem_execbuffer_sync_rings(struct drm_i915_gem_object *obj,
+-			       struct intel_ring_buffer *to)
+-{
+-	struct intel_ring_buffer *from = obj->ring;
+-	u32 seqno;
+-	int ret, idx;
+-
+-	if (from == NULL || to == from)
+-		return 0;
+-
+-	/* XXX gpu semaphores are implicated in various hard hangs on SNB */
+-	if (!intel_enable_semaphores(obj->base.dev))
+-		return i915_gem_object_wait_rendering(obj);
+-
+-	idx = intel_ring_sync_index(from, to);
+-
+-	seqno = obj->last_rendering_seqno;
+-	if (seqno <= from->sync_seqno[idx])
+-		return 0;
+-
+-	if (seqno == from->outstanding_lazy_request) {
+-		struct drm_i915_gem_request *request;
+-
+-		request = kzalloc(sizeof(*request), GFP_KERNEL);
+-		if (request == NULL)
+-			return -ENOMEM;
+-
+-		ret = i915_add_request(from, NULL, request);
+-		if (ret) {
+-			kfree(request);
+-			return ret;
+-		}
+-
+-		seqno = request->seqno;
+-	}
+-
+-	from->sync_seqno[idx] = seqno;
+-
+-	return to->sync_to(to, from, seqno - 1);
+-}
+-
+ static int
+ i915_gem_execbuffer_wait_for_flips(struct intel_ring_buffer *ring, u32 flips)
+ {
+@@ -954,7 +896,7 @@ i915_gem_execbuffer_move_to_gpu(struct intel_ring_buffer *ring,
+ 	}
+ 
+ 	list_for_each_entry(obj, objects, exec_list) {
+-		ret = i915_gem_execbuffer_sync_rings(obj, ring);
++		ret = i915_gem_object_sync(obj, ring);
+ 		if (ret)
+ 			return ret;
+ 	}
+
