@@ -1,0 +1,167 @@
+From d54423037f141518950f324af88a551a82449496 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Fri, 27 Apr 2012 15:17:40 +0200
+Subject: drm/i915: allow the existing error_state to be destroyed
+Git-commit: d54423037f141518950f324af88a551a82449496
+Patch-mainline: v3.5-rc1
+
+... by writing (anything) to i915_error_state.
+
+This way we can simulate a bunch of gpu hangs and run the error_state
+capture code every time (without the need to reload the module).
+
+To make that happen we need to abandon the simple seq_file wrappers
+provided by the drm core. While at it put the new error_state
+refcounting to some good use and associated the error_state to the
+debugfs when opening the file. Otherwise the error_state could change
+while someone is reading it. This should help greatly when we finally
+get around to split up the giant single seq_file block that the
+error_state file currently is into smaller parts.
+
+v2: Actually squash all the fixes into the patch ...
+
+Reviewed-by: Eugeni Dodonov <eugeni.dodonov@intel.com>
+Signed-Off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   90 ++++++++++++++++++++++++++++++-----
+ 1 files changed, 77 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index 72c73de..950f72a 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -688,21 +688,19 @@ static void i915_ring_error_state(struct seq_file *m,
+ 	seq_printf(m, "  ring->tail: 0x%08x\n", error->cpu_ring_tail[ring]);
+ }
+ 
++struct i915_error_state_file_priv {
++	struct drm_device *dev;
++	struct drm_i915_error_state *error;
++};
++
+ static int i915_error_state(struct seq_file *m, void *unused)
+ {
+-	struct drm_info_node *node = (struct drm_info_node *) m->private;
+-	struct drm_device *dev = node->minor->dev;
++	struct i915_error_state_file_priv *error_priv = m->private;
++	struct drm_device *dev = error_priv->dev;
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+-	struct drm_i915_error_state *error;
+-	unsigned long flags;
++	struct drm_i915_error_state *error = error_priv->error;
+ 	int i, j, page, offset, elt;
+ 
+-	spin_lock_irqsave(&dev_priv->error_lock, flags);
+-	error = dev_priv->first_error;
+-	if (error)
+-		kref_get(&error->ref);
+-	spin_unlock_irqrestore(&dev_priv->error_lock, flags);
+-
+ 	if (!error) {
+ 		seq_printf(m, "no error state collected\n");
+ 		return 0;
+@@ -790,11 +788,71 @@ static int i915_error_state(struct seq_file *m, void *unused)
+ 	if (error->display)
+ 		intel_display_print_error_state(m, dev, error->display);
+ 
+-	kref_put(&error->ref, i915_error_state_free);
+-
+ 	return 0;
+ }
+ 
++static ssize_t
++i915_error_state_write(struct file *filp,
++		       const char __user *ubuf,
++		       size_t cnt,
++		       loff_t *ppos)
++{
++	struct seq_file *m = filp->private_data;
++	struct i915_error_state_file_priv *error_priv = m->private;
++	struct drm_device *dev = error_priv->dev;
++
++	DRM_DEBUG_DRIVER("Resetting error state\n");
++
++	mutex_lock(&dev->struct_mutex);
++	i915_destroy_error_state(dev);
++	mutex_unlock(&dev->struct_mutex);
++
++	return cnt;
++}
++
++static int i915_error_state_open(struct inode *inode, struct file *file)
++{
++	struct drm_device *dev = inode->i_private;
++	drm_i915_private_t *dev_priv = dev->dev_private;
++	struct i915_error_state_file_priv *error_priv;
++	unsigned long flags;
++
++	error_priv = kzalloc(sizeof(*error_priv), GFP_KERNEL);
++	if (!error_priv)
++		return -ENOMEM;
++
++	error_priv->dev = dev;
++
++	spin_lock_irqsave(&dev_priv->error_lock, flags);
++	error_priv->error = dev_priv->first_error;
++	if (error_priv->error)
++		kref_get(&error_priv->error->ref);
++	spin_unlock_irqrestore(&dev_priv->error_lock, flags);
++
++	return single_open(file, i915_error_state, error_priv);
++}
++
++static int i915_error_state_release(struct inode *inode, struct file *file)
++{
++	struct seq_file *m = file->private_data;
++	struct i915_error_state_file_priv *error_priv = m->private;
++
++	if (error_priv->error)
++		kref_put(&error_priv->error->ref, i915_error_state_free);
++	kfree(error_priv);
++
++	return single_release(inode, file);
++}
++
++static const struct file_operations i915_error_state_fops = {
++	.owner = THIS_MODULE,
++	.open = i915_error_state_open,
++	.read = seq_read,
++	.write = i915_error_state_write,
++	.llseek = default_llseek,
++	.release = i915_error_state_release,
++};
++
+ static int i915_rstdby_delays(struct seq_file *m, void *unused)
+ {
+ 	struct drm_info_node *node = (struct drm_info_node *) m->private;
+@@ -1646,6 +1704,7 @@ static const struct file_operations i915_ring_stop_fops = {
+ 	.write = i915_ring_stop_write,
+ 	.llseek = default_llseek,
+ };
++
+ static ssize_t
+ i915_max_freq_read(struct file *filp,
+ 		   char __user *ubuf,
+@@ -1900,7 +1959,6 @@ static struct drm_info_list i915_debugfs_list[] = {
+ 	{"i915_gem_hws", i915_hws_info, 0, (void *)RCS},
+ 	{"i915_gem_hws_blt", i915_hws_info, 0, (void *)BCS},
+ 	{"i915_gem_hws_bsd", i915_hws_info, 0, (void *)VCS},
+-	{"i915_error_state", i915_error_state, 0},
+ 	{"i915_rstdby_delays", i915_rstdby_delays, 0},
+ 	{"i915_cur_delayinfo", i915_cur_delayinfo, 0},
+ 	{"i915_delayfreq_table", i915_delayfreq_table, 0},
+@@ -1952,6 +2010,12 @@ int i915_debugfs_init(struct drm_minor *minor)
+ 	if (ret)
+ 		return ret;
+ 
++	ret = i915_debugfs_create(minor->debugfs_root, minor,
++				  "i915_error_state",
++				  &i915_error_state_fops);
++	if (ret)
++		return ret;
++
+ 	return drm_debugfs_create_files(i915_debugfs_list,
+ 					I915_DEBUGFS_ENTRIES,
+ 					minor->debugfs_root, minor);
+
