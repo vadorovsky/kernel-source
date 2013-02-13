@@ -1,0 +1,264 @@
+From 3e9605018ab3e333d51cc90fccfde2031886763b Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 27 Nov 2012 16:22:54 +0000
+Subject: drm/i915: Rearrange code to only have a single method for waiting
+ upon the ring
+Git-commit: 3e9605018ab3e333d51cc90fccfde2031886763b
+Patch-mainline: v3.8-rc2
+
+Replace the wait for the ring to be clear with the more common wait for
+the ring to be idle. The principle advantage is one less exported
+intel_ring_wait function, and the removal of a hardcoded value.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Mika Kuoppala <mika.kuoppala@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_dma.c         |    4 +-
+ drivers/gpu/drm/i915/i915_gem.c         |   25 +----------
+ drivers/gpu/drm/i915/intel_pm.c         |    8 +++-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   73 ++++++++++++++++++++-----------
+ drivers/gpu/drm/i915/intel_ringbuffer.h |    9 +---
+ 5 files changed, 58 insertions(+), 61 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_dma.c b/drivers/gpu/drm/i915/i915_dma.c
+index 4ea331b..80ed751 100644
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -592,10 +592,8 @@ static int i915_dispatch_flip(struct drm_device * dev)
+ 
+ static int i915_quiescent(struct drm_device *dev)
+ {
+-	struct intel_ring_buffer *ring = LP_RING(dev->dev_private);
+-
+ 	i915_kernel_lost_context(dev);
+-	return intel_wait_ring_idle(ring);
++	return intel_ring_idle(LP_RING(dev->dev_private));
+ }
+ 
+ static int i915_flush_ioctl(struct drm_device *dev, void *data,
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index e594435..85a0948 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2480,29 +2480,6 @@ i915_gem_object_unbind(struct drm_i915_gem_object *obj)
+ 	return 0;
+ }
+ 
+-static int i915_ring_idle(struct intel_ring_buffer *ring)
+-{
+-	u32 seqno;
+-	int ret;
+-
+-	/* We need to add any requests required to flush the objects and ring */
+-	if (ring->outstanding_lazy_request) {
+-		ret = i915_add_request(ring, NULL, NULL);
+-		if (ret)
+-			return ret;
+-	}
+-
+-	/* Wait upon the last request to be completed */
+-	if (list_empty(&ring->request_list))
+-		return 0;
+-
+-	seqno = list_entry(ring->request_list.prev,
+-			   struct drm_i915_gem_request,
+-			   list)->seqno;
+-
+-	return i915_wait_seqno(ring, seqno);
+-}
+-
+ int i915_gpu_idle(struct drm_device *dev)
+ {
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+@@ -2515,7 +2492,7 @@ int i915_gpu_idle(struct drm_device *dev)
+ 		if (ret)
+ 			return ret;
+ 
+-		ret = i915_ring_idle(ring);
++		ret = intel_ring_idle(ring);
+ 		if (ret)
+ 			return ret;
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_pm.c b/drivers/gpu/drm/i915/intel_pm.c
+index 58c2f21..f595b8d 100644
+--- a/drivers/gpu/drm/i915/intel_pm.c
++++ b/drivers/gpu/drm/i915/intel_pm.c
+@@ -2653,6 +2653,7 @@ static void ironlake_enable_rc6(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_ring_buffer *ring = &dev_priv->ring[RCS];
++	bool was_interruptible;
+ 	int ret;
+ 
+ 	/* rc6 disabled by default due to repeated reports of hanging during
+@@ -2667,6 +2668,9 @@ static void ironlake_enable_rc6(struct drm_device *dev)
+ 	if (ret)
+ 		return;
+ 
++	was_interruptible = dev_priv->mm.interruptible;
++	dev_priv->mm.interruptible = false;
++
+ 	/*
+ 	 * GPU can automatically power down the render unit if given a page
+ 	 * to save state.
+@@ -2674,6 +2678,7 @@ static void ironlake_enable_rc6(struct drm_device *dev)
+ 	ret = intel_ring_begin(ring, 6);
+ 	if (ret) {
+ 		ironlake_teardown_rc6(dev);
++		dev_priv->mm.interruptible = was_interruptible;
+ 		return;
+ 	}
+ 
+@@ -2694,7 +2699,8 @@ static void ironlake_enable_rc6(struct drm_device *dev)
+ 	 * does an implicit flush, combined with MI_FLUSH above, it should be
+ 	 * safe to assume that renderctx is valid
+ 	 */
+-	ret = intel_wait_ring_idle(ring);
++	ret = intel_ring_idle(ring);
++	dev_priv->mm.interruptible = was_interruptible;
+ 	if (ret) {
+ 		DRM_ERROR("failed to enable ironlake power power savings\n");
+ 		ironlake_teardown_rc6(dev);
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index e4682cd..bc7cf7c 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1175,7 +1175,7 @@ void intel_cleanup_ring_buffer(struct intel_ring_buffer *ring)
+ 
+ 	/* Disable the ring buffer. The ring must be idle at this point */
+ 	dev_priv = ring->dev->dev_private;
+-	ret = intel_wait_ring_idle(ring);
++	ret = intel_ring_idle(ring);
+ 	if (ret)
+ 		DRM_ERROR("failed to quiesce %s whilst cleaning up: %d\n",
+ 			  ring->name, ret);
+@@ -1194,28 +1194,6 @@ void intel_cleanup_ring_buffer(struct intel_ring_buffer *ring)
+ 	cleanup_status_page(ring);
+ }
+ 
+-static int intel_wrap_ring_buffer(struct intel_ring_buffer *ring)
+-{
+-	uint32_t __iomem *virt;
+-	int rem = ring->size - ring->tail;
+-
+-	if (ring->space < rem) {
+-		int ret = intel_wait_ring_buffer(ring, rem);
+-		if (ret)
+-			return ret;
+-	}
+-
+-	virt = ring->virtual_start + ring->tail;
+-	rem /= 4;
+-	while (rem--)
+-		iowrite32(MI_NOOP, virt++);
+-
+-	ring->tail = 0;
+-	ring->space = ring_space(ring);
+-
+-	return 0;
+-}
+-
+ static int intel_ring_wait_seqno(struct intel_ring_buffer *ring, u32 seqno)
+ {
+ 	int ret;
+@@ -1284,7 +1262,7 @@ static int intel_ring_wait_request(struct intel_ring_buffer *ring, int n)
+ 	return 0;
+ }
+ 
+-int intel_wait_ring_buffer(struct intel_ring_buffer *ring, int n)
++static int ring_wait_for_space(struct intel_ring_buffer *ring, int n)
+ {
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+@@ -1327,6 +1305,51 @@ int intel_wait_ring_buffer(struct intel_ring_buffer *ring, int n)
+ 	return -EBUSY;
+ }
+ 
++static int intel_wrap_ring_buffer(struct intel_ring_buffer *ring)
++{
++	uint32_t __iomem *virt;
++	int rem = ring->size - ring->tail;
++
++	if (ring->space < rem) {
++		int ret = ring_wait_for_space(ring, rem);
++		if (ret)
++			return ret;
++	}
++
++	virt = ring->virtual_start + ring->tail;
++	rem /= 4;
++	while (rem--)
++		iowrite32(MI_NOOP, virt++);
++
++	ring->tail = 0;
++	ring->space = ring_space(ring);
++
++	return 0;
++}
++
++int intel_ring_idle(struct intel_ring_buffer *ring)
++{
++	u32 seqno;
++	int ret;
++
++	/* We need to add any requests required to flush the objects and ring */
++	if (ring->outstanding_lazy_request) {
++		ret = i915_add_request(ring, NULL, NULL);
++		if (ret)
++			return ret;
++	}
++
++	/* Wait upon the last request to be completed */
++	if (list_empty(&ring->request_list))
++		return 0;
++
++	seqno = list_entry(ring->request_list.prev,
++			   struct drm_i915_gem_request,
++			   list)->seqno;
++
++	return i915_wait_seqno(ring, seqno);
++}
++
+ static int
+ intel_ring_alloc_seqno(struct intel_ring_buffer *ring)
+ {
+@@ -1359,7 +1382,7 @@ int intel_ring_begin(struct intel_ring_buffer *ring,
+ 	}
+ 
+ 	if (unlikely(ring->space < n)) {
+-		ret = intel_wait_ring_buffer(ring, n);
++		ret = ring_wait_for_space(ring, n);
+ 		if (unlikely(ret))
+ 			return ret;
+ 	}
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.h b/drivers/gpu/drm/i915/intel_ringbuffer.h
+index 0e61302..d4b7416 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -187,22 +187,15 @@ intel_read_status_page(struct intel_ring_buffer *ring,
+ 
+ void intel_cleanup_ring_buffer(struct intel_ring_buffer *ring);
+ 
+-int __must_check intel_wait_ring_buffer(struct intel_ring_buffer *ring, int n);
+-static inline int intel_wait_ring_idle(struct intel_ring_buffer *ring)
+-{
+-	return intel_wait_ring_buffer(ring, ring->size - 8);
+-}
+-
+ int __must_check intel_ring_begin(struct intel_ring_buffer *ring, int n);
+-
+ static inline void intel_ring_emit(struct intel_ring_buffer *ring,
+ 				   u32 data)
+ {
+ 	iowrite32(data, ring->virtual_start + ring->tail);
+ 	ring->tail += 4;
+ }
+-
+ void intel_ring_advance(struct intel_ring_buffer *ring);
++int __must_check intel_ring_idle(struct intel_ring_buffer *ring);
+ 
+ int intel_ring_flush_all_caches(struct intel_ring_buffer *ring);
+ int intel_ring_invalidate_all_caches(struct intel_ring_buffer *ring);
+
