@@ -1,0 +1,644 @@
+From 22b33e8ed0e38b8ddcf082e35580f2e67a3a0262 Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@redhat.com>
+Date: Mon, 2 Apr 2012 11:53:06 +0100
+Subject: nouveau: add PRIME support
+Git-commit: 22b33e8ed0e38b8ddcf082e35580f2e67a3a0262
+Patch-mainline: v3.5-rc1
+
+This adds prime->fd and fd->prime support to nouveau,
+it passes the SG object to TTM, and then populates the
+GART entries using it.
+
+v2: add stubbed kmap + use new function to fill out pages array
+for faulting + add reimport test.
+
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/nouveau/Makefile          |    2 +-
+ drivers/gpu/drm/nouveau/nouveau_bo.c      |   42 ++++++--
+ drivers/gpu/drm/nouveau/nouveau_channel.c |    2 +-
+ drivers/gpu/drm/nouveau/nouveau_drv.c     |    8 ++-
+ drivers/gpu/drm/nouveau/nouveau_drv.h     |   10 ++-
+ drivers/gpu/drm/nouveau/nouveau_fence.c   |    2 +-
+ drivers/gpu/drm/nouveau/nouveau_gem.c     |    6 +-
+ drivers/gpu/drm/nouveau/nouveau_mem.c     |    2 +-
+ drivers/gpu/drm/nouveau/nouveau_prime.c   |  163 +++++++++++++++++++++++++++++
+ drivers/gpu/drm/nouveau/nouveau_sgdma.c   |    5 +-
+ drivers/gpu/drm/nouveau/nouveau_vm.c      |   57 ++++++++++
+ drivers/gpu/drm/nouveau/nouveau_vm.h      |    6 +-
+ drivers/gpu/drm/nouveau/nv04_crtc.c       |    2 +-
+ drivers/gpu/drm/nouveau/nv50_crtc.c       |    4 +-
+ drivers/gpu/drm/nouveau/nv50_evo.c        |    4 +-
+ drivers/gpu/drm/nouveau/nvd0_display.c    |    6 +-
+ 16 files changed, 296 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/Makefile b/drivers/gpu/drm/nouveau/Makefile
+index 1a2ad7e..01f1335 100644
+--- a/drivers/gpu/drm/nouveau/Makefile
++++ b/drivers/gpu/drm/nouveau/Makefile
+@@ -37,7 +37,7 @@ nouveau-y := nouveau_drv.o nouveau_state.o nouveau_channel.o nouveau_mem.o \
+ 	     nv50_calc.o \
+ 	     nv04_pm.o nv40_pm.o nv50_pm.o nva3_pm.o nvc0_pm.o \
+ 	     nv50_vram.o nvc0_vram.o \
+-	     nv50_vm.o nvc0_vm.o
++	     nv50_vm.o nvc0_vm.o nouveau_prime.o
+ 
+ nouveau-$(CONFIG_DRM_NOUVEAU_DEBUG) += nouveau_debugfs.o
+ nouveau-$(CONFIG_COMPAT) += nouveau_ioc32.o
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index 81599d6..4435e11 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -89,12 +89,17 @@ nouveau_bo_fixup_align(struct nouveau_bo *nvbo, u32 flags,
+ int
+ nouveau_bo_new(struct drm_device *dev, int size, int align,
+ 	       uint32_t flags, uint32_t tile_mode, uint32_t tile_flags,
++	       struct sg_table *sg,
+ 	       struct nouveau_bo **pnvbo)
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+ 	struct nouveau_bo *nvbo;
+ 	size_t acc_size;
+ 	int ret;
++	int type = ttm_bo_type_device;
++
++	if (sg)
++		type = ttm_bo_type_sg;
+ 
+ 	nvbo = kzalloc(sizeof(struct nouveau_bo), GFP_KERNEL);
+ 	if (!nvbo)
+@@ -120,8 +125,8 @@ nouveau_bo_new(struct drm_device *dev, int size, int align,
+ 				       sizeof(struct nouveau_bo));
+ 
+ 	ret = ttm_bo_init(&dev_priv->ttm.bdev, &nvbo->bo, size,
+-			  ttm_bo_type_device, &nvbo->placement,
+-			  align >> PAGE_SHIFT, 0, false, NULL, acc_size, NULL,
++			  type, &nvbo->placement,
++			  align >> PAGE_SHIFT, 0, false, NULL, acc_size, sg,
+ 			  nouveau_bo_del_ttm);
+ 	if (ret) {
+ 		/* ttm will call nouveau_bo_del_ttm if it fails.. */
+@@ -817,9 +822,14 @@ nouveau_bo_move_ntfy(struct ttm_buffer_object *bo, struct ttm_mem_reg *new_mem)
+ 		} else
+ 		if (new_mem && new_mem->mem_type == TTM_PL_TT &&
+ 		    nvbo->page_shift == vma->vm->spg_shift) {
+-			nouveau_vm_map_sg(vma, 0, new_mem->
+-					  num_pages << PAGE_SHIFT,
+-					  new_mem->mm_node);
++			if (((struct nouveau_mem *)new_mem->mm_node)->sg)
++				nouveau_vm_map_sg_table(vma, 0, new_mem->
++						  num_pages << PAGE_SHIFT,
++						  new_mem->mm_node);
++			else
++				nouveau_vm_map_sg(vma, 0, new_mem->
++						  num_pages << PAGE_SHIFT,
++						  new_mem->mm_node);
+ 		} else {
+ 			nouveau_vm_unmap(vma);
+ 		}
+@@ -1058,10 +1068,19 @@ nouveau_ttm_tt_populate(struct ttm_tt *ttm)
+ 	struct drm_device *dev;
+ 	unsigned i;
+ 	int r;
++	bool slave = !!(ttm->page_flags & TTM_PAGE_FLAG_SG);
+ 
+ 	if (ttm->state != tt_unpopulated)
+ 		return 0;
+ 
++	if (slave && ttm->sg) {
++		/* make userspace faulting work */
++		drm_prime_sg_to_page_addr_arrays(ttm->sg, ttm->pages,
++						 ttm_dma->dma_address, ttm->num_pages);
++		ttm->state = tt_unbound;
++		return 0;
++	}
++
+ 	dev_priv = nouveau_bdev(ttm->bdev);
+ 	dev = dev_priv->dev;
+ 
+@@ -1106,6 +1125,10 @@ nouveau_ttm_tt_unpopulate(struct ttm_tt *ttm)
+ 	struct drm_nouveau_private *dev_priv;
+ 	struct drm_device *dev;
+ 	unsigned i;
++	bool slave = !!(ttm->page_flags & TTM_PAGE_FLAG_SG);
++
++	if (slave)
++		return;
+ 
+ 	dev_priv = nouveau_bdev(ttm->bdev);
+ 	dev = dev_priv->dev;
+@@ -1181,9 +1204,12 @@ nouveau_bo_vma_add(struct nouveau_bo *nvbo, struct nouveau_vm *vm,
+ 
+ 	if (nvbo->bo.mem.mem_type == TTM_PL_VRAM)
+ 		nouveau_vm_map(vma, nvbo->bo.mem.mm_node);
+-	else
+-	if (nvbo->bo.mem.mem_type == TTM_PL_TT)
+-		nouveau_vm_map_sg(vma, 0, size, node);
++	else if (nvbo->bo.mem.mem_type == TTM_PL_TT) {
++		if (node->sg)
++			nouveau_vm_map_sg_table(vma, 0, size, node);
++		else
++			nouveau_vm_map_sg(vma, 0, size, node);
++	}
+ 
+ 	list_add_tail(&vma->head, &nvbo->vma_list);
+ 	vma->refcount = 1;
+diff --git a/drivers/gpu/drm/nouveau/nouveau_channel.c b/drivers/gpu/drm/nouveau/nouveau_channel.c
+index 846afb0..730bbb2 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_channel.c
++++ b/drivers/gpu/drm/nouveau/nouveau_channel.c
+@@ -38,7 +38,7 @@ nouveau_channel_pushbuf_init(struct nouveau_channel *chan)
+ 	int ret;
+ 
+ 	/* allocate buffer object */
+-	ret = nouveau_bo_new(dev, 65536, 0, mem, 0, 0, &chan->pushbuf_bo);
++	ret = nouveau_bo_new(dev, 65536, 0, mem, 0, 0, NULL, &chan->pushbuf_bo);
+ 	if (ret)
+ 		goto out;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drv.c b/drivers/gpu/drm/nouveau/nouveau_drv.c
+index 4f2030b..b394ecf 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drv.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drv.c
+@@ -408,7 +408,7 @@ static struct drm_driver driver = {
+ 	.driver_features =
+ 		DRIVER_USE_AGP | DRIVER_PCI_DMA | DRIVER_SG |
+ 		DRIVER_HAVE_IRQ | DRIVER_IRQ_SHARED | DRIVER_GEM |
+-		DRIVER_MODESET,
++		DRIVER_MODESET | DRIVER_PRIME,
+ 	.load = nouveau_load,
+ 	.firstopen = nouveau_firstopen,
+ 	.lastclose = nouveau_lastclose,
+@@ -430,6 +430,12 @@ static struct drm_driver driver = {
+ 	.reclaim_buffers = drm_core_reclaim_buffers,
+ 	.ioctls = nouveau_ioctls,
+ 	.fops = &nouveau_driver_fops,
++
++	.prime_handle_to_fd = drm_gem_prime_handle_to_fd,
++	.prime_fd_to_handle = drm_gem_prime_fd_to_handle,
++	.gem_prime_export = nouveau_gem_prime_export,
++	.gem_prime_import = nouveau_gem_prime_import,
++
+ 	.gem_init_object = nouveau_gem_object_new,
+ 	.gem_free_object = nouveau_gem_object_del,
+ 	.gem_open_object = nouveau_gem_object_open,
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drv.h b/drivers/gpu/drm/nouveau/nouveau_drv.h
+index 3aef353..92c9a8a 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drv.h
++++ b/drivers/gpu/drm/nouveau/nouveau_drv.h
+@@ -86,6 +86,7 @@ struct nouveau_mem {
+ 	u32 memtype;
+ 	u64 offset;
+ 	u64 size;
++	struct sg_table *sg;
+ };
+ 
+ struct nouveau_tile_reg {
+@@ -1416,7 +1417,9 @@ extern int nv04_crtc_create(struct drm_device *, int index);
+ extern struct ttm_bo_driver nouveau_bo_driver;
+ extern int nouveau_bo_new(struct drm_device *, int size, int align,
+ 			  uint32_t flags, uint32_t tile_mode,
+-			  uint32_t tile_flags, struct nouveau_bo **);
++			  uint32_t tile_flags,
++			  struct sg_table *sg,
++			  struct nouveau_bo **);
+ extern int nouveau_bo_pin(struct nouveau_bo *, uint32_t flags);
+ extern int nouveau_bo_unpin(struct nouveau_bo *);
+ extern int nouveau_bo_map(struct nouveau_bo *);
+@@ -1501,6 +1504,11 @@ extern int nouveau_gem_ioctl_cpu_fini(struct drm_device *, void *,
+ extern int nouveau_gem_ioctl_info(struct drm_device *, void *,
+ 				  struct drm_file *);
+ 
++extern struct dma_buf *nouveau_gem_prime_export(struct drm_device *dev,
++				struct drm_gem_object *obj, int flags);
++extern struct drm_gem_object *nouveau_gem_prime_import(struct drm_device *dev,
++				struct dma_buf *dma_buf);
++
+ /* nouveau_display.c */
+ int nouveau_display_create(struct drm_device *dev);
+ void nouveau_display_destroy(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_fence.c b/drivers/gpu/drm/nouveau/nouveau_fence.c
+index c1dc20f..965e3d2 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_fence.c
++++ b/drivers/gpu/drm/nouveau/nouveau_fence.c
+@@ -573,7 +573,7 @@ nouveau_fence_init(struct drm_device *dev)
+ 	/* Create a shared VRAM heap for cross-channel sync. */
+ 	if (USE_SEMA(dev)) {
+ 		ret = nouveau_bo_new(dev, size, 0, TTM_PL_FLAG_VRAM,
+-				     0, 0, &dev_priv->fence.bo);
++				     0, 0, NULL, &dev_priv->fence.bo);
+ 		if (ret)
+ 			return ret;
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_gem.c b/drivers/gpu/drm/nouveau/nouveau_gem.c
+index ed52a6f..666dad0 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_gem.c
++++ b/drivers/gpu/drm/nouveau/nouveau_gem.c
+@@ -23,6 +23,7 @@
+  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  *
+  */
++#include <linux/dma-buf.h>
+ #include "drmP.h"
+ #include "drm.h"
+ 
+@@ -53,6 +54,9 @@ nouveau_gem_object_del(struct drm_gem_object *gem)
+ 		nouveau_bo_unpin(nvbo);
+ 	}
+ 
++	if (gem->import_attach)
++		drm_prime_gem_destroy(gem, nvbo->bo.sg);
++
+ 	ttm_bo_unref(&bo);
+ 
+ 	drm_gem_object_release(gem);
+@@ -139,7 +143,7 @@ nouveau_gem_new(struct drm_device *dev, int size, int align, uint32_t domain,
+ 		flags |= TTM_PL_FLAG_SYSTEM;
+ 
+ 	ret = nouveau_bo_new(dev, size, align, flags, tile_mode,
+-			     tile_flags, pnvbo);
++			     tile_flags, NULL, pnvbo);
+ 	if (ret)
+ 		return ret;
+ 	nvbo = *pnvbo;
+diff --git a/drivers/gpu/drm/nouveau/nouveau_mem.c b/drivers/gpu/drm/nouveau/nouveau_mem.c
+index b08065f..bb2f0a4 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_mem.c
++++ b/drivers/gpu/drm/nouveau/nouveau_mem.c
+@@ -416,7 +416,7 @@ nouveau_mem_vram_init(struct drm_device *dev)
+ 
+ 	if (dev_priv->card_type < NV_50) {
+ 		ret = nouveau_bo_new(dev, 256*1024, 0, TTM_PL_FLAG_VRAM,
+-				     0, 0, &dev_priv->vga_ram);
++				     0, 0, NULL, &dev_priv->vga_ram);
+ 		if (ret == 0)
+ 			ret = nouveau_bo_pin(dev_priv->vga_ram,
+ 					     TTM_PL_FLAG_VRAM);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_prime.c b/drivers/gpu/drm/nouveau/nouveau_prime.c
+new file mode 100644
+index 0000000..ed6b846
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nouveau_prime.c
+@@ -0,0 +1,163 @@
++
++#include "drmP.h"
++#include "drm.h"
++
++#include "nouveau_drv.h"
++#include "nouveau_drm.h"
++#include "nouveau_dma.h"
++
++#include <linux/dma-buf.h>
++
++static struct sg_table *nouveau_gem_map_dma_buf(struct dma_buf_attachment *attachment,
++					  enum dma_data_direction dir)
++{
++	struct nouveau_bo *nvbo = attachment->dmabuf->priv;
++	struct drm_device *dev = nvbo->gem->dev;
++	int npages = nvbo->bo.num_pages;
++	struct sg_table *sg;
++	int nents;
++
++	mutex_lock(&dev->struct_mutex);
++	sg = drm_prime_pages_to_sg(nvbo->bo.ttm->pages, npages);
++	nents = dma_map_sg(attachment->dev, sg->sgl, sg->nents, dir);
++	mutex_unlock(&dev->struct_mutex);
++	return sg;
++}
++
++static void nouveau_gem_unmap_dma_buf(struct dma_buf_attachment *attachment,
++				      struct sg_table *sg, enum dma_data_direction dir)
++{
++	dma_unmap_sg(attachment->dev, sg->sgl, sg->nents, dir);
++	sg_free_table(sg);
++	kfree(sg);
++}
++
++static void nouveau_gem_dmabuf_release(struct dma_buf *dma_buf)
++{
++	struct nouveau_bo *nvbo = dma_buf->priv;
++
++	if (nvbo->gem->export_dma_buf == dma_buf) {
++		nvbo->gem->export_dma_buf = NULL;
++		drm_gem_object_unreference_unlocked(nvbo->gem);
++	}
++}
++
++static void *nouveau_gem_kmap_atomic(struct dma_buf *dma_buf, unsigned long page_num)
++{
++	return NULL;
++}
++
++static void nouveau_gem_kunmap_atomic(struct dma_buf *dma_buf, unsigned long page_num, void *addr)
++{
++
++}
++static void *nouveau_gem_kmap(struct dma_buf *dma_buf, unsigned long page_num)
++{
++	return NULL;
++}
++
++static void nouveau_gem_kunmap(struct dma_buf *dma_buf, unsigned long page_num, void *addr)
++{
++
++}
++
++struct dma_buf_ops nouveau_dmabuf_ops =  {
++	.map_dma_buf = nouveau_gem_map_dma_buf,
++	.unmap_dma_buf = nouveau_gem_unmap_dma_buf,
++	.release = nouveau_gem_dmabuf_release,
++	.kmap = nouveau_gem_kmap,
++	.kmap_atomic = nouveau_gem_kmap_atomic,
++	.kunmap = nouveau_gem_kunmap,
++	.kunmap_atomic = nouveau_gem_kunmap_atomic,
++};
++
++static int
++nouveau_prime_new(struct drm_device *dev,
++		  size_t size,
++		  struct sg_table *sg,
++		  struct nouveau_bo **pnvbo)
++{
++	struct nouveau_bo *nvbo;
++	u32 flags = 0;
++	int ret;
++
++	flags = TTM_PL_FLAG_TT;
++
++	ret = nouveau_bo_new(dev, size, 0, flags, 0, 0,
++			     sg, pnvbo);
++	if (ret)
++		return ret;
++	nvbo = *pnvbo;
++
++	/* we restrict allowed domains on nv50+ to only the types
++	 * that were requested at creation time.  not possibly on
++	 * earlier chips without busting the ABI.
++	 */
++	nvbo->valid_domains = NOUVEAU_GEM_DOMAIN_GART;
++	nvbo->gem = drm_gem_object_alloc(dev, nvbo->bo.mem.size);
++	if (!nvbo->gem) {
++		nouveau_bo_ref(NULL, pnvbo);
++		return -ENOMEM;
++	}
++
++	nvbo->gem->driver_private = nvbo;
++	return 0;
++}
++
++struct dma_buf *nouveau_gem_prime_export(struct drm_device *dev,
++				struct drm_gem_object *obj, int flags)
++{
++	struct nouveau_bo *nvbo = nouveau_gem_object(obj);
++	int ret = 0;
++
++	/* pin buffer into GTT */
++	ret = nouveau_bo_pin(nvbo, TTM_PL_FLAG_TT);
++	if (ret)
++		return ERR_PTR(-EINVAL);
++
++	return dma_buf_export(nvbo, &nouveau_dmabuf_ops, obj->size, flags);
++}
++
++struct drm_gem_object *nouveau_gem_prime_import(struct drm_device *dev,
++				struct dma_buf *dma_buf)
++{
++	struct dma_buf_attachment *attach;
++	struct sg_table *sg;
++	struct nouveau_bo *nvbo;
++	int ret;
++
++	if (dma_buf->ops == &nouveau_dmabuf_ops) {
++		nvbo = dma_buf->priv;
++		if (nvbo->gem) {
++			if (nvbo->gem->dev == dev) {
++				drm_gem_object_reference(nvbo->gem);
++				return nvbo->gem;
++			}
++		}
++	}
++	/* need to attach */
++	attach = dma_buf_attach(dma_buf, dev->dev);
++	if (IS_ERR(attach))
++		return ERR_PTR(PTR_ERR(attach));
++
++	sg = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
++	if (IS_ERR(sg)) {
++		ret = PTR_ERR(sg);
++		goto fail_detach;
++	}
++
++	ret = nouveau_prime_new(dev, dma_buf->size, sg, &nvbo);
++	if (ret)
++		goto fail_unmap;
++
++	nvbo->gem->import_attach = attach;
++
++	return nvbo->gem;
++
++fail_unmap:
++	dma_buf_unmap_attachment(attach, sg, DMA_BIDIRECTIONAL);
++fail_detach:
++	dma_buf_detach(dma_buf, attach);
++	return ERR_PTR(ret);
++}
++
+diff --git a/drivers/gpu/drm/nouveau/nouveau_sgdma.c b/drivers/gpu/drm/nouveau/nouveau_sgdma.c
+index 47f245e..27aac9a 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_sgdma.c
++++ b/drivers/gpu/drm/nouveau/nouveau_sgdma.c
+@@ -290,7 +290,10 @@ nv50_sgdma_bind(struct ttm_tt *ttm, struct ttm_mem_reg *mem)
+ 	struct nouveau_mem *node = mem->mm_node;
+ 
+ 	/* noop: bound in move_notify() */
+-	node->pages = nvbe->ttm.dma_address;
++	if (ttm->sg) {
++		node->sg = ttm->sg;
++	} else
++		node->pages = nvbe->ttm.dma_address;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/nouveau/nouveau_vm.c b/drivers/gpu/drm/nouveau/nouveau_vm.c
+index 2bf6c03..11edd5e 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_vm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_vm.c
+@@ -77,6 +77,63 @@ nouveau_vm_map(struct nouveau_vma *vma, struct nouveau_mem *node)
+ }
+ 
+ void
++nouveau_vm_map_sg_table(struct nouveau_vma *vma, u64 delta, u64 length,
++			struct nouveau_mem *mem)
++{
++	struct nouveau_vm *vm = vma->vm;
++	int big = vma->node->type != vm->spg_shift;
++	u32 offset = vma->node->offset + (delta >> 12);
++	u32 bits = vma->node->type - 12;
++	u32 num  = length >> vma->node->type;
++	u32 pde  = (offset >> vm->pgt_bits) - vm->fpde;
++	u32 pte  = (offset & ((1 << vm->pgt_bits) - 1)) >> bits;
++	u32 max  = 1 << (vm->pgt_bits - bits);
++	unsigned m, sglen;
++	u32 end, len;
++	int i;
++	struct scatterlist *sg;
++
++	for_each_sg(mem->sg->sgl, sg, mem->sg->nents, i) {
++		struct nouveau_gpuobj *pgt = vm->pgt[pde].obj[big];
++		sglen = sg_dma_len(sg) >> PAGE_SHIFT;
++
++		end = pte + sglen;
++		if (unlikely(end >= max))
++			end = max;
++		len = end - pte;
++
++		for (m = 0; m < len; m++) {
++			dma_addr_t addr = sg_dma_address(sg) + (m << PAGE_SHIFT);
++
++			vm->map_sg(vma, pgt, mem, pte, 1, &addr);
++			num--;
++			pte++;
++
++			if (num == 0)
++				goto finish;
++		}
++		if (unlikely(end >= max)) {
++			pde++;
++			pte = 0;
++		}
++		if (m < sglen) {
++			for (; m < sglen; m++) {
++				dma_addr_t addr = sg_dma_address(sg) + (m << PAGE_SHIFT);
++
++				vm->map_sg(vma, pgt, mem, pte, 1, &addr);
++				num--;
++				pte++;
++				if (num == 0)
++					goto finish;
++			}
++		}
++
++	}
++finish:
++	vm->flush(vm);
++}
++
++void
+ nouveau_vm_map_sg(struct nouveau_vma *vma, u64 delta, u64 length,
+ 		  struct nouveau_mem *mem)
+ {
+diff --git a/drivers/gpu/drm/nouveau/nouveau_vm.h b/drivers/gpu/drm/nouveau/nouveau_vm.h
+index 4fb6e72..a8246e7 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_vm.h
++++ b/drivers/gpu/drm/nouveau/nouveau_vm.h
+@@ -72,6 +72,9 @@ struct nouveau_vm {
+ 		    u64 phys, u64 delta);
+ 	void (*map_sg)(struct nouveau_vma *, struct nouveau_gpuobj *,
+ 		       struct nouveau_mem *, u32 pte, u32 cnt, dma_addr_t *);
++
++	void (*map_sg_table)(struct nouveau_vma *, struct nouveau_gpuobj *,
++			     struct nouveau_mem *, u32 pte, u32 cnt, dma_addr_t *);
+ 	void (*unmap)(struct nouveau_gpuobj *pgt, u32 pte, u32 cnt);
+ 	void (*flush)(struct nouveau_vm *);
+ };
+@@ -90,7 +93,8 @@ void nouveau_vm_unmap(struct nouveau_vma *);
+ void nouveau_vm_unmap_at(struct nouveau_vma *, u64 offset, u64 length);
+ void nouveau_vm_map_sg(struct nouveau_vma *, u64 offset, u64 length,
+ 		       struct nouveau_mem *);
+-
++void nouveau_vm_map_sg_table(struct nouveau_vma *vma, u64 delta, u64 length,
++			     struct nouveau_mem *mem);
+ /* nv50_vm.c */
+ void nv50_vm_map_pgt(struct nouveau_gpuobj *pgd, u32 pde,
+ 		     struct nouveau_gpuobj *pgt[2]);
+diff --git a/drivers/gpu/drm/nouveau/nv04_crtc.c b/drivers/gpu/drm/nouveau/nv04_crtc.c
+index 728d075..4c31c63 100644
+--- a/drivers/gpu/drm/nouveau/nv04_crtc.c
++++ b/drivers/gpu/drm/nouveau/nv04_crtc.c
+@@ -1047,7 +1047,7 @@ nv04_crtc_create(struct drm_device *dev, int crtc_num)
+ 	drm_mode_crtc_set_gamma_size(&nv_crtc->base, 256);
+ 
+ 	ret = nouveau_bo_new(dev, 64*64*4, 0x100, TTM_PL_FLAG_VRAM,
+-			     0, 0x0000, &nv_crtc->cursor.nvbo);
++			     0, 0x0000, NULL, &nv_crtc->cursor.nvbo);
+ 	if (!ret) {
+ 		ret = nouveau_bo_pin(nv_crtc->cursor.nvbo, TTM_PL_FLAG_VRAM);
+ 		if (!ret)
+diff --git a/drivers/gpu/drm/nouveau/nv50_crtc.c b/drivers/gpu/drm/nouveau/nv50_crtc.c
+index 701b927..cad2abd 100644
+--- a/drivers/gpu/drm/nouveau/nv50_crtc.c
++++ b/drivers/gpu/drm/nouveau/nv50_crtc.c
+@@ -769,7 +769,7 @@ nv50_crtc_create(struct drm_device *dev, int index)
+ 	nv_crtc->lut.depth = 0;
+ 
+ 	ret = nouveau_bo_new(dev, 4096, 0x100, TTM_PL_FLAG_VRAM,
+-			     0, 0x0000, &nv_crtc->lut.nvbo);
++			     0, 0x0000, NULL, &nv_crtc->lut.nvbo);
+ 	if (!ret) {
+ 		ret = nouveau_bo_pin(nv_crtc->lut.nvbo, TTM_PL_FLAG_VRAM);
+ 		if (!ret)
+@@ -795,7 +795,7 @@ nv50_crtc_create(struct drm_device *dev, int index)
+ 	drm_mode_crtc_set_gamma_size(&nv_crtc->base, 256);
+ 
+ 	ret = nouveau_bo_new(dev, 64*64*4, 0x100, TTM_PL_FLAG_VRAM,
+-			     0, 0x0000, &nv_crtc->cursor.nvbo);
++			     0, 0x0000, NULL, &nv_crtc->cursor.nvbo);
+ 	if (!ret) {
+ 		ret = nouveau_bo_pin(nv_crtc->cursor.nvbo, TTM_PL_FLAG_VRAM);
+ 		if (!ret)
+diff --git a/drivers/gpu/drm/nouveau/nv50_evo.c b/drivers/gpu/drm/nouveau/nv50_evo.c
+index 9b962e9..ddcd555 100644
+--- a/drivers/gpu/drm/nouveau/nv50_evo.c
++++ b/drivers/gpu/drm/nouveau/nv50_evo.c
+@@ -117,7 +117,7 @@ nv50_evo_channel_new(struct drm_device *dev, int chid,
+ 	evo->user_get = 4;
+ 	evo->user_put = 0;
+ 
+-	ret = nouveau_bo_new(dev, 4096, 0, TTM_PL_FLAG_VRAM, 0, 0,
++	ret = nouveau_bo_new(dev, 4096, 0, TTM_PL_FLAG_VRAM, 0, 0, NULL,
+ 			     &evo->pushbuf_bo);
+ 	if (ret == 0)
+ 		ret = nouveau_bo_pin(evo->pushbuf_bo, TTM_PL_FLAG_VRAM);
+@@ -333,7 +333,7 @@ nv50_evo_create(struct drm_device *dev)
+ 			goto err;
+ 
+ 		ret = nouveau_bo_new(dev, 4096, 0x1000, TTM_PL_FLAG_VRAM,
+-				     0, 0x0000, &dispc->sem.bo);
++				     0, 0x0000, NULL, &dispc->sem.bo);
+ 		if (!ret) {
+ 			ret = nouveau_bo_pin(dispc->sem.bo, TTM_PL_FLAG_VRAM);
+ 			if (!ret)
+diff --git a/drivers/gpu/drm/nouveau/nvd0_display.c b/drivers/gpu/drm/nouveau/nvd0_display.c
+index 0247250..1f3a9b1 100644
+--- a/drivers/gpu/drm/nouveau/nvd0_display.c
++++ b/drivers/gpu/drm/nouveau/nvd0_display.c
+@@ -882,7 +882,7 @@ nvd0_crtc_create(struct drm_device *dev, int index)
+ 	drm_mode_crtc_set_gamma_size(crtc, 256);
+ 
+ 	ret = nouveau_bo_new(dev, 64 * 64 * 4, 0x100, TTM_PL_FLAG_VRAM,
+-			     0, 0x0000, &nv_crtc->cursor.nvbo);
++			     0, 0x0000, NULL, &nv_crtc->cursor.nvbo);
+ 	if (!ret) {
+ 		ret = nouveau_bo_pin(nv_crtc->cursor.nvbo, TTM_PL_FLAG_VRAM);
+ 		if (!ret)
+@@ -895,7 +895,7 @@ nvd0_crtc_create(struct drm_device *dev, int index)
+ 		goto out;
+ 
+ 	ret = nouveau_bo_new(dev, 8192, 0x100, TTM_PL_FLAG_VRAM,
+-			     0, 0x0000, &nv_crtc->lut.nvbo);
++			     0, 0x0000, NULL, &nv_crtc->lut.nvbo);
+ 	if (!ret) {
+ 		ret = nouveau_bo_pin(nv_crtc->lut.nvbo, TTM_PL_FLAG_VRAM);
+ 		if (!ret)
+@@ -2030,7 +2030,7 @@ nvd0_display_create(struct drm_device *dev)
+ 
+ 	/* small shared memory area we use for notifiers and semaphores */
+ 	ret = nouveau_bo_new(dev, 4096, 0x1000, TTM_PL_FLAG_VRAM,
+-			     0, 0x0000, &disp->sync);
++			     0, 0x0000, NULL, &disp->sync);
+ 	if (!ret) {
+ 		ret = nouveau_bo_pin(disp->sync, TTM_PL_FLAG_VRAM);
+ 		if (!ret)
+
