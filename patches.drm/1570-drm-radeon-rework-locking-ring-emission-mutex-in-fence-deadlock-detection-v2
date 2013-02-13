@@ -1,0 +1,231 @@
+From 8a47cc9ec1249eefd600adb273148c62879a560d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <deathsimple@vodafone.de>
+Date: Wed, 9 May 2012 15:34:48 +0200
+Subject: drm/radeon: rework locking ring emission mutex in fence deadlock
+ detection v2
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 8a47cc9ec1249eefd600adb273148c62879a560d
+Patch-mainline: v3.5-rc1
+
+Some callers illegal called fence_wait_next/empty
+while holding the ring emission mutex. So don't
+relock the mutex in that cases, and move the actual
+locking into the fence code.
+
+v2: Don't try to unlock the mutex if it isn't locked.
+
+Signed-off-by: Christian König <deathsimple@vodafone.de>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/radeon.h        |    4 +-
+ drivers/gpu/drm/radeon/radeon_device.c |    5 +++-
+ drivers/gpu/drm/radeon/radeon_fence.c  |   43 +++++++++++++++++++++----------
+ drivers/gpu/drm/radeon/radeon_pm.c     |    8 +-----
+ drivers/gpu/drm/radeon/radeon_ring.c   |    6 +---
+ 5 files changed, 37 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 7c87117..701094b 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -284,8 +284,8 @@ int radeon_fence_emit(struct radeon_device *rdev, struct radeon_fence *fence);
+ void radeon_fence_process(struct radeon_device *rdev, int ring);
+ bool radeon_fence_signaled(struct radeon_fence *fence);
+ int radeon_fence_wait(struct radeon_fence *fence, bool interruptible);
+-int radeon_fence_wait_next(struct radeon_device *rdev, int ring);
+-int radeon_fence_wait_empty(struct radeon_device *rdev, int ring);
++int radeon_fence_wait_next_locked(struct radeon_device *rdev, int ring);
++int radeon_fence_wait_empty_locked(struct radeon_device *rdev, int ring);
+ struct radeon_fence *radeon_fence_ref(struct radeon_fence *fence);
+ void radeon_fence_unref(struct radeon_fence **fence);
+ unsigned radeon_fence_count_emitted(struct radeon_device *rdev, int ring);
+diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
+index 0e7b72a..b827b2e 100644
+--- a/drivers/gpu/drm/radeon/radeon_device.c
++++ b/drivers/gpu/drm/radeon/radeon_device.c
+@@ -912,9 +912,12 @@ int radeon_suspend_kms(struct drm_device *dev, pm_message_t state)
+ 	}
+ 	/* evict vram memory */
+ 	radeon_bo_evict_vram(rdev);
++
++	mutex_lock(&rdev->ring_lock);
+ 	/* wait for gpu to finish processing current batch */
+ 	for (i = 0; i < RADEON_NUM_RINGS; i++)
+-		radeon_fence_wait_empty(rdev, i);
++		radeon_fence_wait_empty_locked(rdev, i);
++	mutex_unlock(&rdev->ring_lock);
+ 
+ 	radeon_save_bios_scratch_regs(rdev);
+ 
+diff --git a/drivers/gpu/drm/radeon/radeon_fence.c b/drivers/gpu/drm/radeon/radeon_fence.c
+index ed20225..098d1fa 100644
+--- a/drivers/gpu/drm/radeon/radeon_fence.c
++++ b/drivers/gpu/drm/radeon/radeon_fence.c
+@@ -194,7 +194,7 @@ bool radeon_fence_signaled(struct radeon_fence *fence)
+ }
+ 
+ static int radeon_fence_wait_seq(struct radeon_device *rdev, u64 target_seq,
+-				 unsigned ring, bool intr)
++				 unsigned ring, bool intr, bool lock_ring)
+ {
+ 	unsigned long timeout, last_activity;
+ 	uint64_t seq;
+@@ -249,8 +249,16 @@ static int radeon_fence_wait_seq(struct radeon_device *rdev, u64 target_seq,
+ 			if (seq != atomic64_read(&rdev->fence_drv[ring].last_seq)) {
+ 				continue;
+ 			}
++
++			if (lock_ring) {
++				mutex_lock(&rdev->ring_lock);
++			}
++
+ 			/* test if somebody else has already decided that this is a lockup */
+ 			if (last_activity != rdev->fence_drv[ring].last_activity) {
++				if (lock_ring) {
++					mutex_unlock(&rdev->ring_lock);
++				}
+ 				continue;
+ 			}
+ 
+@@ -264,15 +272,17 @@ static int radeon_fence_wait_seq(struct radeon_device *rdev, u64 target_seq,
+ 					rdev->fence_drv[i].last_activity = jiffies;
+ 				}
+ 
+-				/* change last activity so nobody else think there is a lockup */
+-				for (i = 0; i < RADEON_NUM_RINGS; ++i) {
+-					rdev->fence_drv[i].last_activity = jiffies;
+-				}
+-
+ 				/* mark the ring as not ready any more */
+ 				rdev->ring[ring].ready = false;
++				if (lock_ring) {
++					mutex_unlock(&rdev->ring_lock);
++				}
+ 				return -EDEADLK;
+ 			}
++
++			if (lock_ring) {
++				mutex_unlock(&rdev->ring_lock);
++			}
+ 		}
+ 	}
+ 	return 0;
+@@ -287,7 +297,8 @@ int radeon_fence_wait(struct radeon_fence *fence, bool intr)
+ 		return -EINVAL;
+ 	}
+ 
+-	r = radeon_fence_wait_seq(fence->rdev, fence->seq, fence->ring, intr);
++	r = radeon_fence_wait_seq(fence->rdev, fence->seq,
++				  fence->ring, intr, true);
+ 	if (r) {
+ 		return r;
+ 	}
+@@ -295,7 +306,7 @@ int radeon_fence_wait(struct radeon_fence *fence, bool intr)
+ 	return 0;
+ }
+ 
+-int radeon_fence_wait_next(struct radeon_device *rdev, int ring)
++int radeon_fence_wait_next_locked(struct radeon_device *rdev, int ring)
+ {
+ 	uint64_t seq;
+ 
+@@ -305,20 +316,22 @@ int radeon_fence_wait_next(struct radeon_device *rdev, int ring)
+ 	 */
+ 	seq = atomic64_read(&rdev->fence_drv[ring].last_seq) + 1ULL;
+ 	if (seq >= rdev->fence_drv[ring].seq) {
+-		/* nothing to wait for, last_seq is already the last emited fence */
+-		return 0;
++		/* nothing to wait for, last_seq is
++		   already the last emited fence */
++		return -ENOENT;
+ 	}
+-	return radeon_fence_wait_seq(rdev, seq, ring, false);
++	return radeon_fence_wait_seq(rdev, seq, ring, false, false);
+ }
+ 
+-int radeon_fence_wait_empty(struct radeon_device *rdev, int ring)
++int radeon_fence_wait_empty_locked(struct radeon_device *rdev, int ring)
+ {
+ 	/* We are not protected by ring lock when reading current seq
+ 	 * but it's ok as wait empty is call from place where no more
+ 	 * activity can be scheduled so there won't be concurrent access
+ 	 * to seq value.
+ 	 */
+-	return radeon_fence_wait_seq(rdev, rdev->fence_drv[ring].seq, ring, false);
++	return radeon_fence_wait_seq(rdev, rdev->fence_drv[ring].seq,
++				     ring, false, false);
+ }
+ 
+ struct radeon_fence *radeon_fence_ref(struct radeon_fence *fence)
+@@ -410,14 +423,16 @@ void radeon_fence_driver_fini(struct radeon_device *rdev)
+ {
+ 	int ring;
+ 
++	mutex_lock(&rdev->ring_lock);
+ 	for (ring = 0; ring < RADEON_NUM_RINGS; ring++) {
+ 		if (!rdev->fence_drv[ring].initialized)
+ 			continue;
+-		radeon_fence_wait_empty(rdev, ring);
++		radeon_fence_wait_empty_locked(rdev, ring);
+ 		wake_up_all(&rdev->fence_drv[ring].queue);
+ 		radeon_scratch_free(rdev, rdev->fence_drv[ring].scratch_reg);
+ 		rdev->fence_drv[ring].initialized = false;
+ 	}
++	mutex_unlock(&rdev->ring_lock);
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/radeon/radeon_pm.c b/drivers/gpu/drm/radeon/radeon_pm.c
+index 7c38745..0882554 100644
+--- a/drivers/gpu/drm/radeon/radeon_pm.c
++++ b/drivers/gpu/drm/radeon/radeon_pm.c
+@@ -270,13 +270,7 @@ static void radeon_pm_set_clocks(struct radeon_device *rdev)
+ 	} else {
+ 		struct radeon_ring *ring = &rdev->ring[RADEON_RING_TYPE_GFX_INDEX];
+ 		if (ring->ready) {
+-			struct radeon_fence *fence;
+-			radeon_ring_alloc(rdev, ring, 64);
+-			radeon_fence_create(rdev, &fence, radeon_ring_index(rdev, ring));
+-			radeon_fence_emit(rdev, fence);
+-			radeon_ring_commit(rdev, ring);
+-			radeon_fence_wait(fence, false);
+-			radeon_fence_unref(&fence);
++			radeon_fence_wait_empty_locked(rdev, RADEON_RING_TYPE_GFX_INDEX);
+ 		}
+ 	}
+ 	radeon_unmap_vram_bos(rdev);
+diff --git a/drivers/gpu/drm/radeon/radeon_ring.c b/drivers/gpu/drm/radeon/radeon_ring.c
+index 4ae222b..2fdc8c3 100644
+--- a/drivers/gpu/drm/radeon/radeon_ring.c
++++ b/drivers/gpu/drm/radeon/radeon_ring.c
+@@ -347,9 +347,7 @@ int radeon_ring_alloc(struct radeon_device *rdev, struct radeon_ring *ring, unsi
+ 		if (ndw < ring->ring_free_dw) {
+ 			break;
+ 		}
+-		mutex_unlock(&rdev->ring_lock);
+-		r = radeon_fence_wait_next(rdev, radeon_ring_index(rdev, ring));
+-		mutex_lock(&rdev->ring_lock);
++		r = radeon_fence_wait_next_locked(rdev, radeon_ring_index(rdev, ring));
+ 		if (r)
+ 			return r;
+ 	}
+@@ -408,7 +406,6 @@ void radeon_ring_force_activity(struct radeon_device *rdev, struct radeon_ring *
+ {
+ 	int r;
+ 
+-	mutex_lock(&rdev->ring_lock);
+ 	radeon_ring_free_size(rdev, ring);
+ 	if (ring->rptr == ring->wptr) {
+ 		r = radeon_ring_alloc(rdev, ring, 1);
+@@ -417,7 +414,6 @@ void radeon_ring_force_activity(struct radeon_device *rdev, struct radeon_ring *
+ 			radeon_ring_commit(rdev, ring);
+ 		}
+ 	}
+-	mutex_unlock(&rdev->ring_lock);
+ }
+ 
+ void radeon_ring_lockup_update(struct radeon_ring *ring)
+
