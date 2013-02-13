@@ -1,0 +1,182 @@
+From 28c70f162a315bdcfbe0bf940a740ef8bfb918d6 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Sat, 1 Dec 2012 13:53:45 +0100
+Subject: drm/i915: use the gmbus irq for waits
+Git-repo: git://people.freedesktop.org/~danvet/drm-intel
+Git-commit: 28c70f162a315bdcfbe0bf940a740ef8bfb918d6
+Patch-mainline: Not yet, in drm-intel.
+
+We need two special things to properly wire this up:
+- Add another argument to gmbus_wait_hw_status to pass in the
+  correct interrupt bit in gmbus4.
+- Since we can only get an irq for one of the two events we want,
+  hand-roll the wait_event_timeout code so that we wake up every
+  jiffie and can check for NAKs. This way we also subsume gmbus
+  support for platforms without interrupts (or where those are not
+  yet enabled).
+
+The important bit really is to only enable one gmbus interrupt source
+at the same time - with that piece of lore figured out, this seems to
+work flawlessly.
+
+Ben Widawsky rightfully complained the lack of measurements for the
+claimed benefits (especially since the first version was actually
+broken and fell back to bit-banging). Previously reading the 256 byte
+hdmi EDID takes about 72 ms here. With this patch it's down to 33 ms.
+Given that transfering the 256 bytes over i2c at wire speed takes
+20.5ms alone, the reduction in additional overhead is rather nice.
+
+v2: Chris Wilson wondered whether GMBUS4 might contain some set bits
+when booting up an hence result in some spurious interrupts. Since we
+clear GMBUS4 after every wait and we do gmbus transfer really early in
+the setup sequence to detect displays the window is small, but still
+be paranoid and clear it properly.
+
+v3: Clarify the comment that gmbus irq generation can only support one
+kind of event, why it bothers us and how we work around that limit.
+
+Cc: Daniel Kurtz <djkurtz@chromium.org>
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h  |    3 ++
+ drivers/gpu/drm/i915/i915_irq.c  |    4 +++
+ drivers/gpu/drm/i915/intel_i2c.c |   45 ++++++++++++++++++++++++++++---------
+ 3 files changed, 41 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index e7411f3..3843383 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -641,6 +641,7 @@ typedef struct drm_i915_private {
+ 
+ 	struct intel_gmbus gmbus[GMBUS_NUM_PORTS];
+ 
++
+ 	/** gmbus_mutex protects against concurrent usage of the single hw gmbus
+ 	 * controller on different i2c buses. */
+ 	struct mutex gmbus_mutex;
+@@ -650,6 +651,8 @@ typedef struct drm_i915_private {
+ 	 */
+ 	uint32_t gpio_mmio_base;
+ 
++	wait_queue_head_t gmbus_wait_queue;
++
+ 	struct pci_dev *bridge_dev;
+ 	struct intel_ring_buffer ring[I915_NUM_RINGS];
+ 	uint32_t next_seqno;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 956b95f..917a48d 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -527,7 +527,11 @@ static void gen6_queue_rps_work(struct drm_i915_private *dev_priv,
+ 
+ static void gmbus_irq_handler(struct drm_device *dev)
+ {
++	struct drm_i915_private *dev_priv = (drm_i915_private_t *) dev->dev_private;
++
+ 	DRM_DEBUG_DRIVER("GMBUS interrupt\n");
++
++	wake_up_all(&dev_priv->gmbus_wait_queue);
+ }
+ 
+ static irqreturn_t valleyview_irq_handler(int irq, void *arg)
+diff --git a/drivers/gpu/drm/i915/intel_i2c.c b/drivers/gpu/drm/i915/intel_i2c.c
+index a16eecd..8b71892 100644
+--- a/drivers/gpu/drm/i915/intel_i2c.c
++++ b/drivers/gpu/drm/i915/intel_i2c.c
+@@ -63,6 +63,7 @@ intel_i2c_reset(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	I915_WRITE(dev_priv->gpio_mmio_base + GMBUS0, 0);
++	I915_WRITE(dev_priv->gpio_mmio_base + GMBUS4, 0);
+ }
+ 
+ static void intel_i2c_quirk_set(struct drm_i915_private *dev_priv, bool enable)
+@@ -204,20 +205,38 @@ intel_gpio_setup(struct intel_gmbus *bus, u32 pin)
+ 
+ static int
+ gmbus_wait_hw_status(struct drm_i915_private *dev_priv,
+-		     u32 gmbus2_status)
++		     u32 gmbus2_status,
++		     u32 gmbus4_irq_en)
+ {
+-	int ret;
++	int i;
+ 	int reg_offset = dev_priv->gpio_mmio_base;
+-	u32 gmbus2;
++	u32 gmbus2 = 0;
++	DEFINE_WAIT(wait);
++
++	/* Important: The hw handles only the first bit, so set only one! Since
++	 * we also need to check for NAKs besides the hw ready/idle signal, we
++	 * need to wake up periodically and check that ourselves. */
++	I915_WRITE(GMBUS4 + reg_offset, gmbus4_irq_en);
+ 
+-	ret = wait_for((gmbus2 = I915_READ(GMBUS2 + reg_offset)) &
+-		       (GMBUS_SATOER | gmbus2_status),
+-		       50);
++	for (i = 0; i < msecs_to_jiffies(50) + 1; i++) {
++		prepare_to_wait(&dev_priv->gmbus_wait_queue, &wait,
++				TASK_UNINTERRUPTIBLE);
++
++		gmbus2 = I915_READ(GMBUS2 + reg_offset);
++		if (gmbus2 & (GMBUS_SATOER | gmbus2_status))
++			break;
++
++		schedule_timeout(1);
++	}
++	finish_wait(&dev_priv->gmbus_wait_queue, &wait);
++
++	I915_WRITE(GMBUS4 + reg_offset, 0);
+ 
+ 	if (gmbus2 & GMBUS_SATOER)
+ 		return -ENXIO;
+-
+-	return ret;
++	if (gmbus2 & gmbus2_status)
++		return 0;
++	return -ETIMEDOUT;
+ }
+ 
+ static int
+@@ -238,7 +257,8 @@ gmbus_xfer_read(struct drm_i915_private *dev_priv, struct i2c_msg *msg,
+ 		int ret;
+ 		u32 val, loop = 0;
+ 
+-		ret = gmbus_wait_hw_status(dev_priv, GMBUS_HW_RDY);
++		ret = gmbus_wait_hw_status(dev_priv, GMBUS_HW_RDY,
++					   GMBUS_HW_RDY_EN);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -282,7 +302,8 @@ gmbus_xfer_write(struct drm_i915_private *dev_priv, struct i2c_msg *msg)
+ 
+ 		I915_WRITE(GMBUS3 + reg_offset, val);
+ 
+-		ret = gmbus_wait_hw_status(dev_priv, GMBUS_HW_RDY);
++		ret = gmbus_wait_hw_status(dev_priv, GMBUS_HW_RDY,
++					   GMBUS_HW_RDY_EN);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -367,7 +388,8 @@ gmbus_xfer(struct i2c_adapter *adapter,
+ 		if (ret == -ENXIO)
+ 			goto clear_err;
+ 
+-		ret = gmbus_wait_hw_status(dev_priv, GMBUS_HW_WAIT_PHASE);
++		ret = gmbus_wait_hw_status(dev_priv, GMBUS_HW_WAIT_PHASE,
++					   GMBUS_HW_WAIT_EN);
+ 		if (ret == -ENXIO)
+ 			goto clear_err;
+ 		if (ret)
+@@ -473,6 +495,7 @@ int intel_setup_gmbus(struct drm_device *dev)
+ 		dev_priv->gpio_mmio_base = 0;
+ 
+ 	mutex_init(&dev_priv->gmbus_mutex);
++	init_waitqueue_head(&dev_priv->gmbus_wait_queue);
+ 
+ 	for (i = 0; i < GMBUS_NUM_PORTS; i++) {
+ 		struct intel_gmbus *bus = &dev_priv->gmbus[i];
+
