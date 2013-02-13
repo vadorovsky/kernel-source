@@ -1,0 +1,175 @@
+From: Takashi Iwai <tiwai@suse.de>
+Patch-mainline: never
+Subject: Revert commit cdad05216c2b2edfe92a9f87d6ae51aab277f3b2 drm/ttm, drm/vmwgfx: Use RCU locking for object lookups v3
+
+Compatibility patch taken from SUSE:SLE-11-SP3:GA/drm.
+
+Acked-by: Michal Srb <msrb@suse.com>
+---
+diff --git a/drivers/gpu/drm/ttm/ttm_object.c b/drivers/gpu/drm/ttm/ttm_object.c
+index f18eeb4..c785787 100644
+--- a/drivers/gpu/drm/ttm/ttm_object.c
++++ b/drivers/gpu/drm/ttm/ttm_object.c
+@@ -80,7 +80,7 @@ struct ttm_object_file {
+  */
+ 
+ struct ttm_object_device {
+-	spinlock_t object_lock;
++	rwlock_t object_lock;
+ 	struct drm_open_hash object_hash;
+ 	atomic_t object_count;
+ 	struct ttm_mem_global *mem_glob;
+@@ -157,12 +157,12 @@ int ttm_base_object_init(struct ttm_object_file *tfile,
+ 	base->refcount_release = refcount_release;
+ 	base->ref_obj_release = ref_obj_release;
+ 	base->object_type = object_type;
+-	spin_lock(&tdev->object_lock);
++	write_lock(&tdev->object_lock);
+ 	kref_init(&base->refcount);
+ 	ret = drm_ht_just_insert_please(&tdev->object_hash,
+ 					&base->hash,
+ 					(unsigned long)base, 31, 0, 0);
+-	spin_unlock(&tdev->object_lock);
++	write_unlock(&tdev->object_lock);
+ 	if (unlikely(ret != 0))
+ 		goto out_err0;
+ 
+@@ -186,22 +186,30 @@ static void ttm_release_base(struct kref *kref)
+ 	    container_of(kref, struct ttm_base_object, refcount);
+ 	struct ttm_object_device *tdev = base->tfile->tdev;
+ 
+-	spin_lock(&tdev->object_lock);
+ 	(void)drm_ht_remove_item(&tdev->object_hash, &base->hash);
+-	spin_unlock(&tdev->object_lock);
++	write_unlock(&tdev->object_lock);
+ 	if (base->refcount_release) {
+ 		ttm_object_file_unref(&base->tfile);
+ 		base->refcount_release(&base);
+ 	}
++	write_lock(&tdev->object_lock);
+ }
+ 
+ void ttm_base_object_unref(struct ttm_base_object **p_base)
+ {
+ 	struct ttm_base_object *base = *p_base;
++	struct ttm_object_device *tdev = base->tfile->tdev;
+ 
+ 	*p_base = NULL;
+ 
++	/*
++	 * Need to take the lock here to avoid racing with
++	 * users trying to look up the object.
++	 */
++
++	write_lock(&tdev->object_lock);
+ 	kref_put(&base->refcount, ttm_release_base);
++	write_unlock(&tdev->object_lock);
+ }
+ EXPORT_SYMBOL(ttm_base_object_unref);
+ 
+@@ -213,14 +221,14 @@ struct ttm_base_object *ttm_base_object_lookup(struct ttm_object_file *tfile,
+ 	struct drm_hash_item *hash;
+ 	int ret;
+ 
+-	rcu_read_lock();
++	read_lock(&tdev->object_lock);
+ 	ret = drm_ht_find_item(&tdev->object_hash, key, &hash);
+ 
+ 	if (likely(ret == 0)) {
+ 		base = drm_hash_entry(hash, struct ttm_base_object, hash);
+-		ret = kref_get_unless_zero(&base->refcount) ? 0 : -EINVAL;
++		kref_get(&base->refcount);
+ 	}
+-	rcu_read_unlock();
++	read_unlock(&tdev->object_lock);
+ 
+ 	if (unlikely(ret != 0))
+ 		return NULL;
+@@ -418,7 +426,7 @@ struct ttm_object_device *ttm_object_device_init(struct ttm_mem_global
+ 		return NULL;
+ 
+ 	tdev->mem_glob = mem_glob;
+-	spin_lock_init(&tdev->object_lock);
++	rwlock_init(&tdev->object_lock);
+ 	atomic_set(&tdev->object_count, 0);
+ 	ret = drm_ht_create(&tdev->object_hash, hash_order);
+ 
+@@ -436,9 +444,9 @@ void ttm_object_device_release(struct ttm_object_device **p_tdev)
+ 
+ 	*p_tdev = NULL;
+ 
+-	spin_lock(&tdev->object_lock);
++	write_lock(&tdev->object_lock);
+ 	drm_ht_remove(&tdev->object_hash);
+-	spin_unlock(&tdev->object_lock);
++	write_unlock(&tdev->object_lock);
+ 
+ 	kfree(tdev);
+ }
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+index 292c988..596cef3 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_resource.c
+@@ -351,7 +351,7 @@ static void vmw_user_context_free(struct vmw_resource *res)
+ 	    container_of(res, struct vmw_user_context, res);
+ 	struct vmw_private *dev_priv = res->dev_priv;
+ 
+-	ttm_base_object_kfree(ctx, base);
++	kfree(ctx);
+ 	ttm_mem_global_free(vmw_mem_glob(dev_priv),
+ 			    vmw_user_context_size);
+ }
+@@ -1143,7 +1143,7 @@ static void vmw_user_surface_free(struct vmw_resource *res)
+ 	kfree(srf->offsets);
+ 	kfree(srf->sizes);
+ 	kfree(srf->snooper.image);
+-	ttm_base_object_kfree(user_srf, base);
++	kfree(user_srf);
+ 	ttm_mem_global_free(vmw_mem_glob(dev_priv), size);
+ }
+ 
+@@ -1571,7 +1571,7 @@ static void vmw_user_dmabuf_destroy(struct ttm_buffer_object *bo)
+ {
+ 	struct vmw_user_dma_buffer *vmw_user_bo = vmw_user_dma_buffer(bo);
+ 
+-	ttm_base_object_kfree(vmw_user_bo, base);
++	kfree(vmw_user_bo);
+ }
+ 
+ static void vmw_user_dmabuf_release(struct ttm_base_object **p_base)
+@@ -1759,7 +1759,7 @@ static void vmw_user_stream_free(struct vmw_resource *res)
+ 	    container_of(res, struct vmw_user_stream, stream.res);
+ 	struct vmw_private *dev_priv = res->dev_priv;
+ 
+-	ttm_base_object_kfree(stream, base);
++	kfree(stream);
+ 	ttm_mem_global_free(vmw_mem_glob(dev_priv),
+ 			    vmw_user_stream_size);
+ }
+diff --git a/include/drm/ttm/ttm_object.h b/include/drm/ttm/ttm_object.h
+index fc0cf06..b01c563 100644
+--- a/include/drm/ttm/ttm_object.h
++++ b/include/drm/ttm/ttm_object.h
+@@ -40,7 +40,6 @@
+ #include <linux/list.h>
+ #include <drm/drm_hashtab.h>
+ #include <linux/kref.h>
+-#include <linux/rcupdate.h>
+ #include <ttm/ttm_memory.h>
+ 
+ /**
+@@ -121,7 +120,6 @@ struct ttm_object_device;
+  */
+ 
+ struct ttm_base_object {
+-	struct rcu_head rhead;
+ 	struct drm_hash_item hash;
+ 	enum ttm_object_type object_type;
+ 	bool shareable;
+@@ -270,6 +268,4 @@ extern struct ttm_object_device *ttm_object_device_init
+ 
+ extern void ttm_object_device_release(struct ttm_object_device **p_tdev);
+ 
+-#define ttm_base_object_kfree(__object, __base)\
+-	kfree_rcu(__object, __base.rhead)
+ #endif
