@@ -1,0 +1,256 @@
+From: Dave Chinner <dchinner@redhat.com>
+Subject: xfs: xfs_sync_data is redundant.
+Patch-mainline: 3.8-rc1
+Git-commit: 9aa05000f2b7cab4be582afba64af10b2d74727e
+References: bnc#761849
+
+[xfs_sync_data() is actually still used in SLE11 SP2 so the first
+paragraph isn't true there. But it still holds that flushing of inodes
+to reduce delalloc uncertainty can be handled by VFS better.
+
+Also we use writeback_inodes_sb() instead of sync_inodes_sb() as it's much
+faster and any conversion should be perfomed after it returns anyway (see
+comment before xfs_flush_inodes()).]
+
+We don't do any data writeback from XFS any more - the VFS is
+completely responsible for that, including for freeze. We can
+replace the remaining caller with a VFS level function that
+achieves the same thing, but without conflicting with current
+writeback work.
+
+This means we can remove the flush_work and xfs_flush_inodes() - the
+VFS functionality completely replaces the internal flush queue for
+doing this writeback work in a separate context to avoid stack
+overruns.
+
+This does have one complication - it cannot be called with page
+locks held.  Hence move the flushing of delalloc space when ENOSPC
+occurs back up into xfs_file_aio_buffered_write when we don't hold
+any locks that will stall writeback.
+
+Unfortunately, writeback_inodes_sb_if_idle() is not sufficient to
+trigger delalloc conversion fast enough to prevent spurious ENOSPC
+whent here are hundreds of writers, thousands of small files and GBs
+of free RAM.  Hence we need to use sync_sb_inodes() to block callers
+while we wait for writeback like the previous xfs_flush_inodes
+implementation did.
+
+That means we have to hold the s_umount lock here, but because this
+call can nest inside i_mutex (the parent directory in the create
+case, held by the VFS), we have to use down_read_trylock() to avoid
+potential deadlocks. In practice, this trylock will succeed on
+almost every attempt as unmount/remount type operations are
+exceedingly rare.
+
+Note: we always need to pass a count of zero to
+generic_file_buffered_write() as the previously written byte count.
+We only do this by accident before this patch by the virtue of ret
+always being zero when there are no errors. Make this explicit
+rather than needing to specifically zero ret in the ENOSPC retry
+case.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Ben Myers <bpm@sgi.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+
+diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/linux-2.6/xfs_file.c linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/linux-2.6/xfs_file.c
+--- linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/linux-2.6/xfs_file.c	2013-02-11 14:40:58.028464477 +0100
++++ linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/linux-2.6/xfs_file.c	2013-02-11 15:37:26.043496030 +0100
+@@ -941,16 +941,15 @@ xfs_file_buffered_aio_write(
+ write_retry:
+ 	trace_xfs_file_buffered_write(ip, count, iocb->ki_pos, 0);
+ 	ret = generic_file_buffered_write(iocb, iovp, nr_segs,
+-			pos, &iocb->ki_pos, count, ret);
++			pos, &iocb->ki_pos, count, 0);
+ 	/*
+-	 * if we just got an ENOSPC, flush the inode now we aren't holding any
+-	 * page locks and retry *once*
++	 * If we just got an ENOSPC, try to write back all dirty inodes to
++	 * convert delalloc space to free up some of the excess reserved
++	 * metadata space.
+ 	 */
+ 	if (ret == -ENOSPC && !enospc) {
+-		ret = -xfs_flush_pages(ip, 0, -1, 0, FI_NONE);
+-		if (ret)
+-			return ret;
+ 		enospc = 1;
++		xfs_flush_inodes(ip->i_mount);
+ 		goto write_retry;
+ 	}
+ 	current->backing_dev_info = NULL;
+diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/linux-2.6/xfs_super.c linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/linux-2.6/xfs_super.c
+--- linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/linux-2.6/xfs_super.c	2013-02-11 14:40:57.932715749 +0100
++++ linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/linux-2.6/xfs_super.c	2013-02-12 00:34:54.857458171 +0100
+@@ -805,6 +805,24 @@ xfs_setup_devices(
+ 	return 0;
+ }
+ 
++/*
++ * Flush all dirty data to disk. Must not be called while holding an XFS_ILOCK
++ * or a page lock. We use writeback_inodes_sb() so that we don't have to scan
++ * through all inodes waiting for IO. The function returns after all IO is
++ * submitted so delalloc conversion should be performed at that moment.
++ */
++void
++xfs_flush_inodes(
++	struct xfs_mount	*mp)
++{
++	struct super_block	*sb = mp->m_super;
++
++	if (down_read_trylock(&sb->s_umount)) {
++		writeback_inodes_sb(sb);
++		up_read(&sb->s_umount);
++	}
++}
++
+ /* Catch misguided souls that try to use this interface on XFS */
+ STATIC struct inode *
+ xfs_fs_alloc_inode(
+diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/linux-2.6/xfs_super.h linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/linux-2.6/xfs_super.h
+--- linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/linux-2.6/xfs_super.h	2013-02-11 14:40:57.595474930 +0100
++++ linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/linux-2.6/xfs_super.h	2013-02-11 15:31:23.930732065 +0100
+@@ -83,6 +83,7 @@ struct block_device;
+ 
+ extern __uint64_t xfs_max_file_offset(unsigned int);
+ 
++extern void xfs_flush_inodes(struct xfs_mount *mp);
+ extern void xfs_blkdev_issue_flush(struct xfs_buftarg *);
+ 
+ extern const struct export_operations xfs_export_operations;
+diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/linux-2.6/xfs_sync.c linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/linux-2.6/xfs_sync.c
+--- linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/linux-2.6/xfs_sync.c	2013-02-11 14:40:30.252464257 +0100
++++ linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/linux-2.6/xfs_sync.c	2013-02-11 15:34:58.449482043 +0100
+@@ -565,44 +565,10 @@ xfs_reclaim_worker(
+ 	xfs_syncd_queue_reclaim(mp);
+ }
+ 
+-/*
+- * Flush delayed allocate data, attempting to free up reserved space
+- * from existing allocations.  At this point a new allocation attempt
+- * has failed with ENOSPC and we are in the process of scratching our
+- * heads, looking about for more room.
+- *
+- * Queue a new data flush if there isn't one already in progress and
+- * wait for completion of the flush. This means that we only ever have one
+- * inode flush in progress no matter how many ENOSPC events are occurring and
+- * so will prevent the system from bogging down due to every concurrent
+- * ENOSPC event scanning all the active inodes in the system for writeback.
+- */
+-void
+-xfs_flush_inodes(
+-	struct xfs_inode	*ip)
+-{
+-	struct xfs_mount	*mp = ip->i_mount;
+-
+-	queue_work(xfs_syncd_wq, &mp->m_flush_work);
+-	flush_work_sync(&mp->m_flush_work);
+-}
+-
+-STATIC void
+-xfs_flush_worker(
+-	struct work_struct *work)
+-{
+-	struct xfs_mount *mp = container_of(work,
+-					struct xfs_mount, m_flush_work);
+-
+-	xfs_sync_data(mp, SYNC_TRYLOCK);
+-	xfs_sync_data(mp, SYNC_TRYLOCK | SYNC_WAIT);
+-}
+-
+ int
+ xfs_syncd_init(
+ 	struct xfs_mount	*mp)
+ {
+-	INIT_WORK(&mp->m_flush_work, xfs_flush_worker);
+ 	INIT_DELAYED_WORK(&mp->m_sync_work, xfs_sync_worker);
+ 	INIT_DELAYED_WORK(&mp->m_reclaim_work, xfs_reclaim_worker);
+ 
+@@ -618,7 +584,6 @@ xfs_syncd_stop(
+ {
+ 	cancel_delayed_work_sync(&mp->m_sync_work);
+ 	cancel_delayed_work_sync(&mp->m_reclaim_work);
+-	cancel_work_sync(&mp->m_flush_work);
+ }
+ 
+ void
+diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/linux-2.6/xfs_sync.h linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/linux-2.6/xfs_sync.h
+--- linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/linux-2.6/xfs_sync.h	2013-02-11 14:40:30.253464887 +0100
++++ linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/linux-2.6/xfs_sync.h	2013-02-11 15:32:54.648477476 +0100
+@@ -40,8 +40,6 @@ void xfs_syncd_stop(struct xfs_mount *mp
+ int xfs_quiesce_data(struct xfs_mount *mp);
+ void xfs_quiesce_attr(struct xfs_mount *mp);
+ 
+-void xfs_flush_inodes(struct xfs_inode *ip);
+-
+ int xfs_log_dirty_inode(struct xfs_inode *ip, struct xfs_perag *pag, int flags);
+ 
+ int xfs_reclaim_inodes(struct xfs_mount *mp, int mode);
+diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/xfs_iomap.c linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/xfs_iomap.c
+--- linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/xfs_iomap.c	2012-05-15 22:52:33.545789564 +0200
++++ linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/xfs_iomap.c	2013-02-11 15:31:05.543721749 +0100
+@@ -385,7 +385,7 @@ xfs_iomap_write_delay(
+ 	xfs_extlen_t	extsz;
+ 	int		nimaps;
+ 	xfs_bmbt_irec_t imap[XFS_WRITE_IMAPS];
+-	int		prealloc, flushed = 0;
++	int		prealloc;
+ 	int		error;
+ 
+ 	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
+@@ -441,26 +441,17 @@ retry:
+ 	}
+ 
+ 	/*
+-	 * If bmapi returned us nothing, we got either ENOSPC or EDQUOT.  For
+-	 * ENOSPC, * flush all other inodes with delalloc blocks to free up
+-	 * some of the excess reserved metadata space. For both cases, retry
++	 * If bmapi returned us nothing, we got either ENOSPC or EDQUOT. Retry
+ 	 * without EOF preallocation.
+ 	 */
+ 	if (nimaps == 0) {
+ 		trace_xfs_delalloc_enospc(ip, offset, count);
+-		if (flushed)
+-			return XFS_ERROR(error ? error : ENOSPC);
+-
+-		if (error == ENOSPC) {
+-			xfs_iunlock(ip, XFS_ILOCK_EXCL);
+-			xfs_flush_inodes(ip);
+-			xfs_ilock(ip, XFS_ILOCK_EXCL);
++		if (prealloc) {
++			prealloc = 0;
++			error = 0;
++			goto retry;
+ 		}
+-
+-		flushed = 1;
+-		error = 0;
+-		prealloc = 0;
+-		goto retry;
++		return XFS_ERROR(error ? error : ENOSPC);
+ 	}
+ 
+ 	if (!(imap[0].br_startblock || XFS_IS_REALTIME_INODE(ip)))
+diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/xfs_mount.h linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/xfs_mount.h
+--- linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/xfs_mount.h	2013-02-11 14:40:57.942706197 +0100
++++ linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/xfs_mount.h	2013-02-12 00:35:33.466457560 +0100
+@@ -208,7 +208,7 @@ typedef struct xfs_mount {
+ 	struct xfs_mru_cache	*m_filestream;  /* per-mount filestream data */
+ 	struct delayed_work	m_sync_work;	/* background sync work */
+ 	struct delayed_work	m_reclaim_work;	/* background inode reclaim */
+-	struct work_struct	m_flush_work;	/* background inode flush */
++	struct work_struct	m_flush_work;	/* Unused - kept due to KABI */
+ 	__int64_t		m_update_flags;	/* sb flags we need to update
+ 						   on the next remount,rw */
+ 	struct shrinker		m_inode_shrink;	/* inode reclaim shrinker */
+diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/xfs_vnodeops.c linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/xfs_vnodeops.c
+--- linux-3.0-SLE11-SP2-2-xfs_fast_flush/fs/xfs/xfs_vnodeops.c	2013-02-11 14:40:58.004706370 +0100
++++ linux-3.0-SLE11-SP2-1-xfs_slow_trunc/fs/xfs/xfs_vnodeops.c	2013-02-11 15:31:42.934714983 +0100
+@@ -1377,7 +1377,7 @@ xfs_create(
+ 			XFS_TRANS_PERM_LOG_RES, log_count);
+ 	if (error == ENOSPC) {
+ 		/* flush outstanding delalloc blocks and retry */
+-		xfs_flush_inodes(dp);
++		xfs_flush_inodes(mp);
+ 		error = xfs_trans_reserve(tp, resblks, log_res, 0,
+ 				XFS_TRANS_PERM_LOG_RES, log_count);
+ 	}
