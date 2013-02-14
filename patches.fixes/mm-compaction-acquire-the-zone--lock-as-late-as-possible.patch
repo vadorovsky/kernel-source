@@ -1,0 +1,193 @@
+From: Mel Gorman <mgorman@suse.de>
+Date: Tue, 8 Jan 2013 12:19:12 +0000
+Subject: [PATCH] mm: compaction: acquire the zone->lock as late as possible
+
+References: Compaction functionality (bnc#796823)
+Patch-mainline: Yes (v3.7)
+Git-commit: f40d1e42bb988d2a26e8e111ea4c4c7bac819b7e
+
+Compaction's free scanner acquires the zone->lock when checking for
+PageBuddy pages and isolating them.  It does this even if there are no
+PageBuddy pages in the range.
+
+This patch defers acquiring the zone lock for as long as possible.  In the
+event there are no free pages in the pageblock then the lock will not be
+acquired at all which reduces contention on zone->lock.
+
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Acked-by: Rik van Riel <riel@redhat.com>
+Cc: Richard Davies <richard@arachsys.com>
+Cc: Shaohua Li <shli@kernel.org>
+Cc: Avi Kivity <avi@redhat.com>
+Acked-by: Rafael Aquini <aquini@redhat.com>
+Acked-by: Minchan Kim <minchan@kernel.org>
+Tested-by: Peter Ujfalusi <peter.ujfalusi@ti.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ mm/compaction.c |  103 ++++++++++++++++++++++++++++---------------------------
+ 1 file changed, 53 insertions(+), 50 deletions(-)
+
+diff --git a/mm/compaction.c b/mm/compaction.c
+index bdb0199..2a9890d 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -113,19 +113,42 @@ static inline bool compact_trylock_irqsave(spinlock_t *lock,
+ 	return compact_checklock_irqsave(lock, flags, false, cc);
+ }
+ 
++/* Returns true if the page is within a block suitable for migration to */
++static bool suitable_migration_target(struct page *page)
++{
++	int migratetype = get_pageblock_migratetype(page);
++
++	/* Don't interfere with memory hot-remove or the min_free_kbytes blocks */
++	if (migratetype == MIGRATE_ISOLATE || migratetype == MIGRATE_RESERVE)
++		return false;
++
++	/* If the page is a large free page, then allow migration */
++	if (PageBuddy(page) && page_order(page) >= pageblock_order)
++		return true;
++
++	/* If the block is MIGRATE_MOVABLE or MIGRATE_CMA, allow migration */
++	if (migrate_async_suitable(migratetype))
++		return true;
++
++	/* Otherwise skip the block */
++	return false;
++}
++
+ /*
+- * Isolate free pages onto a private freelist. Caller must hold zone->lock.
++ * Isolate free pages onto a private freelist.
+  */
+-static unsigned long isolate_freepages_block(struct zone *zone,
++static unsigned long isolate_freepages_block(struct compact_control *cc,
+ 				unsigned long blockpfn,
+ 				struct list_head *freelist)
+ {
+ 	unsigned long zone_end_pfn, end_pfn;
+ 	int nr_scanned = 0, total_isolated = 0;
+ 	struct page *cursor;
++	unsigned long flags;
++	bool locked = false;
+ 
+ 	/* Get the last PFN we should scan for free pages at */
+-	zone_end_pfn = zone->zone_start_pfn + zone->spanned_pages;
++	zone_end_pfn = cc->zone->zone_start_pfn + cc->zone->spanned_pages;
+ 	end_pfn = min(blockpfn + pageblock_nr_pages, zone_end_pfn);
+ 
+ 	/* Find the first usable PFN in the block to initialse page cursor */
+@@ -135,15 +158,35 @@ static unsigned long isolate_freepages_block(struct zone *zone,
+ 	}
+ 	cursor = pfn_to_page(blockpfn);
+ 
+-	/* Isolate free pages. This assumes the block is valid */
++	/* Isolate free pages. */
+ 	for (; blockpfn < end_pfn; blockpfn++, cursor++) {
+ 		int isolated, i;
+ 		struct page *page = cursor;
+ 
++		nr_scanned++;
+ 		if (!pfn_valid_within(blockpfn))
+ 			continue;
+-		nr_scanned++;
++		if (!PageBuddy(page))
++			continue;
++
++		/*
++		 * The zone lock must be held to isolate freepages.
++		 * Unfortunately this is a very coarse lock and can be
++		 * heavily contended if there are parallel allocations
++		 * or parallel compactions. For async compaction do not
++		 * spin on the lock and we acquire the lock as late as
++		 * possible.
++		 */
++		locked = compact_checklock_irqsave(&cc->zone->lock, &flags,
++								locked, cc);
++		if (!locked)
++			break;
++
++		/* Recheck this is a suitable migration target under lock */
++		if (!suitable_migration_target(page))
++			break;
+ 
++		/* Recheck this is a buddy page under lock */
+ 		if (!PageBuddy(page))
+ 			continue;
+ 
+@@ -163,31 +206,11 @@ static unsigned long isolate_freepages_block(struct zone *zone,
+ 	}
+ 
+ 	trace_mm_compaction_isolate_freepages(nr_scanned, total_isolated);
++	if (locked)
++		spin_unlock_irqrestore(&cc->zone->lock, flags);
+ 	return total_isolated;
+ }
+ 
+-/* Returns true if the page is within a block suitable for migration to */
+-static bool suitable_migration_target(struct page *page)
+-{
+-
+-	int migratetype = get_pageblock_migratetype(page);
+-
+-	/* Don't interfere with memory hot-remove or the min_free_kbytes blocks */
+-	if (migratetype == MIGRATE_ISOLATE || migratetype == MIGRATE_RESERVE)
+-		return false;
+-
+-	/* If the page is a large free page, then allow migration */
+-	if (PageBuddy(page) && page_order(page) >= pageblock_order)
+-		return true;
+-
+-	/* If the block is MIGRATE_MOVABLE, allow migration */
+-	if (migratetype == MIGRATE_MOVABLE)
+-		return true;
+-
+-	/* Otherwise skip the block */
+-	return false;
+-}
+-
+ /*
+  * Based on information in the current compact_control, find blocks
+  * suitable for isolating free pages from and then isolate them.
+@@ -197,7 +220,6 @@ static void isolate_freepages(struct zone *zone,
+ {
+ 	struct page *page;
+ 	unsigned long high_pfn, low_pfn, pfn;
+-	unsigned long flags;
+ 	int nr_freepages = cc->nr_freepages;
+ 	struct list_head *freelist = &cc->freepages;
+ 
+@@ -243,28 +265,9 @@ static void isolate_freepages(struct zone *zone,
+ 		if (!suitable_migration_target(page))
+ 			continue;
+ 
+-		/*
+-		 * Found a block suitable for isolating free pages from. Now
+-		 * we disabled interrupts, double check things are ok and
+-		 * isolate the pages. This is to minimise the time IRQs
+-		 * are disabled
+-		 */
+-		isolated = 0;
+-
+-		/*
+-		 * The zone lock must be held to isolate freepages. This
+-		 * unfortunately this is a very coarse lock and can be
+-		 * heavily contended if there are parallel allocations
+-		 * or parallel compactions. For async compaction do not
+-		 * spin on the lock
+-		 */
+-		if (!compact_trylock_irqsave(&zone->lock, &flags, cc))
+-			break;
+-		if (suitable_migration_target(page)) {
+-			isolated = isolate_freepages_block(zone, pfn, freelist);
+-			nr_freepages += isolated;
+-		}
+-		spin_unlock_irqrestore(&zone->lock, flags);
++		/* Found a block suitable for isolating free pages from */
++		isolated = isolate_freepages_block(cc, pfn, freelist);
++		nr_freepages += isolated;
+ 
+ 		/*
+ 		 * Record the highest PFN we isolated pages from. When next
