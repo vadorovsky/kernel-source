@@ -1,0 +1,416 @@
+From e971bd5e45764ff76df0ff110a19bf6b924f84d6 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <deathsimple@vodafone.de>
+Date: Tue, 11 Sep 2012 16:10:04 +0200
+Subject: drm/radeon: rework the VM code a bit more (v2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: e971bd5e45764ff76df0ff110a19bf6b924f84d6
+Patch-mainline: v3.7-rc1
+
+Roughly based on how nouveau is handling it. Instead of
+adding the bo_va when the address is set add the bo_va
+when the handle is opened, but set the address to zero
+until userspace tells us where to place it.
+
+This fixes another bunch of problems with glamor.
+
+v2: agd5f: fix build after dropping patch 7/8.
+
+Signed-off-by: Christian König <deathsimple@vodafone.de>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/radeon.h        |   30 ++++---
+ drivers/gpu/drm/radeon/radeon_gart.c   |  147 ++++++++++++++++++++-----------
+ drivers/gpu/drm/radeon/radeon_gem.c    |   47 +++++++++--
+ drivers/gpu/drm/radeon/radeon_object.c |    2 +-
+ 4 files changed, 154 insertions(+), 72 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 8cca1d2..4d67f0f 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -292,17 +292,20 @@ struct radeon_mman {
+ 
+ /* bo virtual address in a specific vm */
+ struct radeon_bo_va {
+-	/* bo list is protected by bo being reserved */
++	/* protected by bo being reserved */
+ 	struct list_head		bo_list;
+-	/* vm list is protected by vm mutex */
+-	struct list_head		vm_list;
+-	/* constant after initialization */
+-	struct radeon_vm		*vm;
+-	struct radeon_bo		*bo;
+ 	uint64_t			soffset;
+ 	uint64_t			eoffset;
+ 	uint32_t			flags;
+ 	bool				valid;
++	unsigned			ref_count;
++
++	/* protected by vm mutex */
++	struct list_head		vm_list;
++
++	/* constant after initialization */
++	struct radeon_vm		*vm;
++	struct radeon_bo		*bo;
+ };
+ 
+ struct radeon_bo {
+@@ -1848,14 +1851,15 @@ void radeon_vm_bo_invalidate(struct radeon_device *rdev,
+ 			     struct radeon_bo *bo);
+ struct radeon_bo_va *radeon_vm_bo_find(struct radeon_vm *vm,
+ 				       struct radeon_bo *bo);
+-int radeon_vm_bo_add(struct radeon_device *rdev,
+-		     struct radeon_vm *vm,
+-		     struct radeon_bo *bo,
+-		     uint64_t offset,
+-		     uint32_t flags);
++struct radeon_bo_va *radeon_vm_bo_add(struct radeon_device *rdev,
++				      struct radeon_vm *vm,
++				      struct radeon_bo *bo);
++int radeon_vm_bo_set_addr(struct radeon_device *rdev,
++			  struct radeon_bo_va *bo_va,
++			  uint64_t offset,
++			  uint32_t flags);
+ int radeon_vm_bo_rmv(struct radeon_device *rdev,
+-		     struct radeon_vm *vm,
+-		     struct radeon_bo *bo);
++		     struct radeon_bo_va *bo_va);
+ 
+ /* audio */
+ void r600_audio_update_hdmi(struct work_struct *work);
+diff --git a/drivers/gpu/drm/radeon/radeon_gart.c b/drivers/gpu/drm/radeon/radeon_gart.c
+index 2c59491..2f28ff3 100644
+--- a/drivers/gpu/drm/radeon/radeon_gart.c
++++ b/drivers/gpu/drm/radeon/radeon_gart.c
+@@ -693,51 +693,83 @@ struct radeon_bo_va *radeon_vm_bo_find(struct radeon_vm *vm,
+  * @rdev: radeon_device pointer
+  * @vm: requested vm
+  * @bo: radeon buffer object
+- * @offset: requested offset of the buffer in the VM address space
+- * @flags: attributes of pages (read/write/valid/etc.)
+  *
+  * Add @bo into the requested vm (cayman+).
+- * Add @bo to the list of bos associated with the vm and validate
+- * the offset requested within the vm address space.
+- * Returns 0 for success, error for failure.
++ * Add @bo to the list of bos associated with the vm
++ * Returns newly added bo_va or NULL for failure
+  *
+  * Object has to be reserved!
+  */
+-int radeon_vm_bo_add(struct radeon_device *rdev,
+-		     struct radeon_vm *vm,
+-		     struct radeon_bo *bo,
+-		     uint64_t offset,
+-		     uint32_t flags)
++struct radeon_bo_va *radeon_vm_bo_add(struct radeon_device *rdev,
++				      struct radeon_vm *vm,
++				      struct radeon_bo *bo)
+ {
+-	struct radeon_bo_va *bo_va, *tmp;
+-	struct list_head *head;
+-	uint64_t size = radeon_bo_size(bo), last_offset = 0;
+-	unsigned last_pfn;
++	struct radeon_bo_va *bo_va;
+ 
+ 	bo_va = kzalloc(sizeof(struct radeon_bo_va), GFP_KERNEL);
+ 	if (bo_va == NULL) {
+-		return -ENOMEM;
++		return NULL;
+ 	}
+ 	bo_va->vm = vm;
+ 	bo_va->bo = bo;
+-	bo_va->soffset = offset;
+-	bo_va->eoffset = offset + size;
+-	bo_va->flags = flags;
++	bo_va->soffset = 0;
++	bo_va->eoffset = 0;
++	bo_va->flags = 0;
+ 	bo_va->valid = false;
++	bo_va->ref_count = 1;
+ 	INIT_LIST_HEAD(&bo_va->bo_list);
+ 	INIT_LIST_HEAD(&bo_va->vm_list);
+-	/* make sure object fit at this offset */
+-	if (bo_va->soffset >= bo_va->eoffset) {
+-		kfree(bo_va);
+-		return -EINVAL;
+-	}
+ 
+-	last_pfn = bo_va->eoffset / RADEON_GPU_PAGE_SIZE;
+-	if (last_pfn > rdev->vm_manager.max_pfn) {
+-		kfree(bo_va);
+-		dev_err(rdev->dev, "va above limit (0x%08X > 0x%08X)\n",
+-			last_pfn, rdev->vm_manager.max_pfn);
+-		return -EINVAL;
++	mutex_lock(&vm->mutex);
++	list_add(&bo_va->vm_list, &vm->va);
++	list_add_tail(&bo_va->bo_list, &bo->va);
++	mutex_unlock(&vm->mutex);
++
++	return bo_va;
++}
++
++/**
++ * radeon_vm_bo_set_addr - set bos virtual address inside a vm
++ *
++ * @rdev: radeon_device pointer
++ * @bo_va: bo_va to store the address
++ * @soffset: requested offset of the buffer in the VM address space
++ * @flags: attributes of pages (read/write/valid/etc.)
++ *
++ * Set offset of @bo_va (cayman+).
++ * Validate and set the offset requested within the vm address space.
++ * Returns 0 for success, error for failure.
++ *
++ * Object has to be reserved!
++ */
++int radeon_vm_bo_set_addr(struct radeon_device *rdev,
++			  struct radeon_bo_va *bo_va,
++			  uint64_t soffset,
++			  uint32_t flags)
++{
++	uint64_t size = radeon_bo_size(bo_va->bo);
++	uint64_t eoffset, last_offset = 0;
++	struct radeon_vm *vm = bo_va->vm;
++	struct radeon_bo_va *tmp;
++	struct list_head *head;
++	unsigned last_pfn;
++
++	if (soffset) {
++		/* make sure object fit at this offset */
++		eoffset = soffset + size;
++		if (soffset >= eoffset) {
++			return -EINVAL;
++		}
++
++		last_pfn = eoffset / RADEON_GPU_PAGE_SIZE;
++		if (last_pfn > rdev->vm_manager.max_pfn) {
++			dev_err(rdev->dev, "va above limit (0x%08X > 0x%08X)\n",
++				last_pfn, rdev->vm_manager.max_pfn);
++			return -EINVAL;
++		}
++
++	} else {
++		eoffset = last_pfn = 0;
+ 	}
+ 
+ 	mutex_lock(&vm->mutex);
+@@ -758,24 +790,33 @@ int radeon_vm_bo_add(struct radeon_device *rdev,
+ 	head = &vm->va;
+ 	last_offset = 0;
+ 	list_for_each_entry(tmp, &vm->va, vm_list) {
+-		if (bo_va->soffset >= last_offset && bo_va->eoffset <= tmp->soffset) {
++		if (bo_va == tmp) {
++			/* skip over currently modified bo */
++			continue;
++		}
++
++		if (soffset >= last_offset && eoffset <= tmp->soffset) {
+ 			/* bo can be added before this one */
+ 			break;
+ 		}
+-		if (bo_va->eoffset > tmp->soffset && bo_va->soffset < tmp->eoffset) {
++		if (eoffset > tmp->soffset && soffset < tmp->eoffset) {
+ 			/* bo and tmp overlap, invalid offset */
+ 			dev_err(rdev->dev, "bo %p va 0x%08X conflict with (bo %p 0x%08X 0x%08X)\n",
+-				bo, (unsigned)bo_va->soffset, tmp->bo,
++				bo_va->bo, (unsigned)bo_va->soffset, tmp->bo,
+ 				(unsigned)tmp->soffset, (unsigned)tmp->eoffset);
+-			kfree(bo_va);
+ 			mutex_unlock(&vm->mutex);
+ 			return -EINVAL;
+ 		}
+ 		last_offset = tmp->eoffset;
+ 		head = &tmp->vm_list;
+ 	}
+-	list_add(&bo_va->vm_list, head);
+-	list_add_tail(&bo_va->bo_list, &bo->va);
++
++	bo_va->soffset = soffset;
++	bo_va->eoffset = eoffset;
++	bo_va->flags = flags;
++	bo_va->valid = false;
++	list_move(&bo_va->vm_list, head);
++
+ 	mutex_unlock(&vm->mutex);
+ 	return 0;
+ }
+@@ -855,6 +896,12 @@ int radeon_vm_bo_update_pte(struct radeon_device *rdev,
+ 		return -EINVAL;
+ 	}
+ 
++	if (!bo_va->soffset) {
++		dev_err(rdev->dev, "bo %p don't has a mapping in vm %p\n",
++			bo, vm);
++		return -EINVAL;
++	}
++
+ 	if ((bo_va->valid && mem) || (!bo_va->valid && mem == NULL))
+ 		return 0;
+ 
+@@ -921,33 +968,26 @@ int radeon_vm_bo_update_pte(struct radeon_device *rdev,
+  * radeon_vm_bo_rmv - remove a bo to a specific vm
+  *
+  * @rdev: radeon_device pointer
+- * @vm: requested vm
+- * @bo: radeon buffer object
++ * @bo_va: requested bo_va
+  *
+- * Remove @bo from the requested vm (cayman+).
+- * Remove @bo from the list of bos associated with the vm and
+- * remove the ptes for @bo in the page table.
++ * Remove @bo_va->bo from the requested vm (cayman+).
++ * Remove @bo_va->bo from the list of bos associated with the bo_va->vm and
++ * remove the ptes for @bo_va in the page table.
+  * Returns 0 for success.
+  *
+  * Object have to be reserved!
+  */
+ int radeon_vm_bo_rmv(struct radeon_device *rdev,
+-		     struct radeon_vm *vm,
+-		     struct radeon_bo *bo)
++		     struct radeon_bo_va *bo_va)
+ {
+-	struct radeon_bo_va *bo_va;
+ 	int r;
+ 
+-	bo_va = radeon_vm_bo_find(vm, bo);
+-	if (bo_va == NULL)
+-		return 0;
+-
+ 	mutex_lock(&rdev->vm_manager.lock);
+-	mutex_lock(&vm->mutex);
+-	r = radeon_vm_bo_update_pte(rdev, vm, bo, NULL);
++	mutex_lock(&bo_va->vm->mutex);
++	r = radeon_vm_bo_update_pte(rdev, bo_va->vm, bo_va->bo, NULL);
+ 	mutex_unlock(&rdev->vm_manager.lock);
+ 	list_del(&bo_va->vm_list);
+-	mutex_unlock(&vm->mutex);
++	mutex_unlock(&bo_va->vm->mutex);
+ 	list_del(&bo_va->bo_list);
+ 
+ 	kfree(bo_va);
+@@ -987,6 +1027,7 @@ void radeon_vm_bo_invalidate(struct radeon_device *rdev,
+  */
+ int radeon_vm_init(struct radeon_device *rdev, struct radeon_vm *vm)
+ {
++	struct radeon_bo_va *bo_va;
+ 	int r;
+ 
+ 	vm->id = 0;
+@@ -1006,8 +1047,10 @@ int radeon_vm_init(struct radeon_device *rdev, struct radeon_vm *vm)
+ 	/* map the ib pool buffer at 0 in virtual address space, set
+ 	 * read only
+ 	 */
+-	r = radeon_vm_bo_add(rdev, vm, rdev->ring_tmp_bo.bo, RADEON_VA_IB_OFFSET,
+-			     RADEON_VM_PAGE_READABLE | RADEON_VM_PAGE_SNOOPED);
++	bo_va = radeon_vm_bo_add(rdev, vm, rdev->ring_tmp_bo.bo);
++	r = radeon_vm_bo_set_addr(rdev, bo_va, RADEON_VA_IB_OFFSET,
++				  RADEON_VM_PAGE_READABLE |
++				  RADEON_VM_PAGE_SNOOPED);
+ 	return r;
+ }
+ 
+diff --git a/drivers/gpu/drm/radeon/radeon_gem.c b/drivers/gpu/drm/radeon/radeon_gem.c
+index cfad667..6579bef 100644
+--- a/drivers/gpu/drm/radeon/radeon_gem.c
++++ b/drivers/gpu/drm/radeon/radeon_gem.c
+@@ -124,6 +124,30 @@ void radeon_gem_fini(struct radeon_device *rdev)
+  */
+ int radeon_gem_object_open(struct drm_gem_object *obj, struct drm_file *file_priv)
+ {
++	struct radeon_bo *rbo = gem_to_radeon_bo(obj);
++	struct radeon_device *rdev = rbo->rdev;
++	struct radeon_fpriv *fpriv = file_priv->driver_priv;
++	struct radeon_vm *vm = &fpriv->vm;
++	struct radeon_bo_va *bo_va;
++	int r;
++
++	if (rdev->family < CHIP_CAYMAN) {
++		return 0;
++	}
++
++	r = radeon_bo_reserve(rbo, false);
++	if (r) {
++		return r;
++	}
++
++	bo_va = radeon_vm_bo_find(vm, rbo);
++	if (!bo_va) {
++		bo_va = radeon_vm_bo_add(rdev, vm, rbo);
++	} else {
++		++bo_va->ref_count;
++	}
++	radeon_bo_unreserve(rbo);
++
+ 	return 0;
+ }
+ 
+@@ -134,6 +158,7 @@ void radeon_gem_object_close(struct drm_gem_object *obj,
+ 	struct radeon_device *rdev = rbo->rdev;
+ 	struct radeon_fpriv *fpriv = file_priv->driver_priv;
+ 	struct radeon_vm *vm = &fpriv->vm;
++	struct radeon_bo_va *bo_va;
+ 	int r;
+ 
+ 	if (rdev->family < CHIP_CAYMAN) {
+@@ -146,7 +171,12 @@ void radeon_gem_object_close(struct drm_gem_object *obj,
+ 			"we fail to reserve bo (%d)\n", r);
+ 		return;
+ 	}
+-	radeon_vm_bo_rmv(rdev, vm, rbo);
++	bo_va = radeon_vm_bo_find(vm, rbo);
++	if (bo_va) {
++		if (--bo_va->ref_count == 0) {
++			radeon_vm_bo_rmv(rdev, bo_va);
++		}
++	}
+ 	radeon_bo_unreserve(rbo);
+ }
+ 
+@@ -462,19 +492,24 @@ int radeon_gem_va_ioctl(struct drm_device *dev, void *data,
+ 		drm_gem_object_unreference_unlocked(gobj);
+ 		return r;
+ 	}
++	bo_va = radeon_vm_bo_find(&fpriv->vm, rbo);
++	if (!bo_va) {
++		args->operation = RADEON_VA_RESULT_ERROR;
++		drm_gem_object_unreference_unlocked(gobj);
++		return -ENOENT;
++	}
++
+ 	switch (args->operation) {
+ 	case RADEON_VA_MAP:
+-		bo_va = radeon_vm_bo_find(&fpriv->vm, rbo);
+-		if (bo_va) {
++		if (bo_va->soffset) {
+ 			args->operation = RADEON_VA_RESULT_VA_EXIST;
+ 			args->offset = bo_va->soffset;
+ 			goto out;
+ 		}
+-		r = radeon_vm_bo_add(rdev, &fpriv->vm, rbo,
+-				     args->offset, args->flags);
++		r = radeon_vm_bo_set_addr(rdev, bo_va, args->offset, args->flags);
+ 		break;
+ 	case RADEON_VA_UNMAP:
+-		r = radeon_vm_bo_rmv(rdev, &fpriv->vm, rbo);
++		r = radeon_vm_bo_set_addr(rdev, bo_va, 0, 0);
+ 		break;
+ 	default:
+ 		break;
+diff --git a/drivers/gpu/drm/radeon/radeon_object.c b/drivers/gpu/drm/radeon/radeon_object.c
+index 8d23b7e..a236795 100644
+--- a/drivers/gpu/drm/radeon/radeon_object.c
++++ b/drivers/gpu/drm/radeon/radeon_object.c
+@@ -52,7 +52,7 @@ void radeon_bo_clear_va(struct radeon_bo *bo)
+ 
+ 	list_for_each_entry_safe(bo_va, tmp, &bo->va, bo_list) {
+ 		/* remove from all vm address space */
+-		radeon_vm_bo_rmv(bo->rdev, bo_va->vm, bo);
++		radeon_vm_bo_rmv(bo->rdev, bo_va);
+ 	}
+ }
+ 
+

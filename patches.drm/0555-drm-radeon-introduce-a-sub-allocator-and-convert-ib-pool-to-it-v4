@@ -1,0 +1,1622 @@
+From b15ba51207e54245409d6f46e20dab36f906eed1 Mon Sep 17 00:00:00 2001
+From: Jerome Glisse <jglisse@redhat.com>
+Date: Tue, 15 Nov 2011 11:48:34 -0500
+Subject: drm/radeon: introduce a sub allocator and convert ib pool to it v4
+Git-commit: b15ba51207e54245409d6f46e20dab36f906eed1
+Patch-mainline: v3.3-rc1
+
+Somewhat specializaed sub-allocator designed to perform sub-allocation
+for command buffer not only for current cs ioctl but for future command
+submission ioctl as well. Patch also convert current ib pool to use
+the sub allocator. Idea is that ib poll buffer can be share with other
+command buffer submission not having 64K granularity.
+
+v2 Harmonize pool handling and add suspend/resume callback to pin/unpin
+sa bo (tested on rv280, rv370, r420, rv515, rv610, rv710, redwood, cayman,
+rs480, rs690, rs880)
+v3 Simplify allocator
+v4 Fix radeon_ib_get error path to properly free fence
+
+Signed-off-by: Jerome Glisse <jglisse@redhat.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/Makefile        |    2 +-
+ drivers/gpu/drm/radeon/evergreen.c     |   42 +++---
+ drivers/gpu/drm/radeon/ni.c            |   45 +++---
+ drivers/gpu/drm/radeon/r100.c          |   41 +++---
+ drivers/gpu/drm/radeon/r300.c          |   21 +++-
+ drivers/gpu/drm/radeon/r420.c          |   21 +++-
+ drivers/gpu/drm/radeon/r520.c          |   19 ++-
+ drivers/gpu/drm/radeon/r600.c          |   43 +++---
+ drivers/gpu/drm/radeon/radeon.h        |   63 +++++++--
+ drivers/gpu/drm/radeon/radeon_asic.h   |    2 +-
+ drivers/gpu/drm/radeon/radeon_object.h |   20 +++
+ drivers/gpu/drm/radeon/radeon_ring.c   |  252 ++++++++++++-------------------
+ drivers/gpu/drm/radeon/radeon_sa.c     |  189 ++++++++++++++++++++++++
+ drivers/gpu/drm/radeon/rs400.c         |   21 +++-
+ drivers/gpu/drm/radeon/rs600.c         |   24 +++-
+ drivers/gpu/drm/radeon/rs690.c         |   24 +++-
+ drivers/gpu/drm/radeon/rv515.c         |   19 ++-
+ drivers/gpu/drm/radeon/rv770.c         |   43 +++---
+ 18 files changed, 600 insertions(+), 291 deletions(-)
+
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/Makefile
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/Makefile
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/Makefile
+@@ -71,7 +71,7 @@ radeon-y += radeon_device.o radeon_asic.
+ 	r600_blit_kms.o radeon_pm.o atombios_dp.o r600_audio.o r600_hdmi.o \
+ 	evergreen.o evergreen_cs.o evergreen_blit_shaders.o evergreen_blit_kms.o \
+ 	radeon_trace_points.o ni.o cayman_blit_shaders.o atombios_encoders.o \
+-	radeon_semaphore.o
++	radeon_semaphore.o radeon_sa.o
+ 
+ radeon-$(CONFIG_COMPAT) += radeon_ioc32.o
+ radeon-$(CONFIG_VGA_SWITCHEROO) += radeon_atpx_handler.o
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/evergreen.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/evergreen.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/evergreen.c
+@@ -3136,6 +3136,17 @@ static int evergreen_startup(struct rade
+ 		return r;
+ 	}
+ 
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
++	if (r) {
++		DRM_ERROR("radeon: failed testing IB (%d).\n", r);
++		rdev->accel_working = false;
++		return r;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -3155,18 +3166,13 @@ int evergreen_resume(struct radeon_devic
+ 	/* post card */
+ 	atom_asic_init(rdev->mode_info.atom_context);
+ 
++	rdev->accel_working = true;
+ 	r = evergreen_startup(rdev);
+ 	if (r) {
+ 		DRM_ERROR("evergreen startup failed on resume\n");
+ 		return r;
+ 	}
+ 
+-	r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
+-	if (r) {
+-		DRM_ERROR("radeon: failed testing IB (%d).\n", r);
+-		return r;
+-	}
+-
+ 	r = r600_audio_init(rdev);
+ 	if (r) {
+ 		DRM_ERROR("radeon: audio resume failed\n");
+@@ -3183,12 +3189,13 @@ int evergreen_suspend(struct radeon_devi
+ 
+ 	r600_audio_fini(rdev);
+ 	/* FIXME: we should wait for ring to be empty */
++	radeon_ib_pool_suspend(rdev);
++	r600_blit_suspend(rdev);
+ 	r700_cp_stop(rdev);
+ 	ring->ready = false;
+ 	evergreen_irq_suspend(rdev);
+ 	radeon_wb_disable(rdev);
+ 	evergreen_pcie_gart_disable(rdev);
+-	r600_blit_suspend(rdev);
+ 
+ 	return 0;
+ }
+@@ -3273,29 +3280,24 @@ int evergreen_init(struct radeon_device
+ 	if (r)
+ 		return r;
+ 
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = evergreen_startup(rdev);
+ 	if (r) {
+ 		dev_err(rdev->dev, "disabling GPU acceleration\n");
+ 		r700_cp_fini(rdev);
+ 		r600_irq_fini(rdev);
+ 		radeon_wb_fini(rdev);
++		r100_ib_fini(rdev);
+ 		radeon_irq_kms_fini(rdev);
+ 		evergreen_pcie_gart_fini(rdev);
+ 		rdev->accel_working = false;
+ 	}
+-	if (rdev->accel_working) {
+-		r = radeon_ib_pool_init(rdev);
+-		if (r) {
+-			DRM_ERROR("radeon: failed initializing IB pool (%d).\n", r);
+-			rdev->accel_working = false;
+-		}
+-		r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
+-		if (r) {
+-			DRM_ERROR("radeon: failed testing IB (%d).\n", r);
+-			rdev->accel_working = false;
+-		}
+-	}
+ 
+ 	/* Don't start up if the MC ucode is missing on BTC parts.
+ 	 * The default clocks and voltages before the MC ucode
+@@ -3318,7 +3320,7 @@ void evergreen_fini(struct radeon_device
+ 	r700_cp_fini(rdev);
+ 	r600_irq_fini(rdev);
+ 	radeon_wb_fini(rdev);
+-	radeon_ib_pool_fini(rdev);
++	r100_ib_fini(rdev);
+ 	radeon_irq_kms_fini(rdev);
+ 	evergreen_pcie_gart_fini(rdev);
+ 	r600_vram_scratch_fini(rdev);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/ni.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/ni.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/ni.c
+@@ -1453,6 +1453,17 @@ static int cayman_startup(struct radeon_
+ 	if (r)
+ 		return r;
+ 
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
++	if (r) {
++		DRM_ERROR("radeon: failed testing IB (%d).\n", r);
++		rdev->accel_working = false;
++		return r;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1467,32 +1478,25 @@ int cayman_resume(struct radeon_device *
+ 	/* post card */
+ 	atom_asic_init(rdev->mode_info.atom_context);
+ 
++	rdev->accel_working = true;
+ 	r = cayman_startup(rdev);
+ 	if (r) {
+ 		DRM_ERROR("cayman startup failed on resume\n");
+ 		return r;
+ 	}
+-
+-	r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
+-	if (r) {
+-		DRM_ERROR("radeon: failled testing IB (%d).\n", r);
+-		return r;
+-	}
+-
+ 	return r;
+-
+ }
+ 
+ int cayman_suspend(struct radeon_device *rdev)
+ {
+ 	/* FIXME: we should wait for ring to be empty */
++	radeon_ib_pool_suspend(rdev);
++	r600_blit_suspend(rdev);
+ 	cayman_cp_enable(rdev, false);
+ 	rdev->ring[RADEON_RING_TYPE_GFX_INDEX].ready = false;
+ 	evergreen_irq_suspend(rdev);
+ 	radeon_wb_disable(rdev);
+ 	cayman_pcie_gart_disable(rdev);
+-	r600_blit_suspend(rdev);
+-
+ 	return 0;
+ }
+ 
+@@ -1567,29 +1571,24 @@ int cayman_init(struct radeon_device *rd
+ 	if (r)
+ 		return r;
+ 
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = cayman_startup(rdev);
+ 	if (r) {
+ 		dev_err(rdev->dev, "disabling GPU acceleration\n");
+ 		cayman_cp_fini(rdev);
+ 		r600_irq_fini(rdev);
+ 		radeon_wb_fini(rdev);
++		r100_ib_fini(rdev);
+ 		radeon_irq_kms_fini(rdev);
+ 		cayman_pcie_gart_fini(rdev);
+ 		rdev->accel_working = false;
+ 	}
+-	if (rdev->accel_working) {
+-		r = radeon_ib_pool_init(rdev);
+-		if (r) {
+-			DRM_ERROR("radeon: failed initializing IB pool (%d).\n", r);
+-			rdev->accel_working = false;
+-		}
+-		r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
+-		if (r) {
+-			DRM_ERROR("radeon: failed testing IB (%d).\n", r);
+-			rdev->accel_working = false;
+-		}
+-	}
+ 
+ 	/* Don't start up if the MC ucode is missing.
+ 	 * The default clocks and voltages before the MC ucode
+@@ -1609,7 +1608,7 @@ void cayman_fini(struct radeon_device *r
+ 	cayman_cp_fini(rdev);
+ 	r600_irq_fini(rdev);
+ 	radeon_wb_fini(rdev);
+-	radeon_ib_pool_fini(rdev);
++	r100_ib_fini(rdev);
+ 	radeon_irq_kms_fini(rdev);
+ 	cayman_pcie_gart_fini(rdev);
+ 	r600_vram_scratch_fini(rdev);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r100.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/r100.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r100.c
+@@ -3751,28 +3751,10 @@ int r100_ib_test(struct radeon_device *r
+ 
+ void r100_ib_fini(struct radeon_device *rdev)
+ {
++	radeon_ib_pool_suspend(rdev);
+ 	radeon_ib_pool_fini(rdev);
+ }
+ 
+-int r100_ib_init(struct radeon_device *rdev)
+-{
+-	int r;
+-
+-	r = radeon_ib_pool_init(rdev);
+-	if (r) {
+-		dev_err(rdev->dev, "failed initializing IB pool (%d).\n", r);
+-		r100_ib_fini(rdev);
+-		return r;
+-	}
+-	r = r100_ib_test(rdev);
+-	if (r) {
+-		dev_err(rdev->dev, "failed testing IB (%d).\n", r);
+-		r100_ib_fini(rdev);
+-		return r;
+-	}
+-	return 0;
+-}
+-
+ void r100_mc_stop(struct radeon_device *rdev, struct r100_mc_save *save)
+ {
+ 	/* Shutdown CP we shouldn't need to do that but better be safe than
+@@ -3931,11 +3913,18 @@ static int r100_startup(struct radeon_de
+ 		dev_err(rdev->dev, "failed initializing CP (%d).\n", r);
+ 		return r;
+ 	}
+-	r = r100_ib_init(rdev);
++
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r100_ib_test(rdev);
+ 	if (r) {
+-		dev_err(rdev->dev, "failed initializing IB (%d).\n", r);
++		dev_err(rdev->dev, "failed testing IB (%d).\n", r);
++		rdev->accel_working = false;
+ 		return r;
+ 	}
++
+ 	return 0;
+ }
+ 
+@@ -3958,11 +3947,14 @@ int r100_resume(struct radeon_device *rd
+ 	r100_clock_startup(rdev);
+ 	/* Initialize surface registers */
+ 	radeon_surface_init(rdev);
++
++	rdev->accel_working = true;
+ 	return r100_startup(rdev);
+ }
+ 
+ int r100_suspend(struct radeon_device *rdev)
+ {
++	radeon_ib_pool_suspend(rdev);
+ 	r100_cp_disable(rdev);
+ 	radeon_wb_disable(rdev);
+ 	r100_irq_disable(rdev);
+@@ -4081,7 +4073,14 @@ int r100_init(struct radeon_device *rdev
+ 			return r;
+ 	}
+ 	r100_set_safe_registers(rdev);
++
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = r100_startup(rdev);
+ 	if (r) {
+ 		/* Somethings want wront with the accel init stop accel */
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r300.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/r300.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r300.c
+@@ -1414,11 +1414,18 @@ static int r300_startup(struct radeon_de
+ 		dev_err(rdev->dev, "failed initializing CP (%d).\n", r);
+ 		return r;
+ 	}
+-	r = r100_ib_init(rdev);
++
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r100_ib_test(rdev);
+ 	if (r) {
+-		dev_err(rdev->dev, "failed initializing IB (%d).\n", r);
++		dev_err(rdev->dev, "failed testing IB (%d).\n", r);
++		rdev->accel_working = false;
+ 		return r;
+ 	}
++
+ 	return 0;
+ }
+ 
+@@ -1443,11 +1450,14 @@ int r300_resume(struct radeon_device *rd
+ 	r300_clock_startup(rdev);
+ 	/* Initialize surface registers */
+ 	radeon_surface_init(rdev);
++
++	rdev->accel_working = true;
+ 	return r300_startup(rdev);
+ }
+ 
+ int r300_suspend(struct radeon_device *rdev)
+ {
++	radeon_ib_pool_suspend(rdev);
+ 	r100_cp_disable(rdev);
+ 	radeon_wb_disable(rdev);
+ 	r100_irq_disable(rdev);
+@@ -1548,7 +1558,14 @@ int r300_init(struct radeon_device *rdev
+ 			return r;
+ 	}
+ 	r300_set_reg_safe(rdev);
++
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = r300_startup(rdev);
+ 	if (r) {
+ 		/* Somethings want wront with the accel init stop accel */
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r420.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/r420.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r420.c
+@@ -274,11 +274,18 @@ static int r420_startup(struct radeon_de
+ 		return r;
+ 	}
+ 	r420_cp_errata_init(rdev);
+-	r = r100_ib_init(rdev);
++
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r100_ib_test(rdev);
+ 	if (r) {
+-		dev_err(rdev->dev, "failed initializing IB (%d).\n", r);
++		dev_err(rdev->dev, "failed testing IB (%d).\n", r);
++		rdev->accel_working = false;
+ 		return r;
+ 	}
++
+ 	return 0;
+ }
+ 
+@@ -307,11 +314,14 @@ int r420_resume(struct radeon_device *rd
+ 	r420_clock_resume(rdev);
+ 	/* Initialize surface registers */
+ 	radeon_surface_init(rdev);
++
++	rdev->accel_working = true;
+ 	return r420_startup(rdev);
+ }
+ 
+ int r420_suspend(struct radeon_device *rdev)
+ {
++	radeon_ib_pool_suspend(rdev);
+ 	r420_cp_errata_fini(rdev);
+ 	r100_cp_disable(rdev);
+ 	radeon_wb_disable(rdev);
+@@ -424,7 +434,14 @@ int r420_init(struct radeon_device *rdev
+ 			return r;
+ 	}
+ 	r420_set_reg_safe(rdev);
++
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = r420_startup(rdev);
+ 	if (r) {
+ 		/* Somethings want wront with the accel init stop accel */
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r520.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/r520.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r520.c
+@@ -202,9 +202,15 @@ static int r520_startup(struct radeon_de
+ 		dev_err(rdev->dev, "failed initializing CP (%d).\n", r);
+ 		return r;
+ 	}
+-	r = r100_ib_init(rdev);
++
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r100_ib_test(rdev);
+ 	if (r) {
+-		dev_err(rdev->dev, "failed initializing IB (%d).\n", r);
++		dev_err(rdev->dev, "failed testing IB (%d).\n", r);
++		rdev->accel_working = false;
+ 		return r;
+ 	}
+ 	return 0;
+@@ -229,6 +235,8 @@ int r520_resume(struct radeon_device *rd
+ 	rv515_clock_startup(rdev);
+ 	/* Initialize surface registers */
+ 	radeon_surface_init(rdev);
++
++	rdev->accel_working = true;
+ 	return r520_startup(rdev);
+ }
+ 
+@@ -298,7 +306,14 @@ int r520_init(struct radeon_device *rdev
+ 	if (r)
+ 		return r;
+ 	rv515_set_safe_registers(rdev);
++
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = r520_startup(rdev);
+ 	if (r) {
+ 		/* Somethings want wront with the accel init stop accel */
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r600.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/r600.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/r600.c
+@@ -2486,6 +2486,17 @@ int r600_startup(struct radeon_device *r
+ 	if (r)
+ 		return r;
+ 
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
++	if (r) {
++		DRM_ERROR("radeon: failed testing IB (%d).\n", r);
++		rdev->accel_working = false;
++		return r;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -2514,18 +2525,13 @@ int r600_resume(struct radeon_device *rd
+ 	/* post card */
+ 	atom_asic_init(rdev->mode_info.atom_context);
+ 
++	rdev->accel_working = true;
+ 	r = r600_startup(rdev);
+ 	if (r) {
+ 		DRM_ERROR("r600 startup failed on resume\n");
+ 		return r;
+ 	}
+ 
+-	r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
+-	if (r) {
+-		DRM_ERROR("radeon: failed testing IB (%d).\n", r);
+-		return r;
+-	}
+-
+ 	r = r600_audio_init(rdev);
+ 	if (r) {
+ 		DRM_ERROR("radeon: audio resume failed\n");
+@@ -2538,13 +2544,14 @@ int r600_resume(struct radeon_device *rd
+ int r600_suspend(struct radeon_device *rdev)
+ {
+ 	r600_audio_fini(rdev);
++	radeon_ib_pool_suspend(rdev);
++	r600_blit_suspend(rdev);
+ 	/* FIXME: we should wait for ring to be empty */
+ 	r600_cp_stop(rdev);
+ 	rdev->ring[RADEON_RING_TYPE_GFX_INDEX].ready = false;
+ 	r600_irq_suspend(rdev);
+ 	radeon_wb_disable(rdev);
+ 	r600_pcie_gart_disable(rdev);
+-	r600_blit_suspend(rdev);
+ 
+ 	return 0;
+ }
+@@ -2625,30 +2632,24 @@ int r600_init(struct radeon_device *rdev
+ 	if (r)
+ 		return r;
+ 
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = r600_startup(rdev);
+ 	if (r) {
+ 		dev_err(rdev->dev, "disabling GPU acceleration\n");
+ 		r600_cp_fini(rdev);
+ 		r600_irq_fini(rdev);
+ 		radeon_wb_fini(rdev);
++		r100_ib_fini(rdev);
+ 		radeon_irq_kms_fini(rdev);
+ 		r600_pcie_gart_fini(rdev);
+ 		rdev->accel_working = false;
+ 	}
+-	if (rdev->accel_working) {
+-		r = radeon_ib_pool_init(rdev);
+-		if (r) {
+-			dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
+-			rdev->accel_working = false;
+-		} else {
+-			r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
+-			if (r) {
+-				dev_err(rdev->dev, "IB test failed (%d).\n", r);
+-				rdev->accel_working = false;
+-			}
+-		}
+-	}
+ 
+ 	r = r600_audio_init(rdev);
+ 	if (r)
+@@ -2663,7 +2664,7 @@ void r600_fini(struct radeon_device *rde
+ 	r600_cp_fini(rdev);
+ 	r600_irq_fini(rdev);
+ 	radeon_wb_fini(rdev);
+-	radeon_ib_pool_fini(rdev);
++	r100_ib_fini(rdev);
+ 	radeon_irq_kms_fini(rdev);
+ 	r600_pcie_gart_fini(rdev);
+ 	r600_vram_scratch_fini(rdev);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon.h
+@@ -316,6 +316,48 @@ struct radeon_bo_list {
+ 	u32			tiling_flags;
+ };
+ 
++/* sub-allocation manager, it has to be protected by another lock.
++ * By conception this is an helper for other part of the driver
++ * like the indirect buffer or semaphore, which both have their
++ * locking.
++ *
++ * Principe is simple, we keep a list of sub allocation in offset
++ * order (first entry has offset == 0, last entry has the highest
++ * offset).
++ *
++ * When allocating new object we first check if there is room at
++ * the end total_size - (last_object_offset + last_object_size) >=
++ * alloc_size. If so we allocate new object there.
++ *
++ * When there is not enough room at the end, we start waiting for
++ * each sub object until we reach object_offset+object_size >=
++ * alloc_size, this object then become the sub object we return.
++ *
++ * Alignment can't be bigger than page size.
++ *
++ * Hole are not considered for allocation to keep things simple.
++ * Assumption is that there won't be hole (all object on same
++ * alignment).
++ */
++struct radeon_sa_manager {
++	struct radeon_bo	*bo;
++	struct list_head	sa_bo;
++	unsigned		size;
++	uint64_t		gpu_addr;
++	void			*cpu_ptr;
++	uint32_t		domain;
++};
++
++struct radeon_sa_bo;
++
++/* sub-allocation buffer */
++struct radeon_sa_bo {
++	struct list_head		list;
++	struct radeon_sa_manager	*manager;
++	unsigned			offset;
++	unsigned			size;
++};
++
+ /*
+  * GEM objects.
+  */
+@@ -503,13 +545,12 @@ void radeon_irq_kms_pflip_irq_put(struct
+  */
+ 
+ struct radeon_ib {
+-	struct list_head	list;
++	struct radeon_sa_bo	sa_bo;
+ 	unsigned		idx;
++	uint32_t		length_dw;
+ 	uint64_t		gpu_addr;
+-	struct radeon_fence	*fence;
+ 	uint32_t		*ptr;
+-	uint32_t		length_dw;
+-	bool			free;
++	struct radeon_fence	*fence;
+ };
+ 
+ /*
+@@ -517,12 +558,11 @@ struct radeon_ib {
+  * mutex protects scheduled_ibs, ready, alloc_bm
+  */
+ struct radeon_ib_pool {
+-	struct mutex		mutex;
+-	struct radeon_bo	*robj;
+-	struct list_head	bogus_ib;
+-	struct radeon_ib	ibs[RADEON_IB_POOL_SIZE];
+-	bool			ready;
+-	unsigned		head_id;
++	struct mutex			mutex;
++	struct radeon_sa_manager	sa_manager;
++	struct radeon_ib		ibs[RADEON_IB_POOL_SIZE];
++	bool				ready;
++	unsigned			head_id;
+ };
+ 
+ struct radeon_ring {
+@@ -603,8 +643,9 @@ void radeon_ib_free(struct radeon_device
+ int radeon_ib_schedule(struct radeon_device *rdev, struct radeon_ib *ib);
+ int radeon_ib_pool_init(struct radeon_device *rdev);
+ void radeon_ib_pool_fini(struct radeon_device *rdev);
++int radeon_ib_pool_start(struct radeon_device *rdev);
++int radeon_ib_pool_suspend(struct radeon_device *rdev);
+ int radeon_ib_test(struct radeon_device *rdev);
+-extern void radeon_ib_bogus_add(struct radeon_device *rdev, struct radeon_ib *ib);
+ /* Ring access between begin & end cannot sleep */
+ int radeon_ring_index(struct radeon_device *rdev, struct radeon_ring *cp);
+ void radeon_ring_free_size(struct radeon_device *rdev, struct radeon_ring *cp);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_asic.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_asic.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_asic.h
+@@ -109,7 +109,7 @@ bool r100_gpu_cp_is_lockup(struct radeon
+ 			   struct r100_gpu_lockup *lockup,
+ 			   struct radeon_ring *cp);
+ void r100_ib_fini(struct radeon_device *rdev);
+-int r100_ib_init(struct radeon_device *rdev);
++int r100_ib_test(struct radeon_device *rdev);
+ void r100_irq_disable(struct radeon_device *rdev);
+ void r100_mc_stop(struct radeon_device *rdev, struct r100_mc_save *save);
+ void r100_mc_resume(struct radeon_device *rdev, struct r100_mc_save *save);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_object.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_object.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_object.h
+@@ -130,4 +130,24 @@ extern void radeon_bo_move_notify(struct
+ 					struct ttm_mem_reg *mem);
+ extern int radeon_bo_fault_reserve_notify(struct ttm_buffer_object *bo);
+ extern int radeon_bo_get_surface_reg(struct radeon_bo *bo);
++
++/*
++ * sub allocation
++ */
++extern int radeon_sa_bo_manager_init(struct radeon_device *rdev,
++				     struct radeon_sa_manager *sa_manager,
++				     unsigned size, u32 domain);
++extern void radeon_sa_bo_manager_fini(struct radeon_device *rdev,
++				      struct radeon_sa_manager *sa_manager);
++extern int radeon_sa_bo_manager_start(struct radeon_device *rdev,
++				      struct radeon_sa_manager *sa_manager);
++extern int radeon_sa_bo_manager_suspend(struct radeon_device *rdev,
++					struct radeon_sa_manager *sa_manager);
++extern int radeon_sa_bo_new(struct radeon_device *rdev,
++			    struct radeon_sa_manager *sa_manager,
++			    struct radeon_sa_bo *sa_bo,
++			    unsigned size, unsigned align);
++extern void radeon_sa_bo_free(struct radeon_device *rdev,
++			      struct radeon_sa_bo *sa_bo);
++
+ #endif
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_ring.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_ring.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_ring.c
+@@ -74,92 +74,90 @@ void radeon_ring_write(struct radeon_rin
+ 	ring->ring_free_dw--;
+ }
+ 
+-void radeon_ib_bogus_cleanup(struct radeon_device *rdev)
+-{
+-	struct radeon_ib *ib, *n;
+-
+-	list_for_each_entry_safe(ib, n, &rdev->ib_pool.bogus_ib, list) {
+-		list_del(&ib->list);
+-		vfree(ib->ptr);
+-		kfree(ib);
+-	}
+-}
+-
+-void radeon_ib_bogus_add(struct radeon_device *rdev, struct radeon_ib *ib)
++/*
++ * IB.
++ */
++static bool radeon_ib_try_free(struct radeon_device *rdev,
++			       struct radeon_ib *ib)
+ {
+-	struct radeon_ib *bib;
++	bool done = false;
+ 
+-	bib = kmalloc(sizeof(*bib), GFP_KERNEL);
+-	if (bib == NULL)
+-		return;
+-	bib->ptr = vmalloc(ib->length_dw * 4);
+-	if (bib->ptr == NULL) {
+-		kfree(bib);
+-		return;
++	/* only free ib which have been emited */
++	if (ib->fence && ib->fence->emitted) {
++		if (radeon_fence_signaled(ib->fence)) {
++			radeon_fence_unref(&ib->fence);
++			radeon_sa_bo_free(rdev, &ib->sa_bo);
++			done = true;
++		}
+ 	}
+-	memcpy(bib->ptr, ib->ptr, ib->length_dw * 4);
+-	bib->length_dw = ib->length_dw;
+-	mutex_lock(&rdev->ib_pool.mutex);
+-	list_add_tail(&bib->list, &rdev->ib_pool.bogus_ib);
+-	mutex_unlock(&rdev->ib_pool.mutex);
++	return done;
+ }
+ 
+-/*
+- * IB.
+- */
+ int radeon_ib_get(struct radeon_device *rdev, int ring, struct radeon_ib **ib)
+ {
+ 	struct radeon_fence *fence;
+-	struct radeon_ib *nib;
+-	int r = 0, i, c;
++	unsigned cretry = 0;
++	int r = 0, i, idx;
+ 
+ 	*ib = NULL;
++
+ 	r = radeon_fence_create(rdev, &fence, ring);
+ 	if (r) {
+ 		dev_err(rdev->dev, "failed to create fence for new IB\n");
+ 		return r;
+ 	}
++
+ 	mutex_lock(&rdev->ib_pool.mutex);
+-	for (i = rdev->ib_pool.head_id, c = 0, nib = NULL; c < RADEON_IB_POOL_SIZE; c++, i++) {
+-		i &= (RADEON_IB_POOL_SIZE - 1);
+-		if (rdev->ib_pool.ibs[i].free) {
+-			nib = &rdev->ib_pool.ibs[i];
+-			break;
+-		}
+-	}
+-	if (nib == NULL) {
+-		/* This should never happen, it means we allocated all
+-		 * IB and haven't scheduled one yet, return EBUSY to
+-		 * userspace hoping that on ioctl recall we get better
+-		 * luck
+-		 */
+-		dev_err(rdev->dev, "no free indirect buffer !\n");
++	idx = rdev->ib_pool.head_id;
++retry:
++	if (cretry > 5) {
++		dev_err(rdev->dev, "failed to get an ib after 5 retry\n");
+ 		mutex_unlock(&rdev->ib_pool.mutex);
+ 		radeon_fence_unref(&fence);
+-		return -EBUSY;
++		return -ENOMEM;
+ 	}
+-	rdev->ib_pool.head_id = (nib->idx + 1) & (RADEON_IB_POOL_SIZE - 1);
+-	nib->free = false;
+-	if (nib->fence) {
+-		mutex_unlock(&rdev->ib_pool.mutex);
+-		r = radeon_fence_wait(nib->fence, false);
+-		if (r) {
+-			dev_err(rdev->dev, "error waiting fence of IB(%u:0x%016lX:%u)\n",
+-				nib->idx, (unsigned long)nib->gpu_addr, nib->length_dw);
+-			mutex_lock(&rdev->ib_pool.mutex);
+-			nib->free = true;
+-			mutex_unlock(&rdev->ib_pool.mutex);
+-			radeon_fence_unref(&fence);
+-			return r;
++	cretry++;
++	for (i = 0; i < RADEON_IB_POOL_SIZE; i++) {
++		radeon_ib_try_free(rdev, &rdev->ib_pool.ibs[idx]);
++		if (rdev->ib_pool.ibs[idx].fence == NULL) {
++			r = radeon_sa_bo_new(rdev, &rdev->ib_pool.sa_manager,
++					     &rdev->ib_pool.ibs[idx].sa_bo,
++					     64*1024, 64);
++			if (!r) {
++				*ib = &rdev->ib_pool.ibs[idx];
++				(*ib)->ptr = rdev->ib_pool.sa_manager.cpu_ptr;
++				(*ib)->ptr += ((*ib)->sa_bo.offset >> 2);
++				(*ib)->gpu_addr = rdev->ib_pool.sa_manager.gpu_addr;
++				(*ib)->gpu_addr += (*ib)->sa_bo.offset;
++				(*ib)->fence = fence;
++				/* ib are most likely to be allocated in a ring fashion
++				 * thus rdev->ib_pool.head_id should be the id of the
++				 * oldest ib
++				 */
++				rdev->ib_pool.head_id = (1 + idx);
++				rdev->ib_pool.head_id &= (RADEON_IB_POOL_SIZE - 1);
++				mutex_unlock(&rdev->ib_pool.mutex);
++				return 0;
++			}
+ 		}
+-		mutex_lock(&rdev->ib_pool.mutex);
++		idx = (idx + 1) & (RADEON_IB_POOL_SIZE - 1);
++	}
++	/* this should be rare event, ie all ib scheduled none signaled yet.
++	 */
++	for (i = 0; i < RADEON_IB_POOL_SIZE; i++) {
++		if (rdev->ib_pool.ibs[idx].fence) {
++			r = radeon_fence_wait(rdev->ib_pool.ibs[idx].fence, false);
++			if (!r) {
++				goto retry;
++			}
++			/* an error happened */
++			break;
++		}
++		idx = (idx + 1) & (RADEON_IB_POOL_SIZE - 1);
+ 	}
+-	radeon_fence_unref(&nib->fence);
+-	nib->fence = fence;
+-	nib->length_dw = 0;
+ 	mutex_unlock(&rdev->ib_pool.mutex);
+-	*ib = nib;
+-	return 0;
++	radeon_fence_unref(&fence);
++	return r;
+ }
+ 
+ void radeon_ib_free(struct radeon_device *rdev, struct radeon_ib **ib)
+@@ -170,10 +168,11 @@ void radeon_ib_free(struct radeon_device
+ 	if (tmp == NULL) {
+ 		return;
+ 	}
+-	if (!tmp->fence->emitted)
+-		radeon_fence_unref(&tmp->fence);
+ 	mutex_lock(&rdev->ib_pool.mutex);
+-	tmp->free = true;
++	if (tmp->fence && !tmp->fence->emitted) {
++		radeon_sa_bo_free(rdev, &tmp->sa_bo);
++		radeon_fence_unref(&tmp->fence);
++	}
+ 	mutex_unlock(&rdev->ib_pool.mutex);
+ }
+ 
+@@ -196,94 +195,73 @@ int radeon_ib_schedule(struct radeon_dev
+ 	}
+ 	radeon_ring_ib_execute(rdev, ib->fence->ring, ib);
+ 	radeon_fence_emit(rdev, ib->fence);
+-	mutex_lock(&rdev->ib_pool.mutex);
+-	/* once scheduled IB is considered free and protected by the fence */
+-	ib->free = true;
+-	mutex_unlock(&rdev->ib_pool.mutex);
+ 	radeon_ring_unlock_commit(rdev, ring);
+ 	return 0;
+ }
+ 
+ int radeon_ib_pool_init(struct radeon_device *rdev)
+ {
+-	void *ptr;
+-	uint64_t gpu_addr;
+-	int i;
+-	int r = 0;
++	int i, r;
+ 
+-	if (rdev->ib_pool.robj)
++	mutex_lock(&rdev->ib_pool.mutex);
++	if (rdev->ib_pool.ready) {
++		mutex_unlock(&rdev->ib_pool.mutex);
+ 		return 0;
+-	INIT_LIST_HEAD(&rdev->ib_pool.bogus_ib);
+-	/* Allocate 1M object buffer */
+-	r = radeon_bo_create(rdev, RADEON_IB_POOL_SIZE*64*1024,
+-			     PAGE_SIZE, true, RADEON_GEM_DOMAIN_GTT,
+-			     &rdev->ib_pool.robj);
+-	if (r) {
+-		DRM_ERROR("radeon: failed to ib pool (%d).\n", r);
+-		return r;
+-	}
+-	r = radeon_bo_reserve(rdev->ib_pool.robj, false);
+-	if (unlikely(r != 0))
+-		return r;
+-	r = radeon_bo_pin(rdev->ib_pool.robj, RADEON_GEM_DOMAIN_GTT, &gpu_addr);
+-	if (r) {
+-		radeon_bo_unreserve(rdev->ib_pool.robj);
+-		DRM_ERROR("radeon: failed to pin ib pool (%d).\n", r);
+-		return r;
+ 	}
+-	r = radeon_bo_kmap(rdev->ib_pool.robj, &ptr);
+-	radeon_bo_unreserve(rdev->ib_pool.robj);
++
++	r = radeon_sa_bo_manager_init(rdev, &rdev->ib_pool.sa_manager,
++				      RADEON_IB_POOL_SIZE*64*1024,
++				      RADEON_GEM_DOMAIN_GTT);
+ 	if (r) {
+-		DRM_ERROR("radeon: failed to map ib pool (%d).\n", r);
++		mutex_unlock(&rdev->ib_pool.mutex);
+ 		return r;
+ 	}
+-	for (i = 0; i < RADEON_IB_POOL_SIZE; i++) {
+-		unsigned offset;
+ 
+-		offset = i * 64 * 1024;
+-		rdev->ib_pool.ibs[i].gpu_addr = gpu_addr + offset;
+-		rdev->ib_pool.ibs[i].ptr = ptr + offset;
++	for (i = 0; i < RADEON_IB_POOL_SIZE; i++) {
++		rdev->ib_pool.ibs[i].fence = NULL;
+ 		rdev->ib_pool.ibs[i].idx = i;
+ 		rdev->ib_pool.ibs[i].length_dw = 0;
+-		rdev->ib_pool.ibs[i].free = true;
++		INIT_LIST_HEAD(&rdev->ib_pool.ibs[i].sa_bo.list);
+ 	}
+ 	rdev->ib_pool.head_id = 0;
+ 	rdev->ib_pool.ready = true;
+ 	DRM_INFO("radeon: ib pool ready.\n");
++
+ 	if (radeon_debugfs_ib_init(rdev)) {
+ 		DRM_ERROR("Failed to register debugfs file for IB !\n");
+ 	}
+ 	if (radeon_debugfs_ring_init(rdev)) {
+ 		DRM_ERROR("Failed to register debugfs file for rings !\n");
+ 	}
+-	return r;
++	mutex_unlock(&rdev->ib_pool.mutex);
++	return 0;
+ }
+ 
+ void radeon_ib_pool_fini(struct radeon_device *rdev)
+ {
+-	int r;
+-	struct radeon_bo *robj;
++	unsigned i;
+ 
+-	if (!rdev->ib_pool.ready) {
+-		return;
+-	}
+ 	mutex_lock(&rdev->ib_pool.mutex);
+-	radeon_ib_bogus_cleanup(rdev);
+-	robj = rdev->ib_pool.robj;
+-	rdev->ib_pool.robj = NULL;
+-	mutex_unlock(&rdev->ib_pool.mutex);
+-
+-	if (robj) {
+-		r = radeon_bo_reserve(robj, false);
+-		if (likely(r == 0)) {
+-			radeon_bo_kunmap(robj);
+-			radeon_bo_unpin(robj);
+-			radeon_bo_unreserve(robj);
++	if (rdev->ib_pool.ready) {
++		for (i = 0; i < RADEON_IB_POOL_SIZE; i++) {
++			radeon_sa_bo_free(rdev, &rdev->ib_pool.ibs[i].sa_bo);
++			radeon_fence_unref(&rdev->ib_pool.ibs[i].fence);
+ 		}
+-		radeon_bo_unref(&robj);
++		radeon_sa_bo_manager_fini(rdev, &rdev->ib_pool.sa_manager);
++		rdev->ib_pool.ready = false;
+ 	}
++	mutex_unlock(&rdev->ib_pool.mutex);
+ }
+ 
++int radeon_ib_pool_start(struct radeon_device *rdev)
++{
++	return radeon_sa_bo_manager_start(rdev, &rdev->ib_pool.sa_manager);
++}
++
++int radeon_ib_pool_suspend(struct radeon_device *rdev)
++{
++	return radeon_sa_bo_manager_suspend(rdev, &rdev->ib_pool.sa_manager);
++}
+ 
+ /*
+  * Ring.
+@@ -509,37 +487,8 @@ static int radeon_debugfs_ib_info(struct
+ 	return 0;
+ }
+ 
+-static int radeon_debugfs_ib_bogus_info(struct seq_file *m, void *data)
+-{
+-	struct drm_info_node *node = (struct drm_info_node *) m->private;
+-	struct radeon_device *rdev = node->info_ent->data;
+-	struct radeon_ib *ib;
+-	unsigned i;
+-
+-	mutex_lock(&rdev->ib_pool.mutex);
+-	if (list_empty(&rdev->ib_pool.bogus_ib)) {
+-		mutex_unlock(&rdev->ib_pool.mutex);
+-		seq_printf(m, "no bogus IB recorded\n");
+-		return 0;
+-	}
+-	ib = list_first_entry(&rdev->ib_pool.bogus_ib, struct radeon_ib, list);
+-	list_del_init(&ib->list);
+-	mutex_unlock(&rdev->ib_pool.mutex);
+-	seq_printf(m, "IB size %05u dwords\n", ib->length_dw);
+-	for (i = 0; i < ib->length_dw; i++) {
+-		seq_printf(m, "[%05u]=0x%08X\n", i, ib->ptr[i]);
+-	}
+-	vfree(ib->ptr);
+-	kfree(ib);
+-	return 0;
+-}
+-
+ static struct drm_info_list radeon_debugfs_ib_list[RADEON_IB_POOL_SIZE];
+ static char radeon_debugfs_ib_names[RADEON_IB_POOL_SIZE][32];
+-
+-static struct drm_info_list radeon_debugfs_ib_bogus_info_list[] = {
+-	{"radeon_ib_bogus", radeon_debugfs_ib_bogus_info, 0, NULL},
+-};
+ #endif
+ 
+ int radeon_debugfs_ring_init(struct radeon_device *rdev)
+@@ -556,12 +505,7 @@ int radeon_debugfs_ib_init(struct radeon
+ {
+ #if defined(CONFIG_DEBUG_FS)
+ 	unsigned i;
+-	int r;
+ 
+-	radeon_debugfs_ib_bogus_info_list[0].data = rdev;
+-	r = radeon_debugfs_add_files(rdev, radeon_debugfs_ib_bogus_info_list, 1);
+-	if (r)
+-		return r;
+ 	for (i = 0; i < RADEON_IB_POOL_SIZE; i++) {
+ 		sprintf(radeon_debugfs_ib_names[i], "radeon_ib_%04u", i);
+ 		radeon_debugfs_ib_list[i].name = radeon_debugfs_ib_names[i];
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_sa.c
+===================================================================
+--- /dev/null
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_sa.c
+@@ -0,0 +1,189 @@
++/*
++ * Copyright 2011 Red Hat Inc.
++ * All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the
++ * "Software"), to deal in the Software without restriction, including
++ * without limitation the rights to use, copy, modify, merge, publish,
++ * distribute, sub license, and/or sell copies of the Software, and to
++ * permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. IN NO EVENT SHALL
++ * THE COPYRIGHT HOLDERS, AUTHORS AND/OR ITS SUPPLIERS BE LIABLE FOR ANY CLAIM,
++ * DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
++ * OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
++ * USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * The above copyright notice and this permission notice (including the
++ * next paragraph) shall be included in all copies or substantial portions
++ * of the Software.
++ *
++ */
++/*
++ * Authors:
++ *    Jerome Glisse <glisse@freedesktop.org>
++ */
++#include "drmP.h"
++#include "drm.h"
++#include "radeon.h"
++
++int radeon_sa_bo_manager_init(struct radeon_device *rdev,
++			      struct radeon_sa_manager *sa_manager,
++			      unsigned size, u32 domain)
++{
++	int r;
++
++	sa_manager->bo = NULL;
++	sa_manager->size = size;
++	sa_manager->domain = domain;
++	INIT_LIST_HEAD(&sa_manager->sa_bo);
++
++	r = radeon_bo_create(rdev, size, RADEON_GPU_PAGE_SIZE, true,
++			     RADEON_GEM_DOMAIN_CPU, &sa_manager->bo);
++	if (r) {
++		dev_err(rdev->dev, "(%d) failed to allocate bo for manager\n", r);
++		return r;
++	}
++
++	return r;
++}
++
++void radeon_sa_bo_manager_fini(struct radeon_device *rdev,
++			       struct radeon_sa_manager *sa_manager)
++{
++	struct radeon_sa_bo *sa_bo, *tmp;
++
++	if (!list_empty(&sa_manager->sa_bo)) {
++		dev_err(rdev->dev, "sa_manager is not empty, clearing anyway\n");
++	}
++	list_for_each_entry_safe(sa_bo, tmp, &sa_manager->sa_bo, list) {
++		list_del_init(&sa_bo->list);
++	}
++	radeon_bo_unref(&sa_manager->bo);
++	sa_manager->size = 0;
++}
++
++int radeon_sa_bo_manager_start(struct radeon_device *rdev,
++			       struct radeon_sa_manager *sa_manager)
++{
++	int r;
++
++	if (sa_manager->bo == NULL) {
++		dev_err(rdev->dev, "no bo for sa manager\n");
++		return -EINVAL;
++	}
++
++	/* map the buffer */
++	r = radeon_bo_reserve(sa_manager->bo, false);
++	if (r) {
++		dev_err(rdev->dev, "(%d) failed to reserve manager bo\n", r);
++		return r;
++	}
++	r = radeon_bo_pin(sa_manager->bo, sa_manager->domain, &sa_manager->gpu_addr);
++	if (r) {
++		radeon_bo_unreserve(sa_manager->bo);
++		dev_err(rdev->dev, "(%d) failed to pin manager bo\n", r);
++		return r;
++	}
++	r = radeon_bo_kmap(sa_manager->bo, &sa_manager->cpu_ptr);
++	radeon_bo_unreserve(sa_manager->bo);
++	return r;
++}
++
++int radeon_sa_bo_manager_suspend(struct radeon_device *rdev,
++				 struct radeon_sa_manager *sa_manager)
++{
++	int r;
++
++	if (sa_manager->bo == NULL) {
++		dev_err(rdev->dev, "no bo for sa manager\n");
++		return -EINVAL;
++	}
++
++	r = radeon_bo_reserve(sa_manager->bo, false);
++	if (!r) {
++		radeon_bo_kunmap(sa_manager->bo);
++		radeon_bo_unpin(sa_manager->bo);
++		radeon_bo_unreserve(sa_manager->bo);
++	}
++	return r;
++}
++
++/*
++ * Principe is simple, we keep a list of sub allocation in offset
++ * order (first entry has offset == 0, last entry has the highest
++ * offset).
++ *
++ * When allocating new object we first check if there is room at
++ * the end total_size - (last_object_offset + last_object_size) >=
++ * alloc_size. If so we allocate new object there.
++ *
++ * When there is not enough room at the end, we start waiting for
++ * each sub object until we reach object_offset+object_size >=
++ * alloc_size, this object then become the sub object we return.
++ *
++ * Alignment can't be bigger than page size
++ */
++int radeon_sa_bo_new(struct radeon_device *rdev,
++		     struct radeon_sa_manager *sa_manager,
++		     struct radeon_sa_bo *sa_bo,
++		     unsigned size, unsigned align)
++{
++	struct radeon_sa_bo *tmp;
++	struct list_head *head;
++	unsigned offset = 0, wasted = 0;
++
++	BUG_ON(align > RADEON_GPU_PAGE_SIZE);
++	BUG_ON(size > sa_manager->size);
++
++	/* no one ? */
++	head = sa_manager->sa_bo.prev;
++	if (list_empty(&sa_manager->sa_bo)) {
++		goto out;
++	}
++
++	/* look for a hole big enough */
++	offset = 0;
++	list_for_each_entry(tmp, &sa_manager->sa_bo, list) {
++		/* room before this object ? */
++		if ((tmp->offset - offset) >= size) {
++			head = tmp->list.prev;
++			goto out;
++		}
++		offset = tmp->offset + tmp->size;
++		wasted = offset % align;
++		if (wasted) {
++			wasted = align - wasted;
++		}
++		offset += wasted;
++	}
++	/* room at the end ? */
++	head = sa_manager->sa_bo.prev;
++	tmp = list_entry(head, struct radeon_sa_bo, list);
++	offset = tmp->offset + tmp->size;
++	wasted = offset % align;
++	if (wasted) {
++		wasted = align - wasted;
++	}
++	offset += wasted;
++	if ((sa_manager->size - offset) < size) {
++		/* failed to find somethings big enough */
++		return -ENOMEM;
++	}
++
++out:
++	sa_bo->manager = sa_manager;
++	sa_bo->offset = offset;
++	sa_bo->size = size;
++	list_add(&sa_bo->list, head);
++	return 0;
++}
++
++void radeon_sa_bo_free(struct radeon_device *rdev, struct radeon_sa_bo *sa_bo)
++{
++	list_del_init(&sa_bo->list);
++}
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/rs400.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/rs400.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/rs400.c
+@@ -425,11 +425,18 @@ static int rs400_startup(struct radeon_d
+ 		dev_err(rdev->dev, "failed initializing CP (%d).\n", r);
+ 		return r;
+ 	}
+-	r = r100_ib_init(rdev);
++
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r100_ib_test(rdev);
+ 	if (r) {
+-		dev_err(rdev->dev, "failed initializing IB (%d).\n", r);
++		dev_err(rdev->dev, "failed testing IB (%d).\n", r);
++		rdev->accel_working = false;
+ 		return r;
+ 	}
++
+ 	return 0;
+ }
+ 
+@@ -453,11 +460,14 @@ int rs400_resume(struct radeon_device *r
+ 	r300_clock_startup(rdev);
+ 	/* Initialize surface registers */
+ 	radeon_surface_init(rdev);
++
++	rdev->accel_working = true;
+ 	return rs400_startup(rdev);
+ }
+ 
+ int rs400_suspend(struct radeon_device *rdev)
+ {
++	radeon_ib_pool_suspend(rdev);
+ 	r100_cp_disable(rdev);
+ 	radeon_wb_disable(rdev);
+ 	r100_irq_disable(rdev);
+@@ -536,7 +546,14 @@ int rs400_init(struct radeon_device *rde
+ 	if (r)
+ 		return r;
+ 	r300_set_reg_safe(rdev);
++
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = rs400_startup(rdev);
+ 	if (r) {
+ 		/* Somethings want wront with the accel init stop accel */
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/rs600.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/rs600.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/rs600.c
+@@ -862,15 +862,21 @@ static int rs600_startup(struct radeon_d
+ 		dev_err(rdev->dev, "failed initializing CP (%d).\n", r);
+ 		return r;
+ 	}
+-	r = r100_ib_init(rdev);
++
++	r = r600_audio_init(rdev);
+ 	if (r) {
+-		dev_err(rdev->dev, "failed initializing IB (%d).\n", r);
++		dev_err(rdev->dev, "failed initializing audio\n");
+ 		return r;
+ 	}
+ 
+-	r = r600_audio_init(rdev);
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r100_ib_test(rdev);
+ 	if (r) {
+-		dev_err(rdev->dev, "failed initializing audio\n");
++		dev_err(rdev->dev, "failed testing IB (%d).\n", r);
++		rdev->accel_working = false;
+ 		return r;
+ 	}
+ 
+@@ -895,11 +901,14 @@ int rs600_resume(struct radeon_device *r
+ 	rv515_clock_startup(rdev);
+ 	/* Initialize surface registers */
+ 	radeon_surface_init(rdev);
++
++	rdev->accel_working = true;
+ 	return rs600_startup(rdev);
+ }
+ 
+ int rs600_suspend(struct radeon_device *rdev)
+ {
++	radeon_ib_pool_suspend(rdev);
+ 	r600_audio_fini(rdev);
+ 	r100_cp_disable(rdev);
+ 	radeon_wb_disable(rdev);
+@@ -980,7 +989,14 @@ int rs600_init(struct radeon_device *rde
+ 	if (r)
+ 		return r;
+ 	rs600_set_safe_registers(rdev);
++
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = rs600_startup(rdev);
+ 	if (r) {
+ 		/* Somethings want wront with the accel init stop accel */
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/rs690.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/rs690.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/rs690.c
+@@ -636,15 +636,21 @@ static int rs690_startup(struct radeon_d
+ 		dev_err(rdev->dev, "failed initializing CP (%d).\n", r);
+ 		return r;
+ 	}
+-	r = r100_ib_init(rdev);
++
++	r = r600_audio_init(rdev);
+ 	if (r) {
+-		dev_err(rdev->dev, "failed initializing IB (%d).\n", r);
++		dev_err(rdev->dev, "failed initializing audio\n");
+ 		return r;
+ 	}
+ 
+-	r = r600_audio_init(rdev);
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r100_ib_test(rdev);
+ 	if (r) {
+-		dev_err(rdev->dev, "failed initializing audio\n");
++		dev_err(rdev->dev, "failed testing IB (%d).\n", r);
++		rdev->accel_working = false;
+ 		return r;
+ 	}
+ 
+@@ -669,11 +675,14 @@ int rs690_resume(struct radeon_device *r
+ 	rv515_clock_startup(rdev);
+ 	/* Initialize surface registers */
+ 	radeon_surface_init(rdev);
++
++	rdev->accel_working = true;
+ 	return rs690_startup(rdev);
+ }
+ 
+ int rs690_suspend(struct radeon_device *rdev)
+ {
++	radeon_ib_pool_suspend(rdev);
+ 	r600_audio_fini(rdev);
+ 	r100_cp_disable(rdev);
+ 	radeon_wb_disable(rdev);
+@@ -755,7 +764,14 @@ int rs690_init(struct radeon_device *rde
+ 	if (r)
+ 		return r;
+ 	rs600_set_safe_registers(rdev);
++
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = rs690_startup(rdev);
+ 	if (r) {
+ 		/* Somethings want wront with the accel init stop accel */
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/rv515.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/rv515.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/rv515.c
+@@ -395,9 +395,15 @@ static int rv515_startup(struct radeon_d
+ 		dev_err(rdev->dev, "failed initializing CP (%d).\n", r);
+ 		return r;
+ 	}
+-	r = r100_ib_init(rdev);
++
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r100_ib_test(rdev);
+ 	if (r) {
+-		dev_err(rdev->dev, "failed initializing IB (%d).\n", r);
++		dev_err(rdev->dev, "failed testing IB (%d).\n", r);
++		rdev->accel_working = false;
+ 		return r;
+ 	}
+ 	return 0;
+@@ -422,6 +428,8 @@ int rv515_resume(struct radeon_device *r
+ 	rv515_clock_startup(rdev);
+ 	/* Initialize surface registers */
+ 	radeon_surface_init(rdev);
++
++	rdev->accel_working = true;
+ 	return rv515_startup(rdev);
+ }
+ 
+@@ -518,7 +526,14 @@ int rv515_init(struct radeon_device *rde
+ 	if (r)
+ 		return r;
+ 	rv515_set_safe_registers(rdev);
++
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = rv515_startup(rdev);
+ 	if (r) {
+ 		/* Somethings want wront with the accel init stop accel */
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/rv770.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/rv770.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/rv770.c
+@@ -1112,6 +1112,17 @@ static int rv770_startup(struct radeon_d
+ 	if (r)
+ 		return r;
+ 
++	r = radeon_ib_pool_start(rdev);
++	if (r)
++		return r;
++
++	r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
++	if (r) {
++		dev_err(rdev->dev, "IB test failed (%d).\n", r);
++		rdev->accel_working = false;
++		return r;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1126,18 +1137,13 @@ int rv770_resume(struct radeon_device *r
+ 	/* post card */
+ 	atom_asic_init(rdev->mode_info.atom_context);
+ 
++	rdev->accel_working = true;
+ 	r = rv770_startup(rdev);
+ 	if (r) {
+ 		DRM_ERROR("r600 startup failed on resume\n");
+ 		return r;
+ 	}
+ 
+-	r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
+-	if (r) {
+-		DRM_ERROR("radeon: failed testing IB (%d).\n", r);
+-		return r;
+-	}
+-
+ 	r = r600_audio_init(rdev);
+ 	if (r) {
+ 		dev_err(rdev->dev, "radeon: audio init failed\n");
+@@ -1151,13 +1157,14 @@ int rv770_resume(struct radeon_device *r
+ int rv770_suspend(struct radeon_device *rdev)
+ {
+ 	r600_audio_fini(rdev);
++	radeon_ib_pool_suspend(rdev);
++	r600_blit_suspend(rdev);
+ 	/* FIXME: we should wait for ring to be empty */
+ 	r700_cp_stop(rdev);
+ 	rdev->ring[RADEON_RING_TYPE_GFX_INDEX].ready = false;
+ 	r600_irq_suspend(rdev);
+ 	radeon_wb_disable(rdev);
+ 	rv770_pcie_gart_disable(rdev);
+-	r600_blit_suspend(rdev);
+ 
+ 	return 0;
+ }
+@@ -1236,30 +1243,24 @@ int rv770_init(struct radeon_device *rde
+ 	if (r)
+ 		return r;
+ 
++	r = radeon_ib_pool_init(rdev);
+ 	rdev->accel_working = true;
++	if (r) {
++		dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
++		rdev->accel_working = false;
++	}
++
+ 	r = rv770_startup(rdev);
+ 	if (r) {
+ 		dev_err(rdev->dev, "disabling GPU acceleration\n");
+ 		r700_cp_fini(rdev);
+ 		r600_irq_fini(rdev);
+ 		radeon_wb_fini(rdev);
++		r100_ib_fini(rdev);
+ 		radeon_irq_kms_fini(rdev);
+ 		rv770_pcie_gart_fini(rdev);
+ 		rdev->accel_working = false;
+ 	}
+-	if (rdev->accel_working) {
+-		r = radeon_ib_pool_init(rdev);
+-		if (r) {
+-			dev_err(rdev->dev, "IB initialization failed (%d).\n", r);
+-			rdev->accel_working = false;
+-		} else {
+-			r = r600_ib_test(rdev, RADEON_RING_TYPE_GFX_INDEX);
+-			if (r) {
+-				dev_err(rdev->dev, "IB test failed (%d).\n", r);
+-				rdev->accel_working = false;
+-			}
+-		}
+-	}
+ 
+ 	r = r600_audio_init(rdev);
+ 	if (r) {
+@@ -1276,7 +1277,7 @@ void rv770_fini(struct radeon_device *rd
+ 	r700_cp_fini(rdev);
+ 	r600_irq_fini(rdev);
+ 	radeon_wb_fini(rdev);
+-	radeon_ib_pool_fini(rdev);
++	r100_ib_fini(rdev);
+ 	radeon_irq_kms_fini(rdev);
+ 	rv770_pcie_gart_fini(rdev);
+ 	r600_vram_scratch_fini(rdev);

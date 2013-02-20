@@ -1,0 +1,141 @@
+From 4f73a96bd76914009682432842ac04a32ab9115b Mon Sep 17 00:00:00 2001
+From: Thomas Hellstrom <thellstrom@vmware.com>
+Date: Thu, 1 Sep 2011 20:18:43 +0000
+Subject: vmwgfx: Make vmw_wait_seqno a bit more readable
+Git-commit: 4f73a96bd76914009682432842ac04a32ab9115b
+Patch-mainline: v3.2-rc1
+
+Break out on-demand enabling and disabling of fence irqs to make
+the function more readable. Also make dev_priv->fence_queue_waiters an int
+instead of an atomic_t since we only manipulate it with dev_priv->hw_mutex
+held.
+
+Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+Reviewed-by: Jakob Bornecrantz <jakob@vmware.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.c |    2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_drv.h |    2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_irq.c |   57 +++++++++++++++++++++-------------
+ 3 files changed, 37 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+index c8b5a53..4f65f1e 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -291,7 +291,7 @@ static int vmw_driver_load(struct drm_device *dev, unsigned long chipset)
+ 	mutex_init(&dev_priv->init_mutex);
+ 	init_waitqueue_head(&dev_priv->fence_queue);
+ 	init_waitqueue_head(&dev_priv->fifo_queue);
+-	atomic_set(&dev_priv->fence_queue_waiters, 0);
++	dev_priv->fence_queue_waiters = 0;
+ 	atomic_set(&dev_priv->fifo_queue_waiters, 0);
+ 
+ 	dev_priv->io_start = pci_resource_start(dev->pdev, 0);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+index 9c3016b..3018871 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.h
+@@ -241,7 +241,7 @@ struct vmw_private {
+ 	atomic_t marker_seq;
+ 	wait_queue_head_t fence_queue;
+ 	wait_queue_head_t fifo_queue;
+-	atomic_t fence_queue_waiters;
++	int fence_queue_waiters; /* Protected by hw_mutex */
+ 	atomic_t fifo_queue_waiters;
+ 	uint32_t last_read_seqno;
+ 	spinlock_t irq_lock;
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_irq.c b/drivers/gpu/drm/vmwgfx/vmwgfx_irq.c
+index 48701d2..13dde06 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_irq.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_irq.c
+@@ -175,12 +175,43 @@ int vmw_fallback_wait(struct vmw_private *dev_priv,
+ 	return ret;
+ }
+ 
++static void vmw_seqno_waiter_add(struct vmw_private *dev_priv)
++{
++	mutex_lock(&dev_priv->hw_mutex);
++	if (dev_priv->fence_queue_waiters++ == 0) {
++		unsigned long irq_flags;
++
++		spin_lock_irqsave(&dev_priv->irq_lock, irq_flags);
++		outl(SVGA_IRQFLAG_ANY_FENCE,
++		     dev_priv->io_start + VMWGFX_IRQSTATUS_PORT);
++		vmw_write(dev_priv, SVGA_REG_IRQMASK,
++			  vmw_read(dev_priv, SVGA_REG_IRQMASK) |
++			  SVGA_IRQFLAG_ANY_FENCE);
++		spin_unlock_irqrestore(&dev_priv->irq_lock, irq_flags);
++	}
++	mutex_unlock(&dev_priv->hw_mutex);
++}
++
++static void vmw_seqno_waiter_remove(struct vmw_private *dev_priv)
++{
++	mutex_lock(&dev_priv->hw_mutex);
++	if (--dev_priv->fence_queue_waiters == 0) {
++		unsigned long irq_flags;
++
++		spin_lock_irqsave(&dev_priv->irq_lock, irq_flags);
++		vmw_write(dev_priv, SVGA_REG_IRQMASK,
++			  vmw_read(dev_priv, SVGA_REG_IRQMASK) &
++			  ~SVGA_IRQFLAG_ANY_FENCE);
++		spin_unlock_irqrestore(&dev_priv->irq_lock, irq_flags);
++	}
++	mutex_unlock(&dev_priv->hw_mutex);
++}
++
+ int vmw_wait_seqno(struct vmw_private *dev_priv,
+ 		      bool lazy, uint32_t seqno,
+ 		      bool interruptible, unsigned long timeout)
+ {
+ 	long ret;
+-	unsigned long irq_flags;
+ 	struct vmw_fifo_state *fifo = &dev_priv->fifo;
+ 
+ 	if (likely(dev_priv->last_read_seqno - seqno < VMW_FENCE_WRAP))
+@@ -199,17 +230,7 @@ int vmw_wait_seqno(struct vmw_private *dev_priv,
+ 		return vmw_fallback_wait(dev_priv, lazy, false, seqno,
+ 					 interruptible, timeout);
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
+-	if (atomic_add_return(1, &dev_priv->fence_queue_waiters) > 0) {
+-		spin_lock_irqsave(&dev_priv->irq_lock, irq_flags);
+-		outl(SVGA_IRQFLAG_ANY_FENCE,
+-		     dev_priv->io_start + VMWGFX_IRQSTATUS_PORT);
+-		vmw_write(dev_priv, SVGA_REG_IRQMASK,
+-			  vmw_read(dev_priv, SVGA_REG_IRQMASK) |
+-			  SVGA_IRQFLAG_ANY_FENCE);
+-		spin_unlock_irqrestore(&dev_priv->irq_lock, irq_flags);
+-	}
+-	mutex_unlock(&dev_priv->hw_mutex);
++	vmw_seqno_waiter_add(dev_priv);
+ 
+ 	if (interruptible)
+ 		ret = wait_event_interruptible_timeout
+@@ -222,21 +243,13 @@ int vmw_wait_seqno(struct vmw_private *dev_priv,
+ 		     vmw_seqno_passed(dev_priv, seqno),
+ 		     timeout);
+ 
++	vmw_seqno_waiter_remove(dev_priv);
++
+ 	if (unlikely(ret == 0))
+ 		ret = -EBUSY;
+ 	else if (likely(ret > 0))
+ 		ret = 0;
+ 
+-	mutex_lock(&dev_priv->hw_mutex);
+-	if (atomic_dec_and_test(&dev_priv->fence_queue_waiters)) {
+-		spin_lock_irqsave(&dev_priv->irq_lock, irq_flags);
+-		vmw_write(dev_priv, SVGA_REG_IRQMASK,
+-			  vmw_read(dev_priv, SVGA_REG_IRQMASK) &
+-			  ~SVGA_IRQFLAG_ANY_FENCE);
+-		spin_unlock_irqrestore(&dev_priv->irq_lock, irq_flags);
+-	}
+-	mutex_unlock(&dev_priv->hw_mutex);
+-
+ 	return ret;
+ }
+ 
+

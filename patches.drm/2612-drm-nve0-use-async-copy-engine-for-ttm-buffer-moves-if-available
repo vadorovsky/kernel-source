@@ -1,0 +1,298 @@
+From 49981046e3dc2f934663548a270d4bf1a4534bb9 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Mon, 6 Aug 2012 19:38:25 +1000
+Subject: drm/nve0: use async copy engine for ttm buffer moves if available
+Git-commit: 49981046e3dc2f934663548a270d4bf1a4534bb9
+Patch-mainline: v3.7-rc3
+
+Kepler PFIFO lost the ability to address multiple engines from a single
+channel, so we need a separate one for the copy engine.
+
+v2: Marcin Slusarz <marcin.slusarz@gmail.com>
+- regression fix: restore hw accelerated buffer copies
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/nouveau/nouveau_abi16.c |    5 ++++
+ drivers/gpu/drm/nouveau/nouveau_bo.c    |   31 ++++++++++++++++++++++-----
+ drivers/gpu/drm/nouveau/nouveau_bo.h    |    2 +-
+ drivers/gpu/drm/nouveau/nouveau_chan.c  |   35 ++++++++++++++++--------------
+ drivers/gpu/drm/nouveau/nouveau_chan.h  |    2 +-
+ drivers/gpu/drm/nouveau/nouveau_drm.c   |   22 +++++++++++++++++-
+ drivers/gpu/drm/nouveau/nouveau_drm.h   |    1 +
+ 7 files changed, 72 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_abi16.c b/drivers/gpu/drm/nouveau/nouveau_abi16.c
+index 9e6ced3..cc79c79 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_abi16.c
++++ b/drivers/gpu/drm/nouveau/nouveau_abi16.c
+@@ -264,6 +264,11 @@ nouveau_abi16_ioctl_channel_alloc(ABI16_IOCTL_ARGS)
+ 	abi16->handles |= (1 << init->channel);
+ 
+ 	/* create channel object and initialise dma and fence management */
++	if (device->card_type >= NV_E0) {
++		init->fb_ctxdma_handle = NVE0_CHANNEL_IND_ENGINE_GR;
++		init->tt_ctxdma_handle = 0;
++	}
++
+ 	ret = nouveau_channel_new(drm, cli, NVDRM_DEVICE, NVDRM_CHAN |
+ 				  init->channel, init->fb_ctxdma_handle,
+ 				  init->tt_ctxdma_handle, &chan->chan);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.c b/drivers/gpu/drm/nouveau/nouveau_bo.c
+index ef96bdb..259e5f1 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -571,6 +571,18 @@ nouveau_bo_move_accel_cleanup(struct nouveau_channel *chan,
+ }
+ 
+ static int
++nve0_bo_move_init(struct nouveau_channel *chan, u32 handle)
++{
++	int ret = RING_SPACE(chan, 2);
++	if (ret == 0) {
++		BEGIN_NVC0(chan, NvSubCopy, 0x0000, 1);
++		OUT_RING  (chan, handle);
++		FIRE_RING (chan);
++	}
++	return ret;
++}
++
++static int
+ nve0_bo_move_copy(struct nouveau_channel *chan, struct ttm_buffer_object *bo,
+ 		  struct ttm_mem_reg *old_mem, struct ttm_mem_reg *new_mem)
+ {
+@@ -991,10 +1003,8 @@ out:
+ }
+ 
+ void
+-nouveau_bo_move_init(struct nouveau_channel *chan)
++nouveau_bo_move_init(struct nouveau_drm *drm)
+ {
+-	struct nouveau_cli *cli = chan->cli;
+-	struct nouveau_drm *drm = chan->drm;
+ 	static const struct {
+ 		const char *name;
+ 		int engine;
+@@ -1004,7 +1014,8 @@ nouveau_bo_move_init(struct nouveau_channel *chan)
+ 			    struct ttm_mem_reg *, struct ttm_mem_reg *);
+ 		int (*init)(struct nouveau_channel *, u32 handle);
+ 	} _methods[] = {
+-		{  "COPY", 0, 0xa0b5, nve0_bo_move_copy, nvc0_bo_move_init },
++		{  "COPY", 0, 0xa0b5, nve0_bo_move_copy, nve0_bo_move_init },
++		{  "GRCE", 0, 0xa0b5, nve0_bo_move_copy, nvc0_bo_move_init },
+ 		{ "COPY1", 5, 0x90b8, nvc0_bo_move_copy, nvc0_bo_move_init },
+ 		{ "COPY0", 4, 0x90b5, nvc0_bo_move_copy, nvc0_bo_move_init },
+ 		{  "COPY", 0, 0x85b5, nva3_bo_move_copy, nv50_bo_move_init },
+@@ -1020,14 +1031,22 @@ nouveau_bo_move_init(struct nouveau_channel *chan)
+ 
+ 	do {
+ 		struct nouveau_object *object;
++		struct nouveau_channel *chan;
+ 		u32 handle = (mthd->engine << 16) | mthd->oclass;
+ 
+-		ret = nouveau_object_new(nv_object(cli), chan->handle, handle,
++		if (mthd->init == nve0_bo_move_init)
++			chan = drm->cechan;
++		else
++			chan = drm->channel;
++		if (chan == NULL)
++			continue;
++
++		ret = nouveau_object_new(nv_object(drm), chan->handle, handle,
+ 					 mthd->oclass, NULL, 0, &object);
+ 		if (ret == 0) {
+ 			ret = mthd->init(chan, handle);
+ 			if (ret) {
+-				nouveau_object_del(nv_object(cli),
++				nouveau_object_del(nv_object(drm),
+ 						   chan->handle, handle);
+ 				continue;
+ 			}
+diff --git a/drivers/gpu/drm/nouveau/nouveau_bo.h b/drivers/gpu/drm/nouveau/nouveau_bo.h
+index c42aea9..dec51b1 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_bo.h
++++ b/drivers/gpu/drm/nouveau/nouveau_bo.h
+@@ -61,7 +61,7 @@ nouveau_bo_ref(struct nouveau_bo *ref, struct nouveau_bo **pnvbo)
+ 
+ extern struct ttm_bo_driver nouveau_bo_driver;
+ 
+-void nouveau_bo_move_init(struct nouveau_channel *);
++void nouveau_bo_move_init(struct nouveau_drm *);
+ int  nouveau_bo_new(struct drm_device *, int size, int align, u32 flags,
+ 		    u32 tile_mode, u32 tile_flags, struct sg_table *sg,
+ 		    struct nouveau_bo **);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_chan.c b/drivers/gpu/drm/nouveau/nouveau_chan.c
+index b1eea19..62c7edf 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_chan.c
++++ b/drivers/gpu/drm/nouveau/nouveau_chan.c
+@@ -184,7 +184,8 @@ nouveau_channel_prep(struct nouveau_drm *drm, struct nouveau_cli *cli,
+ 
+ int
+ nouveau_channel_ind(struct nouveau_drm *drm, struct nouveau_cli *cli,
+-		    u32 parent, u32 handle, struct nouveau_channel **pchan)
++		    u32 parent, u32 handle, u32 engine,
++		    struct nouveau_channel **pchan)
+ {
+ 	static const u16 oclasses[] = { 0xa06f, 0x906f, 0x826f, 0x506f, 0 };
+ 	const u16 *oclass = oclasses;
+@@ -202,7 +203,7 @@ nouveau_channel_ind(struct nouveau_drm *drm, struct nouveau_cli *cli,
+ 	args.pushbuf = chan->push.handle;
+ 	args.ioffset = 0x10000 + chan->push.vma.offset;
+ 	args.ilength = 0x02000;
+-	args.engine  = NVE0_CHANNEL_IND_ENGINE_GR;
++	args.engine  = engine;
+ 
+ 	do {
+ 		ret = nouveau_object_new(nv_object(cli), parent, handle,
+@@ -261,9 +262,6 @@ nouveau_channel_init(struct nouveau_channel *chan, u32 vram, u32 gart)
+ 	struct nv_dma_class args;
+ 	int ret, i;
+ 
+-	chan->vram = vram;
+-	chan->gart = gart;
+-
+ 	/* allocate dma objects to cover all allowed vram, and gart */
+ 	if (device->card_type < NV_C0) {
+ 		if (device->card_type >= NV_50) {
+@@ -301,6 +299,9 @@ nouveau_channel_init(struct nouveau_channel *chan, u32 vram, u32 gart)
+ 					 0x003d, &args, sizeof(args), &object);
+ 		if (ret)
+ 			return ret;
++
++		chan->vram = vram;
++		chan->gart = gart;
+ 	}
+ 
+ 	/* initialise dma tracking parameters */
+@@ -336,15 +337,17 @@ nouveau_channel_init(struct nouveau_channel *chan, u32 vram, u32 gart)
+ 	/* allocate software object class (used for fences on <= nv05, and
+ 	 * to signal flip completion), bind it to a subchannel.
+ 	 */
+-	ret = nouveau_object_new(nv_object(client), chan->handle,
+-				 NvSw, nouveau_abi16_swclass(chan->drm),
+-				 NULL, 0, &object);
+-	if (ret)
+-		return ret;
++	if (chan != chan->drm->cechan) {
++		ret = nouveau_object_new(nv_object(client), chan->handle,
++					 NvSw, nouveau_abi16_swclass(chan->drm),
++					 NULL, 0, &object);
++		if (ret)
++			return ret;
+ 
+-	swch = (void *)object->parent;
+-	swch->flip = nouveau_flip_complete;
+-	swch->flip_data = chan;
++		swch = (void *)object->parent;
++		swch->flip = nouveau_flip_complete;
++		swch->flip_data = chan;
++	}
+ 
+ 	if (device->card_type < NV_C0) {
+ 		ret = RING_SPACE(chan, 2);
+@@ -362,12 +365,12 @@ nouveau_channel_init(struct nouveau_channel *chan, u32 vram, u32 gart)
+ 
+ int
+ nouveau_channel_new(struct nouveau_drm *drm, struct nouveau_cli *cli,
+-		    u32 parent, u32 handle, u32 vram, u32 gart,
++		    u32 parent, u32 handle, u32 arg0, u32 arg1,
+ 		    struct nouveau_channel **pchan)
+ {
+ 	int ret;
+ 
+-	ret = nouveau_channel_ind(drm, cli, parent, handle, pchan);
++	ret = nouveau_channel_ind(drm, cli, parent, handle, arg0, pchan);
+ 	if (ret) {
+ 		NV_DEBUG(drm, "ib channel create, %d\n", ret);
+ 		ret = nouveau_channel_dma(drm, cli, parent, handle, pchan);
+@@ -377,7 +380,7 @@ nouveau_channel_new(struct nouveau_drm *drm, struct nouveau_cli *cli,
+ 		}
+ 	}
+ 
+-	ret = nouveau_channel_init(*pchan, vram, gart);
++	ret = nouveau_channel_init(*pchan, arg0, arg1);
+ 	if (ret) {
+ 		NV_ERROR(drm, "channel failed to initialise, %d\n", ret);
+ 		nouveau_channel_del(pchan);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_chan.h b/drivers/gpu/drm/nouveau/nouveau_chan.h
+index 0fa9424..40f97e2 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_chan.h
++++ b/drivers/gpu/drm/nouveau/nouveau_chan.h
+@@ -39,7 +39,7 @@ struct nouveau_channel {
+ 
+ 
+ int  nouveau_channel_new(struct nouveau_drm *, struct nouveau_cli *,
+-			 u32 parent, u32 handle, u32 vram, u32 gart,
++			 u32 parent, u32 handle, u32 arg0, u32 arg1,
+ 			 struct nouveau_channel **);
+ void nouveau_channel_del(struct nouveau_channel **);
+ int  nouveau_channel_idle(struct nouveau_channel *);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.c b/drivers/gpu/drm/nouveau/nouveau_drm.c
+index 8b508ce..4dfc40e3d 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.c
+@@ -109,6 +109,7 @@ nouveau_accel_fini(struct nouveau_drm *drm)
+ {
+ 	nouveau_gpuobj_ref(NULL, &drm->notify);
+ 	nouveau_channel_del(&drm->channel);
++	nouveau_channel_del(&drm->cechan);
+ 	if (drm->fence)
+ 		nouveau_fence(drm)->dtor(drm);
+ }
+@@ -118,6 +119,7 @@ nouveau_accel_init(struct nouveau_drm *drm)
+ {
+ 	struct nouveau_device *device = nv_device(drm->device);
+ 	struct nouveau_object *object;
++	u32 arg0, arg1;
+ 	int ret;
+ 
+ 	if (nouveau_noaccel)
+@@ -134,8 +136,24 @@ nouveau_accel_init(struct nouveau_drm *drm)
+ 		return;
+ 	}
+ 
++	if (device->card_type >= NV_E0) {
++		ret = nouveau_channel_new(drm, &drm->client, NVDRM_DEVICE,
++					  NVDRM_CHAN + 1,
++					  NVE0_CHANNEL_IND_ENGINE_CE0 |
++					  NVE0_CHANNEL_IND_ENGINE_CE1, 0,
++					  &drm->cechan);
++		if (ret)
++			NV_ERROR(drm, "failed to create ce channel, %d\n", ret);
++
++		arg0 = NVE0_CHANNEL_IND_ENGINE_GR;
++		arg1 = 0;
++	} else {
++		arg0 = NvDmaFB;
++		arg1 = NvDmaTT;
++	}
++
+ 	ret = nouveau_channel_new(drm, &drm->client, NVDRM_DEVICE, NVDRM_CHAN,
+-				  NvDmaFB, NvDmaTT, &drm->channel);
++				  arg0, arg1, &drm->channel);
+ 	if (ret) {
+ 		NV_ERROR(drm, "failed to create kernel channel, %d\n", ret);
+ 		nouveau_accel_fini(drm);
+@@ -167,7 +185,7 @@ nouveau_accel_init(struct nouveau_drm *drm)
+ 	}
+ 
+ 
+-	nouveau_bo_move_init(drm->channel);
++	nouveau_bo_move_init(drm);
+ }
+ 
+ static int __devinit
+diff --git a/drivers/gpu/drm/nouveau/nouveau_drm.h b/drivers/gpu/drm/nouveau/nouveau_drm.h
+index 6abd1a1..ab0c174 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_drm.h
++++ b/drivers/gpu/drm/nouveau/nouveau_drm.h
+@@ -97,6 +97,7 @@ struct nouveau_drm {
+ 	void *fence;
+ 
+ 	/* context for accelerated drm-internal operations */
++	struct nouveau_channel *cechan;
+ 	struct nouveau_channel *channel;
+ 	struct nouveau_gpuobj *notify;
+ 	struct nouveau_fbdev *fbcon;
+

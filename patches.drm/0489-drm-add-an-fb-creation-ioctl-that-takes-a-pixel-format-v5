@@ -1,0 +1,865 @@
+From 308e5bcbdb10452e8aba31aa21432fb67ee46d72 Mon Sep 17 00:00:00 2001
+From: Jesse Barnes <jbarnes@virtuousgeek.org>
+Date: Mon, 14 Nov 2011 14:51:28 -0800
+Subject: drm: add an fb creation ioctl that takes a pixel format v5
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 308e5bcbdb10452e8aba31aa21432fb67ee46d72
+Patch-mainline: v3.3-rc1
+
+To properly support the various plane formats supported by different
+hardware, the kernel must know the pixel format of a framebuffer object.
+So add a new ioctl taking a format argument corresponding to a fourcc
+name from the new drm_fourcc.h header file.  Implement the fb creation
+hooks in terms of the new mode_fb_cmd2 using helpers where the old
+bpp/depth values are needed.
+
+v2: create DRM specific fourcc header file for sharing with libdrm etc
+v3: fix rebase failure and use DRM fourcc codes in intel_display.c and
+    update commit message
+v4: make fb_cmd2 handle field into an array for multi-object formats
+    pull in Ville's fix for the memcpy in drm_plane_init
+    apply Ville's cleanup to zero out fb_cmd2 arg in drm_mode_addfb
+v5: add 'flags' field for interlaced support (from Ville)
+
+Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Acked-by: Alan Cox <alan@lxorguk.ukuu.org.uk>
+Reviewed-by: Rob Clark <rob.clark@linaro.org>
+Signed-off-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/drm_crtc.c                |  111 +++++++++++++++++++++++++++--
+ drivers/gpu/drm/drm_crtc_helper.c         |   51 ++++++++++++-
+ drivers/gpu/drm/drm_drv.c                 |    1 +
+ drivers/gpu/drm/i915/intel_display.c      |   39 ++++++-----
+ drivers/gpu/drm/i915/intel_drv.h          |    2 +-
+ drivers/gpu/drm/i915/intel_fb.c           |   11 ++--
+ drivers/gpu/drm/nouveau/nouveau_display.c |    6 +-
+ drivers/gpu/drm/nouveau/nouveau_fb.h      |    2 +-
+ drivers/gpu/drm/nouveau/nouveau_fbcon.c   |   13 ++--
+ drivers/gpu/drm/radeon/radeon_display.c   |    8 +-
+ drivers/gpu/drm/radeon/radeon_fb.c        |   18 +++--
+ drivers/gpu/drm/radeon/radeon_mode.h      |    2 +-
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.c       |   22 ++++--
+ drivers/gpu/drm/vmwgfx/vmwgfx_kms.h       |    1 +
+ drivers/staging/gma500/framebuffer.c      |    2 +-
+ include/drm/drm.h                         |    1 +
+ include/drm/drm_crtc.h                    |    9 ++-
+ include/drm/drm_crtc_helper.h             |    4 +-
+ include/drm/drm_fourcc.h                  |   63 ++++++++++++++++
+ include/drm/drm_mode.h                    |   27 +++++++
+ 20 files changed, 327 insertions(+), 66 deletions(-)
+
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/drm_crtc.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/drm_crtc.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/drm_crtc.c
+@@ -35,6 +35,7 @@
+ #include "drmP.h"
+ #include "drm_crtc.h"
+ #include "drm_edid.h"
++#include "drm_fourcc.h"
+ 
+ struct drm_prop_enum_list {
+ 	int type;
+@@ -567,7 +568,7 @@ int drm_plane_init(struct drm_device *de
+ 		return -ENOMEM;
+ 	}
+ 
+-	memcpy(plane->format_types, formats, format_count);
++	memcpy(plane->format_types, formats, format_count * sizeof(uint32_t));
+ 	plane->format_count = format_count;
+ 	plane->possible_crtcs = possible_crtcs;
+ 
+@@ -1914,6 +1915,42 @@ out:
+ 	return ret;
+ }
+ 
++/* Original addfb only supported RGB formats, so figure out which one */
++uint32_t drm_mode_legacy_fb_format(uint32_t bpp, uint32_t depth)
++{
++	uint32_t fmt;
++
++	switch (bpp) {
++	case 8:
++		fmt = DRM_FOURCC_RGB332;
++		break;
++	case 16:
++		if (depth == 15)
++			fmt = DRM_FOURCC_RGB555;
++		else
++			fmt = DRM_FOURCC_RGB565;
++		break;
++	case 24:
++		fmt = DRM_FOURCC_RGB24;
++		break;
++	case 32:
++		if (depth == 24)
++			fmt = DRM_FOURCC_RGB24;
++		else if (depth == 30)
++			fmt = DRM_INTEL_RGB30;
++		else
++			fmt = DRM_FOURCC_RGB32;
++		break;
++	default:
++		DRM_ERROR("bad bpp, assuming RGB24 pixel format\n");
++		fmt = DRM_FOURCC_RGB24;
++		break;
++	}
++
++	return fmt;
++}
++EXPORT_SYMBOL(drm_mode_legacy_fb_format);
++
+ /**
+  * drm_mode_addfb - add an FB to the graphics configuration
+  * @inode: inode from the ioctl
+@@ -1934,7 +1971,74 @@ out:
+ int drm_mode_addfb(struct drm_device *dev,
+ 		   void *data, struct drm_file *file_priv)
+ {
+-	struct drm_mode_fb_cmd *r = data;
++	struct drm_mode_fb_cmd *or = data;
++	struct drm_mode_fb_cmd2 r = {};
++	struct drm_mode_config *config = &dev->mode_config;
++	struct drm_framebuffer *fb;
++	int ret = 0;
++
++	/* Use new struct with format internally */
++	r.fb_id = or->fb_id;
++	r.width = or->width;
++	r.height = or->height;
++	r.pitches[0] = or->pitch;
++	r.pixel_format = drm_mode_legacy_fb_format(or->bpp, or->depth);
++	r.handles[0] = or->handle;
++
++	if (!drm_core_check_feature(dev, DRIVER_MODESET))
++		return -EINVAL;
++
++	if ((config->min_width > r.width) || (r.width > config->max_width)) {
++		DRM_ERROR("mode new framebuffer width not within limits\n");
++		return -EINVAL;
++	}
++	if ((config->min_height > r.height) || (r.height > config->max_height)) {
++		DRM_ERROR("mode new framebuffer height not within limits\n");
++		return -EINVAL;
++	}
++
++	mutex_lock(&dev->mode_config.mutex);
++
++	/* TODO check buffer is sufficiently large */
++	/* TODO setup destructor callback */
++
++	fb = dev->mode_config.funcs->fb_create(dev, file_priv, &r);
++	if (IS_ERR(fb)) {
++		DRM_ERROR("could not create framebuffer\n");
++		ret = PTR_ERR(fb);
++		goto out;
++	}
++
++	or->fb_id = fb->base.id;
++	list_add(&fb->filp_head, &file_priv->fbs);
++	DRM_DEBUG_KMS("[FB:%d]\n", fb->base.id);
++
++out:
++	mutex_unlock(&dev->mode_config.mutex);
++	return ret;
++}
++
++/**
++ * drm_mode_addfb2 - add an FB to the graphics configuration
++ * @inode: inode from the ioctl
++ * @filp: file * from the ioctl
++ * @cmd: cmd from ioctl
++ * @arg: arg from ioctl
++ *
++ * LOCKING:
++ * Takes mode config lock.
++ *
++ * Add a new FB to the specified CRTC, given a user request with format.
++ *
++ * Called by the user via ioctl.
++ *
++ * RETURNS:
++ * Zero on success, errno on failure.
++ */
++int drm_mode_addfb2(struct drm_device *dev,
++		    void *data, struct drm_file *file_priv)
++{
++	struct drm_mode_fb_cmd2 *r = data;
+ 	struct drm_mode_config *config = &dev->mode_config;
+ 	struct drm_framebuffer *fb;
+ 	int ret = 0;
+@@ -1955,9 +2059,6 @@ int drm_mode_addfb(struct drm_device *de
+ 
+ 	mutex_lock(&dev->mode_config.mutex);
+ 
+-	/* TODO check buffer is sufficiently large */
+-	/* TODO setup destructor callback */
+-
+ 	fb = dev->mode_config.funcs->fb_create(dev, file_priv, r);
+ 	if (IS_ERR(fb)) {
+ 		DRM_ERROR("could not create framebuffer\n");
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/drm_crtc_helper.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/drm_crtc_helper.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/drm_crtc_helper.c
+@@ -33,6 +33,7 @@
+ 
+ #include "drmP.h"
+ #include "drm_crtc.h"
++#include "drm_fourcc.h"
+ #include "drm_crtc_helper.h"
+ #include "drm_fb_helper.h"
+ #include <linux/dmi.h>
+@@ -846,14 +847,56 @@ void drm_helper_connector_dpms(struct dr
+ }
+ EXPORT_SYMBOL(drm_helper_connector_dpms);
+ 
++/*
++ * Just need to support RGB formats here for compat with code that doesn't
++ * use pixel formats directly yet.
++ */
++void drm_helper_get_fb_bpp_depth(uint32_t format, unsigned int *depth,
++				 int *bpp)
++{
++	switch (format) {
++	case DRM_FOURCC_RGB332:
++		*depth = 8;
++		*bpp = 8;
++		break;
++	case DRM_FOURCC_RGB555:
++		*depth = 15;
++		*bpp = 16;
++		break;
++	case DRM_FOURCC_RGB565:
++		*depth = 16;
++		*bpp = 16;
++		break;
++	case DRM_FOURCC_RGB24:
++		*depth = 24;
++		*bpp = 32;
++		break;
++	case DRM_INTEL_RGB30:
++		*depth = 30;
++		*bpp = 32;
++		break;
++	case DRM_FOURCC_RGB32:
++		*depth = 32;
++		*bpp = 32;
++		break;
++	default:
++		DRM_DEBUG_KMS("unsupported pixel format\n");
++		*depth = 0;
++		*bpp = 0;
++		break;
++	}
++}
++EXPORT_SYMBOL(drm_helper_get_fb_bpp_depth);
++
+ int drm_helper_mode_fill_fb_struct(struct drm_framebuffer *fb,
+-				   struct drm_mode_fb_cmd *mode_cmd)
++				   struct drm_mode_fb_cmd2 *mode_cmd)
+ {
+ 	fb->width = mode_cmd->width;
+ 	fb->height = mode_cmd->height;
+-	fb->pitch = mode_cmd->pitch;
+-	fb->bits_per_pixel = mode_cmd->bpp;
+-	fb->depth = mode_cmd->depth;
++	fb->pitch = mode_cmd->pitches[0];
++	drm_helper_get_fb_bpp_depth(mode_cmd->pixel_format, &fb->depth,
++				    &fb->bits_per_pixel);
++	fb->pixel_format = mode_cmd->pixel_format;
+ 
+ 	return 0;
+ }
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/drm_drv.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/drm_drv.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/drm_drv.c
+@@ -152,6 +152,7 @@ static struct drm_ioctl_desc drm_ioctls[
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_GETPROPBLOB, drm_mode_getblob_ioctl, DRM_MASTER|DRM_CONTROL_ALLOW|DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_GETFB, drm_mode_getfb, DRM_MASTER|DRM_CONTROL_ALLOW|DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_ADDFB, drm_mode_addfb, DRM_MASTER|DRM_CONTROL_ALLOW|DRM_UNLOCKED),
++	DRM_IOCTL_DEF(DRM_IOCTL_MODE_ADDFB2, drm_mode_addfb2, DRM_MASTER|DRM_CONTROL_ALLOW|DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_RMFB, drm_mode_rmfb, DRM_MASTER|DRM_CONTROL_ALLOW|DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_PAGE_FLIP, drm_mode_page_flip_ioctl, DRM_MASTER|DRM_CONTROL_ALLOW|DRM_UNLOCKED),
+ 	DRM_IOCTL_DEF(DRM_IOCTL_MODE_DIRTYFB, drm_mode_dirtyfb_ioctl, DRM_MASTER|DRM_CONTROL_ALLOW|DRM_UNLOCKED),
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_display.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/intel_display.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_display.c
+@@ -6383,7 +6383,7 @@ static struct drm_display_mode load_dete
+ 
+ static struct drm_framebuffer *
+ intel_framebuffer_create(struct drm_device *dev,
+-			 struct drm_mode_fb_cmd *mode_cmd,
++			 struct drm_mode_fb_cmd2 *mode_cmd,
+ 			 struct drm_i915_gem_object *obj)
+ {
+ 	struct intel_framebuffer *intel_fb;
+@@ -6425,7 +6425,7 @@ intel_framebuffer_create_for_mode(struct
+ 				  int depth, int bpp)
+ {
+ 	struct drm_i915_gem_object *obj;
+-	struct drm_mode_fb_cmd mode_cmd;
++	struct drm_mode_fb_cmd2 mode_cmd;
+ 
+ 	obj = i915_gem_alloc_object(dev,
+ 				    intel_framebuffer_size_for_mode(mode, bpp));
+@@ -6434,9 +6434,9 @@ intel_framebuffer_create_for_mode(struct
+ 
+ 	mode_cmd.width = mode->hdisplay;
+ 	mode_cmd.height = mode->vdisplay;
+-	mode_cmd.depth = depth;
+-	mode_cmd.bpp = bpp;
+-	mode_cmd.pitch = intel_framebuffer_pitch_for_width(mode_cmd.width, bpp);
++	mode_cmd.pitches[0] = intel_framebuffer_pitch_for_width(mode_cmd.width,
++								bpp);
++	mode_cmd.pixel_format = 0;
+ 
+ 	return intel_framebuffer_create(dev, &mode_cmd, obj);
+ }
+@@ -7686,7 +7686,7 @@ static const struct drm_framebuffer_func
+ 
+ int intel_framebuffer_init(struct drm_device *dev,
+ 			   struct intel_framebuffer *intel_fb,
+-			   struct drm_mode_fb_cmd *mode_cmd,
++			   struct drm_mode_fb_cmd2 *mode_cmd,
+ 			   struct drm_i915_gem_object *obj)
+ {
+ 	int ret;
+@@ -7694,21 +7694,23 @@ int intel_framebuffer_init(struct drm_de
+ 	if (obj->tiling_mode == I915_TILING_Y)
+ 		return -EINVAL;
+ 
+-	if (mode_cmd->pitch & 63)
++	if (mode_cmd->pitches[0] & 63)
+ 		return -EINVAL;
+ 
+-	switch (mode_cmd->bpp) {
+-	case 8:
+-	case 16:
+-		/* Only pre-ILK can handle 5:5:5 */
+-		if (mode_cmd->depth == 15 && !HAS_PCH_SPLIT(dev))
+-			return -EINVAL;
++	switch (mode_cmd->pixel_format) {
++	case DRM_FOURCC_RGB332:
++	case DRM_FOURCC_RGB565:
++	case DRM_FOURCC_RGB24:
++	case DRM_INTEL_RGB30:
++		/* RGB formats are common across chipsets */
+ 		break;
+-
+-	case 24:
+-	case 32:
++	case DRM_FOURCC_YUYV:
++	case DRM_FOURCC_UYVY:
++	case DRM_FOURCC_YVYU:
++	case DRM_FOURCC_VYUY:
+ 		break;
+ 	default:
++		DRM_ERROR("unsupported pixel format\n");
+ 		return -EINVAL;
+ 	}
+ 
+@@ -7726,11 +7728,12 @@ int intel_framebuffer_init(struct drm_de
+ static struct drm_framebuffer *
+ intel_user_framebuffer_create(struct drm_device *dev,
+ 			      struct drm_file *filp,
+-			      struct drm_mode_fb_cmd *mode_cmd)
++			      struct drm_mode_fb_cmd2 *mode_cmd)
+ {
+ 	struct drm_i915_gem_object *obj;
+ 
+-	obj = to_intel_bo(drm_gem_object_lookup(dev, filp, mode_cmd->handle));
++	obj = to_intel_bo(drm_gem_object_lookup(dev, filp,
++						mode_cmd->handles[0]));
+ 	if (&obj->base == NULL)
+ 		return ERR_PTR(-ENOENT);
+ 
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_drv.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/intel_drv.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_drv.h
+@@ -360,7 +360,7 @@ extern int intel_pin_and_fence_fb_obj(st
+ 
+ extern int intel_framebuffer_init(struct drm_device *dev,
+ 				  struct intel_framebuffer *ifb,
+-				  struct drm_mode_fb_cmd *mode_cmd,
++				  struct drm_mode_fb_cmd2 *mode_cmd,
+ 				  struct drm_i915_gem_object *obj);
+ extern int intel_fbdev_init(struct drm_device *dev);
+ extern void intel_fbdev_fini(struct drm_device *dev);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_fb.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/intel_fb.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_fb.c
+@@ -65,7 +65,7 @@ static int intelfb_create(struct intel_f
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct fb_info *info;
+ 	struct drm_framebuffer *fb;
+-	struct drm_mode_fb_cmd mode_cmd;
++	struct drm_mode_fb_cmd2 mode_cmd;
+ 	struct drm_i915_gem_object *obj;
+ 	struct device *device = &dev->pdev->dev;
+ 	int size, ret;
+@@ -77,11 +77,12 @@ static int intelfb_create(struct intel_f
+ 	mode_cmd.width = sizes->surface_width;
+ 	mode_cmd.height = sizes->surface_height;
+ 
+-	mode_cmd.bpp = sizes->surface_bpp;
+-	mode_cmd.pitch = ALIGN(mode_cmd.width * ((mode_cmd.bpp + 7) / 8), 64);
+-	mode_cmd.depth = sizes->surface_depth;
++	mode_cmd.pitches[0] = ALIGN(mode_cmd.width * ((sizes->surface_bpp + 7) /
++						      8), 64);
++	mode_cmd.pixel_format = drm_mode_legacy_fb_format(sizes->surface_bpp,
++							  sizes->surface_depth);
+ 
+-	size = mode_cmd.pitch * mode_cmd.height;
++	size = mode_cmd.pitches[0] * mode_cmd.height;
+ 	size = ALIGN(size, PAGE_SIZE);
+ 	obj = i915_gem_alloc_object(dev, size);
+ 	if (!obj) {
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_display.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/nouveau/nouveau_display.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_display.c
+@@ -64,7 +64,7 @@ static const struct drm_framebuffer_func
+ int
+ nouveau_framebuffer_init(struct drm_device *dev,
+ 			 struct nouveau_framebuffer *nv_fb,
+-			 struct drm_mode_fb_cmd *mode_cmd,
++			 struct drm_mode_fb_cmd2 *mode_cmd,
+ 			 struct nouveau_bo *nvbo)
+ {
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+@@ -124,13 +124,13 @@ nouveau_framebuffer_init(struct drm_devi
+ static struct drm_framebuffer *
+ nouveau_user_framebuffer_create(struct drm_device *dev,
+ 				struct drm_file *file_priv,
+-				struct drm_mode_fb_cmd *mode_cmd)
++				struct drm_mode_fb_cmd2 *mode_cmd)
+ {
+ 	struct nouveau_framebuffer *nouveau_fb;
+ 	struct drm_gem_object *gem;
+ 	int ret;
+ 
+-	gem = drm_gem_object_lookup(dev, file_priv, mode_cmd->handle);
++	gem = drm_gem_object_lookup(dev, file_priv, mode_cmd->handles[0]);
+ 	if (!gem)
+ 		return ERR_PTR(-ENOENT);
+ 
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_fb.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/nouveau/nouveau_fb.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_fb.h
+@@ -45,5 +45,5 @@ nouveau_framebuffer(struct drm_framebuff
+ extern const struct drm_mode_config_funcs nouveau_mode_config_funcs;
+ 
+ int nouveau_framebuffer_init(struct drm_device *dev, struct nouveau_framebuffer *nouveau_fb,
+-			     struct drm_mode_fb_cmd *mode_cmd, struct nouveau_bo *nvbo);
++			     struct drm_mode_fb_cmd2 *mode_cmd, struct nouveau_bo *nvbo);
+ #endif /* __NOUVEAU_FB_H__ */
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_fbcon.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/nouveau/nouveau_fbcon.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_fbcon.c
+@@ -281,7 +281,7 @@ nouveau_fbcon_create(struct nouveau_fbde
+ 	struct nouveau_framebuffer *nouveau_fb;
+ 	struct nouveau_channel *chan;
+ 	struct nouveau_bo *nvbo;
+-	struct drm_mode_fb_cmd mode_cmd;
++	struct drm_mode_fb_cmd2 mode_cmd;
+ 	struct pci_dev *pdev = dev->pdev;
+ 	struct device *device = &pdev->dev;
+ 	int size, ret;
+@@ -289,12 +289,13 @@ nouveau_fbcon_create(struct nouveau_fbde
+ 	mode_cmd.width = sizes->surface_width;
+ 	mode_cmd.height = sizes->surface_height;
+ 
+-	mode_cmd.bpp = sizes->surface_bpp;
+-	mode_cmd.pitch = mode_cmd.width * (mode_cmd.bpp >> 3);
+-	mode_cmd.pitch = roundup(mode_cmd.pitch, 256);
+-	mode_cmd.depth = sizes->surface_depth;
++	mode_cmd.pitches[0] = mode_cmd.width * (sizes->surface_bpp >> 3);
++	mode_cmd.pitches[0] = roundup(mode_cmd.pitches[0], 256);
+ 
+-	size = mode_cmd.pitch * mode_cmd.height;
++	mode_cmd.pixel_format = drm_mode_legacy_fb_format(sizes->surface_bpp,
++							  sizes->surface_depth);
++
++	size = mode_cmd.pitches[0] * mode_cmd.height;
+ 	size = roundup(size, PAGE_SIZE);
+ 
+ 	ret = nouveau_gem_new(dev, size, 0, NOUVEAU_GEM_DOMAIN_VRAM,
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_display.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_display.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_display.c
+@@ -1081,7 +1081,7 @@ static const struct drm_framebuffer_func
+ void
+ radeon_framebuffer_init(struct drm_device *dev,
+ 			struct radeon_framebuffer *rfb,
+-			struct drm_mode_fb_cmd *mode_cmd,
++			struct drm_mode_fb_cmd2 *mode_cmd,
+ 			struct drm_gem_object *obj)
+ {
+ 	rfb->obj = obj;
+@@ -1092,15 +1092,15 @@ radeon_framebuffer_init(struct drm_devic
+ static struct drm_framebuffer *
+ radeon_user_framebuffer_create(struct drm_device *dev,
+ 			       struct drm_file *file_priv,
+-			       struct drm_mode_fb_cmd *mode_cmd)
++			       struct drm_mode_fb_cmd2 *mode_cmd)
+ {
+ 	struct drm_gem_object *obj;
+ 	struct radeon_framebuffer *radeon_fb;
+ 
+-	obj = drm_gem_object_lookup(dev, file_priv, mode_cmd->handle);
++	obj = drm_gem_object_lookup(dev, file_priv, mode_cmd->handles[0]);
+ 	if (obj ==  NULL) {
+ 		dev_err(&dev->pdev->dev, "No GEM object associated to handle 0x%08X, "
+-			"can't create framebuffer\n", mode_cmd->handle);
++			"can't create framebuffer\n", mode_cmd->handles[0]);
+ 		return ERR_PTR(-ENOENT);
+ 	}
+ 
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_fb.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_fb.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_fb.c
+@@ -103,7 +103,7 @@ static void radeonfb_destroy_pinned_obje
+ }
+ 
+ static int radeonfb_create_pinned_object(struct radeon_fbdev *rfbdev,
+-					 struct drm_mode_fb_cmd *mode_cmd,
++					 struct drm_mode_fb_cmd2 *mode_cmd,
+ 					 struct drm_gem_object **gobj_p)
+ {
+ 	struct radeon_device *rdev = rfbdev->rdev;
+@@ -114,13 +114,17 @@ static int radeonfb_create_pinned_object
+ 	int ret;
+ 	int aligned_size, size;
+ 	int height = mode_cmd->height;
++	u32 bpp, depth;
++
++	drm_helper_get_fb_bpp_depth(mode_cmd->pixel_format, &depth, &bpp);
+ 
+ 	/* need to align pitch with crtc limits */
+-	mode_cmd->pitch = radeon_align_pitch(rdev, mode_cmd->width, mode_cmd->bpp, fb_tiled) * ((mode_cmd->bpp + 1) / 8);
++	mode_cmd->pitches[0] = radeon_align_pitch(rdev, mode_cmd->width, bpp,
++						  fb_tiled) * ((bpp + 1) / 8);
+ 
+ 	if (rdev->family >= CHIP_R600)
+ 		height = ALIGN(mode_cmd->height, 8);
+-	size = mode_cmd->pitch * height;
++	size = mode_cmd->pitches[0] * height;
+ 	aligned_size = ALIGN(size, PAGE_SIZE);
+ 	ret = radeon_gem_object_create(rdev, aligned_size, 0,
+ 				       RADEON_GEM_DOMAIN_VRAM,
+@@ -151,7 +155,7 @@ static int radeonfb_create_pinned_object
+ 	if (tiling_flags) {
+ 		ret = radeon_bo_set_tiling_flags(rbo,
+ 						 tiling_flags | RADEON_TILING_SURFACE,
+-						 mode_cmd->pitch);
++						 mode_cmd->pitches[0]);
+ 		if (ret)
+ 			dev_err(rdev->dev, "FB failed to set tiling flags\n");
+ 	}
+@@ -187,7 +191,7 @@ static int radeonfb_create(struct radeon
+ 	struct radeon_device *rdev = rfbdev->rdev;
+ 	struct fb_info *info;
+ 	struct drm_framebuffer *fb = NULL;
+-	struct drm_mode_fb_cmd mode_cmd;
++	struct drm_mode_fb_cmd2 mode_cmd;
+ 	struct drm_gem_object *gobj = NULL;
+ 	struct radeon_bo *rbo = NULL;
+ 	struct device *device = &rdev->pdev->dev;
+@@ -201,8 +205,8 @@ static int radeonfb_create(struct radeon
+ 	if ((sizes->surface_bpp == 24) && ASIC_IS_AVIVO(rdev))
+ 		sizes->surface_bpp = 32;
+ 
+-	mode_cmd.bpp = sizes->surface_bpp;
+-	mode_cmd.depth = sizes->surface_depth;
++	mode_cmd.pixel_format = drm_mode_legacy_fb_format(sizes->surface_bpp,
++							  sizes->surface_depth);
+ 
+ 	ret = radeonfb_create_pinned_object(rfbdev, &mode_cmd, &gobj);
+ 	rbo = gem_to_radeon_bo(gobj);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_mode.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_mode.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_mode.h
+@@ -643,7 +643,7 @@ extern void radeon_crtc_fb_gamma_get(str
+ 				     u16 *blue, int regno);
+ void radeon_framebuffer_init(struct drm_device *dev,
+ 			     struct radeon_framebuffer *rfb,
+-			     struct drm_mode_fb_cmd *mode_cmd,
++			     struct drm_mode_fb_cmd2 *mode_cmd,
+ 			     struct drm_gem_object *obj);
+ 
+ int radeonfb_remove(struct drm_device *dev, struct drm_framebuffer *fb);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -1085,7 +1085,7 @@ out_err1:
+ 
+ static struct drm_framebuffer *vmw_kms_fb_create(struct drm_device *dev,
+ 						 struct drm_file *file_priv,
+-						 struct drm_mode_fb_cmd *mode_cmd)
++						 struct drm_mode_fb_cmd2 *mode_cmd2)
+ {
+ 	struct vmw_private *dev_priv = vmw_priv(dev);
+ 	struct ttm_object_file *tfile = vmw_fpriv(file_priv)->tfile;
+@@ -1093,8 +1093,16 @@ static struct drm_framebuffer *vmw_kms_f
+ 	struct vmw_surface *surface = NULL;
+ 	struct vmw_dma_buffer *bo = NULL;
+ 	struct ttm_base_object *user_obj;
++	struct drm_mode_fb_cmd mode_cmd;
+ 	int ret;
+ 
++	mode_cmd.width = mode_cmd2->width;
++	mode_cmd.height = mode_cmd2->height;
++	mode_cmd.pitch = mode_cmd2->pitches[0];
++	mode_cmd.handle = mode_cmd2->handles[0];
++	drm_helper_get_fb_bpp_depth(mode_cmd2->pixel_format, &mode_cmd.depth,
++				    &mode_cmd.bpp);
++
+ 	/**
+ 	 * This code should be conditioned on Screen Objects not being used.
+ 	 * If screen objects are used, we can allocate a GMR to hold the
+@@ -1102,8 +1110,8 @@ static struct drm_framebuffer *vmw_kms_f
+ 	 */
+ 
+ 	if (!vmw_kms_validate_mode_vram(dev_priv,
+-					mode_cmd->pitch,
+-					mode_cmd->height)) {
++					mode_cmd.pitch,
++					mode_cmd.height)) {
+ 		DRM_ERROR("VRAM size is too small for requested mode.\n");
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+@@ -1117,7 +1125,7 @@ static struct drm_framebuffer *vmw_kms_f
+ 	 * command stream using user-space handles.
+ 	 */
+ 
+-	user_obj = ttm_base_object_lookup(tfile, mode_cmd->handle);
++	user_obj = ttm_base_object_lookup(tfile, mode_cmd.handle);
+ 	if (unlikely(user_obj == NULL)) {
+ 		DRM_ERROR("Could not locate requested kms frame buffer.\n");
+ 		return ERR_PTR(-ENOENT);
+@@ -1125,7 +1133,7 @@ static struct drm_framebuffer *vmw_kms_f
+ 
+ 	/* returns either a dmabuf or surface */
+ 	ret = vmw_user_lookup_handle(dev_priv, tfile,
+-				     mode_cmd->handle,
++				     mode_cmd.handle,
+ 				     &surface, &bo);
+ 	if (ret)
+ 		goto err_out;
+@@ -1133,10 +1141,10 @@ static struct drm_framebuffer *vmw_kms_f
+ 	/* Create the new framebuffer depending one what we got back */
+ 	if (bo)
+ 		ret = vmw_kms_new_framebuffer_dmabuf(dev_priv, bo, &vfb,
+-						     mode_cmd);
++						     &mode_cmd);
+ 	else if (surface)
+ 		ret = vmw_kms_new_framebuffer_surface(dev_priv, file_priv,
+-						      surface, &vfb, mode_cmd);
++						      surface, &vfb, &mode_cmd);
+ 	else
+ 		BUG();
+ 
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_kms.h
+@@ -29,6 +29,7 @@
+ #define VMWGFX_KMS_H_
+ 
+ #include "drmP.h"
++#include "drm_crtc_helper.h"
+ #include "vmwgfx_drv.h"
+ 
+ #define VMWGFX_NUM_DISPLAY_UNITS 8
+Index: linux-3.0-SLE11-SP3/include/drm/drm.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/include/drm/drm.h
++++ linux-3.0-SLE11-SP3/include/drm/drm.h
+@@ -717,6 +717,7 @@ struct drm_get_cap {
+ #define DRM_IOCTL_MODE_GETPLANERESOURCES DRM_IOWR(0xB5, struct drm_mode_get_plane_res)
+ #define DRM_IOCTL_MODE_GETPLANE	DRM_IOWR(0xB6, struct drm_mode_get_plane)
+ #define DRM_IOCTL_MODE_SETPLANE	DRM_IOWR(0xB7, struct drm_mode_set_plane)
++#define DRM_IOCTL_MODE_ADDFB2		DRM_IOWR(0xB8, struct drm_mode_fb_cmd2)
+ 
+ /**
+  * Device specific ioctls should only be in their respective headers
+Index: linux-3.0-SLE11-SP3/include/drm/drm_crtc.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/include/drm/drm_crtc.h
++++ linux-3.0-SLE11-SP3/include/drm/drm_crtc.h
+@@ -29,9 +29,10 @@
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
+ #include <linux/idr.h>
+-
+ #include <linux/fb.h>
+ 
++#include <drm/drm_fourcc.h>
++
+ struct drm_device;
+ struct drm_mode_set;
+ struct drm_framebuffer;
+@@ -246,6 +247,7 @@ struct drm_framebuffer {
+ 	unsigned int depth;
+ 	int bits_per_pixel;
+ 	int flags;
++	uint32_t pixel_format; /* fourcc format */
+ 	struct list_head filp_head;
+ 	/* if you are using the helper */
+ 	void *helper_private;
+@@ -619,7 +621,7 @@ struct drm_mode_set {
+  * struct drm_mode_config_funcs - configure CRTCs for a given screen layout
+  */
+ struct drm_mode_config_funcs {
+-	struct drm_framebuffer *(*fb_create)(struct drm_device *dev, struct drm_file *file_priv, struct drm_mode_fb_cmd *mode_cmd);
++	struct drm_framebuffer *(*fb_create)(struct drm_device *dev, struct drm_file *file_priv, struct drm_mode_fb_cmd2 *mode_cmd);
+ 	void (*output_poll_changed)(struct drm_device *dev);
+ };
+ 
+@@ -838,6 +840,9 @@ extern int drm_mode_cursor_ioctl(struct
+ 				void *data, struct drm_file *file_priv);
+ extern int drm_mode_addfb(struct drm_device *dev,
+ 			  void *data, struct drm_file *file_priv);
++extern int drm_mode_addfb2(struct drm_device *dev,
++			   void *data, struct drm_file *file_priv);
++extern uint32_t drm_mode_legacy_fb_format(uint32_t bpp, uint32_t depth);
+ extern int drm_mode_rmfb(struct drm_device *dev,
+ 			 void *data, struct drm_file *file_priv);
+ extern int drm_mode_getfb(struct drm_device *dev,
+Index: linux-3.0-SLE11-SP3/include/drm/drm_crtc_helper.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/include/drm/drm_crtc_helper.h
++++ linux-3.0-SLE11-SP3/include/drm/drm_crtc_helper.h
+@@ -116,8 +116,10 @@ extern bool drm_helper_encoder_in_use(st
+ 
+ extern void drm_helper_connector_dpms(struct drm_connector *connector, int mode);
+ 
++extern void drm_helper_get_fb_bpp_depth(uint32_t format, unsigned int *depth,
++					int *bpp);
+ extern int drm_helper_mode_fill_fb_struct(struct drm_framebuffer *fb,
+-					  struct drm_mode_fb_cmd *mode_cmd);
++					  struct drm_mode_fb_cmd2 *mode_cmd);
+ 
+ static inline void drm_crtc_helper_add(struct drm_crtc *crtc,
+ 				       const struct drm_crtc_helper_funcs *funcs)
+Index: linux-3.0-SLE11-SP3/include/drm/drm_fourcc.h
+===================================================================
+--- /dev/null
++++ linux-3.0-SLE11-SP3/include/drm/drm_fourcc.h
+@@ -0,0 +1,63 @@
++/*
++ * Copyright 2011 Intel Corporation
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a
++ * copy of this software and associated documentation files (the "Software"),
++ * to deal in the Software without restriction, including without limitation
++ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
++ * and/or sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice (including the next
++ * paragraph) shall be included in all copies or substantial portions of the
++ * Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
++ * VA LINUX SYSTEMS AND/OR ITS SUPPLIERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
++ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
++ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#ifndef DRM_FOURCC_H
++#define DRM_FOURCC_H
++
++/*
++ * We don't use the V4L header because
++ * 1) the fourcc codes are well defined and trivial to construct
++ * 2) we don't want user apps to have to pull in v4l headers just for fourcc
++ * 3) the v4l fourcc codes are mixed up with a bunch of other code and are
++ *    part of the v4l API, so changing them to something linux-generic isn't
++ *    feasible
++ *
++ * So the below includes the fourcc codes used by the DRM and its drivers,
++ * along with potential device specific codes.
++ */
++
++#include <linux/types.h>
++
++#define fourcc_code(a,b,c,d) ((u32)(a) | ((u32)(b) << 8) | \
++			      ((u32)(c) << 16) | ((u32)(d) << 24))
++
++/* RGB codes */
++#define DRM_FOURCC_RGB332 fourcc_code('R','G','B','1')
++#define DRM_FOURCC_RGB555 fourcc_code('R','G','B','O')
++#define DRM_FOURCC_RGB565 fourcc_code('R','G','B','P')
++#define DRM_FOURCC_RGB24  fourcc_code('R','G','B','3')
++#define DRM_FOURCC_RGB32  fourcc_code('R','G','B','4')
++
++#define DRM_FOURCC_BGR24  fourcc_code('B','G','R','3')
++#define DRM_FOURCC_BGR32  fourcc_code('B','G','R','4')
++
++/* YUV codes */
++#define DRM_FOURCC_YUYV   fourcc_code('Y', 'U', 'Y', 'V')
++#define DRM_FOURCC_YVYU   fourcc_code('Y', 'V', 'Y', 'U')
++#define DRM_FOURCC_UYVY   fourcc_code('U', 'Y', 'V', 'Y')
++#define DRM_FOURCC_VYUY   fourcc_code('V', 'Y', 'U', 'Y')
++
++/* DRM specific codes */
++#define DRM_INTEL_RGB30   fourcc_code('R','G','B','0') /* RGB x:10:10:10 */
++
++#endif /* DRM_FOURCC_H */
+Index: linux-3.0-SLE11-SP3/include/drm/drm_mode.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/include/drm/drm_mode.h
++++ linux-3.0-SLE11-SP3/include/drm/drm_mode.h
+@@ -268,6 +268,33 @@ struct drm_mode_fb_cmd {
+ 	__u32 handle;
+ };
+ 
++#define DRM_MODE_FB_INTERLACED	(1<<0 /* for interlaced framebuffers */
++
++struct drm_mode_fb_cmd2 {
++	__u32 fb_id;
++	__u32 width, height;
++	__u32 pixel_format; /* fourcc code from drm_fourcc.h */
++	__u32 flags; /* see above flags */
++
++	/*
++	 * In case of planar formats, this ioctl allows up to 4
++	 * buffer objects with offets and pitches per plane.
++	 * The pitch and offset order is dictated by the fourcc,
++	 * e.g. NV12 (http://fourcc.org/yuv.php#NV12) is described as:
++	 *
++	 *   YUV 4:2:0 image with a plane of 8 bit Y samples
++	 *   followed by an interleaved U/V plane containing
++	 *   8 bit 2x2 subsampled colour difference samples.
++	 *
++	 * So it would consist of Y as offset[0] and UV as
++	 * offeset[1].  Note that offset[0] will generally
++	 * be 0.
++	 */
++	__u32 handles[4];
++	__u32 pitches[4]; /* pitch for each plane */
++	__u32 offsets[4]; /* offset of each plane */
++};
++
+ #define DRM_MODE_FB_DIRTY_ANNOTATE_COPY 0x01
+ #define DRM_MODE_FB_DIRTY_ANNOTATE_FILL 0x02
+ #define DRM_MODE_FB_DIRTY_FLAGS         0x03

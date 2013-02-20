@@ -1,0 +1,271 @@
+From a71d8d94525e8fd855c0466fb586ae1cb008f3a2 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 15 Feb 2012 11:25:36 +0000
+Subject: drm/i915: Record the tail at each request and use it to estimate the
+ head
+Git-commit: a71d8d94525e8fd855c0466fb586ae1cb008f3a2
+Patch-mainline: v3.4-rc1
+
+By recording the location of every request in the ringbuffer, we know
+that in order to retire the request the GPU must have finished reading
+it and so the GPU head is now beyond the tail of the request. We can
+therefore provide a conservative estimate of where the GPU is reading
+from in order to avoid having to read back the ring buffer registers
+when polling for space upon starting a new write into the ringbuffer.
+
+A secondary effect is that this allows us to convert
+intel_ring_buffer_wait() to use i915_wait_request() and so consolidate
+upon the single function to handle the complicated task of waiting upon
+the GPU. A necessary precaution is that we need to make that wait
+uninterruptible to match the existing conditions as all the callers of
+intel_ring_begin() have not been audited to handle ERESTARTSYS
+correctly.
+
+By using a conservative estimate for the head, and always processing all
+outstanding requests first, we prevent a race condition between using
+the estimate and direct reads of I915_RING_HEAD which could result in
+the value of the head going backwards, and the tail overflowing once
+again. We are also careful to mark any request that we skip over in
+order to free space in ring as consumed which provides a
+self-consistency check.
+
+Given sufficient abuse, such as a set of unthrottled GPU bound
+cairo-traces, avoiding the use of I915_RING_HEAD gives a 10-20% boost on
+Sandy Bridge (i5-2520m):
+  firefox-paintball  18927ms -> 15646ms: 1.21x speedup
+  firefox-fishtank   12563ms -> 11278ms: 1.11x speedup
+which is a mild consolation for the performance those traces achieved from
+exploiting the buggy autoreported head.
+
+v2: Add a few more comments and make request->tail a conservative
+estimate as suggested by Daniel Vetter.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+[danvet: resolve conflicts with retirement defering and the lack of
+the autoreport head removal (that will go in through -fixes).]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    5 ++
+ drivers/gpu/drm/i915/i915_gem.c         |   17 ++++++-
+ drivers/gpu/drm/i915/intel_ringbuffer.c |   83 +++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/intel_ringbuffer.h |   15 ++++++
+ 4 files changed, 119 insertions(+), 1 deletions(-)
+
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_drv.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/i915_drv.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_drv.h
+@@ -947,6 +947,9 @@ struct drm_i915_gem_request {
+ 	/** GEM sequence number associated with this request. */
+ 	uint32_t seqno;
+ 
++	/** Postion in the ringbuffer of the end of the request */
++	u32 tail;
++
+ 	/** Time at which this request was emitted, in jiffies. */
+ 	unsigned long emitted_jiffies;
+ 
+@@ -1239,6 +1242,8 @@ i915_gem_object_unpin_fence(struct drm_i
+ }
+ 
+ void i915_gem_retire_requests(struct drm_device *dev);
++void i915_gem_retire_requests_ring(struct intel_ring_buffer *ring);
++
+ void i915_gem_reset(struct drm_device *dev);
+ void i915_gem_clflush_object(struct drm_i915_gem_object *obj);
+ int __must_check i915_gem_object_set_domain(struct drm_i915_gem_object *obj,
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/i915_gem.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/i915_gem.c
+@@ -1619,12 +1619,20 @@ i915_add_request(struct intel_ring_buffe
+ {
+ 	drm_i915_private_t *dev_priv = ring->dev->dev_private;
+ 	uint32_t seqno;
++	u32 request_ring_position;
+ 	int was_empty;
+ 	int ret;
+ 
+ 	BUG_ON(request == NULL);
+ 	seqno = i915_gem_next_request_seqno(ring);
+ 
++	/* Record the position of the start of the request so that
++	 * should we detect the updated seqno part-way through the
++	 * GPU processing the request, we never over-estimate the
++	 * position of the head.
++	 */
++	request_ring_position = intel_ring_get_tail(ring);
++
+ 	ret = ring->add_request(ring, &seqno);
+ 	if (ret)
+ 	    return ret;
+@@ -1633,6 +1641,7 @@ i915_add_request(struct intel_ring_buffe
+ 
+ 	request->seqno = seqno;
+ 	request->ring = ring;
++	request->tail = request_ring_position;
+ 	request->emitted_jiffies = jiffies;
+ 	was_empty = list_empty(&ring->request_list);
+ 	list_add_tail(&request->list, &ring->request_list);
+@@ -1769,7 +1778,7 @@ void i915_gem_reset(struct drm_device *d
+ /**
+  * This function clears the request list as sequence numbers are passed.
+  */
+-static void
++void
+ i915_gem_retire_requests_ring(struct intel_ring_buffer *ring)
+ {
+ 	uint32_t seqno;
+@@ -1797,6 +1806,12 @@ i915_gem_retire_requests_ring(struct int
+ 			break;
+ 
+ 		trace_i915_gem_request_retire(ring, request->seqno);
++		/* We know the GPU must have read the request to have
++		 * sent us the seqno + interrupt, so use the position
++		 * of tail of the request to update the last known position
++		 * of the GPU head.
++		 */
++		ring->last_retired_head = request->tail;
+ 
+ 		list_del(&request->list);
+ 		i915_gem_request_remove_from_client(request);
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_ringbuffer.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -586,6 +586,7 @@ pc_render_add_request(struct intel_ring_
+ 	PIPE_CONTROL_FLUSH(ring, scratch_addr);
+ 	scratch_addr += 128;
+ 	PIPE_CONTROL_FLUSH(ring, scratch_addr);
++
+ 	intel_ring_emit(ring, GFX_OP_PIPE_CONTROL(4) | PIPE_CONTROL_QW_WRITE |
+ 			PIPE_CONTROL_WRITE_FLUSH |
+ 			PIPE_CONTROL_TEXTURE_CACHE_INVALIDATE |
+@@ -1110,11 +1111,93 @@ static int intel_wrap_ring_buffer(struct
+ 	return 0;
+ }
+ 
++static int intel_ring_wait_seqno(struct intel_ring_buffer *ring, u32 seqno)
++{
++	struct drm_i915_private *dev_priv = ring->dev->dev_private;
++	bool was_interruptible;
++	int ret;
++
++	/* XXX As we have not yet audited all the paths to check that
++	 * they are ready for ERESTARTSYS from intel_ring_begin, do not
++	 * allow us to be interruptible by a signal.
++	 */
++	was_interruptible = dev_priv->mm.interruptible;
++	dev_priv->mm.interruptible = false;
++
++	ret = i915_wait_request(ring, seqno, true);
++
++	dev_priv->mm.interruptible = was_interruptible;
++
++	return ret;
++}
++
++static int intel_ring_wait_request(struct intel_ring_buffer *ring, int n)
++{
++	struct drm_i915_gem_request *request;
++	u32 seqno = 0;
++	int ret;
++
++	i915_gem_retire_requests_ring(ring);
++
++	if (ring->last_retired_head != -1) {
++		ring->head = ring->last_retired_head;
++		ring->last_retired_head = -1;
++		ring->space = ring_space(ring);
++		if (ring->space >= n)
++			return 0;
++	}
++
++	list_for_each_entry(request, &ring->request_list, list) {
++		int space;
++
++		if (request->tail == -1)
++			continue;
++
++		space = request->tail - (ring->tail + 8);
++		if (space < 0)
++			space += ring->size;
++		if (space >= n) {
++			seqno = request->seqno;
++			break;
++		}
++
++		/* Consume this request in case we need more space than
++		 * is available and so need to prevent a race between
++		 * updating last_retired_head and direct reads of
++		 * I915_RING_HEAD. It also provides a nice sanity check.
++		 */
++		request->tail = -1;
++	}
++
++	if (seqno == 0)
++		return -ENOSPC;
++
++	ret = intel_ring_wait_seqno(ring, seqno);
++	if (ret)
++		return ret;
++
++	if (WARN_ON(ring->last_retired_head == -1))
++		return -ENOSPC;
++
++	ring->head = ring->last_retired_head;
++	ring->last_retired_head = -1;
++	ring->space = ring_space(ring);
++	if (WARN_ON(ring->space < n))
++		return -ENOSPC;
++
++	return 0;
++}
++
+ int intel_wait_ring_buffer(struct intel_ring_buffer *ring, int n)
+ {
+ 	struct drm_device *dev = ring->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	unsigned long end;
++	int ret;
++
++	ret = intel_ring_wait_request(ring, n);
++	if (ret != -ENOSPC)
++		return ret;
+ 
+ 	trace_i915_ring_wait_begin(ring);
+ 	if (drm_core_check_feature(dev, DRIVER_GEM))
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_ringbuffer.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/i915/intel_ringbuffer.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/i915/intel_ringbuffer.h
+@@ -46,6 +46,16 @@ struct  intel_ring_buffer {
+ 	int		effective_size;
+ 	struct intel_hw_status_page status_page;
+ 
++	/** We track the position of the requests in the ring buffer, and
++	 * when each is retired we increment last_retired_head as the GPU
++	 * must have finished processing the request and so we know we
++	 * can advance the ringbuffer up to that position.
++	 *
++	 * last_retired_head is set to -1 after the value is consumed so
++	 * we can detect new retirements.
++	 */
++	u32		last_retired_head;
++
+ 	spinlock_t	irq_lock;
+ 	u32		irq_refcount;
+ 	u32		irq_mask;
+@@ -193,6 +203,11 @@ int intel_init_blt_ring_buffer(struct dr
+ u32 intel_ring_get_active_head(struct intel_ring_buffer *ring);
+ void intel_ring_setup_status_page(struct intel_ring_buffer *ring);
+ 
++static inline u32 intel_ring_get_tail(struct intel_ring_buffer *ring)
++{
++	return ring->tail;
++}
++
+ static inline void i915_trace_irq_get(struct intel_ring_buffer *ring, u32 seqno)
+ {
+ 	if (ring->trace_irq_seqno == 0 && ring->irq_get(ring))

@@ -1,0 +1,194 @@
+From e36891900855b3bed5d9cc9209655e6dfa435a5f Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <ben@bwidawsk.net>
+Date: Fri, 25 May 2012 16:56:22 -0700
+Subject: drm/i915: Dynamic Parity Detection handling
+Git-commit: e36891900855b3bed5d9cc9209655e6dfa435a5f
+Patch-mainline: v3.6-rc1
+
+On IVB hardware we are given an interrupt whenever a L3 parity error
+occurs in the L3 cache. The L3 cache is used by internal GPU clients
+only.  This is a very rare occurrence (in fact to test this I need to
+use specially instrumented silicon).
+
+When a row in the L3 cache detects a parity error the HW generates an
+interrupt. The interrupt is masked in GTIMR until we get a chance to
+read some registers and alert userspace via a uevent. With this
+information userspace can use a sysfs interface (follow-up patch) to
+remap those rows.
+
+Way above my level of understanding, but if a given row fails, it is
+statistically more likely to fail again than a row which has not failed.
+Therefore it is desirable for an operating system to maintain a lifelong
+list of failing rows and always remap any bad rows on driver load.
+Hardware limits the number of rows that are remappable per bank/subbank,
+and should more than that many rows detect parity errors, software
+should maintain a list of the most frequent errors, and remap those
+rows.
+
+V2: Drop WARN_ON(IS_GEN6) (Jesse)
+DRM_DEBUG row/bank/subbank on errror (Jesse)
+Comment updates (Jesse)
+
+Reviewed-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h |    2 +
+ drivers/gpu/drm/i915/i915_irq.c |   86 +++++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/i915/i915_reg.h |   17 ++++++++
+ 3 files changed, 105 insertions(+), 0 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index a17e31e..504f53e 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -816,6 +816,8 @@ typedef struct drm_i915_private {
+ 
+ 	struct drm_property *broadcast_rgb_property;
+ 	struct drm_property *force_audio_property;
++
++	struct work_struct parity_error_work;
+ } drm_i915_private_t;
+ 
+ /* Iterate over initialised rings */
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 5134a62..c526635 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -398,6 +398,86 @@ static void gen6_pm_rps_work(struct work_struct *work)
+ 	mutex_unlock(&dev_priv->dev->struct_mutex);
+ }
+ 
++
++/**
++ * ivybridge_parity_work - Workqueue called when a parity error interrupt
++ * occurred.
++ * @work: workqueue struct
++ *
++ * Doesn't actually do anything except notify userspace. As a consequence of
++ * this event, userspace should try to remap the bad rows since statistically
++ * it is likely the same row is more likely to go bad again.
++ */
++static void ivybridge_parity_work(struct work_struct *work)
++{
++	drm_i915_private_t *dev_priv = container_of(work, drm_i915_private_t,
++						    parity_error_work);
++	u32 error_status, row, bank, subbank;
++	char *parity_event[5];
++	uint32_t misccpctl;
++	unsigned long flags;
++
++	/* We must turn off DOP level clock gating to access the L3 registers.
++	 * In order to prevent a get/put style interface, acquire struct mutex
++	 * any time we access those registers.
++	 */
++	mutex_lock(&dev_priv->dev->struct_mutex);
++
++	misccpctl = I915_READ(GEN7_MISCCPCTL);
++	I915_WRITE(GEN7_MISCCPCTL, misccpctl & ~GEN7_DOP_CLOCK_GATE_ENABLE);
++	POSTING_READ(GEN7_MISCCPCTL);
++
++	error_status = I915_READ(GEN7_L3CDERRST1);
++	row = GEN7_PARITY_ERROR_ROW(error_status);
++	bank = GEN7_PARITY_ERROR_BANK(error_status);
++	subbank = GEN7_PARITY_ERROR_SUBBANK(error_status);
++
++	I915_WRITE(GEN7_L3CDERRST1, GEN7_PARITY_ERROR_VALID |
++				    GEN7_L3CDERRST1_ENABLE);
++	POSTING_READ(GEN7_L3CDERRST1);
++
++	I915_WRITE(GEN7_MISCCPCTL, misccpctl);
++
++	spin_lock_irqsave(&dev_priv->irq_lock, flags);
++	dev_priv->gt_irq_mask &= ~GT_GEN7_L3_PARITY_ERROR_INTERRUPT;
++	I915_WRITE(GTIMR, dev_priv->gt_irq_mask);
++	spin_unlock_irqrestore(&dev_priv->irq_lock, flags);
++
++	mutex_unlock(&dev_priv->dev->struct_mutex);
++
++	parity_event[0] = "L3_PARITY_ERROR=1";
++	parity_event[1] = kasprintf(GFP_KERNEL, "ROW=%d", row);
++	parity_event[2] = kasprintf(GFP_KERNEL, "BANK=%d", bank);
++	parity_event[3] = kasprintf(GFP_KERNEL, "SUBBANK=%d", subbank);
++	parity_event[4] = NULL;
++
++	kobject_uevent_env(&dev_priv->dev->primary->kdev.kobj,
++			   KOBJ_CHANGE, parity_event);
++
++	DRM_DEBUG("Parity error: Row = %d, Bank = %d, Sub bank = %d.\n",
++		  row, bank, subbank);
++
++	kfree(parity_event[3]);
++	kfree(parity_event[2]);
++	kfree(parity_event[1]);
++}
++
++void ivybridge_handle_parity_error(struct drm_device *dev)
++{
++	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
++	unsigned long flags;
++
++	if (!IS_IVYBRIDGE(dev))
++		return;
++
++	spin_lock_irqsave(&dev_priv->irq_lock, flags);
++	dev_priv->gt_irq_mask |= GT_GEN7_L3_PARITY_ERROR_INTERRUPT;
++	I915_WRITE(GTIMR, dev_priv->gt_irq_mask);
++	spin_unlock_irqrestore(&dev_priv->irq_lock, flags);
++
++	queue_work(dev_priv->wq, &dev_priv->parity_error_work);
++}
++
+ static void snb_gt_irq_handler(struct drm_device *dev,
+ 			       struct drm_i915_private *dev_priv,
+ 			       u32 gt_iir)
+@@ -417,6 +497,9 @@ static void snb_gt_irq_handler(struct drm_device *dev,
+ 		DRM_ERROR("GT error interrupt 0x%08x\n", gt_iir);
+ 		i915_handle_error(dev, false);
+ 	}
++
++	if (gt_iir & GT_GEN7_L3_PARITY_ERROR_INTERRUPT)
++		ivybridge_handle_parity_error(dev);
+ }
+ 
+ static void gen6_queue_rps_work(struct drm_i915_private *dev_priv,
+@@ -1641,6 +1724,9 @@ static void ironlake_irq_preinstall(struct drm_device *dev)
+ 	atomic_set(&dev_priv->irq_received, 0);
+ 
+ 
++	if (IS_IVYBRIDGE(dev))
++		INIT_WORK(&dev_priv->parity_error_work, ivybridge_parity_work);
++
+ 	I915_WRITE(HWSTAM, 0xeffe);
+ 
+ 	/* XXX hotplug from PCH */
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 1855ac7..2f31df0 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -4094,6 +4094,23 @@
+ #define   GEN6_RC6			3
+ #define   GEN6_RC7			4
+ 
++#define GEN7_MISCCPCTL			(0x9424)
++#define   GEN7_DOP_CLOCK_GATE_ENABLE	(1<<0)
++
++/* IVYBRIDGE DPF */
++#define GEN7_L3CDERRST1			0xB008 /* L3CD Error Status 1 */
++#define   GEN7_L3CDERRST1_ROW_MASK	(0x7ff<<14)
++#define   GEN7_PARITY_ERROR_VALID	(1<<13)
++#define   GEN7_L3CDERRST1_BANK_MASK	(3<<11)
++#define   GEN7_L3CDERRST1_SUBBANK_MASK	(7<<8)
++#define GEN7_PARITY_ERROR_ROW(reg) \
++		((reg & GEN7_L3CDERRST1_ROW_MASK) >> 14)
++#define GEN7_PARITY_ERROR_BANK(reg) \
++		((reg & GEN7_L3CDERRST1_BANK_MASK) >> 11)
++#define GEN7_PARITY_ERROR_SUBBANK(reg) \
++		((reg & GEN7_L3CDERRST1_SUBBANK_MASK) >> 8)
++#define   GEN7_L3CDERRST1_ENABLE	(1<<7)
++
+ #define G4X_AUD_VID_DID			0x62020
+ #define INTEL_AUDIO_DEVCL		0x808629FB
+ #define INTEL_AUDIO_DEVBLC		0x80862801
+

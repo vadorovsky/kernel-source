@@ -1,0 +1,505 @@
+From b2cabb0e1d205708dab11bd9e1b97fd080537096 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Sun, 1 Jul 2012 22:42:24 +0200
+Subject: drm/i915: convert dpms functions of dvo/sdvo/crt
+Git-commit: b2cabb0e1d205708dab11bd9e1b97fd080537096
+Patch-mainline: v3.7-rc1
+
+Yeah, big patch but I couldn't come up with a neat idea of how to
+split it up further, that wouldn't break dpms on cloned configs
+somehow. But the changes in dvo/sdvo/crt are all pretty much
+orthonogal, so it's not too bad a patch.
+
+These are the only encoders that support cloning, which requires a few
+special changes compared to the previous patches.
+- Compute the desired state of the display pipe by walking all
+  connected encoders and checking whether any has active connectors.
+  To make this clearer, drop the old mode parameter to the crtc dpms
+  function and rename it to intel_crtc_update_dpms.
+- There's the curious case of intel_crtc->dpms_mode. With the previous
+  patches to remove the overlay pipe A code and to rework the load
+  detect pipe code, the big users are gone. We still keep it to avoid
+  enabling the pipe twice, but we duplicate this logic with
+  crtc->active, too. Still, leave this for now and just push a fake
+  dpms mode into it that reflects the state of the display pipe.
+
+Changes in the encoder dpms functions:
+- We clamp the dpms state to the supported range right away. This is
+  escpecially important for the VGA outputs, where only older hw
+  supports the intermediate states. This (and the crt->adpa_reg patch)
+  allows us to unify the crt dpms code again between all variants
+  (gmch, vlv and pch).
+- We only enable/disable the output for dvo/sdvo and leave the encoder
+  running. The encoder will be disabled/enabled when we switch the
+  state of the entire output pipeline (which will happen right away
+  for non-cloned setups). This way the duplication is reduced and
+  strange interaction when disabling output ports at the wrong time
+  avoided.
+
+The dpms code for all three types of connectors contains a bit of
+duplicated logic, but I think keeping these special cases separate is
+simpler: CRT is the only one that hanldes intermediate dpms state
+(which requires extra logic to enable/disable things in the right
+order), and introducing some abstraction just to share the code
+between dvo and sdvo smells like overkill. We can do that once someone
+bothers to implement cloning for the more modern outputs. But I doubt
+that this will ever happen.
+
+v2: s/crtc/crt/_set_dpms, noticed by Paulo Zanoni.
+
+Reviewed-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+Signed-Off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/intel_crt.c     |   97 +++++++++++++++++----------------
+ drivers/gpu/drm/i915/intel_display.c |   37 ++++++-------
+ drivers/gpu/drm/i915/intel_drv.h     |    1 +
+ drivers/gpu/drm/i915/intel_dvo.c     |   39 ++++++++++----
+ drivers/gpu/drm/i915/intel_sdvo.c    |   58 +++++++++------------
+ 5 files changed, 121 insertions(+), 111 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_crt.c b/drivers/gpu/drm/i915/intel_crt.c
+index 543ea40..76646c7 100644
+--- a/drivers/gpu/drm/i915/intel_crt.c
++++ b/drivers/gpu/drm/i915/intel_crt.c
+@@ -84,13 +84,17 @@ static void intel_enable_crt(struct intel_encoder *encoder)
+ 	I915_WRITE(crt->adpa_reg, temp);
+ }
+ 
+-static void pch_crt_dpms(struct drm_encoder *encoder, int mode)
++/* Note: The caller is required to filter out dpms modes not supported by the
++ * platform. */
++static void intel_crt_set_dpms(struct intel_encoder *encoder, int mode)
+ {
+-	struct drm_device *dev = encoder->dev;
++	struct drm_device *dev = encoder->base.dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_crt *crt = intel_encoder_to_crt(encoder);
+ 	u32 temp;
+ 
+-	temp = I915_READ(PCH_ADPA);
++	temp = I915_READ(crt->adpa_reg);
++	temp &= ~(ADPA_HSYNC_CNTL_DISABLE | ADPA_VSYNC_CNTL_DISABLE);
+ 	temp &= ~ADPA_DAC_ENABLE;
+ 
+ 	switch (mode) {
+@@ -98,44 +102,59 @@ static void pch_crt_dpms(struct drm_encoder *encoder, int mode)
+ 		temp |= ADPA_DAC_ENABLE;
+ 		break;
+ 	case DRM_MODE_DPMS_STANDBY:
++		temp |= ADPA_DAC_ENABLE | ADPA_HSYNC_CNTL_DISABLE;
++		break;
+ 	case DRM_MODE_DPMS_SUSPEND:
++		temp |= ADPA_DAC_ENABLE | ADPA_VSYNC_CNTL_DISABLE;
++		break;
+ 	case DRM_MODE_DPMS_OFF:
+-		/* Just leave port enable cleared */
++		temp |= ADPA_HSYNC_CNTL_DISABLE | ADPA_VSYNC_CNTL_DISABLE;
+ 		break;
+ 	}
+ 
+-	I915_WRITE(PCH_ADPA, temp);
++	I915_WRITE(crt->adpa_reg, temp);
+ }
+ 
+-static void gmch_crt_dpms(struct drm_encoder *encoder, int mode)
++static void intel_crt_dpms(struct drm_connector *connector, int mode)
+ {
+-	struct drm_device *dev = encoder->dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	u32 temp;
+-
+-	temp = I915_READ(ADPA);
+-	temp &= ~(ADPA_HSYNC_CNTL_DISABLE | ADPA_VSYNC_CNTL_DISABLE);
+-	temp &= ~ADPA_DAC_ENABLE;
++	struct drm_device *dev = connector->dev;
++	struct intel_encoder *encoder = intel_attached_encoder(connector);
++	struct drm_crtc *crtc;
++	int old_dpms;
+ 
+-	if (IS_VALLEYVIEW(dev) && mode != DRM_MODE_DPMS_ON)
++	/* PCH platforms and VLV only support on/off. */
++	if (INTEL_INFO(dev)->gen < 5 && mode != DRM_MODE_DPMS_ON)
+ 		mode = DRM_MODE_DPMS_OFF;
+ 
+-	switch (mode) {
+-	case DRM_MODE_DPMS_ON:
+-		temp |= ADPA_DAC_ENABLE;
+-		break;
+-	case DRM_MODE_DPMS_STANDBY:
+-		temp |= ADPA_DAC_ENABLE | ADPA_HSYNC_CNTL_DISABLE;
+-		break;
+-	case DRM_MODE_DPMS_SUSPEND:
+-		temp |= ADPA_DAC_ENABLE | ADPA_VSYNC_CNTL_DISABLE;
+-		break;
+-	case DRM_MODE_DPMS_OFF:
+-		temp |= ADPA_HSYNC_CNTL_DISABLE | ADPA_VSYNC_CNTL_DISABLE;
+-		break;
++	if (mode == connector->dpms)
++		return;
++
++	old_dpms = connector->dpms;
++	connector->dpms = mode;
++
++	/* Only need to change hw state when actually enabled */
++	crtc = encoder->base.crtc;
++	if (!crtc) {
++		encoder->connectors_active = false;
++		return;
+ 	}
+ 
+-	I915_WRITE(ADPA, temp);
++	/* We need the pipe to run for anything but OFF. */
++	if (mode == DRM_MODE_DPMS_OFF)
++		encoder->connectors_active = false;
++	else
++		encoder->connectors_active = true;
++
++	if (mode < old_dpms) {
++		/* From off to on, enable the pipe first. */
++		intel_crtc_update_dpms(crtc);
++
++		intel_crt_set_dpms(encoder, mode);
++	} else {
++		intel_crt_set_dpms(encoder, mode);
++
++		intel_crtc_update_dpms(crtc);
++	}
+ }
+ 
+ static int intel_crt_mode_valid(struct drm_connector *connector,
+@@ -596,27 +615,17 @@ static void intel_crt_reset(struct drm_connector *connector)
+  * Routines for controlling stuff on the analog port
+  */
+ 
+-static const struct drm_encoder_helper_funcs pch_encoder_funcs = {
+-	.mode_fixup = intel_crt_mode_fixup,
+-	.prepare = intel_encoder_noop,
+-	.commit = intel_encoder_noop,
+-	.mode_set = intel_crt_mode_set,
+-	.dpms = pch_crt_dpms,
+-	.disable = intel_encoder_disable,
+-};
+-
+-static const struct drm_encoder_helper_funcs gmch_encoder_funcs = {
++static const struct drm_encoder_helper_funcs crt_encoder_funcs = {
+ 	.mode_fixup = intel_crt_mode_fixup,
+ 	.prepare = intel_encoder_noop,
+ 	.commit = intel_encoder_noop,
+ 	.mode_set = intel_crt_mode_set,
+-	.dpms = gmch_crt_dpms,
+ 	.disable = intel_encoder_disable,
+ };
+ 
+ static const struct drm_connector_funcs intel_crt_connector_funcs = {
+ 	.reset = intel_crt_reset,
+-	.dpms = drm_helper_connector_dpms,
++	.dpms = intel_crt_dpms,
+ 	.detect = intel_crt_detect,
+ 	.fill_modes = drm_helper_probe_single_connector_modes,
+ 	.destroy = intel_crt_destroy,
+@@ -657,7 +666,6 @@ void intel_crt_init(struct drm_device *dev)
+ 	struct intel_crt *crt;
+ 	struct intel_connector *intel_connector;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	const struct drm_encoder_helper_funcs *encoder_helper_funcs;
+ 
+ 	/* Skip machines without VGA that falsely report hotplug events */
+ 	if (dmi_check_system(intel_no_crt))
+@@ -696,11 +704,6 @@ void intel_crt_init(struct drm_device *dev)
+ 	connector->doublescan_allowed = 0;
+ 
+ 	if (HAS_PCH_SPLIT(dev))
+-		encoder_helper_funcs = &pch_encoder_funcs;
+-	else
+-		encoder_helper_funcs = &gmch_encoder_funcs;
+-
+-	if (HAS_PCH_SPLIT(dev))
+ 		crt->adpa_reg = PCH_ADPA;
+ 	else if (IS_VALLEYVIEW(dev))
+ 		crt->adpa_reg = VLV_ADPA;
+@@ -710,7 +713,7 @@ void intel_crt_init(struct drm_device *dev)
+ 	crt->base.disable = intel_disable_crt;
+ 	crt->base.enable = intel_enable_crt;
+ 
+-	drm_encoder_helper_add(&crt->base.base, encoder_helper_funcs);
++	drm_encoder_helper_add(&crt->base.base, &crt_encoder_funcs);
+ 	drm_connector_helper_add(connector, &intel_crt_connector_helper_funcs);
+ 
+ 	drm_sysfs_connector_add(connector);
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index cbd356f..0d48ebe 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -3462,34 +3462,31 @@ static void i9xx_crtc_off(struct drm_crtc *crtc)
+ /**
+  * Sets the power management mode of the pipe and plane.
+  */
+-static void intel_crtc_dpms(struct drm_crtc *crtc, int mode)
++void intel_crtc_update_dpms(struct drm_crtc *crtc)
+ {
+ 	struct drm_device *dev = crtc->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_i915_master_private *master_priv;
+ 	struct intel_crtc *intel_crtc = to_intel_crtc(crtc);
++	struct intel_encoder *intel_encoder;
+ 	int pipe = intel_crtc->pipe;
+-	bool enabled;
++	bool enabled, enable = false;
++	int mode;
++
++	for_each_encoder_on_crtc(dev, crtc, intel_encoder)
++		enable |= intel_encoder->connectors_active;
++
++	mode = enable ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF;
+ 
+ 	if (intel_crtc->dpms_mode == mode)
+ 		return;
+ 
+ 	intel_crtc->dpms_mode = mode;
+ 
+-	/* XXX: When our outputs are all unaware of DPMS modes other than off
+-	 * and on, we should map those modes to DRM_MODE_DPMS_OFF in the CRTC.
+-	 */
+-	switch (mode) {
+-	case DRM_MODE_DPMS_ON:
+-	case DRM_MODE_DPMS_STANDBY:
+-	case DRM_MODE_DPMS_SUSPEND:
++	if (enable)
+ 		dev_priv->display.crtc_enable(crtc);
+-		break;
+-
+-	case DRM_MODE_DPMS_OFF:
++	else
+ 		dev_priv->display.crtc_disable(crtc);
+-		break;
+-	}
+ 
+ 	if (!dev->primary->master)
+ 		return;
+@@ -3498,7 +3495,7 @@ static void intel_crtc_dpms(struct drm_crtc *crtc, int mode)
+ 	if (!master_priv->sarea_priv)
+ 		return;
+ 
+-	enabled = crtc->enabled && mode != DRM_MODE_DPMS_OFF;
++	enabled = crtc->enabled && enable;
+ 
+ 	switch (pipe) {
+ 	case 0:
+@@ -3517,11 +3514,12 @@ static void intel_crtc_dpms(struct drm_crtc *crtc, int mode)
+ 
+ static void intel_crtc_disable(struct drm_crtc *crtc)
+ {
+-	struct drm_crtc_helper_funcs *crtc_funcs = crtc->helper_private;
+ 	struct drm_device *dev = crtc->dev;
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 
+-	crtc_funcs->dpms(crtc, DRM_MODE_DPMS_OFF);
++	/* crtc->disable is only called when we have no encoders, hence this
++	 * will disable the pipe. */
++	intel_crtc_update_dpms(crtc);
+ 	dev_priv->display.off(crtc);
+ 
+ 	assert_plane_disabled(dev->dev_private, to_intel_crtc(crtc)->plane);
+@@ -3581,11 +3579,11 @@ void intel_encoder_dpms(struct intel_encoder *encoder, int mode)
+ 	if (mode == DRM_MODE_DPMS_ON) {
+ 		encoder->connectors_active = true;
+ 
+-		intel_crtc_dpms(encoder->base.crtc, DRM_MODE_DPMS_ON);
++		intel_crtc_update_dpms(encoder->base.crtc);
+ 	} else {
+ 		encoder->connectors_active = false;
+ 
+-		intel_crtc_dpms(encoder->base.crtc, DRM_MODE_DPMS_OFF);
++		intel_crtc_update_dpms(encoder->base.crtc);
+ 	}
+ }
+ 
+@@ -6609,7 +6607,6 @@ static void intel_crtc_reset(struct drm_crtc *crtc)
+ }
+ 
+ static struct drm_crtc_helper_funcs intel_helper_funcs = {
+-	.dpms = intel_crtc_dpms,
+ 	.mode_fixup = intel_crtc_mode_fixup,
+ 	.mode_set = intel_crtc_mode_set,
+ 	.mode_set_base = intel_pipe_set_base,
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 759dcba..2456245 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -411,6 +411,7 @@ extern void intel_panel_destroy_backlight(struct drm_device *dev);
+ extern enum drm_connector_status intel_panel_detect(struct drm_device *dev);
+ 
+ extern void intel_crtc_load_lut(struct drm_crtc *crtc);
++extern void intel_crtc_update_dpms(struct drm_crtc *crtc);
+ extern void intel_encoder_prepare(struct drm_encoder *encoder);
+ extern void intel_encoder_commit(struct drm_encoder *encoder);
+ extern void intel_encoder_noop(struct drm_encoder *encoder);
+diff --git a/drivers/gpu/drm/i915/intel_dvo.c b/drivers/gpu/drm/i915/intel_dvo.c
+index 4ad988f..c55a13e 100644
+--- a/drivers/gpu/drm/i915/intel_dvo.c
++++ b/drivers/gpu/drm/i915/intel_dvo.c
+@@ -129,21 +129,39 @@ static void intel_enable_dvo(struct intel_encoder *encoder)
+ 	intel_dvo->dev.dev_ops->dpms(&intel_dvo->dev, true);
+ }
+ 
+-static void intel_dvo_dpms(struct drm_encoder *encoder, int mode)
++static void intel_dvo_dpms(struct drm_connector *connector, int mode)
+ {
+-	struct drm_i915_private *dev_priv = encoder->dev->dev_private;
+-	struct intel_dvo *intel_dvo = enc_to_intel_dvo(encoder);
+-	u32 dvo_reg = intel_dvo->dev.dvo_reg;
+-	u32 temp = I915_READ(dvo_reg);
++	struct intel_dvo *intel_dvo = intel_attached_dvo(connector);
++	struct drm_crtc *crtc;
++
++	/* dvo supports only 2 dpms states. */
++	if (mode != DRM_MODE_DPMS_ON)
++		mode = DRM_MODE_DPMS_OFF;
++
++	if (mode == connector->dpms)
++		return;
++
++	connector->dpms = mode;
++
++	/* Only need to change hw state when actually enabled */
++	crtc = intel_dvo->base.base.crtc;
++	if (!crtc) {
++		intel_dvo->base.connectors_active = false;
++		return;
++	}
+ 
+ 	if (mode == DRM_MODE_DPMS_ON) {
+-		I915_WRITE(dvo_reg, temp | DVO_ENABLE);
+-		I915_READ(dvo_reg);
++		intel_dvo->base.connectors_active = true;
++
++		intel_crtc_update_dpms(crtc);
++
+ 		intel_dvo->dev.dev_ops->dpms(&intel_dvo->dev, true);
+ 	} else {
+ 		intel_dvo->dev.dev_ops->dpms(&intel_dvo->dev, false);
+-		I915_WRITE(dvo_reg, temp & ~DVO_ENABLE);
+-		I915_READ(dvo_reg);
++
++		intel_dvo->base.connectors_active = false;
++
++		intel_crtc_update_dpms(crtc);
+ 	}
+ }
+ 
+@@ -299,7 +317,6 @@ static void intel_dvo_destroy(struct drm_connector *connector)
+ }
+ 
+ static const struct drm_encoder_helper_funcs intel_dvo_helper_funcs = {
+-	.dpms = intel_dvo_dpms,
+ 	.mode_fixup = intel_dvo_mode_fixup,
+ 	.prepare = intel_encoder_noop,
+ 	.mode_set = intel_dvo_mode_set,
+@@ -308,7 +325,7 @@ static const struct drm_encoder_helper_funcs intel_dvo_helper_funcs = {
+ };
+ 
+ static const struct drm_connector_funcs intel_dvo_connector_funcs = {
+-	.dpms = drm_helper_connector_dpms,
++	.dpms = intel_dvo_dpms,
+ 	.detect = intel_dvo_detect,
+ 	.destroy = intel_dvo_destroy,
+ 	.fill_modes = drm_helper_probe_single_connector_modes,
+diff --git a/drivers/gpu/drm/i915/intel_sdvo.c b/drivers/gpu/drm/i915/intel_sdvo.c
+index 20feaa3..a01c470 100644
+--- a/drivers/gpu/drm/i915/intel_sdvo.c
++++ b/drivers/gpu/drm/i915/intel_sdvo.c
+@@ -1192,51 +1192,44 @@ static void intel_enable_sdvo(struct intel_encoder *encoder)
+ 	intel_sdvo_set_active_outputs(intel_sdvo, intel_sdvo->attached_output);
+ }
+ 
+-static void intel_sdvo_dpms(struct drm_encoder *encoder, int mode)
++static void intel_sdvo_dpms(struct drm_connector *connector, int mode)
+ {
+-	struct drm_device *dev = encoder->dev;
+-	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct intel_sdvo *intel_sdvo = to_intel_sdvo(encoder);
+-	struct intel_crtc *intel_crtc = to_intel_crtc(encoder->crtc);
+-	u32 temp;
++	struct drm_crtc *crtc;
++	struct intel_sdvo *intel_sdvo = intel_attached_sdvo(connector);
++
++	/* dvo supports only 2 dpms states. */
++	if (mode != DRM_MODE_DPMS_ON)
++		mode = DRM_MODE_DPMS_OFF;
++
++	if (mode == connector->dpms)
++		return;
++
++	connector->dpms = mode;
++
++	/* Only need to change hw state when actually enabled */
++	crtc = intel_sdvo->base.base.crtc;
++	if (!crtc) {
++		intel_sdvo->base.connectors_active = false;
++		return;
++	}
+ 
+ 	if (mode != DRM_MODE_DPMS_ON) {
+ 		intel_sdvo_set_active_outputs(intel_sdvo, 0);
+ 		if (0)
+ 			intel_sdvo_set_encoder_power_state(intel_sdvo, mode);
+ 
+-		if (mode == DRM_MODE_DPMS_OFF) {
+-			temp = I915_READ(intel_sdvo->sdvo_reg);
+-			if ((temp & SDVO_ENABLE) != 0) {
+-				intel_sdvo_write_sdvox(intel_sdvo, temp & ~SDVO_ENABLE);
+-			}
+-		}
+-	} else {
+-		bool input1, input2;
+-		int i;
+-		u8 status;
++		intel_sdvo->base.connectors_active = false;
+ 
+-		temp = I915_READ(intel_sdvo->sdvo_reg);
+-		if ((temp & SDVO_ENABLE) == 0)
+-			intel_sdvo_write_sdvox(intel_sdvo, temp | SDVO_ENABLE);
+-		for (i = 0; i < 2; i++)
+-			intel_wait_for_vblank(dev, intel_crtc->pipe);
++		intel_crtc_update_dpms(crtc);
++	} else {
++		intel_sdvo->base.connectors_active = true;
+ 
+-		status = intel_sdvo_get_trained_inputs(intel_sdvo, &input1, &input2);
+-		/* Warn if the device reported failure to sync.
+-		 * A lot of SDVO devices fail to notify of sync, but it's
+-		 * a given it the status is a success, we succeeded.
+-		 */
+-		if (status == SDVO_CMD_STATUS_SUCCESS && !input1) {
+-			DRM_DEBUG_KMS("First %s output reported failure to "
+-					"sync\n", SDVO_NAME(intel_sdvo));
+-		}
++		intel_crtc_update_dpms(crtc);
+ 
+ 		if (0)
+ 			intel_sdvo_set_encoder_power_state(intel_sdvo, mode);
+ 		intel_sdvo_set_active_outputs(intel_sdvo, intel_sdvo->attached_output);
+ 	}
+-	return;
+ }
+ 
+ static int intel_sdvo_mode_valid(struct drm_connector *connector,
+@@ -1895,7 +1888,6 @@ done:
+ }
+ 
+ static const struct drm_encoder_helper_funcs intel_sdvo_helper_funcs = {
+-	.dpms = intel_sdvo_dpms,
+ 	.mode_fixup = intel_sdvo_mode_fixup,
+ 	.prepare = intel_encoder_noop,
+ 	.mode_set = intel_sdvo_mode_set,
+@@ -1904,7 +1896,7 @@ static const struct drm_encoder_helper_funcs intel_sdvo_helper_funcs = {
+ };
+ 
+ static const struct drm_connector_funcs intel_sdvo_connector_funcs = {
+-	.dpms = drm_helper_connector_dpms,
++	.dpms = intel_sdvo_dpms,
+ 	.detect = intel_sdvo_detect,
+ 	.fill_modes = drm_helper_probe_single_connector_modes,
+ 	.set_property = intel_sdvo_set_property,
+

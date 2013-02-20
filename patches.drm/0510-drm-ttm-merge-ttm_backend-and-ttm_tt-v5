@@ -1,0 +1,1375 @@
+From 649bf3ca77343e3be1e0af8e21356fa569b1abd9 Mon Sep 17 00:00:00 2001
+From: Jerome Glisse <jglisse@redhat.com>
+Date: Tue, 1 Nov 2011 20:46:13 -0400
+Subject: drm/ttm: merge ttm_backend and ttm_tt V5
+Git-commit: 649bf3ca77343e3be1e0af8e21356fa569b1abd9
+Patch-mainline: v3.3-rc1
+
+ttm_backend will only exist with a ttm_tt, and ttm_tt
+will only be of interest when bound to a backend. Merge them
+to avoid code and data duplication.
+
+V2 Rebase on top of memory accounting overhaul
+V3 Rebase on top of more memory accounting changes
+V4 Rebase on top of no memory account changes (where/when is my
+   delorean when i need it ?)
+V5 make sure ttm is unbound before destroying, change commit
+   message on suggestion from Tormod Volden
+
+Signed-off-by: Jerome Glisse <jglisse@redhat.com>
+Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Reviewed-by: Thomas Hellstrom <thellstrom@vmware.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/nouveau/nouveau_bo.c    |   14 ++-
+ drivers/gpu/drm/nouveau/nouveau_drv.h   |    5 +-
+ drivers/gpu/drm/nouveau/nouveau_sgdma.c |  188 ++++++++++++---------------
+ drivers/gpu/drm/radeon/radeon_ttm.c     |  219 ++++++++++++-------------------
+ drivers/gpu/drm/ttm/ttm_agp_backend.c   |   88 +++++--------
+ drivers/gpu/drm/ttm/ttm_bo.c            |    9 +-
+ drivers/gpu/drm/ttm/ttm_tt.c            |   59 ++-------
+ drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c  |   66 +++-------
+ include/drm/ttm/ttm_bo_driver.h         |  104 ++++++---------
+ 9 files changed, 294 insertions(+), 458 deletions(-)
+
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_bo.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/nouveau/nouveau_bo.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_bo.c
+@@ -343,8 +343,10 @@ nouveau_bo_wr32(struct nouveau_bo *nvbo,
+ 		*mem = val;
+ }
+ 
+-static struct ttm_backend *
+-nouveau_bo_create_ttm_backend_entry(struct ttm_bo_device *bdev)
++static struct ttm_tt *
++nouveau_ttm_tt_create(struct ttm_bo_device *bdev,
++		      unsigned long size, uint32_t page_flags,
++		      struct page *dummy_read_page)
+ {
+ 	struct drm_nouveau_private *dev_priv = nouveau_bdev(bdev);
+ 	struct drm_device *dev = dev_priv->dev;
+@@ -352,11 +354,13 @@ nouveau_bo_create_ttm_backend_entry(stru
+ 	switch (dev_priv->gart_info.type) {
+ #if __OS_HAS_AGP
+ 	case NOUVEAU_GART_AGP:
+-		return ttm_agp_backend_init(bdev, dev->agp->bridge);
++		return ttm_agp_tt_create(bdev, dev->agp->bridge,
++					 size, page_flags, dummy_read_page);
+ #endif
+ 	case NOUVEAU_GART_PDMA:
+ 	case NOUVEAU_GART_HW:
+-		return nouveau_sgdma_init_ttm(dev);
++		return nouveau_sgdma_create_ttm(bdev, size, page_flags,
++						dummy_read_page);
+ 	default:
+ 		NV_ERROR(dev, "Unknown GART type %d\n",
+ 			 dev_priv->gart_info.type);
+@@ -1045,7 +1049,7 @@ nouveau_bo_fence(struct nouveau_bo *nvbo
+ }
+ 
+ struct ttm_bo_driver nouveau_bo_driver = {
+-	.create_ttm_backend_entry = nouveau_bo_create_ttm_backend_entry,
++	.ttm_tt_create = &nouveau_ttm_tt_create,
+ 	.invalidate_caches = nouveau_bo_invalidate_caches,
+ 	.init_mem_type = nouveau_bo_init_mem_type,
+ 	.evict_flags = nouveau_bo_evict_flags,
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_drv.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/nouveau/nouveau_drv.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_drv.h
+@@ -1000,7 +1000,10 @@ extern int nouveau_sgdma_init(struct drm
+ extern void nouveau_sgdma_takedown(struct drm_device *);
+ extern uint32_t nouveau_sgdma_get_physical(struct drm_device *,
+ 					   uint32_t offset);
+-extern struct ttm_backend *nouveau_sgdma_init_ttm(struct drm_device *);
++extern struct ttm_tt *nouveau_sgdma_create_ttm(struct ttm_bo_device *bdev,
++					       unsigned long size,
++					       uint32_t page_flags,
++					       struct page *dummy_read_page);
+ 
+ /* nouveau_debugfs.c */
+ #if defined(CONFIG_DRM_NOUVEAU_DEBUG)
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_sgdma.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/nouveau/nouveau_sgdma.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/nouveau/nouveau_sgdma.c
+@@ -8,44 +8,23 @@
+ #define NV_CTXDMA_PAGE_MASK  (NV_CTXDMA_PAGE_SIZE - 1)
+ 
+ struct nouveau_sgdma_be {
+-	struct ttm_backend backend;
++	struct ttm_tt ttm;
+ 	struct drm_device *dev;
+-
+-	dma_addr_t *pages;
+-	unsigned nr_pages;
+-	bool unmap_pages;
+-
+ 	u64 offset;
+-	bool bound;
+ };
+ 
+ static int
+-nouveau_sgdma_populate(struct ttm_backend *be, unsigned long num_pages,
+-		       struct page **pages, struct page *dummy_read_page,
+-		       dma_addr_t *dma_addrs)
++nouveau_sgdma_dma_map(struct ttm_tt *ttm)
+ {
+-	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)be;
++	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)ttm;
+ 	struct drm_device *dev = nvbe->dev;
+ 	int i;
+ 
+-	NV_DEBUG(nvbe->dev, "num_pages = %ld\n", num_pages);
+-
+-	nvbe->pages = dma_addrs;
+-	nvbe->nr_pages = num_pages;
+-	nvbe->unmap_pages = true;
+-
+-	/* this code path isn't called and is incorrect anyways */
+-	if (0) { /* dma_addrs[0] != DMA_ERROR_CODE) { */
+-		nvbe->unmap_pages = false;
+-		return 0;
+-	}
+-
+-	for (i = 0; i < num_pages; i++) {
+-		nvbe->pages[i] = pci_map_page(dev->pdev, pages[i], 0,
+-					      PAGE_SIZE, PCI_DMA_BIDIRECTIONAL);
+-		if (pci_dma_mapping_error(dev->pdev, nvbe->pages[i])) {
+-			nvbe->nr_pages = --i;
+-			be->func->clear(be);
++	for (i = 0; i < ttm->num_pages; i++) {
++		ttm->dma_address[i] = pci_map_page(dev->pdev, ttm->pages[i],
++						   0, PAGE_SIZE,
++						   PCI_DMA_BIDIRECTIONAL);
++		if (pci_dma_mapping_error(dev->pdev, ttm->dma_address[i])) {
+ 			return -EFAULT;
+ 		}
+ 	}
+@@ -54,56 +33,53 @@ nouveau_sgdma_populate(struct ttm_backen
+ }
+ 
+ static void
+-nouveau_sgdma_clear(struct ttm_backend *be)
++nouveau_sgdma_dma_unmap(struct ttm_tt *ttm)
+ {
+-	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)be;
++	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)ttm;
+ 	struct drm_device *dev = nvbe->dev;
++	int i;
+ 
+-	if (nvbe->bound)
+-		be->func->unbind(be);
+-
+-	if (nvbe->unmap_pages) {
+-		while (nvbe->nr_pages--) {
+-			pci_unmap_page(dev->pdev, nvbe->pages[nvbe->nr_pages],
++	for (i = 0; i < ttm->num_pages; i++) {
++		if (ttm->dma_address[i]) {
++			pci_unmap_page(dev->pdev, ttm->dma_address[i],
+ 				       PAGE_SIZE, PCI_DMA_BIDIRECTIONAL);
+ 		}
+-		nvbe->unmap_pages = false;
++		ttm->dma_address[i] = 0;
+ 	}
+-
+-	nvbe->pages = NULL;
+ }
+ 
+ static void
+-nouveau_sgdma_destroy(struct ttm_backend *be)
++nouveau_sgdma_destroy(struct ttm_tt *ttm)
+ {
+-	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)be;
++	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)ttm;
+ 
+-	if (be) {
++	if (ttm) {
+ 		NV_DEBUG(nvbe->dev, "\n");
+ 
+-		if (nvbe) {
+-			if (nvbe->pages)
+-				be->func->clear(be);
+-			kfree(nvbe);
+-		}
++		kfree(nvbe);
+ 	}
+ }
+ 
+ static int
+-nv04_sgdma_bind(struct ttm_backend *be, struct ttm_mem_reg *mem)
++nv04_sgdma_bind(struct ttm_tt *ttm, struct ttm_mem_reg *mem)
+ {
+-	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)be;
++	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)ttm;
+ 	struct drm_device *dev = nvbe->dev;
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+ 	struct nouveau_gpuobj *gpuobj = dev_priv->gart_info.sg_ctxdma;
+ 	unsigned i, j, pte;
++	int r;
+ 
+ 	NV_DEBUG(dev, "pg=0x%lx\n", mem->start);
++	r = nouveau_sgdma_dma_map(ttm);
++	if (r) {
++		return r;
++	}
+ 
+ 	nvbe->offset = mem->start << PAGE_SHIFT;
+ 	pte = (nvbe->offset >> NV_CTXDMA_PAGE_SHIFT) + 2;
+-	for (i = 0; i < nvbe->nr_pages; i++) {
+-		dma_addr_t dma_offset = nvbe->pages[i];
++	for (i = 0; i < ttm->num_pages; i++) {
++		dma_addr_t dma_offset = ttm->dma_address[i];
+ 		uint32_t offset_l = lower_32_bits(dma_offset);
+ 
+ 		for (j = 0; j < PAGE_SIZE / NV_CTXDMA_PAGE_SIZE; j++, pte++) {
+@@ -112,14 +88,13 @@ nv04_sgdma_bind(struct ttm_backend *be,
+ 		}
+ 	}
+ 
+-	nvbe->bound = true;
+ 	return 0;
+ }
+ 
+ static int
+-nv04_sgdma_unbind(struct ttm_backend *be)
++nv04_sgdma_unbind(struct ttm_tt *ttm)
+ {
+-	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)be;
++	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)ttm;
+ 	struct drm_device *dev = nvbe->dev;
+ 	struct drm_nouveau_private *dev_priv = dev->dev_private;
+ 	struct nouveau_gpuobj *gpuobj = dev_priv->gart_info.sg_ctxdma;
+@@ -127,22 +102,20 @@ nv04_sgdma_unbind(struct ttm_backend *be
+ 
+ 	NV_DEBUG(dev, "\n");
+ 
+-	if (!nvbe->bound)
++	if (ttm->state != tt_bound)
+ 		return 0;
+ 
+ 	pte = (nvbe->offset >> NV_CTXDMA_PAGE_SHIFT) + 2;
+-	for (i = 0; i < nvbe->nr_pages; i++) {
++	for (i = 0; i < ttm->num_pages; i++) {
+ 		for (j = 0; j < PAGE_SIZE / NV_CTXDMA_PAGE_SIZE; j++, pte++)
+ 			nv_wo32(gpuobj, (pte * 4) + 0, 0x00000000);
+ 	}
+ 
+-	nvbe->bound = false;
++	nouveau_sgdma_dma_unmap(ttm);
+ 	return 0;
+ }
+ 
+ static struct ttm_backend_func nv04_sgdma_backend = {
+-	.populate		= nouveau_sgdma_populate,
+-	.clear			= nouveau_sgdma_clear,
+ 	.bind			= nv04_sgdma_bind,
+ 	.unbind			= nv04_sgdma_unbind,
+ 	.destroy		= nouveau_sgdma_destroy
+@@ -161,16 +134,21 @@ nv41_sgdma_flush(struct nouveau_sgdma_be
+ }
+ 
+ static int
+-nv41_sgdma_bind(struct ttm_backend *be, struct ttm_mem_reg *mem)
++nv41_sgdma_bind(struct ttm_tt *ttm, struct ttm_mem_reg *mem)
+ {
+-	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)be;
++	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)ttm;
+ 	struct drm_nouveau_private *dev_priv = nvbe->dev->dev_private;
+ 	struct nouveau_gpuobj *pgt = dev_priv->gart_info.sg_ctxdma;
+-	dma_addr_t *list = nvbe->pages;
++	dma_addr_t *list = ttm->dma_address;
+ 	u32 pte = mem->start << 2;
+-	u32 cnt = nvbe->nr_pages;
++	u32 cnt = ttm->num_pages;
++	int r;
+ 
+ 	nvbe->offset = mem->start << PAGE_SHIFT;
++	r = nouveau_sgdma_dma_map(ttm);
++	if (r) {
++		return r;
++	}
+ 
+ 	while (cnt--) {
+ 		nv_wo32(pgt, pte, (*list++ >> 7) | 1);
+@@ -178,18 +156,17 @@ nv41_sgdma_bind(struct ttm_backend *be,
+ 	}
+ 
+ 	nv41_sgdma_flush(nvbe);
+-	nvbe->bound = true;
+ 	return 0;
+ }
+ 
+ static int
+-nv41_sgdma_unbind(struct ttm_backend *be)
++nv41_sgdma_unbind(struct ttm_tt *ttm)
+ {
+-	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)be;
++	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)ttm;
+ 	struct drm_nouveau_private *dev_priv = nvbe->dev->dev_private;
+ 	struct nouveau_gpuobj *pgt = dev_priv->gart_info.sg_ctxdma;
+ 	u32 pte = (nvbe->offset >> 12) << 2;
+-	u32 cnt = nvbe->nr_pages;
++	u32 cnt = ttm->num_pages;
+ 
+ 	while (cnt--) {
+ 		nv_wo32(pgt, pte, 0x00000000);
+@@ -197,24 +174,23 @@ nv41_sgdma_unbind(struct ttm_backend *be
+ 	}
+ 
+ 	nv41_sgdma_flush(nvbe);
+-	nvbe->bound = false;
++	nouveau_sgdma_dma_unmap(ttm);
+ 	return 0;
+ }
+ 
+ static struct ttm_backend_func nv41_sgdma_backend = {
+-	.populate		= nouveau_sgdma_populate,
+-	.clear			= nouveau_sgdma_clear,
+ 	.bind			= nv41_sgdma_bind,
+ 	.unbind			= nv41_sgdma_unbind,
+ 	.destroy		= nouveau_sgdma_destroy
+ };
+ 
+ static void
+-nv44_sgdma_flush(struct nouveau_sgdma_be *nvbe)
++nv44_sgdma_flush(struct ttm_tt *ttm)
+ {
++	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)ttm;
+ 	struct drm_device *dev = nvbe->dev;
+ 
+-	nv_wr32(dev, 0x100814, (nvbe->nr_pages - 1) << 12);
++	nv_wr32(dev, 0x100814, (ttm->num_pages - 1) << 12);
+ 	nv_wr32(dev, 0x100808, nvbe->offset | 0x20);
+ 	if (!nv_wait(dev, 0x100808, 0x00000001, 0x00000001))
+ 		NV_ERROR(dev, "gart flush timeout: 0x%08x\n",
+@@ -273,17 +249,21 @@ nv44_sgdma_fill(struct nouveau_gpuobj *p
+ }
+ 
+ static int
+-nv44_sgdma_bind(struct ttm_backend *be, struct ttm_mem_reg *mem)
++nv44_sgdma_bind(struct ttm_tt *ttm, struct ttm_mem_reg *mem)
+ {
+-	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)be;
++	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)ttm;
+ 	struct drm_nouveau_private *dev_priv = nvbe->dev->dev_private;
+ 	struct nouveau_gpuobj *pgt = dev_priv->gart_info.sg_ctxdma;
+-	dma_addr_t *list = nvbe->pages;
++	dma_addr_t *list = ttm->dma_address;
+ 	u32 pte = mem->start << 2, tmp[4];
+-	u32 cnt = nvbe->nr_pages;
+-	int i;
++	u32 cnt = ttm->num_pages;
++	int i, r;
+ 
+ 	nvbe->offset = mem->start << PAGE_SHIFT;
++	r = nouveau_sgdma_dma_map(ttm);
++	if (r) {
++		return r;
++	}
+ 
+ 	if (pte & 0x0000000c) {
+ 		u32  max = 4 - ((pte >> 2) & 0x3);
+@@ -308,19 +288,18 @@ nv44_sgdma_bind(struct ttm_backend *be,
+ 	if (cnt)
+ 		nv44_sgdma_fill(pgt, list, pte, cnt);
+ 
+-	nv44_sgdma_flush(nvbe);
+-	nvbe->bound = true;
++	nv44_sgdma_flush(ttm);
+ 	return 0;
+ }
+ 
+ static int
+-nv44_sgdma_unbind(struct ttm_backend *be)
++nv44_sgdma_unbind(struct ttm_tt *ttm)
+ {
+-	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)be;
++	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)ttm;
+ 	struct drm_nouveau_private *dev_priv = nvbe->dev->dev_private;
+ 	struct nouveau_gpuobj *pgt = dev_priv->gart_info.sg_ctxdma;
+ 	u32 pte = (nvbe->offset >> 12) << 2;
+-	u32 cnt = nvbe->nr_pages;
++	u32 cnt = ttm->num_pages;
+ 
+ 	if (pte & 0x0000000c) {
+ 		u32  max = 4 - ((pte >> 2) & 0x3);
+@@ -342,55 +321,53 @@ nv44_sgdma_unbind(struct ttm_backend *be
+ 	if (cnt)
+ 		nv44_sgdma_fill(pgt, NULL, pte, cnt);
+ 
+-	nv44_sgdma_flush(nvbe);
+-	nvbe->bound = false;
++	nv44_sgdma_flush(ttm);
++	nouveau_sgdma_dma_unmap(ttm);
+ 	return 0;
+ }
+ 
+ static struct ttm_backend_func nv44_sgdma_backend = {
+-	.populate		= nouveau_sgdma_populate,
+-	.clear			= nouveau_sgdma_clear,
+ 	.bind			= nv44_sgdma_bind,
+ 	.unbind			= nv44_sgdma_unbind,
+ 	.destroy		= nouveau_sgdma_destroy
+ };
+ 
+ static int
+-nv50_sgdma_bind(struct ttm_backend *be, struct ttm_mem_reg *mem)
++nv50_sgdma_bind(struct ttm_tt *ttm, struct ttm_mem_reg *mem)
+ {
+-	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)be;
+ 	struct nouveau_mem *node = mem->mm_node;
++	int r;
++
+ 	/* noop: bound in move_notify() */
+-	node->pages = nvbe->pages;
+-	nvbe->pages = (dma_addr_t *)node;
+-	nvbe->bound = true;
++	r = nouveau_sgdma_dma_map(ttm);
++	if (r) {
++		return r;
++	}
++	node->pages = ttm->dma_address;
+ 	return 0;
+ }
+ 
+ static int
+-nv50_sgdma_unbind(struct ttm_backend *be)
++nv50_sgdma_unbind(struct ttm_tt *ttm)
+ {
+-	struct nouveau_sgdma_be *nvbe = (struct nouveau_sgdma_be *)be;
+-	struct nouveau_mem *node = (struct nouveau_mem *)nvbe->pages;
+ 	/* noop: unbound in move_notify() */
+-	nvbe->pages = node->pages;
+-	node->pages = NULL;
+-	nvbe->bound = false;
++	nouveau_sgdma_dma_unmap(ttm);
+ 	return 0;
+ }
+ 
+ static struct ttm_backend_func nv50_sgdma_backend = {
+-	.populate		= nouveau_sgdma_populate,
+-	.clear			= nouveau_sgdma_clear,
+ 	.bind			= nv50_sgdma_bind,
+ 	.unbind			= nv50_sgdma_unbind,
+ 	.destroy		= nouveau_sgdma_destroy
+ };
+ 
+-struct ttm_backend *
+-nouveau_sgdma_init_ttm(struct drm_device *dev)
++struct ttm_tt *
++nouveau_sgdma_create_ttm(struct ttm_bo_device *bdev,
++			 unsigned long size, uint32_t page_flags,
++			 struct page *dummy_read_page)
+ {
+-	struct drm_nouveau_private *dev_priv = dev->dev_private;
++	struct drm_nouveau_private *dev_priv = nouveau_bdev(bdev);
++	struct drm_device *dev = dev_priv->dev;
+ 	struct nouveau_sgdma_be *nvbe;
+ 
+ 	nvbe = kzalloc(sizeof(*nvbe), GFP_KERNEL);
+@@ -398,9 +375,12 @@ nouveau_sgdma_init_ttm(struct drm_device
+ 		return NULL;
+ 
+ 	nvbe->dev = dev;
++	nvbe->ttm.func = dev_priv->gart_info.func;
+ 
+-	nvbe->backend.func = dev_priv->gart_info.func;
+-	return &nvbe->backend;
++	if (ttm_tt_init(&nvbe->ttm, bdev, size, page_flags, dummy_read_page)) {
++		return NULL;
++	}
++	return &nvbe->ttm;
+ }
+ 
+ int
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_ttm.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/radeon/radeon_ttm.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/radeon/radeon_ttm.c
+@@ -114,24 +114,6 @@ static void radeon_ttm_global_fini(struc
+ 	}
+ }
+ 
+-struct ttm_backend *radeon_ttm_backend_create(struct radeon_device *rdev);
+-
+-static struct ttm_backend*
+-radeon_create_ttm_backend_entry(struct ttm_bo_device *bdev)
+-{
+-	struct radeon_device *rdev;
+-
+-	rdev = radeon_get_rdev(bdev);
+-#if __OS_HAS_AGP
+-	if (rdev->flags & RADEON_IS_AGP) {
+-		return ttm_agp_backend_init(bdev, rdev->ddev->agp->bridge);
+-	} else
+-#endif
+-	{
+-		return radeon_ttm_backend_create(rdev);
+-	}
+-}
+-
+ static int radeon_invalidate_caches(struct ttm_bo_device *bdev, uint32_t flags)
+ {
+ 	return 0;
+@@ -515,8 +497,90 @@ static bool radeon_sync_obj_signaled(voi
+ 	return radeon_fence_signaled((struct radeon_fence *)sync_obj);
+ }
+ 
++/*
++ * TTM backend functions.
++ */
++struct radeon_ttm_tt {
++	struct ttm_tt			ttm;
++	struct radeon_device		*rdev;
++	u64				offset;
++};
++
++static int radeon_ttm_backend_bind(struct ttm_tt *ttm,
++				   struct ttm_mem_reg *bo_mem)
++{
++	struct radeon_ttm_tt *gtt;
++	int r;
++
++	gtt = container_of(ttm, struct radeon_ttm_tt, ttm);
++	gtt->offset = (unsigned long)(bo_mem->start << PAGE_SHIFT);
++	if (!ttm->num_pages) {
++		WARN(1, "nothing to bind %lu pages for mreg %p back %p!\n",
++		     ttm->num_pages, bo_mem, ttm);
++	}
++	r = radeon_gart_bind(gtt->rdev, gtt->offset,
++			     ttm->num_pages, ttm->pages, ttm->dma_address);
++	if (r) {
++		DRM_ERROR("failed to bind %lu pages at 0x%08X\n",
++			  ttm->num_pages, (unsigned)gtt->offset);
++		return r;
++	}
++	return 0;
++}
++
++static int radeon_ttm_backend_unbind(struct ttm_tt *ttm)
++{
++	struct radeon_ttm_tt *gtt;
++
++	gtt = container_of(ttm, struct radeon_ttm_tt, ttm);
++	radeon_gart_unbind(gtt->rdev, gtt->offset, ttm->num_pages);
++	return 0;
++}
++
++static void radeon_ttm_backend_destroy(struct ttm_tt *ttm)
++{
++	struct radeon_ttm_tt *gtt;
++
++	gtt = container_of(ttm, struct radeon_ttm_tt, ttm);
++	kfree(gtt);
++}
++
++static struct ttm_backend_func radeon_backend_func = {
++	.bind = &radeon_ttm_backend_bind,
++	.unbind = &radeon_ttm_backend_unbind,
++	.destroy = &radeon_ttm_backend_destroy,
++};
++
++struct ttm_tt *radeon_ttm_tt_create(struct ttm_bo_device *bdev,
++				    unsigned long size, uint32_t page_flags,
++				    struct page *dummy_read_page)
++{
++	struct radeon_device *rdev;
++	struct radeon_ttm_tt *gtt;
++
++	rdev = radeon_get_rdev(bdev);
++#if __OS_HAS_AGP
++	if (rdev->flags & RADEON_IS_AGP) {
++		return ttm_agp_tt_create(bdev, rdev->ddev->agp->bridge,
++					 size, page_flags, dummy_read_page);
++	}
++#endif
++
++	gtt = kzalloc(sizeof(struct radeon_ttm_tt), GFP_KERNEL);
++	if (gtt == NULL) {
++		return NULL;
++	}
++	gtt->ttm.func = &radeon_backend_func;
++	gtt->rdev = rdev;
++	if (ttm_tt_init(&gtt->ttm, bdev, size, page_flags, dummy_read_page)) {
++		return NULL;
++	}
++	return &gtt->ttm;
++}
++
++
+ static struct ttm_bo_driver radeon_bo_driver = {
+-	.create_ttm_backend_entry = &radeon_create_ttm_backend_entry,
++	.ttm_tt_create = &radeon_ttm_tt_create,
+ 	.invalidate_caches = &radeon_invalidate_caches,
+ 	.init_mem_type = &radeon_init_mem_type,
+ 	.evict_flags = &radeon_evict_flags,
+@@ -680,123 +744,6 @@ int radeon_mmap(struct file *filp, struc
+ }
+ 
+ 
+-/*
+- * TTM backend functions.
+- */
+-struct radeon_ttm_backend {
+-	struct ttm_backend		backend;
+-	struct radeon_device		*rdev;
+-	unsigned long			num_pages;
+-	struct page			**pages;
+-	struct page			*dummy_read_page;
+-	dma_addr_t			*dma_addrs;
+-	bool				populated;
+-	bool				bound;
+-	unsigned			offset;
+-};
+-
+-static int radeon_ttm_backend_populate(struct ttm_backend *backend,
+-				       unsigned long num_pages,
+-				       struct page **pages,
+-				       struct page *dummy_read_page,
+-				       dma_addr_t *dma_addrs)
+-{
+-	struct radeon_ttm_backend *gtt;
+-
+-	gtt = container_of(backend, struct radeon_ttm_backend, backend);
+-	gtt->pages = pages;
+-	gtt->dma_addrs = dma_addrs;
+-	gtt->num_pages = num_pages;
+-	gtt->dummy_read_page = dummy_read_page;
+-	gtt->populated = true;
+-	return 0;
+-}
+-
+-static void radeon_ttm_backend_clear(struct ttm_backend *backend)
+-{
+-	struct radeon_ttm_backend *gtt;
+-
+-	gtt = container_of(backend, struct radeon_ttm_backend, backend);
+-	gtt->pages = NULL;
+-	gtt->dma_addrs = NULL;
+-	gtt->num_pages = 0;
+-	gtt->dummy_read_page = NULL;
+-	gtt->populated = false;
+-	gtt->bound = false;
+-}
+-
+-
+-static int radeon_ttm_backend_bind(struct ttm_backend *backend,
+-				   struct ttm_mem_reg *bo_mem)
+-{
+-	struct radeon_ttm_backend *gtt;
+-	int r;
+-
+-	gtt = container_of(backend, struct radeon_ttm_backend, backend);
+-	gtt->offset = bo_mem->start << PAGE_SHIFT;
+-	if (!gtt->num_pages) {
+-		WARN(1, "nothing to bind %lu pages for mreg %p back %p!\n",
+-		     gtt->num_pages, bo_mem, backend);
+-	}
+-	r = radeon_gart_bind(gtt->rdev, gtt->offset,
+-			     gtt->num_pages, gtt->pages, gtt->dma_addrs);
+-	if (r) {
+-		DRM_ERROR("failed to bind %lu pages at 0x%08X\n",
+-			  gtt->num_pages, gtt->offset);
+-		return r;
+-	}
+-	gtt->bound = true;
+-	return 0;
+-}
+-
+-static int radeon_ttm_backend_unbind(struct ttm_backend *backend)
+-{
+-	struct radeon_ttm_backend *gtt;
+-
+-	gtt = container_of(backend, struct radeon_ttm_backend, backend);
+-	radeon_gart_unbind(gtt->rdev, gtt->offset, gtt->num_pages);
+-	gtt->bound = false;
+-	return 0;
+-}
+-
+-static void radeon_ttm_backend_destroy(struct ttm_backend *backend)
+-{
+-	struct radeon_ttm_backend *gtt;
+-
+-	gtt = container_of(backend, struct radeon_ttm_backend, backend);
+-	if (gtt->bound) {
+-		radeon_ttm_backend_unbind(backend);
+-	}
+-	kfree(gtt);
+-}
+-
+-static struct ttm_backend_func radeon_backend_func = {
+-	.populate = &radeon_ttm_backend_populate,
+-	.clear = &radeon_ttm_backend_clear,
+-	.bind = &radeon_ttm_backend_bind,
+-	.unbind = &radeon_ttm_backend_unbind,
+-	.destroy = &radeon_ttm_backend_destroy,
+-};
+-
+-struct ttm_backend *radeon_ttm_backend_create(struct radeon_device *rdev)
+-{
+-	struct radeon_ttm_backend *gtt;
+-
+-	gtt = kzalloc(sizeof(struct radeon_ttm_backend), GFP_KERNEL);
+-	if (gtt == NULL) {
+-		return NULL;
+-	}
+-	gtt->backend.bdev = &rdev->mman.bdev;
+-	gtt->backend.func = &radeon_backend_func;
+-	gtt->rdev = rdev;
+-	gtt->pages = NULL;
+-	gtt->num_pages = 0;
+-	gtt->dummy_read_page = NULL;
+-	gtt->populated = false;
+-	gtt->bound = false;
+-	return &gtt->backend;
+-}
+-
+ #define RADEON_DEBUGFS_MEM_TYPES 2
+ 
+ #if defined(CONFIG_DEBUG_FS)
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/ttm/ttm_agp_backend.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/ttm/ttm_agp_backend.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/ttm/ttm_agp_backend.c
+@@ -40,45 +40,33 @@
+ #include <asm/agp.h>
+ 
+ struct ttm_agp_backend {
+-	struct ttm_backend backend;
++	struct ttm_tt ttm;
+ 	struct agp_memory *mem;
+ 	struct agp_bridge_data *bridge;
+ };
+ 
+-static int ttm_agp_populate(struct ttm_backend *backend,
+-			    unsigned long num_pages, struct page **pages,
+-			    struct page *dummy_read_page,
+-			    dma_addr_t *dma_addrs)
++static int ttm_agp_bind(struct ttm_tt *ttm, struct ttm_mem_reg *bo_mem)
+ {
+-	struct ttm_agp_backend *agp_be =
+-	    container_of(backend, struct ttm_agp_backend, backend);
+-	struct page **cur_page, **last_page = pages + num_pages;
++	struct ttm_agp_backend *agp_be = container_of(ttm, struct ttm_agp_backend, ttm);
++	struct drm_mm_node *node = bo_mem->mm_node;
+ 	struct agp_memory *mem;
++	int ret, cached = (bo_mem->placement & TTM_PL_FLAG_CACHED);
++	unsigned i;
+ 
+-	mem = agp_allocate_memory(agp_be->bridge, num_pages, AGP_USER_MEMORY);
++	mem = agp_allocate_memory(agp_be->bridge, ttm->num_pages, AGP_USER_MEMORY);
+ 	if (unlikely(mem == NULL))
+ 		return -ENOMEM;
+ 
+ 	mem->page_count = 0;
+-	for (cur_page = pages; cur_page < last_page; ++cur_page) {
+-		struct page *page = *cur_page;
++	for (i = 0; i < ttm->num_pages; i++) {
++		struct page *page = ttm->pages[i];
++
+ 		if (!page)
+-			page = dummy_read_page;
++			page = ttm->dummy_read_page;
+ 
+ 		mem->pages[mem->page_count++] = page;
+ 	}
+ 	agp_be->mem = mem;
+-	return 0;
+-}
+-
+-static int ttm_agp_bind(struct ttm_backend *backend, struct ttm_mem_reg *bo_mem)
+-{
+-	struct ttm_agp_backend *agp_be =
+-	    container_of(backend, struct ttm_agp_backend, backend);
+-	struct drm_mm_node *node = bo_mem->mm_node;
+-	struct agp_memory *mem = agp_be->mem;
+-	int cached = (bo_mem->placement & TTM_PL_FLAG_CACHED);
+-	int ret;
+ 
+ 	mem->is_flushed = 1;
+ 	mem->type = (cached) ? AGP_USER_CACHED_MEMORY : AGP_USER_MEMORY;
+@@ -90,50 +78,38 @@ static int ttm_agp_bind(struct ttm_backe
+ 	return ret;
+ }
+ 
+-static int ttm_agp_unbind(struct ttm_backend *backend)
++static int ttm_agp_unbind(struct ttm_tt *ttm)
+ {
+-	struct ttm_agp_backend *agp_be =
+-	    container_of(backend, struct ttm_agp_backend, backend);
+-
+-	if (agp_be->mem->is_bound)
+-		return agp_unbind_memory(agp_be->mem);
+-	else
+-		return 0;
+-}
++	struct ttm_agp_backend *agp_be = container_of(ttm, struct ttm_agp_backend, ttm);
+ 
+-static void ttm_agp_clear(struct ttm_backend *backend)
+-{
+-	struct ttm_agp_backend *agp_be =
+-	    container_of(backend, struct ttm_agp_backend, backend);
+-	struct agp_memory *mem = agp_be->mem;
+-
+-	if (mem) {
+-		ttm_agp_unbind(backend);
+-		agp_free_memory(mem);
++	if (agp_be->mem) {
++		if (agp_be->mem->is_bound)
++			return agp_unbind_memory(agp_be->mem);
++		agp_free_memory(agp_be->mem);
++		agp_be->mem = NULL;
+ 	}
+-	agp_be->mem = NULL;
++	return 0;
+ }
+ 
+-static void ttm_agp_destroy(struct ttm_backend *backend)
++static void ttm_agp_destroy(struct ttm_tt *ttm)
+ {
+-	struct ttm_agp_backend *agp_be =
+-	    container_of(backend, struct ttm_agp_backend, backend);
++	struct ttm_agp_backend *agp_be = container_of(ttm, struct ttm_agp_backend, ttm);
+ 
+ 	if (agp_be->mem)
+-		ttm_agp_clear(backend);
++		ttm_agp_unbind(ttm);
+ 	kfree(agp_be);
+ }
+ 
+ static struct ttm_backend_func ttm_agp_func = {
+-	.populate = ttm_agp_populate,
+-	.clear = ttm_agp_clear,
+ 	.bind = ttm_agp_bind,
+ 	.unbind = ttm_agp_unbind,
+ 	.destroy = ttm_agp_destroy,
+ };
+ 
+-struct ttm_backend *ttm_agp_backend_init(struct ttm_bo_device *bdev,
+-					 struct agp_bridge_data *bridge)
++struct ttm_tt *ttm_agp_tt_create(struct ttm_bo_device *bdev,
++				 struct agp_bridge_data *bridge,
++				 unsigned long size, uint32_t page_flags,
++				 struct page *dummy_read_page)
+ {
+ 	struct ttm_agp_backend *agp_be;
+ 
+@@ -143,10 +119,14 @@ struct ttm_backend *ttm_agp_backend_init
+ 
+ 	agp_be->mem = NULL;
+ 	agp_be->bridge = bridge;
+-	agp_be->backend.func = &ttm_agp_func;
+-	agp_be->backend.bdev = bdev;
+-	return &agp_be->backend;
++	agp_be->ttm.func = &ttm_agp_func;
++
++	if (ttm_tt_init(&agp_be->ttm, bdev, size, page_flags, dummy_read_page)) {
++		return NULL;
++	}
++
++	return &agp_be->ttm;
+ }
+-EXPORT_SYMBOL(ttm_agp_backend_init);
++EXPORT_SYMBOL(ttm_agp_tt_create);
+ 
+ #endif
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/ttm/ttm_bo.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/ttm/ttm_bo.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -337,8 +337,8 @@ static int ttm_bo_add_ttm(struct ttm_buf
+ 		if (zero_alloc)
+ 			page_flags |= TTM_PAGE_FLAG_ZERO_ALLOC;
+ 	case ttm_bo_type_kernel:
+-		bo->ttm = ttm_tt_create(bdev, bo->num_pages << PAGE_SHIFT,
+-					page_flags, glob->dummy_read_page);
++		bo->ttm = bdev->driver->ttm_tt_create(bdev, bo->num_pages << PAGE_SHIFT,
++						      page_flags, glob->dummy_read_page);
+ 		if (unlikely(bo->ttm == NULL))
+ 			ret = -ENOMEM;
+ 		break;
+@@ -1443,10 +1443,7 @@ int ttm_bo_global_init(struct drm_global
+ 		goto out_no_shrink;
+ 	}
+ 
+-	glob->ttm_bo_extra_size =
+-		ttm_round_pot(sizeof(struct ttm_tt)) +
+-		ttm_round_pot(sizeof(struct ttm_backend));
+-
++	glob->ttm_bo_extra_size = ttm_round_pot(sizeof(struct ttm_tt));
+ 	glob->ttm_bo_size = glob->ttm_bo_extra_size +
+ 		ttm_round_pot(sizeof(struct ttm_buffer_object));
+ 
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/ttm/ttm_tt.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/ttm/ttm_tt.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/ttm/ttm_tt.c
+@@ -104,7 +104,6 @@ int ttm_tt_populate(struct ttm_tt *ttm)
+ {
+ 	struct page *page;
+ 	unsigned long i;
+-	struct ttm_backend *be;
+ 	int ret;
+ 
+ 	if (ttm->state != tt_unpopulated)
+@@ -116,16 +115,11 @@ int ttm_tt_populate(struct ttm_tt *ttm)
+ 			return ret;
+ 	}
+ 
+-	be = ttm->be;
+-
+ 	for (i = 0; i < ttm->num_pages; ++i) {
+ 		page = __ttm_tt_get_page(ttm, i);
+ 		if (!page)
+ 			return -ENOMEM;
+ 	}
+-
+-	be->func->populate(be, ttm->num_pages, ttm->pages,
+-			   ttm->dummy_read_page, ttm->dma_address);
+ 	ttm->state = tt_unbound;
+ 	return 0;
+ }
+@@ -234,11 +228,8 @@ EXPORT_SYMBOL(ttm_tt_set_placement_cachi
+ 
+ static void ttm_tt_free_alloced_pages(struct ttm_tt *ttm)
+ {
+-	struct ttm_backend *be = ttm->be;
+ 	unsigned i;
+ 
+-	if (be)
+-		be->func->clear(be);
+ 	for (i = 0; i < ttm->num_pages; ++i) {
+ 		if (ttm->pages[i]) {
+ 			ttm_mem_global_free_page(ttm->glob->mem_glob,
+@@ -252,20 +243,15 @@ static void ttm_tt_free_alloced_pages(st
+ 
+ void ttm_tt_destroy(struct ttm_tt *ttm)
+ {
+-	struct ttm_backend *be;
+-
+ 	if (unlikely(ttm == NULL))
+ 		return;
+ 
+-	be = ttm->be;
+-	if (likely(be != NULL)) {
+-		be->func->destroy(be);
+-		ttm->be = NULL;
++	if (ttm->state == tt_bound) {
++		ttm_tt_unbind(ttm);
+ 	}
+ 
+ 	if (likely(ttm->pages != NULL)) {
+ 		ttm_tt_free_alloced_pages(ttm);
+-
+ 		ttm_tt_free_page_directory(ttm);
+ 	}
+ 
+@@ -273,52 +259,38 @@ void ttm_tt_destroy(struct ttm_tt *ttm)
+ 	    ttm->swap_storage)
+ 		fput(ttm->swap_storage);
+ 
+-	kfree(ttm);
++	ttm->swap_storage = NULL;
++	ttm->func->destroy(ttm);
+ }
+ 
+-struct ttm_tt *ttm_tt_create(struct ttm_bo_device *bdev, unsigned long size,
+-			     uint32_t page_flags, struct page *dummy_read_page)
++int ttm_tt_init(struct ttm_tt *ttm, struct ttm_bo_device *bdev,
++		unsigned long size, uint32_t page_flags,
++		struct page *dummy_read_page)
+ {
+-	struct ttm_bo_driver *bo_driver = bdev->driver;
+-	struct ttm_tt *ttm;
+-
+-	if (!bo_driver)
+-		return NULL;
+-
+-	ttm = kzalloc(sizeof(*ttm), GFP_KERNEL);
+-	if (!ttm)
+-		return NULL;
+-
++	ttm->bdev = bdev;
+ 	ttm->glob = bdev->glob;
+ 	ttm->num_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+ 	ttm->caching_state = tt_cached;
+ 	ttm->page_flags = page_flags;
+-
+ 	ttm->dummy_read_page = dummy_read_page;
++	ttm->state = tt_unpopulated;
+ 
+ 	ttm_tt_alloc_page_directory(ttm);
+ 	if (!ttm->pages || !ttm->dma_address) {
+ 		ttm_tt_destroy(ttm);
+ 		printk(KERN_ERR TTM_PFX "Failed allocating page table\n");
+-		return NULL;
+-	}
+-	ttm->be = bo_driver->create_ttm_backend_entry(bdev);
+-	if (!ttm->be) {
+-		ttm_tt_destroy(ttm);
+-		printk(KERN_ERR TTM_PFX "Failed creating ttm backend entry\n");
+-		return NULL;
++		return -ENOMEM;
+ 	}
+-	ttm->state = tt_unpopulated;
+-	return ttm;
++	return 0;
+ }
++EXPORT_SYMBOL(ttm_tt_init);
+ 
+ void ttm_tt_unbind(struct ttm_tt *ttm)
+ {
+ 	int ret;
+-	struct ttm_backend *be = ttm->be;
+ 
+ 	if (ttm->state == tt_bound) {
+-		ret = be->func->unbind(be);
++		ret = ttm->func->unbind(ttm);
+ 		BUG_ON(ret);
+ 		ttm->state = tt_unbound;
+ 	}
+@@ -327,7 +299,6 @@ void ttm_tt_unbind(struct ttm_tt *ttm)
+ int ttm_tt_bind(struct ttm_tt *ttm, struct ttm_mem_reg *bo_mem)
+ {
+ 	int ret = 0;
+-	struct ttm_backend *be;
+ 
+ 	if (!ttm)
+ 		return -EINVAL;
+@@ -335,13 +306,11 @@ int ttm_tt_bind(struct ttm_tt *ttm, stru
+ 	if (ttm->state == tt_bound)
+ 		return 0;
+ 
+-	be = ttm->be;
+-
+ 	ret = ttm_tt_populate(ttm);
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = be->func->bind(be, bo_mem);
++	ret = ttm->func->bind(ttm, bo_mem);
+ 	if (unlikely(ret != 0))
+ 		return ret;
+ 
+Index: linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/vmwgfx/vmwgfx_buffer.c
+@@ -139,85 +139,61 @@ struct ttm_placement vmw_srf_placement =
+ 	.busy_placement = gmr_vram_placement_flags
+ };
+ 
+-struct vmw_ttm_backend {
+-	struct ttm_backend backend;
+-	struct page **pages;
+-	unsigned long num_pages;
++struct vmw_ttm_tt {
++	struct ttm_tt ttm;
+ 	struct vmw_private *dev_priv;
+ 	int gmr_id;
+ };
+ 
+-static int vmw_ttm_populate(struct ttm_backend *backend,
+-			    unsigned long num_pages, struct page **pages,
+-			    struct page *dummy_read_page,
+-			    dma_addr_t *dma_addrs)
++static int vmw_ttm_bind(struct ttm_tt *ttm, struct ttm_mem_reg *bo_mem)
+ {
+-	struct vmw_ttm_backend *vmw_be =
+-	    container_of(backend, struct vmw_ttm_backend, backend);
+-
+-	vmw_be->pages = pages;
+-	vmw_be->num_pages = num_pages;
+-
+-	return 0;
+-}
+-
+-static int vmw_ttm_bind(struct ttm_backend *backend, struct ttm_mem_reg *bo_mem)
+-{
+-	struct vmw_ttm_backend *vmw_be =
+-	    container_of(backend, struct vmw_ttm_backend, backend);
++	struct vmw_ttm_tt *vmw_be = container_of(ttm, struct vmw_ttm_tt, ttm);
+ 
+ 	vmw_be->gmr_id = bo_mem->start;
+ 
+-	return vmw_gmr_bind(vmw_be->dev_priv, vmw_be->pages,
+-			    vmw_be->num_pages, vmw_be->gmr_id);
++	return vmw_gmr_bind(vmw_be->dev_priv, ttm->pages,
++			    ttm->num_pages, vmw_be->gmr_id);
+ }
+ 
+-static int vmw_ttm_unbind(struct ttm_backend *backend)
++static int vmw_ttm_unbind(struct ttm_tt *ttm)
+ {
+-	struct vmw_ttm_backend *vmw_be =
+-	    container_of(backend, struct vmw_ttm_backend, backend);
++	struct vmw_ttm_tt *vmw_be = container_of(ttm, struct vmw_ttm_tt, ttm);
+ 
+ 	vmw_gmr_unbind(vmw_be->dev_priv, vmw_be->gmr_id);
+ 	return 0;
+ }
+ 
+-static void vmw_ttm_clear(struct ttm_backend *backend)
++static void vmw_ttm_destroy(struct ttm_tt *ttm)
+ {
+-	struct vmw_ttm_backend *vmw_be =
+-		container_of(backend, struct vmw_ttm_backend, backend);
+-
+-	vmw_be->pages = NULL;
+-	vmw_be->num_pages = 0;
+-}
+-
+-static void vmw_ttm_destroy(struct ttm_backend *backend)
+-{
+-	struct vmw_ttm_backend *vmw_be =
+-	    container_of(backend, struct vmw_ttm_backend, backend);
++	struct vmw_ttm_tt *vmw_be = container_of(ttm, struct vmw_ttm_tt, ttm);
+ 
+ 	kfree(vmw_be);
+ }
+ 
+ static struct ttm_backend_func vmw_ttm_func = {
+-	.populate = vmw_ttm_populate,
+-	.clear = vmw_ttm_clear,
+ 	.bind = vmw_ttm_bind,
+ 	.unbind = vmw_ttm_unbind,
+ 	.destroy = vmw_ttm_destroy,
+ };
+ 
+-struct ttm_backend *vmw_ttm_backend_init(struct ttm_bo_device *bdev)
++struct ttm_tt *vmw_ttm_tt_create(struct ttm_bo_device *bdev,
++				 unsigned long size, uint32_t page_flags,
++				 struct page *dummy_read_page)
+ {
+-	struct vmw_ttm_backend *vmw_be;
++	struct vmw_ttm_tt *vmw_be;
+ 
+ 	vmw_be = kmalloc(sizeof(*vmw_be), GFP_KERNEL);
+ 	if (!vmw_be)
+ 		return NULL;
+ 
+-	vmw_be->backend.func = &vmw_ttm_func;
++	vmw_be->ttm.func = &vmw_ttm_func;
+ 	vmw_be->dev_priv = container_of(bdev, struct vmw_private, bdev);
+ 
+-	return &vmw_be->backend;
++	if (ttm_tt_init(&vmw_be->ttm, bdev, size, page_flags, dummy_read_page)) {
++		return NULL;
++	}
++
++	return &vmw_be->ttm;
+ }
+ 
+ int vmw_invalidate_caches(struct ttm_bo_device *bdev, uint32_t flags)
+@@ -357,7 +333,7 @@ static int vmw_sync_obj_wait(void *sync_
+ }
+ 
+ struct ttm_bo_driver vmw_bo_driver = {
+-	.create_ttm_backend_entry = vmw_ttm_backend_init,
++	.ttm_tt_create = &vmw_ttm_tt_create,
+ 	.invalidate_caches = vmw_invalidate_caches,
+ 	.init_mem_type = vmw_init_mem_type,
+ 	.evict_flags = vmw_evict_flags,
+Index: linux-3.0-SLE11-SP3/include/drm/ttm/ttm_bo_driver.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/include/drm/ttm/ttm_bo_driver.h
++++ linux-3.0-SLE11-SP3/include/drm/ttm/ttm_bo_driver.h
+@@ -43,36 +43,9 @@ struct ttm_backend;
+ 
+ struct ttm_backend_func {
+ 	/**
+-	 * struct ttm_backend_func member populate
+-	 *
+-	 * @backend: Pointer to a struct ttm_backend.
+-	 * @num_pages: Number of pages to populate.
+-	 * @pages: Array of pointers to ttm pages.
+-	 * @dummy_read_page: Page to be used instead of NULL pages in the
+-	 * array @pages.
+-	 * @dma_addrs: Array of DMA (bus) address of the ttm pages.
+-	 *
+-	 * Populate the backend with ttm pages. Depending on the backend,
+-	 * it may or may not copy the @pages array.
+-	 */
+-	int (*populate) (struct ttm_backend *backend,
+-			 unsigned long num_pages, struct page **pages,
+-			 struct page *dummy_read_page,
+-			 dma_addr_t *dma_addrs);
+-	/**
+-	 * struct ttm_backend_func member clear
+-	 *
+-	 * @backend: Pointer to a struct ttm_backend.
+-	 *
+-	 * This is an "unpopulate" function. Release all resources
+-	 * allocated with populate.
+-	 */
+-	void (*clear) (struct ttm_backend *backend);
+-
+-	/**
+ 	 * struct ttm_backend_func member bind
+ 	 *
+-	 * @backend: Pointer to a struct ttm_backend.
++	 * @ttm: Pointer to a struct ttm_tt.
+ 	 * @bo_mem: Pointer to a struct ttm_mem_reg describing the
+ 	 * memory type and location for binding.
+ 	 *
+@@ -80,40 +53,27 @@ struct ttm_backend_func {
+ 	 * indicated by @bo_mem. This function should be able to handle
+ 	 * differences between aperture and system page sizes.
+ 	 */
+-	int (*bind) (struct ttm_backend *backend, struct ttm_mem_reg *bo_mem);
++	int (*bind) (struct ttm_tt *ttm, struct ttm_mem_reg *bo_mem);
+ 
+ 	/**
+ 	 * struct ttm_backend_func member unbind
+ 	 *
+-	 * @backend: Pointer to a struct ttm_backend.
++	 * @ttm: Pointer to a struct ttm_tt.
+ 	 *
+ 	 * Unbind previously bound backend pages. This function should be
+ 	 * able to handle differences between aperture and system page sizes.
+ 	 */
+-	int (*unbind) (struct ttm_backend *backend);
++	int (*unbind) (struct ttm_tt *ttm);
+ 
+ 	/**
+ 	 * struct ttm_backend_func member destroy
+ 	 *
+-	 * @backend: Pointer to a struct ttm_backend.
++	 * @ttm: Pointer to a struct ttm_tt.
+ 	 *
+-	 * Destroy the backend.
++	 * Destroy the backend. This will be call back from ttm_tt_destroy so
++	 * don't call ttm_tt_destroy from the callback or infinite loop.
+ 	 */
+-	void (*destroy) (struct ttm_backend *backend);
+-};
+-
+-/**
+- * struct ttm_backend
+- *
+- * @bdev: Pointer to a struct ttm_bo_device.
+- * @func: Pointer to a struct ttm_backend_func that describes
+- * the backend methods.
+- *
+- */
+-
+-struct ttm_backend {
+-	struct ttm_bo_device *bdev;
+-	struct ttm_backend_func *func;
++	void (*destroy) (struct ttm_tt *ttm);
+ };
+ 
+ #define TTM_PAGE_FLAG_WRITE           (1 << 3)
+@@ -131,6 +91,9 @@ enum ttm_caching_state {
+ /**
+  * struct ttm_tt
+  *
++ * @bdev: Pointer to a struct ttm_bo_device.
++ * @func: Pointer to a struct ttm_backend_func that describes
++ * the backend methods.
+  * @dummy_read_page: Page to map where the ttm_tt page array contains a NULL
+  * pointer.
+  * @pages: Array of pages backing the data.
+@@ -148,6 +111,8 @@ enum ttm_caching_state {
+  */
+ 
+ struct ttm_tt {
++	struct ttm_bo_device *bdev;
++	struct ttm_backend_func *func;
+ 	struct page *dummy_read_page;
+ 	struct page **pages;
+ 	uint32_t page_flags;
+@@ -336,15 +301,22 @@ struct ttm_mem_type_manager {
+ 
+ struct ttm_bo_driver {
+ 	/**
+-	 * struct ttm_bo_driver member create_ttm_backend_entry
++	 * ttm_tt_create
+ 	 *
+-	 * @bdev: The buffer object device.
+-	 *
+-	 * Create a driver specific struct ttm_backend.
+-	 */
+-
+-	struct ttm_backend *(*create_ttm_backend_entry)
+-	 (struct ttm_bo_device *bdev);
++	 * @bdev: pointer to a struct ttm_bo_device:
++	 * @size: Size of the data needed backing.
++	 * @page_flags: Page flags as identified by TTM_PAGE_FLAG_XX flags.
++	 * @dummy_read_page: See struct ttm_bo_device.
++	 *
++	 * Create a struct ttm_tt to back data with system memory pages.
++	 * No pages are actually allocated.
++	 * Returns:
++	 * NULL: Out of memory.
++	 */
++	struct ttm_tt *(*ttm_tt_create)(struct ttm_bo_device *bdev,
++					unsigned long size,
++					uint32_t page_flags,
++					struct page *dummy_read_page);
+ 
+ 	/**
+ 	 * struct ttm_bo_driver member invalidate_caches
+@@ -585,8 +557,9 @@ ttm_flag_masked(uint32_t *old, uint32_t
+ }
+ 
+ /**
+- * ttm_tt_create
++ * ttm_tt_init
+  *
++ * @ttm: The struct ttm_tt.
+  * @bdev: pointer to a struct ttm_bo_device:
+  * @size: Size of the data needed backing.
+  * @page_flags: Page flags as identified by TTM_PAGE_FLAG_XX flags.
+@@ -597,10 +570,9 @@ ttm_flag_masked(uint32_t *old, uint32_t
+  * Returns:
+  * NULL: Out of memory.
+  */
+-extern struct ttm_tt *ttm_tt_create(struct ttm_bo_device *bdev,
+-				    unsigned long size,
+-				    uint32_t page_flags,
+-				    struct page *dummy_read_page);
++extern int ttm_tt_init(struct ttm_tt *ttm, struct ttm_bo_device *bdev,
++			unsigned long size, uint32_t page_flags,
++			struct page *dummy_read_page);
+ 
+ /**
+  * ttm_ttm_bind:
+@@ -626,7 +598,7 @@ extern int ttm_tt_populate(struct ttm_tt
+  *
+  * @ttm: The struct ttm_tt.
+  *
+- * Unbind, unpopulate and destroy a struct ttm_tt.
++ * Unbind, unpopulate and destroy common struct ttm_tt.
+  */
+ extern void ttm_tt_destroy(struct ttm_tt *ttm);
+ 
+@@ -1013,17 +985,23 @@ extern const struct ttm_mem_type_manager
+ #include <linux/agp_backend.h>
+ 
+ /**
+- * ttm_agp_backend_init
++ * ttm_agp_tt_create
+  *
+  * @bdev: Pointer to a struct ttm_bo_device.
+  * @bridge: The agp bridge this device is sitting on.
++ * @size: Size of the data needed backing.
++ * @page_flags: Page flags as identified by TTM_PAGE_FLAG_XX flags.
++ * @dummy_read_page: See struct ttm_bo_device.
++ *
+  *
+  * Create a TTM backend that uses the indicated AGP bridge as an aperture
+  * for TT memory. This function uses the linux agpgart interface to
+  * bind and unbind memory backing a ttm_tt.
+  */
+-extern struct ttm_backend *ttm_agp_backend_init(struct ttm_bo_device *bdev,
+-						struct agp_bridge_data *bridge);
++extern struct ttm_tt *ttm_agp_tt_create(struct ttm_bo_device *bdev,
++					struct agp_bridge_data *bridge,
++					unsigned long size, uint32_t page_flags,
++					struct page *dummy_read_page);
+ #endif
+ 
+ #endif

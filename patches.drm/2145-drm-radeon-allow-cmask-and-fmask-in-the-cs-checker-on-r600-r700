@@ -1,0 +1,261 @@
+From c116cc94969447f44fd7205a027084ceebe90d34 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Marek=20Ol=C5=A1=C3=A1k?= <maraeo@gmail.com>
+Date: Sun, 19 Aug 2012 02:22:09 +0200
+Subject: drm/radeon: allow CMASK and FMASK in the CS checker on r600-r700
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: c116cc94969447f44fd7205a027084ceebe90d34
+Patch-mainline: v3.6-rc3
+
+MSAA is impossible without them.
+
+Signed-off-by: Marek Olšák <maraeo@gmail.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Reviewed-by: Jerome Glisse <jglisse@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/r600_cs.c     |   94 +++++++++++++++++++++++++++++----
+ drivers/gpu/drm/radeon/r600d.h       |   17 ++++++
+ drivers/gpu/drm/radeon/radeon_drv.c  |    3 +-
+ drivers/gpu/drm/radeon/reg_srcs/r600 |    8 ---
+ 4 files changed, 101 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/r600_cs.c b/drivers/gpu/drm/radeon/r600_cs.c
+index 3dab49c..1bec5b8 100644
+--- a/drivers/gpu/drm/radeon/r600_cs.c
++++ b/drivers/gpu/drm/radeon/r600_cs.c
+@@ -47,13 +47,17 @@ struct r600_cs_track {
+ 	u32			npipes;
+ 	/* value we track */
+ 	u32			sq_config;
++	u32			log_nsamples;
+ 	u32			nsamples;
+ 	u32			cb_color_base_last[8];
+ 	struct radeon_bo	*cb_color_bo[8];
+ 	u64			cb_color_bo_mc[8];
+-	u32			cb_color_bo_offset[8];
+-	struct radeon_bo	*cb_color_frag_bo[8]; /* unused */
+-	struct radeon_bo	*cb_color_tile_bo[8]; /* unused */
++	u64			cb_color_bo_offset[8];
++	struct radeon_bo	*cb_color_frag_bo[8];
++	u64			cb_color_frag_offset[8];
++	struct radeon_bo	*cb_color_tile_bo[8];
++	u64			cb_color_tile_offset[8];
++	u32			cb_color_mask[8];
+ 	u32			cb_color_info[8];
+ 	u32			cb_color_view[8];
+ 	u32			cb_color_size_idx[8]; /* unused */
+@@ -349,10 +353,6 @@ static int r600_cs_track_validate_cb(struct radeon_cs_parser *p, int i)
+ 	unsigned array_mode;
+ 	u32 format;
+ 
+-	if (G_0280A0_TILE_MODE(track->cb_color_info[i])) {
+-		dev_warn(p->dev, "FMASK or CMASK buffer are not supported by this kernel\n");
+-		return -EINVAL;
+-	}
+ 	size = radeon_bo_size(track->cb_color_bo[i]) - track->cb_color_bo_offset[i];
+ 	format = G_0280A0_FORMAT(track->cb_color_info[i]);
+ 	if (!r600_fmt_is_valid_color(format)) {
+@@ -441,7 +441,7 @@ static int r600_cs_track_validate_cb(struct radeon_cs_parser *p, int i)
+ 			 * broken userspace.
+ 			 */
+ 		} else {
+-			dev_warn(p->dev, "%s offset[%d] %d %d %d %lu too big (%d %d) (%d %d %d)\n",
++			dev_warn(p->dev, "%s offset[%d] %d %llu %d %lu too big (%d %d) (%d %d %d)\n",
+ 				 __func__, i, array_mode,
+ 				 track->cb_color_bo_offset[i], tmp,
+ 				 radeon_bo_size(track->cb_color_bo[i]),
+@@ -458,6 +458,51 @@ static int r600_cs_track_validate_cb(struct radeon_cs_parser *p, int i)
+ 	tmp = S_028060_PITCH_TILE_MAX((pitch / 8) - 1) |
+ 		S_028060_SLICE_TILE_MAX(slice_tile_max - 1);
+ 	ib[track->cb_color_size_idx[i]] = tmp;
++
++	/* FMASK/CMASK */
++	switch (G_0280A0_TILE_MODE(track->cb_color_info[i])) {
++	case V_0280A0_TILE_DISABLE:
++		break;
++	case V_0280A0_FRAG_ENABLE:
++		if (track->nsamples > 1) {
++			uint32_t tile_max = G_028100_FMASK_TILE_MAX(track->cb_color_mask[i]);
++			/* the tile size is 8x8, but the size is in units of bits.
++			 * for bytes, do just * 8. */
++			uint32_t bytes = track->nsamples * track->log_nsamples * 8 * (tile_max + 1);
++
++			if (bytes + track->cb_color_frag_offset[i] >
++			    radeon_bo_size(track->cb_color_frag_bo[i])) {
++				dev_warn(p->dev, "%s FMASK_TILE_MAX too large "
++					 "(tile_max=%u, bytes=%u, offset=%llu, bo_size=%lu)\n",
++					 __func__, tile_max, bytes,
++					 track->cb_color_frag_offset[i],
++					 radeon_bo_size(track->cb_color_frag_bo[i]));
++				return -EINVAL;
++			}
++		}
++		/* fall through */
++	case V_0280A0_CLEAR_ENABLE:
++	{
++		uint32_t block_max = G_028100_CMASK_BLOCK_MAX(track->cb_color_mask[i]);
++		/* One block = 128x128 pixels, one 8x8 tile has 4 bits..
++		 * (128*128) / (8*8) / 2 = 128 bytes per block. */
++		uint32_t bytes = (block_max + 1) * 128;
++
++		if (bytes + track->cb_color_tile_offset[i] >
++		    radeon_bo_size(track->cb_color_tile_bo[i])) {
++			dev_warn(p->dev, "%s CMASK_BLOCK_MAX too large "
++				 "(block_max=%u, bytes=%u, offset=%llu, bo_size=%lu)\n",
++				 __func__, block_max, bytes,
++				 track->cb_color_tile_offset[i],
++				 radeon_bo_size(track->cb_color_tile_bo[i]));
++			return -EINVAL;
++		}
++		break;
++	}
++	default:
++		dev_warn(p->dev, "%s invalid tile mode\n", __func__);
++		return -EINVAL;
++	}
+ 	return 0;
+ }
+ 
+@@ -1231,6 +1276,7 @@ static int r600_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 		break;
+ 	case R_028C04_PA_SC_AA_CONFIG:
+ 		tmp = G_028C04_MSAA_NUM_SAMPLES(radeon_get_ib_value(p, idx));
++		track->log_nsamples = tmp;
+ 		track->nsamples = 1 << tmp;
+ 		track->cb_dirty = true;
+ 		break;
+@@ -1312,16 +1358,21 @@ static int r600_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 				dev_err(p->dev, "Broken old userspace ? no cb_color0_base supplied before trying to write 0x%08X\n", reg);
+ 				return -EINVAL;
+ 			}
+-			ib[idx] = track->cb_color_base_last[tmp];
+ 			track->cb_color_frag_bo[tmp] = track->cb_color_bo[tmp];
++			track->cb_color_frag_offset[tmp] = track->cb_color_bo_offset[tmp];
++			ib[idx] = track->cb_color_base_last[tmp];
+ 		} else {
+ 			r = r600_cs_packet_next_reloc(p, &reloc);
+ 			if (r) {
+ 				dev_err(p->dev, "bad SET_CONTEXT_REG 0x%04X\n", reg);
+ 				return -EINVAL;
+ 			}
+-			ib[idx] += (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
+ 			track->cb_color_frag_bo[tmp] = reloc->robj;
++			track->cb_color_frag_offset[tmp] = (u64)ib[idx] << 8;
++			ib[idx] += (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
++		}
++		if (G_0280A0_TILE_MODE(track->cb_color_info[tmp])) {
++			track->cb_dirty = true;
+ 		}
+ 		break;
+ 	case R_0280C0_CB_COLOR0_TILE:
+@@ -1338,16 +1389,35 @@ static int r600_cs_check_reg(struct radeon_cs_parser *p, u32 reg, u32 idx)
+ 				dev_err(p->dev, "Broken old userspace ? no cb_color0_base supplied before trying to write 0x%08X\n", reg);
+ 				return -EINVAL;
+ 			}
+-			ib[idx] = track->cb_color_base_last[tmp];
+ 			track->cb_color_tile_bo[tmp] = track->cb_color_bo[tmp];
++			track->cb_color_tile_offset[tmp] = track->cb_color_bo_offset[tmp];
++			ib[idx] = track->cb_color_base_last[tmp];
+ 		} else {
+ 			r = r600_cs_packet_next_reloc(p, &reloc);
+ 			if (r) {
+ 				dev_err(p->dev, "bad SET_CONTEXT_REG 0x%04X\n", reg);
+ 				return -EINVAL;
+ 			}
+-			ib[idx] += (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
+ 			track->cb_color_tile_bo[tmp] = reloc->robj;
++			track->cb_color_tile_offset[tmp] = (u64)ib[idx] << 8;
++			ib[idx] += (u32)((reloc->lobj.gpu_offset >> 8) & 0xffffffff);
++		}
++		if (G_0280A0_TILE_MODE(track->cb_color_info[tmp])) {
++			track->cb_dirty = true;
++		}
++		break;
++	case R_028100_CB_COLOR0_MASK:
++	case R_028104_CB_COLOR1_MASK:
++	case R_028108_CB_COLOR2_MASK:
++	case R_02810C_CB_COLOR3_MASK:
++	case R_028110_CB_COLOR4_MASK:
++	case R_028114_CB_COLOR5_MASK:
++	case R_028118_CB_COLOR6_MASK:
++	case R_02811C_CB_COLOR7_MASK:
++		tmp = (reg - R_028100_CB_COLOR0_MASK) / 4;
++		track->cb_color_mask[tmp] = ib[idx];
++		if (G_0280A0_TILE_MODE(track->cb_color_info[tmp])) {
++			track->cb_dirty = true;
+ 		}
+ 		break;
+ 	case CB_COLOR0_BASE:
+diff --git a/drivers/gpu/drm/radeon/r600d.h b/drivers/gpu/drm/radeon/r600d.h
+index fd328f4..bdb69a6 100644
+--- a/drivers/gpu/drm/radeon/r600d.h
++++ b/drivers/gpu/drm/radeon/r600d.h
+@@ -92,6 +92,20 @@
+ #define R_028094_CB_COLOR5_VIEW                      0x028094
+ #define R_028098_CB_COLOR6_VIEW                      0x028098
+ #define R_02809C_CB_COLOR7_VIEW                      0x02809C
++#define R_028100_CB_COLOR0_MASK                      0x028100
++#define   S_028100_CMASK_BLOCK_MAX(x)                  (((x) & 0xFFF) << 0)
++#define   G_028100_CMASK_BLOCK_MAX(x)                  (((x) >> 0) & 0xFFF)
++#define   C_028100_CMASK_BLOCK_MAX                     0xFFFFF000
++#define   S_028100_FMASK_TILE_MAX(x)                   (((x) & 0xFFFFF) << 12)
++#define   G_028100_FMASK_TILE_MAX(x)                   (((x) >> 12) & 0xFFFFF)
++#define   C_028100_FMASK_TILE_MAX                      0x00000FFF
++#define R_028104_CB_COLOR1_MASK                      0x028104
++#define R_028108_CB_COLOR2_MASK                      0x028108
++#define R_02810C_CB_COLOR3_MASK                      0x02810C
++#define R_028110_CB_COLOR4_MASK                      0x028110
++#define R_028114_CB_COLOR5_MASK                      0x028114
++#define R_028118_CB_COLOR6_MASK                      0x028118
++#define R_02811C_CB_COLOR7_MASK                      0x02811C
+ #define CB_COLOR0_INFO                                  0x280a0
+ #	define CB_FORMAT(x)				((x) << 2)
+ #       define CB_ARRAY_MODE(x)                         ((x) << 8)
+@@ -1400,6 +1414,9 @@
+ #define   S_0280A0_TILE_MODE(x)                        (((x) & 0x3) << 18)
+ #define   G_0280A0_TILE_MODE(x)                        (((x) >> 18) & 0x3)
+ #define   C_0280A0_TILE_MODE                           0xFFF3FFFF
++#define     V_0280A0_TILE_DISABLE			0
++#define     V_0280A0_CLEAR_ENABLE			1
++#define     V_0280A0_FRAG_ENABLE			2
+ #define   S_0280A0_BLEND_CLAMP(x)                      (((x) & 0x1) << 20)
+ #define   G_0280A0_BLEND_CLAMP(x)                      (((x) >> 20) & 0x1)
+ #define   C_0280A0_BLEND_CLAMP                         0xFFEFFFFF
+diff --git a/drivers/gpu/drm/radeon/radeon_drv.c b/drivers/gpu/drm/radeon/radeon_drv.c
+index d7269f4..27d22d7 100644
+--- a/drivers/gpu/drm/radeon/radeon_drv.c
++++ b/drivers/gpu/drm/radeon/radeon_drv.c
+@@ -62,9 +62,10 @@
+  *   2.18.0 - r600-eg: allow "invalid" DB formats
+  *   2.19.0 - r600-eg: MSAA textures
+  *   2.20.0 - r600-si: RADEON_INFO_TIMESTAMP query
++ *   2.21.0 - r600-r700: FMASK and CMASK
+  */
+ #define KMS_DRIVER_MAJOR	2
+-#define KMS_DRIVER_MINOR	20
++#define KMS_DRIVER_MINOR	21
+ #define KMS_DRIVER_PATCHLEVEL	0
+ int radeon_driver_load_kms(struct drm_device *dev, unsigned long flags);
+ int radeon_driver_unload_kms(struct drm_device *dev);
+diff --git a/drivers/gpu/drm/radeon/reg_srcs/r600 b/drivers/gpu/drm/radeon/reg_srcs/r600
+index 5e659b0..f93e45d 100644
+--- a/drivers/gpu/drm/radeon/reg_srcs/r600
++++ b/drivers/gpu/drm/radeon/reg_srcs/r600
+@@ -744,14 +744,6 @@ r600 0x9400
+ 0x00028C38 CB_CLRCMP_DST
+ 0x00028C3C CB_CLRCMP_MSK
+ 0x00028C34 CB_CLRCMP_SRC
+-0x00028100 CB_COLOR0_MASK
+-0x00028104 CB_COLOR1_MASK
+-0x00028108 CB_COLOR2_MASK
+-0x0002810C CB_COLOR3_MASK
+-0x00028110 CB_COLOR4_MASK
+-0x00028114 CB_COLOR5_MASK
+-0x00028118 CB_COLOR6_MASK
+-0x0002811C CB_COLOR7_MASK
+ 0x00028808 CB_COLOR_CONTROL
+ 0x0002842C CB_FOG_BLUE
+ 0x00028428 CB_FOG_GREEN
+

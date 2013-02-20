@@ -1,0 +1,160 @@
+From dfcf5f36529d69eb35f4fdedfa6f244c5249698c Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Tue, 20 Mar 2012 17:18:14 -0400
+Subject: drm/radeon/kms: add support for the CONST IB to the CS ioctl
+Git-commit: dfcf5f36529d69eb35f4fdedfa6f244c5249698c
+Patch-mainline: v3.4-rc1
+
+This adds a new chunk id to the CS ioctl to support the
+INDIRECT_BUFFER_CONST packet.
+
+On SI, the CP adds a new engine called the CE (Constant Engine)
+which runs simulatenously with the DE (Drawing Engine, formerly
+called the ME).  This allows the CP to process two related IBs
+simultaneously.  The CE is tasked with loading the constant data
+(constant buffers, resource descriptors, samplers, etc.) while
+the DE loads context register state and issues drawing commands.
+It's up to the userspace application to sychronize the CE and the
+DE using special synchronization packets.
+
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/radeon.h      |    3 ++
+ drivers/gpu/drm/radeon/radeon_cs.c   |   47 ++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/radeon/radeon_ring.c |    1 +
+ include/drm/radeon_drm.h             |    1 +
+ 4 files changed, 52 insertions(+), 0 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 972f167..f467fe5 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -632,6 +632,7 @@ struct radeon_ib {
+ 	uint32_t		*ptr;
+ 	struct radeon_fence	*fence;
+ 	unsigned		vm_id;
++	bool			is_const_ib;
+ };
+ 
+ /*
+@@ -836,7 +837,9 @@ struct radeon_cs_parser {
+ 	int			chunk_ib_idx;
+ 	int			chunk_relocs_idx;
+ 	int			chunk_flags_idx;
++	int			chunk_const_ib_idx;
+ 	struct radeon_ib	*ib;
++	struct radeon_ib	*const_ib;
+ 	void			*track;
+ 	unsigned		family;
+ 	int			parser_error;
+diff --git a/drivers/gpu/drm/radeon/radeon_cs.c b/drivers/gpu/drm/radeon/radeon_cs.c
+index d9d9f5a..087bd50 100644
+--- a/drivers/gpu/drm/radeon/radeon_cs.c
++++ b/drivers/gpu/drm/radeon/radeon_cs.c
+@@ -170,6 +170,7 @@ int radeon_cs_parser_init(struct radeon_cs_parser *p, void *data)
+ 	p->chunk_ib_idx = -1;
+ 	p->chunk_relocs_idx = -1;
+ 	p->chunk_flags_idx = -1;
++	p->chunk_const_ib_idx = -1;
+ 	p->chunks_array = kcalloc(cs->num_chunks, sizeof(uint64_t), GFP_KERNEL);
+ 	if (p->chunks_array == NULL) {
+ 		return -ENOMEM;
+@@ -208,6 +209,12 @@ int radeon_cs_parser_init(struct radeon_cs_parser *p, void *data)
+ 			if (p->chunks[i].length_dw == 0)
+ 				return -EINVAL;
+ 		}
++		if (p->chunks[i].chunk_id == RADEON_CHUNK_ID_CONST_IB) {
++			p->chunk_const_ib_idx = i;
++			/* zero length CONST IB isn't useful */
++			if (p->chunks[i].length_dw == 0)
++				return -EINVAL;
++		}
+ 		if (p->chunks[i].chunk_id == RADEON_CHUNK_ID_FLAGS) {
+ 			p->chunk_flags_idx = i;
+ 			/* zero length flags aren't useful */
+@@ -389,6 +396,32 @@ static int radeon_cs_ib_vm_chunk(struct radeon_device *rdev,
+ 	if ((parser->cs_flags & RADEON_CS_USE_VM) == 0)
+ 		return 0;
+ 
++	if ((rdev->family >= CHIP_TAHITI) &&
++	    (parser->chunk_const_ib_idx != -1)) {
++		ib_chunk = &parser->chunks[parser->chunk_const_ib_idx];
++		if (ib_chunk->length_dw > RADEON_IB_VM_MAX_SIZE) {
++			DRM_ERROR("cs IB CONST too big: %d\n", ib_chunk->length_dw);
++			return -EINVAL;
++		}
++		r =  radeon_ib_get(rdev, parser->ring, &parser->const_ib,
++				   ib_chunk->length_dw * 4);
++		if (r) {
++			DRM_ERROR("Failed to get const ib !\n");
++			return r;
++		}
++		parser->const_ib->is_const_ib = true;
++		parser->const_ib->length_dw = ib_chunk->length_dw;
++		/* Copy the packet into the IB */
++		if (DRM_COPY_FROM_USER(parser->const_ib->ptr, ib_chunk->user_ptr,
++				       ib_chunk->length_dw * 4)) {
++			return -EFAULT;
++		}
++		r = radeon_ring_ib_parse(rdev, parser->ring, parser->const_ib);
++		if (r) {
++			return r;
++		}
++	}
++
+ 	ib_chunk = &parser->chunks[parser->chunk_ib_idx];
+ 	if (ib_chunk->length_dw > RADEON_IB_VM_MAX_SIZE) {
+ 		DRM_ERROR("cs IB too big: %d\n", ib_chunk->length_dw);
+@@ -424,11 +457,25 @@ static int radeon_cs_ib_vm_chunk(struct radeon_device *rdev,
+ 	if (r) {
+ 		DRM_ERROR("Failed to synchronize rings !\n");
+ 	}
++
++	if ((rdev->family >= CHIP_TAHITI) &&
++	    (parser->chunk_const_ib_idx != -1)) {
++		parser->const_ib->vm_id = vm->id;
++		/* ib pool is bind at 0 in virtual address space to gpu_addr is the
++		 * offset inside the pool bo
++		 */
++		parser->const_ib->gpu_addr = parser->const_ib->sa_bo.offset;
++		r = radeon_ib_schedule(rdev, parser->const_ib);
++		if (r)
++			goto out;
++	}
++
+ 	parser->ib->vm_id = vm->id;
+ 	/* ib pool is bind at 0 in virtual address space to gpu_addr is the
+ 	 * offset inside the pool bo
+ 	 */
+ 	parser->ib->gpu_addr = parser->ib->sa_bo.offset;
++	parser->ib->is_const_ib = false;
+ 	r = radeon_ib_schedule(rdev, parser->ib);
+ out:
+ 	if (!r) {
+diff --git a/drivers/gpu/drm/radeon/radeon_ring.c b/drivers/gpu/drm/radeon/radeon_ring.c
+index 3056620..cc33b3d 100644
+--- a/drivers/gpu/drm/radeon/radeon_ring.c
++++ b/drivers/gpu/drm/radeon/radeon_ring.c
+@@ -133,6 +133,7 @@ retry:
+ 				(*ib)->gpu_addr += (*ib)->sa_bo.offset;
+ 				(*ib)->fence = fence;
+ 				(*ib)->vm_id = 0;
++				(*ib)->is_const_ib = false;
+ 				/* ib are most likely to be allocated in a ring fashion
+ 				 * thus rdev->ib_pool.head_id should be the id of the
+ 				 * oldest ib
+diff --git a/include/drm/radeon_drm.h b/include/drm/radeon_drm.h
+index 6cde931..7c491b4 100644
+--- a/include/drm/radeon_drm.h
++++ b/include/drm/radeon_drm.h
+@@ -908,6 +908,7 @@ struct drm_radeon_gem_va {
+ #define RADEON_CHUNK_ID_RELOCS	0x01
+ #define RADEON_CHUNK_ID_IB	0x02
+ #define RADEON_CHUNK_ID_FLAGS	0x03
++#define RADEON_CHUNK_ID_CONST_IB	0x04
+ 
+ /* The first dword of RADEON_CHUNK_ID_FLAGS is a uint32 of these flags: */
+ #define RADEON_CS_KEEP_TILING_FLAGS 0x01
+

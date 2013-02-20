@@ -1,0 +1,622 @@
+From d2800ee59ed28a5eaf3a4a8645feca040eacf7df Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Tue, 20 Mar 2012 17:18:13 -0400
+Subject: drm/radeon/kms: add support for MC/VM setup on SI
+Git-commit: d2800ee59ed28a5eaf3a4a8645feca040eacf7df
+Patch-mainline: v3.4-rc1
+
+Sets up the VM and adds support for the new VM ioctls.
+
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/si.c  |  328 ++++++++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/radeon/sid.h |  219 ++++++++++++++++++++++++++++
+ 2 files changed, 547 insertions(+), 0 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/si.c b/drivers/gpu/drm/radeon/si.c
+index 58ad900..ad91c5f 100644
+--- a/drivers/gpu/drm/radeon/si.c
++++ b/drivers/gpu/drm/radeon/si.c
+@@ -1608,3 +1608,331 @@ int si_asic_reset(struct radeon_device *rdev)
+ 	return si_gpu_soft_reset(rdev);
+ }
+ 
++/* MC */
++static void si_mc_program(struct radeon_device *rdev)
++{
++	struct evergreen_mc_save save;
++	u32 tmp;
++	int i, j;
++
++	/* Initialize HDP */
++	for (i = 0, j = 0; i < 32; i++, j += 0x18) {
++		WREG32((0x2c14 + j), 0x00000000);
++		WREG32((0x2c18 + j), 0x00000000);
++		WREG32((0x2c1c + j), 0x00000000);
++		WREG32((0x2c20 + j), 0x00000000);
++		WREG32((0x2c24 + j), 0x00000000);
++	}
++	WREG32(HDP_REG_COHERENCY_FLUSH_CNTL, 0);
++
++	evergreen_mc_stop(rdev, &save);
++	if (radeon_mc_wait_for_idle(rdev)) {
++		dev_warn(rdev->dev, "Wait for MC idle timedout !\n");
++	}
++	/* Lockout access through VGA aperture*/
++	WREG32(VGA_HDP_CONTROL, VGA_MEMORY_DISABLE);
++	/* Update configuration */
++	WREG32(MC_VM_SYSTEM_APERTURE_LOW_ADDR,
++	       rdev->mc.vram_start >> 12);
++	WREG32(MC_VM_SYSTEM_APERTURE_HIGH_ADDR,
++	       rdev->mc.vram_end >> 12);
++	WREG32(MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR,
++	       rdev->vram_scratch.gpu_addr >> 12);
++	tmp = ((rdev->mc.vram_end >> 24) & 0xFFFF) << 16;
++	tmp |= ((rdev->mc.vram_start >> 24) & 0xFFFF);
++	WREG32(MC_VM_FB_LOCATION, tmp);
++	/* XXX double check these! */
++	WREG32(HDP_NONSURFACE_BASE, (rdev->mc.vram_start >> 8));
++	WREG32(HDP_NONSURFACE_INFO, (2 << 7) | (1 << 30));
++	WREG32(HDP_NONSURFACE_SIZE, 0x3FFFFFFF);
++	WREG32(MC_VM_AGP_BASE, 0);
++	WREG32(MC_VM_AGP_TOP, 0x0FFFFFFF);
++	WREG32(MC_VM_AGP_BOT, 0x0FFFFFFF);
++	if (radeon_mc_wait_for_idle(rdev)) {
++		dev_warn(rdev->dev, "Wait for MC idle timedout !\n");
++	}
++	evergreen_mc_resume(rdev, &save);
++	/* we need to own VRAM, so turn off the VGA renderer here
++	 * to stop it overwriting our objects */
++	rv515_vga_render_disable(rdev);
++}
++
++/* SI MC address space is 40 bits */
++static void si_vram_location(struct radeon_device *rdev,
++			     struct radeon_mc *mc, u64 base)
++{
++	mc->vram_start = base;
++	if (mc->mc_vram_size > (0xFFFFFFFFFFULL - base + 1)) {
++		dev_warn(rdev->dev, "limiting VRAM to PCI aperture size\n");
++		mc->real_vram_size = mc->aper_size;
++		mc->mc_vram_size = mc->aper_size;
++	}
++	mc->vram_end = mc->vram_start + mc->mc_vram_size - 1;
++	dev_info(rdev->dev, "VRAM: %lluM 0x%016llX - 0x%016llX (%lluM used)\n",
++			mc->mc_vram_size >> 20, mc->vram_start,
++			mc->vram_end, mc->real_vram_size >> 20);
++}
++
++static void si_gtt_location(struct radeon_device *rdev, struct radeon_mc *mc)
++{
++	u64 size_af, size_bf;
++
++	size_af = ((0xFFFFFFFFFFULL - mc->vram_end) + mc->gtt_base_align) & ~mc->gtt_base_align;
++	size_bf = mc->vram_start & ~mc->gtt_base_align;
++	if (size_bf > size_af) {
++		if (mc->gtt_size > size_bf) {
++			dev_warn(rdev->dev, "limiting GTT\n");
++			mc->gtt_size = size_bf;
++		}
++		mc->gtt_start = (mc->vram_start & ~mc->gtt_base_align) - mc->gtt_size;
++	} else {
++		if (mc->gtt_size > size_af) {
++			dev_warn(rdev->dev, "limiting GTT\n");
++			mc->gtt_size = size_af;
++		}
++		mc->gtt_start = (mc->vram_end + 1 + mc->gtt_base_align) & ~mc->gtt_base_align;
++	}
++	mc->gtt_end = mc->gtt_start + mc->gtt_size - 1;
++	dev_info(rdev->dev, "GTT: %lluM 0x%016llX - 0x%016llX\n",
++			mc->gtt_size >> 20, mc->gtt_start, mc->gtt_end);
++}
++
++static void si_vram_gtt_location(struct radeon_device *rdev,
++				 struct radeon_mc *mc)
++{
++	if (mc->mc_vram_size > 0xFFC0000000ULL) {
++		/* leave room for at least 1024M GTT */
++		dev_warn(rdev->dev, "limiting VRAM\n");
++		mc->real_vram_size = 0xFFC0000000ULL;
++		mc->mc_vram_size = 0xFFC0000000ULL;
++	}
++	si_vram_location(rdev, &rdev->mc, 0);
++	rdev->mc.gtt_base_align = 0;
++	si_gtt_location(rdev, mc);
++}
++
++static int si_mc_init(struct radeon_device *rdev)
++{
++	u32 tmp;
++	int chansize, numchan;
++
++	/* Get VRAM informations */
++	rdev->mc.vram_is_ddr = true;
++	tmp = RREG32(MC_ARB_RAMCFG);
++	if (tmp & CHANSIZE_OVERRIDE) {
++		chansize = 16;
++	} else if (tmp & CHANSIZE_MASK) {
++		chansize = 64;
++	} else {
++		chansize = 32;
++	}
++	tmp = RREG32(MC_SHARED_CHMAP);
++	switch ((tmp & NOOFCHAN_MASK) >> NOOFCHAN_SHIFT) {
++	case 0:
++	default:
++		numchan = 1;
++		break;
++	case 1:
++		numchan = 2;
++		break;
++	case 2:
++		numchan = 4;
++		break;
++	case 3:
++		numchan = 8;
++		break;
++	case 4:
++		numchan = 3;
++		break;
++	case 5:
++		numchan = 6;
++		break;
++	case 6:
++		numchan = 10;
++		break;
++	case 7:
++		numchan = 12;
++		break;
++	case 8:
++		numchan = 16;
++		break;
++	}
++	rdev->mc.vram_width = numchan * chansize;
++	/* Could aper size report 0 ? */
++	rdev->mc.aper_base = pci_resource_start(rdev->pdev, 0);
++	rdev->mc.aper_size = pci_resource_len(rdev->pdev, 0);
++	/* size in MB on si */
++	rdev->mc.mc_vram_size = RREG32(CONFIG_MEMSIZE) * 1024 * 1024;
++	rdev->mc.real_vram_size = RREG32(CONFIG_MEMSIZE) * 1024 * 1024;
++	rdev->mc.visible_vram_size = rdev->mc.aper_size;
++	si_vram_gtt_location(rdev, &rdev->mc);
++	radeon_update_bandwidth_info(rdev);
++
++	return 0;
++}
++
++/*
++ * GART
++ */
++void si_pcie_gart_tlb_flush(struct radeon_device *rdev)
++{
++	/* flush hdp cache */
++	WREG32(HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
++
++	/* bits 0-15 are the VM contexts0-15 */
++	WREG32(VM_INVALIDATE_REQUEST, 1);
++}
++
++int si_pcie_gart_enable(struct radeon_device *rdev)
++{
++	int r, i;
++
++	if (rdev->gart.robj == NULL) {
++		dev_err(rdev->dev, "No VRAM object for PCIE GART.\n");
++		return -EINVAL;
++	}
++	r = radeon_gart_table_vram_pin(rdev);
++	if (r)
++		return r;
++	radeon_gart_restore(rdev);
++	/* Setup TLB control */
++	WREG32(MC_VM_MX_L1_TLB_CNTL,
++	       (0xA << 7) |
++	       ENABLE_L1_TLB |
++	       SYSTEM_ACCESS_MODE_NOT_IN_SYS |
++	       ENABLE_ADVANCED_DRIVER_MODEL |
++	       SYSTEM_APERTURE_UNMAPPED_ACCESS_PASS_THRU);
++	/* Setup L2 cache */
++	WREG32(VM_L2_CNTL, ENABLE_L2_CACHE |
++	       ENABLE_L2_PTE_CACHE_LRU_UPDATE_BY_WRITE |
++	       ENABLE_L2_PDE0_CACHE_LRU_UPDATE_BY_WRITE |
++	       EFFECTIVE_L2_QUEUE_SIZE(7) |
++	       CONTEXT1_IDENTITY_ACCESS_MODE(1));
++	WREG32(VM_L2_CNTL2, INVALIDATE_ALL_L1_TLBS | INVALIDATE_L2_CACHE);
++	WREG32(VM_L2_CNTL3, L2_CACHE_BIGK_ASSOCIATIVITY |
++	       L2_CACHE_BIGK_FRAGMENT_SIZE(0));
++	/* setup context0 */
++	WREG32(VM_CONTEXT0_PAGE_TABLE_START_ADDR, rdev->mc.gtt_start >> 12);
++	WREG32(VM_CONTEXT0_PAGE_TABLE_END_ADDR, rdev->mc.gtt_end >> 12);
++	WREG32(VM_CONTEXT0_PAGE_TABLE_BASE_ADDR, rdev->gart.table_addr >> 12);
++	WREG32(VM_CONTEXT0_PROTECTION_FAULT_DEFAULT_ADDR,
++			(u32)(rdev->dummy_page.addr >> 12));
++	WREG32(VM_CONTEXT0_CNTL2, 0);
++	WREG32(VM_CONTEXT0_CNTL, (ENABLE_CONTEXT | PAGE_TABLE_DEPTH(0) |
++				  RANGE_PROTECTION_FAULT_ENABLE_DEFAULT));
++
++	WREG32(0x15D4, 0);
++	WREG32(0x15D8, 0);
++	WREG32(0x15DC, 0);
++
++	/* empty context1-15 */
++	/* FIXME start with 1G, once using 2 level pt switch to full
++	 * vm size space
++	 */
++	/* set vm size, must be a multiple of 4 */
++	WREG32(VM_CONTEXT1_PAGE_TABLE_START_ADDR, 0);
++	WREG32(VM_CONTEXT1_PAGE_TABLE_END_ADDR, (1 << 30) / RADEON_GPU_PAGE_SIZE);
++	for (i = 1; i < 16; i++) {
++		if (i < 8)
++			WREG32(VM_CONTEXT0_PAGE_TABLE_BASE_ADDR + (i << 2),
++			       rdev->gart.table_addr >> 12);
++		else
++			WREG32(VM_CONTEXT8_PAGE_TABLE_BASE_ADDR + ((i - 8) << 2),
++			       rdev->gart.table_addr >> 12);
++	}
++
++	/* enable context1-15 */
++	WREG32(VM_CONTEXT1_PROTECTION_FAULT_DEFAULT_ADDR,
++	       (u32)(rdev->dummy_page.addr >> 12));
++	WREG32(VM_CONTEXT1_CNTL2, 0);
++	WREG32(VM_CONTEXT1_CNTL, ENABLE_CONTEXT | PAGE_TABLE_DEPTH(0) |
++				RANGE_PROTECTION_FAULT_ENABLE_DEFAULT);
++
++	si_pcie_gart_tlb_flush(rdev);
++	DRM_INFO("PCIE GART of %uM enabled (table at 0x%016llX).\n",
++		 (unsigned)(rdev->mc.gtt_size >> 20),
++		 (unsigned long long)rdev->gart.table_addr);
++	rdev->gart.ready = true;
++	return 0;
++}
++
++void si_pcie_gart_disable(struct radeon_device *rdev)
++{
++	/* Disable all tables */
++	WREG32(VM_CONTEXT0_CNTL, 0);
++	WREG32(VM_CONTEXT1_CNTL, 0);
++	/* Setup TLB control */
++	WREG32(MC_VM_MX_L1_TLB_CNTL, SYSTEM_ACCESS_MODE_NOT_IN_SYS |
++	       SYSTEM_APERTURE_UNMAPPED_ACCESS_PASS_THRU);
++	/* Setup L2 cache */
++	WREG32(VM_L2_CNTL, ENABLE_L2_PTE_CACHE_LRU_UPDATE_BY_WRITE |
++	       ENABLE_L2_PDE0_CACHE_LRU_UPDATE_BY_WRITE |
++	       EFFECTIVE_L2_QUEUE_SIZE(7) |
++	       CONTEXT1_IDENTITY_ACCESS_MODE(1));
++	WREG32(VM_L2_CNTL2, 0);
++	WREG32(VM_L2_CNTL3, L2_CACHE_BIGK_ASSOCIATIVITY |
++	       L2_CACHE_BIGK_FRAGMENT_SIZE(0));
++	radeon_gart_table_vram_unpin(rdev);
++}
++
++void si_pcie_gart_fini(struct radeon_device *rdev)
++{
++	si_pcie_gart_disable(rdev);
++	radeon_gart_table_vram_free(rdev);
++	radeon_gart_fini(rdev);
++}
++
++/*
++ * vm
++ */
++int si_vm_init(struct radeon_device *rdev)
++{
++	/* number of VMs */
++	rdev->vm_manager.nvm = 16;
++	/* base offset of vram pages */
++	rdev->vm_manager.vram_base_offset = 0;
++
++	return 0;
++}
++
++void si_vm_fini(struct radeon_device *rdev)
++{
++}
++
++int si_vm_bind(struct radeon_device *rdev, struct radeon_vm *vm, int id)
++{
++	if (id < 8)
++		WREG32(VM_CONTEXT0_PAGE_TABLE_BASE_ADDR + (id << 2), vm->pt_gpu_addr >> 12);
++	else
++		WREG32(VM_CONTEXT8_PAGE_TABLE_BASE_ADDR + ((id - 8) << 2),
++		       vm->pt_gpu_addr >> 12);
++	/* flush hdp cache */
++	WREG32(HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
++	/* bits 0-15 are the VM contexts0-15 */
++	WREG32(VM_INVALIDATE_REQUEST, 1 << id);
++	return 0;
++}
++
++void si_vm_unbind(struct radeon_device *rdev, struct radeon_vm *vm)
++{
++	if (vm->id < 8)
++		WREG32(VM_CONTEXT0_PAGE_TABLE_BASE_ADDR + (vm->id << 2), 0);
++	else
++		WREG32(VM_CONTEXT8_PAGE_TABLE_BASE_ADDR + ((vm->id - 8) << 2), 0);
++	/* flush hdp cache */
++	WREG32(HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
++	/* bits 0-15 are the VM contexts0-15 */
++	WREG32(VM_INVALIDATE_REQUEST, 1 << vm->id);
++}
++
++void si_vm_tlb_flush(struct radeon_device *rdev, struct radeon_vm *vm)
++{
++	if (vm->id == -1)
++		return;
++
++	/* flush hdp cache */
++	WREG32(HDP_MEM_COHERENCY_FLUSH_CNTL, 0x1);
++	/* bits 0-15 are the VM contexts0-15 */
++	WREG32(VM_INVALIDATE_REQUEST, 1 << vm->id);
++}
++
+diff --git a/drivers/gpu/drm/radeon/sid.h b/drivers/gpu/drm/radeon/sid.h
+index 4c6ff1c..4d9cdc8 100644
+--- a/drivers/gpu/drm/radeon/sid.h
++++ b/drivers/gpu/drm/radeon/sid.h
+@@ -50,6 +50,9 @@
+ #define SI_MAX_TCC               16
+ #define SI_MAX_TCC_MASK          0xFFFF
+ 
++#define VGA_HDP_CONTROL  				0x328
++#define		VGA_MEMORY_DISABLE				(1 << 4)
++
+ #define DMIF_ADDR_CONFIG  				0xBD4
+ 
+ #define	SRBM_STATUS				        0xE50
+@@ -57,11 +60,88 @@
+ #define	CC_SYS_RB_BACKEND_DISABLE			0xe80
+ #define	GC_USER_SYS_RB_BACKEND_DISABLE			0xe84
+ 
++#define VM_L2_CNTL					0x1400
++#define		ENABLE_L2_CACHE					(1 << 0)
++#define		ENABLE_L2_FRAGMENT_PROCESSING			(1 << 1)
++#define		L2_CACHE_PTE_ENDIAN_SWAP_MODE(x)		((x) << 2)
++#define		L2_CACHE_PDE_ENDIAN_SWAP_MODE(x)		((x) << 4)
++#define		ENABLE_L2_PTE_CACHE_LRU_UPDATE_BY_WRITE		(1 << 9)
++#define		ENABLE_L2_PDE0_CACHE_LRU_UPDATE_BY_WRITE	(1 << 10)
++#define		EFFECTIVE_L2_QUEUE_SIZE(x)			(((x) & 7) << 15)
++#define		CONTEXT1_IDENTITY_ACCESS_MODE(x)		(((x) & 3) << 19)
++#define VM_L2_CNTL2					0x1404
++#define		INVALIDATE_ALL_L1_TLBS				(1 << 0)
++#define		INVALIDATE_L2_CACHE				(1 << 1)
++#define		INVALIDATE_CACHE_MODE(x)			((x) << 26)
++#define			INVALIDATE_PTE_AND_PDE_CACHES		0
++#define			INVALIDATE_ONLY_PTE_CACHES		1
++#define			INVALIDATE_ONLY_PDE_CACHES		2
++#define VM_L2_CNTL3					0x1408
++#define		BANK_SELECT(x)					((x) << 0)
++#define		L2_CACHE_UPDATE_MODE(x)				((x) << 6)
++#define		L2_CACHE_BIGK_FRAGMENT_SIZE(x)			((x) << 15)
++#define		L2_CACHE_BIGK_ASSOCIATIVITY			(1 << 20)
++#define	VM_L2_STATUS					0x140C
++#define		L2_BUSY						(1 << 0)
++#define VM_CONTEXT0_CNTL				0x1410
++#define		ENABLE_CONTEXT					(1 << 0)
++#define		PAGE_TABLE_DEPTH(x)				(((x) & 3) << 1)
++#define		RANGE_PROTECTION_FAULT_ENABLE_DEFAULT		(1 << 4)
++#define VM_CONTEXT1_CNTL				0x1414
++#define VM_CONTEXT0_CNTL2				0x1430
++#define VM_CONTEXT1_CNTL2				0x1434
++#define	VM_CONTEXT8_PAGE_TABLE_BASE_ADDR		0x1438
++#define	VM_CONTEXT9_PAGE_TABLE_BASE_ADDR		0x143c
++#define	VM_CONTEXT10_PAGE_TABLE_BASE_ADDR		0x1440
++#define	VM_CONTEXT11_PAGE_TABLE_BASE_ADDR		0x1444
++#define	VM_CONTEXT12_PAGE_TABLE_BASE_ADDR		0x1448
++#define	VM_CONTEXT13_PAGE_TABLE_BASE_ADDR		0x144c
++#define	VM_CONTEXT14_PAGE_TABLE_BASE_ADDR		0x1450
++#define	VM_CONTEXT15_PAGE_TABLE_BASE_ADDR		0x1454
++
++#define VM_INVALIDATE_REQUEST				0x1478
++#define VM_INVALIDATE_RESPONSE				0x147c
++
++#define VM_CONTEXT0_PROTECTION_FAULT_DEFAULT_ADDR	0x1518
++#define VM_CONTEXT1_PROTECTION_FAULT_DEFAULT_ADDR	0x151c
++
++#define	VM_CONTEXT0_PAGE_TABLE_BASE_ADDR		0x153c
++#define	VM_CONTEXT1_PAGE_TABLE_BASE_ADDR		0x1540
++#define	VM_CONTEXT2_PAGE_TABLE_BASE_ADDR		0x1544
++#define	VM_CONTEXT3_PAGE_TABLE_BASE_ADDR		0x1548
++#define	VM_CONTEXT4_PAGE_TABLE_BASE_ADDR		0x154c
++#define	VM_CONTEXT5_PAGE_TABLE_BASE_ADDR		0x1550
++#define	VM_CONTEXT6_PAGE_TABLE_BASE_ADDR		0x1554
++#define	VM_CONTEXT7_PAGE_TABLE_BASE_ADDR		0x1558
++#define	VM_CONTEXT0_PAGE_TABLE_START_ADDR		0x155c
++#define	VM_CONTEXT1_PAGE_TABLE_START_ADDR		0x1560
++
++#define	VM_CONTEXT0_PAGE_TABLE_END_ADDR			0x157C
++#define	VM_CONTEXT1_PAGE_TABLE_END_ADDR			0x1580
++
+ #define MC_SHARED_CHMAP						0x2004
+ #define		NOOFCHAN_SHIFT					12
+ #define		NOOFCHAN_MASK					0x0000f000
+ #define MC_SHARED_CHREMAP					0x2008
+ 
++#define	MC_VM_FB_LOCATION				0x2024
++#define	MC_VM_AGP_TOP					0x2028
++#define	MC_VM_AGP_BOT					0x202C
++#define	MC_VM_AGP_BASE					0x2030
++#define	MC_VM_SYSTEM_APERTURE_LOW_ADDR			0x2034
++#define	MC_VM_SYSTEM_APERTURE_HIGH_ADDR			0x2038
++#define	MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR		0x203C
++
++#define	MC_VM_MX_L1_TLB_CNTL				0x2064
++#define		ENABLE_L1_TLB					(1 << 0)
++#define		ENABLE_L1_FRAGMENT_PROCESSING			(1 << 1)
++#define		SYSTEM_ACCESS_MODE_PA_ONLY			(0 << 3)
++#define		SYSTEM_ACCESS_MODE_USE_SYS_MAP			(1 << 3)
++#define		SYSTEM_ACCESS_MODE_IN_SYS			(2 << 3)
++#define		SYSTEM_ACCESS_MODE_NOT_IN_SYS			(3 << 3)
++#define		SYSTEM_APERTURE_UNMAPPED_ACCESS_PASS_THRU	(0 << 5)
++#define		ENABLE_ADVANCED_DRIVER_MODEL			(1 << 6)
++
+ #define	MC_ARB_RAMCFG					0x2760
+ #define		NOOFBANK_SHIFT					0
+ #define		NOOFBANK_MASK					0x00000003
+@@ -73,19 +153,29 @@
+ #define		NOOFCOLS_MASK					0x000000C0
+ #define		CHANSIZE_SHIFT					8
+ #define		CHANSIZE_MASK					0x00000100
++#define		CHANSIZE_OVERRIDE				(1 << 11)
+ #define		NOOFGROUPS_SHIFT				12
+ #define		NOOFGROUPS_MASK					0x00001000
+ 
+ #define	HDP_HOST_PATH_CNTL				0x2C00
++#define	HDP_NONSURFACE_BASE				0x2C04
++#define	HDP_NONSURFACE_INFO				0x2C08
++#define	HDP_NONSURFACE_SIZE				0x2C0C
+ 
+ #define HDP_ADDR_CONFIG  				0x2F48
+ #define HDP_MISC_CNTL					0x2F4C
+ #define 	HDP_FLUSH_INVALIDATE_CACHE			(1 << 0)
+ 
++#define	CONFIG_MEMSIZE					0x5428
++
++#define HDP_MEM_COHERENCY_FLUSH_CNTL			0x5480
++
+ #define	BIF_FB_EN						0x5490
+ #define		FB_READ_EN					(1 << 0)
+ #define		FB_WRITE_EN					(1 << 1)
+ 
++#define HDP_REG_COHERENCY_FLUSH_CNTL			0x54A0
++
+ #define	DC_LB_MEMORY_SPLIT					0x6b0c
+ #define		DC_LB_MEMORY_CONFIG(x)				((x) << 20)
+ 
+@@ -321,5 +411,134 @@
+ #define	TCP_CHAN_STEER_LO				0xac0c
+ #define	TCP_CHAN_STEER_HI				0xac10
+ 
++/*
++ * PM4
++ */
++#define	PACKET_TYPE0	0
++#define	PACKET_TYPE1	1
++#define	PACKET_TYPE2	2
++#define	PACKET_TYPE3	3
++
++#define CP_PACKET_GET_TYPE(h) (((h) >> 30) & 3)
++#define CP_PACKET_GET_COUNT(h) (((h) >> 16) & 0x3FFF)
++#define CP_PACKET0_GET_REG(h) (((h) & 0xFFFF) << 2)
++#define CP_PACKET3_GET_OPCODE(h) (((h) >> 8) & 0xFF)
++#define PACKET0(reg, n)	((PACKET_TYPE0 << 30) |				\
++			 (((reg) >> 2) & 0xFFFF) |			\
++			 ((n) & 0x3FFF) << 16)
++#define CP_PACKET2			0x80000000
++#define		PACKET2_PAD_SHIFT		0
++#define		PACKET2_PAD_MASK		(0x3fffffff << 0)
++
++#define PACKET2(v)	(CP_PACKET2 | REG_SET(PACKET2_PAD, (v)))
++
++#define PACKET3(op, n)	((PACKET_TYPE3 << 30) |				\
++			 (((op) & 0xFF) << 8) |				\
++			 ((n) & 0x3FFF) << 16)
++
++/* Packet 3 types */
++#define	PACKET3_NOP					0x10
++#define	PACKET3_SET_BASE				0x11
++#define		PACKET3_BASE_INDEX(x)                  ((x) << 0)
++#define			GDS_PARTITION_BASE		2
++#define			CE_PARTITION_BASE		3
++#define	PACKET3_CLEAR_STATE				0x12
++#define	PACKET3_INDEX_BUFFER_SIZE			0x13
++#define	PACKET3_DISPATCH_DIRECT				0x15
++#define	PACKET3_DISPATCH_INDIRECT			0x16
++#define	PACKET3_ALLOC_GDS				0x1B
++#define	PACKET3_WRITE_GDS_RAM				0x1C
++#define	PACKET3_ATOMIC_GDS				0x1D
++#define	PACKET3_ATOMIC					0x1E
++#define	PACKET3_OCCLUSION_QUERY				0x1F
++#define	PACKET3_SET_PREDICATION				0x20
++#define	PACKET3_REG_RMW					0x21
++#define	PACKET3_COND_EXEC				0x22
++#define	PACKET3_PRED_EXEC				0x23
++#define	PACKET3_DRAW_INDIRECT				0x24
++#define	PACKET3_DRAW_INDEX_INDIRECT			0x25
++#define	PACKET3_INDEX_BASE				0x26
++#define	PACKET3_DRAW_INDEX_2				0x27
++#define	PACKET3_CONTEXT_CONTROL				0x28
++#define	PACKET3_INDEX_TYPE				0x2A
++#define	PACKET3_DRAW_INDIRECT_MULTI			0x2C
++#define	PACKET3_DRAW_INDEX_AUTO				0x2D
++#define	PACKET3_DRAW_INDEX_IMMD				0x2E
++#define	PACKET3_NUM_INSTANCES				0x2F
++#define	PACKET3_DRAW_INDEX_MULTI_AUTO			0x30
++#define	PACKET3_INDIRECT_BUFFER_CONST			0x31
++#define	PACKET3_INDIRECT_BUFFER				0x32
++#define	PACKET3_STRMOUT_BUFFER_UPDATE			0x34
++#define	PACKET3_DRAW_INDEX_OFFSET_2			0x35
++#define	PACKET3_DRAW_INDEX_MULTI_ELEMENT		0x36
++#define	PACKET3_WRITE_DATA				0x37
++#define	PACKET3_DRAW_INDEX_INDIRECT_MULTI		0x38
++#define	PACKET3_MEM_SEMAPHORE				0x39
++#define	PACKET3_MPEG_INDEX				0x3A
++#define	PACKET3_COPY_DW					0x3B
++#define	PACKET3_WAIT_REG_MEM				0x3C
++#define	PACKET3_MEM_WRITE				0x3D
++#define	PACKET3_COPY_DATA				0x40
++#define	PACKET3_PFP_SYNC_ME				0x42
++#define	PACKET3_SURFACE_SYNC				0x43
++#              define PACKET3_DEST_BASE_0_ENA      (1 << 0)
++#              define PACKET3_DEST_BASE_1_ENA      (1 << 1)
++#              define PACKET3_CB0_DEST_BASE_ENA    (1 << 6)
++#              define PACKET3_CB1_DEST_BASE_ENA    (1 << 7)
++#              define PACKET3_CB2_DEST_BASE_ENA    (1 << 8)
++#              define PACKET3_CB3_DEST_BASE_ENA    (1 << 9)
++#              define PACKET3_CB4_DEST_BASE_ENA    (1 << 10)
++#              define PACKET3_CB5_DEST_BASE_ENA    (1 << 11)
++#              define PACKET3_CB6_DEST_BASE_ENA    (1 << 12)
++#              define PACKET3_CB7_DEST_BASE_ENA    (1 << 13)
++#              define PACKET3_DB_DEST_BASE_ENA     (1 << 14)
++#              define PACKET3_DEST_BASE_2_ENA      (1 << 19)
++#              define PACKET3_DEST_BASE_3_ENA      (1 << 21)
++#              define PACKET3_TCL1_ACTION_ENA      (1 << 22)
++#              define PACKET3_TC_ACTION_ENA        (1 << 23)
++#              define PACKET3_CB_ACTION_ENA        (1 << 25)
++#              define PACKET3_DB_ACTION_ENA        (1 << 26)
++#              define PACKET3_SH_KCACHE_ACTION_ENA (1 << 27)
++#              define PACKET3_SH_ICACHE_ACTION_ENA (1 << 29)
++#define	PACKET3_ME_INITIALIZE				0x44
++#define		PACKET3_ME_INITIALIZE_DEVICE_ID(x) ((x) << 16)
++#define	PACKET3_COND_WRITE				0x45
++#define	PACKET3_EVENT_WRITE				0x46
++#define	PACKET3_EVENT_WRITE_EOP				0x47
++#define	PACKET3_EVENT_WRITE_EOS				0x48
++#define	PACKET3_PREAMBLE_CNTL				0x4A
++#              define PACKET3_PREAMBLE_BEGIN_CLEAR_STATE     (2 << 28)
++#              define PACKET3_PREAMBLE_END_CLEAR_STATE       (3 << 28)
++#define	PACKET3_ONE_REG_WRITE				0x57
++#define	PACKET3_LOAD_CONFIG_REG				0x5F
++#define	PACKET3_LOAD_CONTEXT_REG			0x60
++#define	PACKET3_LOAD_SH_REG				0x61
++#define	PACKET3_SET_CONFIG_REG				0x68
++#define		PACKET3_SET_CONFIG_REG_START			0x00008000
++#define		PACKET3_SET_CONFIG_REG_END			0x0000b000
++#define	PACKET3_SET_CONTEXT_REG				0x69
++#define		PACKET3_SET_CONTEXT_REG_START			0x00028000
++#define		PACKET3_SET_CONTEXT_REG_END			0x00029000
++#define	PACKET3_SET_CONTEXT_REG_INDIRECT		0x73
++#define	PACKET3_SET_RESOURCE_INDIRECT			0x74
++#define	PACKET3_SET_SH_REG				0x76
++#define		PACKET3_SET_SH_REG_START			0x0000b000
++#define		PACKET3_SET_SH_REG_END				0x0000c000
++#define	PACKET3_SET_SH_REG_OFFSET			0x77
++#define	PACKET3_ME_WRITE				0x7A
++#define	PACKET3_SCRATCH_RAM_WRITE			0x7D
++#define	PACKET3_SCRATCH_RAM_READ			0x7E
++#define	PACKET3_CE_WRITE				0x7F
++#define	PACKET3_LOAD_CONST_RAM				0x80
++#define	PACKET3_WRITE_CONST_RAM				0x81
++#define	PACKET3_WRITE_CONST_RAM_OFFSET			0x82
++#define	PACKET3_DUMP_CONST_RAM				0x83
++#define	PACKET3_INCREMENT_CE_COUNTER			0x84
++#define	PACKET3_INCREMENT_DE_COUNTER			0x85
++#define	PACKET3_WAIT_ON_CE_COUNTER			0x86
++#define	PACKET3_WAIT_ON_DE_COUNTER			0x87
++#define	PACKET3_WAIT_ON_DE_COUNTER_DIFF			0x88
++#define	PACKET3_SET_CE_DE_COUNTERS			0x89
++#define	PACKET3_WAIT_ON_AVAIL_BUFFER			0x8A
+ 
+ #endif
+

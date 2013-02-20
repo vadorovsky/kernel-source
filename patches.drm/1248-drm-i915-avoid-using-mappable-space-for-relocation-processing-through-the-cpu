@@ -1,0 +1,155 @@
+From dabdfe021ab1e985e6566009c774fb03f14b568e Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Mon, 26 Mar 2012 10:10:27 +0200
+Subject: drm/i915: Avoid using mappable space for relocation processing
+ through the CPU
+Git-commit: dabdfe021ab1e985e6566009c774fb03f14b568e
+Patch-mainline: v3.6-rc1
+
+We try to avoid writing the relocations through the uncached GTT, if the
+buffer is currently in the CPU write domain and so will be flushed out to
+main memory afterwards anyway. Also on SandyBridge we can safely write
+to the pages in cacheable memory, so long as the buffer is LLC mapped.
+In either of these cases, we therefore do not need to force the
+reallocation of the buffer into the mappable region of the GTT, reducing
+the aperture pressure.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    2 +
+ drivers/gpu/drm/i915/i915_gem.c            |    4 +--
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |   36 +++++++++++++++++++--------
+ 3 files changed, 28 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index d680f09..93e06a3 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1266,6 +1266,8 @@ int __must_check
+ i915_gem_object_set_to_gtt_domain(struct drm_i915_gem_object *obj,
+ 				  bool write);
+ int __must_check
++i915_gem_object_set_to_cpu_domain(struct drm_i915_gem_object *obj, bool write);
++int __must_check
+ i915_gem_object_pin_to_display_plane(struct drm_i915_gem_object *obj,
+ 				     u32 alignment,
+ 				     struct intel_ring_buffer *pipelined);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 90e3fc1..09c033e 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -39,8 +39,6 @@
+ static __must_check int i915_gem_object_flush_gpu_write_domain(struct drm_i915_gem_object *obj);
+ static void i915_gem_object_flush_gtt_write_domain(struct drm_i915_gem_object *obj);
+ static void i915_gem_object_flush_cpu_write_domain(struct drm_i915_gem_object *obj);
+-static __must_check int i915_gem_object_set_to_cpu_domain(struct drm_i915_gem_object *obj,
+-							  bool write);
+ static __must_check int i915_gem_object_set_cpu_read_domain_range(struct drm_i915_gem_object *obj,
+ 								  uint64_t offset,
+ 								  uint64_t size);
+@@ -3073,7 +3071,7 @@ i915_gem_object_finish_gpu(struct drm_i915_gem_object *obj)
+  * This function returns when the move is complete, including waiting on
+  * flushes to occur.
+  */
+-static int
++int
+ i915_gem_object_set_to_cpu_domain(struct drm_i915_gem_object *obj, bool write)
+ {
+ 	uint32_t old_write_domain, old_read_domains;
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 1fa0131..eb85860 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -266,6 +266,12 @@ eb_destroy(struct eb_objects *eb)
+ 	kfree(eb);
+ }
+ 
++static inline int use_cpu_reloc(struct drm_i915_gem_object *obj)
++{
++	return (obj->base.write_domain == I915_GEM_DOMAIN_CPU ||
++		obj->cache_level != I915_CACHE_NONE);
++}
++
+ static int
+ i915_gem_execbuffer_relocate_entry(struct drm_i915_gem_object *obj,
+ 				   struct eb_objects *eb,
+@@ -354,11 +360,19 @@ i915_gem_execbuffer_relocate_entry(struct drm_i915_gem_object *obj,
+ 		return ret;
+ 	}
+ 
++	/* We can't wait for rendering with pagefaults disabled */
++	if (obj->active && in_atomic())
++		return -EFAULT;
++
+ 	reloc->delta += target_offset;
+-	if (obj->base.write_domain == I915_GEM_DOMAIN_CPU) {
++	if (use_cpu_reloc(obj)) {
+ 		uint32_t page_offset = reloc->offset & ~PAGE_MASK;
+ 		char *vaddr;
+ 
++		ret = i915_gem_object_set_to_cpu_domain(obj, 1);
++		if (ret)
++			return ret;
++
+ 		vaddr = kmap_atomic(obj->pages[reloc->offset >> PAGE_SHIFT]);
+ 		*(uint32_t *)(vaddr + page_offset) = reloc->delta;
+ 		kunmap_atomic(vaddr);
+@@ -367,10 +381,6 @@ i915_gem_execbuffer_relocate_entry(struct drm_i915_gem_object *obj,
+ 		uint32_t __iomem *reloc_entry;
+ 		void __iomem *reloc_page;
+ 
+-		/* We can't wait for rendering with pagefaults disabled */
+-		if (obj->active && in_atomic())
+-			return -EFAULT;
+-
+ 		ret = i915_gem_object_set_to_gtt_domain(obj, 1);
+ 		if (ret)
+ 			return ret;
+@@ -493,6 +503,13 @@ i915_gem_execbuffer_relocate(struct drm_device *dev,
+ #define  __EXEC_OBJECT_HAS_FENCE (1<<31)
+ 
+ static int
++need_reloc_mappable(struct drm_i915_gem_object *obj)
++{
++	struct drm_i915_gem_exec_object2 *entry = obj->exec_entry;
++	return entry->relocation_count && !use_cpu_reloc(obj);
++}
++
++static int
+ pin_and_fence_object(struct drm_i915_gem_object *obj,
+ 		     struct intel_ring_buffer *ring)
+ {
+@@ -505,8 +522,7 @@ pin_and_fence_object(struct drm_i915_gem_object *obj,
+ 		has_fenced_gpu_access &&
+ 		entry->flags & EXEC_OBJECT_NEEDS_FENCE &&
+ 		obj->tiling_mode != I915_TILING_NONE;
+-	need_mappable =
+-		entry->relocation_count ? true : need_fence;
++	need_mappable = need_fence || need_reloc_mappable(obj);
+ 
+ 	ret = i915_gem_object_pin(obj, entry->alignment, need_mappable);
+ 	if (ret)
+@@ -563,8 +579,7 @@ i915_gem_execbuffer_reserve(struct intel_ring_buffer *ring,
+ 			has_fenced_gpu_access &&
+ 			entry->flags & EXEC_OBJECT_NEEDS_FENCE &&
+ 			obj->tiling_mode != I915_TILING_NONE;
+-		need_mappable =
+-			entry->relocation_count ? true : need_fence;
++		need_mappable = need_fence || need_reloc_mappable(obj);
+ 
+ 		if (need_mappable)
+ 			list_move(&obj->exec_list, &ordered_objects);
+@@ -604,8 +619,7 @@ i915_gem_execbuffer_reserve(struct intel_ring_buffer *ring,
+ 				has_fenced_gpu_access &&
+ 				entry->flags & EXEC_OBJECT_NEEDS_FENCE &&
+ 				obj->tiling_mode != I915_TILING_NONE;
+-			need_mappable =
+-				entry->relocation_count ? true : need_fence;
++			need_mappable = need_fence || need_reloc_mappable(obj);
+ 
+ 			if ((entry->alignment && obj->gtt_offset & (entry->alignment - 1)) ||
+ 			    (need_mappable && !obj->map_and_fenceable))
+

@@ -1,0 +1,175 @@
+From 3acec63aee5d082f86218973912e682e84ec2a05 Mon Sep 17 00:00:00 2001
+From: Ben Skeggs <bskeggs@redhat.com>
+Date: Fri, 10 Aug 2012 13:47:56 +1000
+Subject: drm/nouveau/core: protect engine context list with hardirq-safe
+ spinlock
+Git-commit: 3acec63aee5d082f86218973912e682e84ec2a05
+Patch-mainline: v3.7-rc3
+
+IRQ handlers will need access to engine contexts.
+
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/nouveau/core/core/engctx.c         |   74 +++++++++++++++-----
+ drivers/gpu/drm/nouveau/core/core/engine.c         |    1 +
+ drivers/gpu/drm/nouveau/core/include/core/engctx.h |    2 +-
+ drivers/gpu/drm/nouveau/core/include/core/engine.h |    3 +
+ 4 files changed, 60 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/core/core/engctx.c b/drivers/gpu/drm/nouveau/core/core/engctx.c
+index 50dc16d..38c0612 100644
+--- a/drivers/gpu/drm/nouveau/core/core/engctx.c
++++ b/drivers/gpu/drm/nouveau/core/core/engctx.c
+@@ -30,6 +30,25 @@
+ 
+ #include <subdev/vm.h>
+ 
++static inline int
++nouveau_engctx_exists(struct nouveau_object *parent,
++		      struct nouveau_engine *engine, void **pobject)
++{
++	struct nouveau_engctx *engctx;
++	struct nouveau_object *parctx;
++
++	list_for_each_entry(engctx, &engine->contexts, head) {
++		parctx = nv_pclass(nv_object(engctx), NV_PARENT_CLASS);
++		if (parctx == parent) {
++			atomic_inc(&nv_object(engctx)->refcount);
++			*pobject = engctx;
++			return 1;
++		}
++	}
++
++	return 0;
++}
++
+ int
+ nouveau_engctx_create_(struct nouveau_object *parent,
+ 		       struct nouveau_object *engobj,
+@@ -41,23 +60,22 @@ nouveau_engctx_create_(struct nouveau_object *parent,
+ 	struct nouveau_client *client = nouveau_client(parent);
+ 	struct nouveau_engine *engine = nv_engine(engobj);
+ 	struct nouveau_subdev *subdev = nv_subdev(engine);
+-	struct nouveau_engctx *engctx;
+-	struct nouveau_object *ctxpar;
++	struct nouveau_object *engctx;
++	unsigned long save;
+ 	int ret;
+ 
+-	/* use existing context for the engine if one is available */
+-	mutex_lock(&subdev->mutex);
+-	list_for_each_entry(engctx, &engine->contexts, head) {
+-		ctxpar = nv_pclass(nv_object(engctx), NV_PARENT_CLASS);
+-		if (ctxpar == parent) {
+-			atomic_inc(&nv_object(engctx)->refcount);
+-			*pobject = engctx;
+-			mutex_unlock(&subdev->mutex);
+-			return 1;
+-		}
+-	}
+-	mutex_unlock(&subdev->mutex);
++	/* check if this engine already has a context for the parent object,
++	 * and reference it instead of creating a new one
++	 */
++	spin_lock_irqsave(&engine->lock, save);
++	ret = nouveau_engctx_exists(parent, engine, pobject);
++	spin_unlock_irqrestore(&engine->lock, save);
++	if (ret)
++		return ret;
+ 
++	/* create the new context, supports creating both raw objects and
++	 * objects backed by instance memory
++	 */
+ 	if (size) {
+ 		ret = nouveau_gpuobj_create_(parent, engobj, oclass,
+ 					     NV_ENGCTX_CLASS,
+@@ -69,25 +87,43 @@ nouveau_engctx_create_(struct nouveau_object *parent,
+ 	}
+ 
+ 	engctx = *pobject;
+-	if (engctx && client->vm)
+-		atomic_inc(&client->vm->engref[nv_engidx(engobj)]);
+ 	if (ret)
+ 		return ret;
+ 
+-	list_add(&engctx->head, &engine->contexts);
++	/* must take the lock again and re-check a context doesn't already
++	 * exist (in case of a race) - the lock had to be dropped before as
++	 * it's not possible to allocate the object with it held.
++	 */
++	spin_lock_irqsave(&engine->lock, save);
++	ret = nouveau_engctx_exists(parent, engine, pobject);
++	if (ret) {
++		spin_unlock_irqrestore(&engine->lock, save);
++		nouveau_object_ref(NULL, &engctx);
++		return ret;
++	}
++
++	if (client->vm)
++		atomic_inc(&client->vm->engref[nv_engidx(engobj)]);
++	list_add(&nv_engctx(engctx)->head, &engine->contexts);
++	spin_unlock_irqrestore(&engine->lock, save);
+ 	return 0;
+ }
+ 
+ void
+ nouveau_engctx_destroy(struct nouveau_engctx *engctx)
+ {
+-	struct nouveau_object *engine = nv_object(engctx)->engine;
++	struct nouveau_object *engobj = nv_object(engctx)->engine;
++	struct nouveau_engine *engine = nv_engine(engobj);
+ 	struct nouveau_client *client = nouveau_client(engctx);
++	unsigned long save;
+ 
+ 	nouveau_gpuobj_unmap(&engctx->vma);
++	spin_lock_irqsave(&engine->lock, save);
+ 	list_del(&engctx->head);
++	spin_unlock_irqrestore(&engine->lock, save);
++
+ 	if (client->vm)
+-		atomic_dec(&client->vm->engref[nv_engidx(engine)]);
++		atomic_dec(&client->vm->engref[nv_engidx(engobj)]);
+ 
+ 	if (engctx->base.size)
+ 		nouveau_gpuobj_destroy(&engctx->base);
+diff --git a/drivers/gpu/drm/nouveau/core/core/engine.c b/drivers/gpu/drm/nouveau/core/core/engine.c
+index ee2905b..09b3bd5 100644
+--- a/drivers/gpu/drm/nouveau/core/core/engine.c
++++ b/drivers/gpu/drm/nouveau/core/core/engine.c
+@@ -50,5 +50,6 @@ nouveau_engine_create_(struct nouveau_object *parent,
+ 	}
+ 
+ 	INIT_LIST_HEAD(&engine->contexts);
++	spin_lock_init(&engine->lock);
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/nouveau/core/include/core/engctx.h b/drivers/gpu/drm/nouveau/core/include/core/engctx.h
+index cbc9eb3..3bc6ccd 100644
+--- a/drivers/gpu/drm/nouveau/core/include/core/engctx.h
++++ b/drivers/gpu/drm/nouveau/core/include/core/engctx.h
+@@ -15,7 +15,7 @@ struct nouveau_engctx {
+ 	struct list_head head;
+ };
+ 
+-static inline void *
++static inline struct nouveau_engctx *
+ nv_engctx(void *obj)
+ {
+ #if CONFIG_NOUVEAU_DEBUG >= NV_DBG_PARANOIA
+diff --git a/drivers/gpu/drm/nouveau/core/include/core/engine.h b/drivers/gpu/drm/nouveau/core/include/core/engine.h
+index 1a7b0a7..666d06d 100644
+--- a/drivers/gpu/drm/nouveau/core/include/core/engine.h
++++ b/drivers/gpu/drm/nouveau/core/include/core/engine.h
+@@ -11,7 +11,10 @@ struct nouveau_engine {
+ 	struct nouveau_subdev base;
+ 	struct nouveau_oclass *cclass;
+ 	struct nouveau_oclass *sclass;
++
+ 	struct list_head contexts;
++	spinlock_t lock;
++
+ 	void (*tile_prog)(struct nouveau_engine *, int region);
+ 	int  (*tlb_flush)(struct nouveau_engine *);
+ };
+

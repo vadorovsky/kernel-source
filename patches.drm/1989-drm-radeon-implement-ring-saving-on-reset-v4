@@ -1,0 +1,211 @@
+From 55d7c22192becd0ec827a6901899ff56fa985658 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <deathsimple@vodafone.de>
+Date: Mon, 9 Jul 2012 11:52:44 +0200
+Subject: drm/radeon: implement ring saving on reset v4
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 55d7c22192becd0ec827a6901899ff56fa985658
+Patch-mainline: v3.6-rc1
+
+Try to save whatever is on the rings when
+we encounter an lockup.
+
+v2: Fix spelling error. Free saved ring data if reset fails.
+    Add documentation for the new functions.
+v3: Some more spelling fixes
+v4: It doesn't make sense to save anything if all fences
+    are signaled
+
+Signed-off-by: Christian König <deathsimple@vodafone.de>
+Reviewed-by: Michel Dänzer <michel.daenzer@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/radeon.h        |    4 ++
+ drivers/gpu/drm/radeon/radeon_device.c |   48 +++++++++++++++---
+ drivers/gpu/drm/radeon/radeon_ring.c   |   82 ++++++++++++++++++++++++++++++++
+ 3 files changed, 126 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 64d39ad..6715e4c 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -768,6 +768,10 @@ int radeon_ring_test(struct radeon_device *rdev, struct radeon_ring *cp);
+ void radeon_ring_force_activity(struct radeon_device *rdev, struct radeon_ring *ring);
+ void radeon_ring_lockup_update(struct radeon_ring *ring);
+ bool radeon_ring_test_lockup(struct radeon_device *rdev, struct radeon_ring *ring);
++unsigned radeon_ring_backup(struct radeon_device *rdev, struct radeon_ring *ring,
++			    uint32_t **data);
++int radeon_ring_restore(struct radeon_device *rdev, struct radeon_ring *ring,
++			unsigned size, uint32_t *data);
+ int radeon_ring_init(struct radeon_device *rdev, struct radeon_ring *cp, unsigned ring_size,
+ 		     unsigned rptr_offs, unsigned rptr_reg, unsigned wptr_reg,
+ 		     u32 ptr_reg_shift, u32 ptr_reg_mask, u32 nop);
+diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
+index bbd0971..0302a9f 100644
+--- a/drivers/gpu/drm/radeon/radeon_device.c
++++ b/drivers/gpu/drm/radeon/radeon_device.c
+@@ -996,7 +996,12 @@ int radeon_resume_kms(struct drm_device *dev)
+ 
+ int radeon_gpu_reset(struct radeon_device *rdev)
+ {
+-	int r;
++	unsigned ring_sizes[RADEON_NUM_RINGS];
++	uint32_t *ring_data[RADEON_NUM_RINGS];
++
++	bool saved = false;
++
++	int i, r;
+ 	int resched;
+ 
+ 	down_write(&rdev->exclusive_lock);
+@@ -1005,20 +1010,47 @@ int radeon_gpu_reset(struct radeon_device *rdev)
+ 	resched = ttm_bo_lock_delayed_workqueue(&rdev->mman.bdev);
+ 	radeon_suspend(rdev);
+ 
++	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
++		ring_sizes[i] = radeon_ring_backup(rdev, &rdev->ring[i],
++						   &ring_data[i]);
++		if (ring_sizes[i]) {
++			saved = true;
++			dev_info(rdev->dev, "Saved %d dwords of commands "
++				 "on ring %d.\n", ring_sizes[i], i);
++		}
++	}
++
++retry:
+ 	r = radeon_asic_reset(rdev);
+ 	if (!r) {
+-		dev_info(rdev->dev, "GPU reset succeed\n");
++		dev_info(rdev->dev, "GPU reset succeeded, trying to resume\n");
+ 		radeon_resume(rdev);
++	}
+ 
+-		r = radeon_ib_ring_tests(rdev);
+-		if (r)
+-			DRM_ERROR("ib ring test failed (%d).\n", r);
++	radeon_restore_bios_scratch_regs(rdev);
++	drm_helper_resume_force_mode(rdev->ddev);
+ 
+-		radeon_restore_bios_scratch_regs(rdev);
+-		drm_helper_resume_force_mode(rdev->ddev);
+-		ttm_bo_unlock_delayed_workqueue(&rdev->mman.bdev, resched);
++	if (!r) {
++		for (i = 0; i < RADEON_NUM_RINGS; ++i) {
++			radeon_ring_restore(rdev, &rdev->ring[i],
++					    ring_sizes[i], ring_data[i]);
++		}
++
++		r = radeon_ib_ring_tests(rdev);
++		if (r) {
++			dev_err(rdev->dev, "ib ring test failed (%d).\n", r);
++			if (saved) {
++				radeon_suspend(rdev);
++				goto retry;
++			}
++		}
++	} else {
++		for (i = 0; i < RADEON_NUM_RINGS; ++i) {
++			kfree(ring_data[i]);
++		}
+ 	}
+ 
++	ttm_bo_unlock_delayed_workqueue(&rdev->mman.bdev, resched);
+ 	if (r) {
+ 		/* bad news, how to tell it to userspace ? */
+ 		dev_info(rdev->dev, "GPU reset failed\n");
+diff --git a/drivers/gpu/drm/radeon/radeon_ring.c b/drivers/gpu/drm/radeon/radeon_ring.c
+index ce8eb9d..75cbe46 100644
+--- a/drivers/gpu/drm/radeon/radeon_ring.c
++++ b/drivers/gpu/drm/radeon/radeon_ring.c
+@@ -362,6 +362,88 @@ bool radeon_ring_test_lockup(struct radeon_device *rdev, struct radeon_ring *rin
+ 	return false;
+ }
+ 
++/**
++ * radeon_ring_backup - Back up the content of a ring
++ *
++ * @rdev: radeon_device pointer
++ * @ring: the ring we want to back up
++ *
++ * Saves all unprocessed commits from a ring, returns the number of dwords saved.
++ */
++unsigned radeon_ring_backup(struct radeon_device *rdev, struct radeon_ring *ring,
++			    uint32_t **data)
++{
++	unsigned size, ptr, i;
++	int ridx = radeon_ring_index(rdev, ring);
++
++	/* just in case lock the ring */
++	mutex_lock(&rdev->ring_lock);
++	*data = NULL;
++
++	if (ring->ring_obj == NULL || !ring->rptr_save_reg) {
++		mutex_unlock(&rdev->ring_lock);
++		return 0;
++	}
++
++	/* it doesn't make sense to save anything if all fences are signaled */
++	if (!radeon_fence_count_emitted(rdev, ridx)) {
++		mutex_unlock(&rdev->ring_lock);
++		return 0;
++	}
++
++	/* calculate the number of dw on the ring */
++	ptr = RREG32(ring->rptr_save_reg);
++	size = ring->wptr + (ring->ring_size / 4);
++	size -= ptr;
++	size &= ring->ptr_mask;
++	if (size == 0) {
++		mutex_unlock(&rdev->ring_lock);
++		return 0;
++	}
++
++	/* and then save the content of the ring */
++	*data = kmalloc(size * 4, GFP_KERNEL);
++	for (i = 0; i < size; ++i) {
++		(*data)[i] = ring->ring[ptr++];
++		ptr &= ring->ptr_mask;
++	}
++
++	mutex_unlock(&rdev->ring_lock);
++	return size;
++}
++
++/**
++ * radeon_ring_restore - append saved commands to the ring again
++ *
++ * @rdev: radeon_device pointer
++ * @ring: ring to append commands to
++ * @size: number of dwords we want to write
++ * @data: saved commands
++ *
++ * Allocates space on the ring and restore the previously saved commands.
++ */
++int radeon_ring_restore(struct radeon_device *rdev, struct radeon_ring *ring,
++			unsigned size, uint32_t *data)
++{
++	int i, r;
++
++	if (!size || !data)
++		return 0;
++
++	/* restore the saved ring content */
++	r = radeon_ring_lock(rdev, ring, size);
++	if (r)
++		return r;
++
++	for (i = 0; i < size; ++i) {
++		radeon_ring_write(ring, data[i]);
++	}
++
++	radeon_ring_unlock_commit(rdev, ring);
++	kfree(data);
++	return 0;
++}
++
+ int radeon_ring_init(struct radeon_device *rdev, struct radeon_ring *ring, unsigned ring_size,
+ 		     unsigned rptr_offs, unsigned rptr_reg, unsigned wptr_reg,
+ 		     u32 ptr_reg_shift, u32 ptr_reg_mask, u32 nop)
+

@@ -1,0 +1,133 @@
+From a5570178c059cec59e9835be20bc8546377fa7b5 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Tue, 4 Sep 2012 21:02:54 +0100
+Subject: drm/i915: Pin backing pages whilst exporting through a dmabuf vmap
+Git-commit: a5570178c059cec59e9835be20bc8546377fa7b5
+Patch-mainline: v3.7-rc3
+
+We need to refcount our pages in order to prevent reaping them at
+inopportune times, such as when they currently vmapped or exported to
+another driver. However, we also wish to keep the lazy deallocation of
+our pages so we need to take a pin/unpinned approach rather than a
+simple refcount.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Ben Widawsky <ben@bwidawsk.net>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h        |   12 ++++++++++++
+ drivers/gpu/drm/i915/i915_gem.c        |   11 +++++++++--
+ drivers/gpu/drm/i915/i915_gem_dmabuf.c |    8 ++++++--
+ 3 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index ada8ea1..12a0757 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1008,6 +1008,7 @@ struct drm_i915_gem_object {
+ 	unsigned int has_global_gtt_mapping:1;
+ 
+ 	struct page **pages;
++	int pages_pin_count;
+ 
+ 	/**
+ 	 * DMAR support
+@@ -1341,6 +1342,17 @@ void i915_gem_release_mmap(struct drm_i915_gem_object *obj);
+ void i915_gem_lastclose(struct drm_device *dev);
+ 
+ int __must_check i915_gem_object_get_pages(struct drm_i915_gem_object *obj);
++static inline void i915_gem_object_pin_pages(struct drm_i915_gem_object *obj)
++{
++	BUG_ON(obj->pages == NULL);
++	obj->pages_pin_count++;
++}
++static inline void i915_gem_object_unpin_pages(struct drm_i915_gem_object *obj)
++{
++	BUG_ON(obj->pages_pin_count == 0);
++	obj->pages_pin_count--;
++}
++
+ int __must_check i915_mutex_lock_interruptible(struct drm_device *dev);
+ int i915_gem_object_sync(struct drm_i915_gem_object *obj,
+ 			 struct intel_ring_buffer *to);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 4b2ee7c..ea3a5e1 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1699,6 +1699,9 @@ i915_gem_object_put_pages(struct drm_i915_gem_object *obj)
+ 
+ 	BUG_ON(obj->gtt_space);
+ 
++	if (obj->pages_pin_count)
++		return -EBUSY;
++
+ 	ops->put_pages(obj);
+ 
+ 	list_del(&obj->gtt_list);
+@@ -1837,6 +1840,8 @@ i915_gem_object_get_pages(struct drm_i915_gem_object *obj)
+ 	if (obj->sg_table || obj->pages)
+ 		return 0;
+ 
++	BUG_ON(obj->pages_pin_count);
++
+ 	ret = ops->get_pages(obj);
+ 	if (ret)
+ 		return ret;
+@@ -3743,6 +3748,7 @@ void i915_gem_free_object(struct drm_gem_object *gem_obj)
+ 		dev_priv->mm.interruptible = was_interruptible;
+ 	}
+ 
++	obj->pages_pin_count = 0;
+ 	i915_gem_object_put_pages(obj);
+ 	i915_gem_object_free_mmap_offset(obj);
+ 
+@@ -4402,9 +4408,10 @@ i915_gem_inactive_shrink(struct shrinker *shrinker, struct shrink_control *sc)
+ 
+ 	cnt = 0;
+ 	list_for_each_entry(obj, &dev_priv->mm.unbound_list, gtt_list)
+-		cnt += obj->base.size >> PAGE_SHIFT;
++		if (obj->pages_pin_count == 0)
++			cnt += obj->base.size >> PAGE_SHIFT;
+ 	list_for_each_entry(obj, &dev_priv->mm.bound_list, gtt_list)
+-		if (obj->pin_count == 0)
++		if (obj->pin_count == 0 && obj->pages_pin_count == 0)
+ 			cnt += obj->base.size >> PAGE_SHIFT;
+ 
+ 	mutex_unlock(&dev->struct_mutex);
+diff --git a/drivers/gpu/drm/i915/i915_gem_dmabuf.c b/drivers/gpu/drm/i915/i915_gem_dmabuf.c
+index e4f1141..eca4726 100644
+--- a/drivers/gpu/drm/i915/i915_gem_dmabuf.c
++++ b/drivers/gpu/drm/i915/i915_gem_dmabuf.c
+@@ -50,6 +50,8 @@ static struct sg_table *i915_gem_map_dma_buf(struct dma_buf_attachment *attachme
+ 	/* link the pages into an SG then map the sg */
+ 	sg = drm_prime_pages_to_sg(obj->pages, npages);
+ 	nents = dma_map_sg(attachment->dev, sg->sgl, sg->nents, dir);
++	i915_gem_object_pin_pages(obj);
++
+ out:
+ 	mutex_unlock(&dev->struct_mutex);
+ 	return sg;
+@@ -102,6 +104,7 @@ static void *i915_gem_dmabuf_vmap(struct dma_buf *dma_buf)
+ 	}
+ 
+ 	obj->vmapping_count = 1;
++	i915_gem_object_pin_pages(obj);
+ out_unlock:
+ 	mutex_unlock(&dev->struct_mutex);
+ 	return obj->dma_buf_vmapping;
+@@ -117,10 +120,11 @@ static void i915_gem_dmabuf_vunmap(struct dma_buf *dma_buf, void *vaddr)
+ 	if (ret)
+ 		return;
+ 
+-	--obj->vmapping_count;
+-	if (obj->vmapping_count == 0) {
++	if (--obj->vmapping_count == 0) {
+ 		vunmap(obj->dma_buf_vmapping);
+ 		obj->dma_buf_vmapping = NULL;
++
++		i915_gem_object_unpin_pages(obj);
+ 	}
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+

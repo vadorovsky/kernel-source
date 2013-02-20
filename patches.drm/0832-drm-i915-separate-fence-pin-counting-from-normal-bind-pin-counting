@@ -1,0 +1,392 @@
+From 1690e1eb7a9021826853e181baa48dd77090da28 Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 14 Dec 2011 13:57:08 +0100
+Subject: drm/i915: Separate fence pin counting from normal bind pin counting
+Git-commit: 1690e1eb7a9021826853e181baa48dd77090da28
+Patch-mainline: v3.4-rc1
+
+In order to correctly account for reserving space in the GTT and fences
+for a batch buffer, we need to independently track whether the fence is
+pinned due to a fenced GPU access in the batch or whether the buffer is
+pinned in the aperture. Currently we count the fenced as pinned if the
+buffer has already been seen in the execbuffer. This leads to a false
+accounting of available fence registers, causing frequent mass evictions.
+Worse, if coupled with the change to make i915_gem_object_get_fence()
+report EDADLK upon fence starvation, the batchbuffer can fail with only
+one fence required...
+
+Fixes intel-gpu-tools/tests/gem_fenced_exec_thrash
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=38735
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Tested-by: Paul Neumann <paul104x@yahoo.de>
+[danvet: Resolve the functional conflict with Jesse Barnes sprite
+patches, acked by Chris Wilson on irc.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h            |   19 ++++
+ drivers/gpu/drm/i915/i915_gem.c            |    7 +-
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |  137 ++++++++++++++++++----------
+ drivers/gpu/drm/i915/intel_display.c       |   16 +++-
+ drivers/gpu/drm/i915/intel_drv.h           |    1 +
+ drivers/gpu/drm/i915/intel_sprite.c        |    4 +-
+ 6 files changed, 128 insertions(+), 56 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 733f5f5..12e8cce 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -135,6 +135,7 @@ struct drm_i915_fence_reg {
+ 	struct list_head lru_list;
+ 	struct drm_i915_gem_object *obj;
+ 	uint32_t setup_seqno;
++	int pin_count;
+ };
+ 
+ struct sdvo_device_mapping {
+@@ -1159,6 +1160,24 @@ int __must_check i915_gem_object_get_fence(struct drm_i915_gem_object *obj,
+ 					   struct intel_ring_buffer *pipelined);
+ int __must_check i915_gem_object_put_fence(struct drm_i915_gem_object *obj);
+ 
++static inline void
++i915_gem_object_pin_fence(struct drm_i915_gem_object *obj)
++{
++	if (obj->fence_reg != I915_FENCE_REG_NONE) {
++		struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
++		dev_priv->fence_regs[obj->fence_reg].pin_count++;
++	}
++}
++
++static inline void
++i915_gem_object_unpin_fence(struct drm_i915_gem_object *obj)
++{
++	if (obj->fence_reg != I915_FENCE_REG_NONE) {
++		struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
++		dev_priv->fence_regs[obj->fence_reg].pin_count--;
++	}
++}
++
+ void i915_gem_retire_requests(struct drm_device *dev);
+ void i915_gem_reset(struct drm_device *dev);
+ void i915_gem_clflush_object(struct drm_i915_gem_object *obj);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index ff3066c..c78930e 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2435,6 +2435,8 @@ i915_gem_object_put_fence(struct drm_i915_gem_object *obj)
+ 
+ 	if (obj->fence_reg != I915_FENCE_REG_NONE) {
+ 		struct drm_i915_private *dev_priv = obj->base.dev->dev_private;
++
++		WARN_ON(dev_priv->fence_regs[obj->fence_reg].pin_count);
+ 		i915_gem_clear_fence_reg(obj->base.dev,
+ 					 &dev_priv->fence_regs[obj->fence_reg]);
+ 
+@@ -2459,7 +2461,7 @@ i915_find_fence_reg(struct drm_device *dev,
+ 		if (!reg->obj)
+ 			return reg;
+ 
+-		if (!reg->obj->pin_count)
++		if (!reg->pin_count)
+ 			avail = reg;
+ 	}
+ 
+@@ -2469,7 +2471,7 @@ i915_find_fence_reg(struct drm_device *dev,
+ 	/* None available, try to steal one or wait for a user to finish */
+ 	avail = first = NULL;
+ 	list_for_each_entry(reg, &dev_priv->mm.fence_list, lru_list) {
+-		if (reg->obj->pin_count)
++		if (reg->pin_count)
+ 			continue;
+ 
+ 		if (first == NULL)
+@@ -2664,6 +2666,7 @@ i915_gem_clear_fence_reg(struct drm_device *dev,
+ 	list_del_init(&reg->lru_list);
+ 	reg->obj = NULL;
+ 	reg->setup_seqno = 0;
++	reg->pin_count = 0;
+ }
+ 
+ /**
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 49b3ebc..4a43ef5 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -461,6 +461,54 @@ i915_gem_execbuffer_relocate(struct drm_device *dev,
+ 	return ret;
+ }
+ 
++#define  __EXEC_OBJECT_HAS_FENCE (1<<31)
++
++static int
++pin_and_fence_object(struct drm_i915_gem_object *obj,
++		     struct intel_ring_buffer *ring)
++{
++	struct drm_i915_gem_exec_object2 *entry = obj->exec_entry;
++	bool has_fenced_gpu_access = INTEL_INFO(ring->dev)->gen < 4;
++	bool need_fence, need_mappable;
++	int ret;
++
++	need_fence =
++		has_fenced_gpu_access &&
++		entry->flags & EXEC_OBJECT_NEEDS_FENCE &&
++		obj->tiling_mode != I915_TILING_NONE;
++	need_mappable =
++		entry->relocation_count ? true : need_fence;
++
++	ret = i915_gem_object_pin(obj, entry->alignment, need_mappable);
++	if (ret)
++		return ret;
++
++	if (has_fenced_gpu_access) {
++		if (entry->flags & EXEC_OBJECT_NEEDS_FENCE) {
++			if (obj->tiling_mode) {
++				ret = i915_gem_object_get_fence(obj, ring);
++				if (ret)
++					goto err_unpin;
++
++				entry->flags |= __EXEC_OBJECT_HAS_FENCE;
++				i915_gem_object_pin_fence(obj);
++			} else {
++				ret = i915_gem_object_put_fence(obj);
++				if (ret)
++					goto err_unpin;
++			}
++		}
++		obj->pending_fenced_gpu_access = need_fence;
++	}
++
++	entry->offset = obj->gtt_offset;
++	return 0;
++
++err_unpin:
++	i915_gem_object_unpin(obj);
++	return ret;
++}
++
+ static int
+ i915_gem_execbuffer_reserve(struct intel_ring_buffer *ring,
+ 			    struct drm_file *file,
+@@ -518,6 +566,7 @@ i915_gem_execbuffer_reserve(struct intel_ring_buffer *ring,
+ 		list_for_each_entry(obj, objects, exec_list) {
+ 			struct drm_i915_gem_exec_object2 *entry = obj->exec_entry;
+ 			bool need_fence, need_mappable;
++
+ 			if (!obj->gtt_space)
+ 				continue;
+ 
+@@ -532,58 +581,47 @@ i915_gem_execbuffer_reserve(struct intel_ring_buffer *ring,
+ 			    (need_mappable && !obj->map_and_fenceable))
+ 				ret = i915_gem_object_unbind(obj);
+ 			else
+-				ret = i915_gem_object_pin(obj,
+-							  entry->alignment,
+-							  need_mappable);
++				ret = pin_and_fence_object(obj, ring);
+ 			if (ret)
+ 				goto err;
+-
+-			entry++;
+ 		}
+ 
+ 		/* Bind fresh objects */
+ 		list_for_each_entry(obj, objects, exec_list) {
+-			struct drm_i915_gem_exec_object2 *entry = obj->exec_entry;
+-			bool need_fence;
+-
+-			need_fence =
+-				has_fenced_gpu_access &&
+-				entry->flags & EXEC_OBJECT_NEEDS_FENCE &&
+-				obj->tiling_mode != I915_TILING_NONE;
+-
+-			if (!obj->gtt_space) {
+-				bool need_mappable =
+-					entry->relocation_count ? true : need_fence;
++			if (obj->gtt_space)
++				continue;
+ 
+-				ret = i915_gem_object_pin(obj,
+-							  entry->alignment,
+-							  need_mappable);
+-				if (ret)
+-					break;
+-			}
++			ret = pin_and_fence_object(obj, ring);
++			if (ret) {
++				int ret_ignore;
+ 
+-			if (has_fenced_gpu_access) {
+-				if (need_fence) {
+-					ret = i915_gem_object_get_fence(obj, ring);
+-					if (ret)
+-						break;
+-				} else if (entry->flags & EXEC_OBJECT_NEEDS_FENCE &&
+-					   obj->tiling_mode == I915_TILING_NONE) {
+-					/* XXX pipelined! */
+-					ret = i915_gem_object_put_fence(obj);
+-					if (ret)
+-						break;
+-				}
+-				obj->pending_fenced_gpu_access = need_fence;
++				/* This can potentially raise a harmless
++				 * -EINVAL if we failed to bind in the above
++				 * call. It cannot raise -EINTR since we know
++				 * that the bo is freshly bound and so will
++				 * not need to be flushed or waited upon.
++				 */
++				ret_ignore = i915_gem_object_unbind(obj);
++				(void)ret_ignore;
++				WARN_ON(obj->gtt_space);
++				break;
+ 			}
+-
+-			entry->offset = obj->gtt_offset;
+ 		}
+ 
+ 		/* Decrement pin count for bound objects */
+ 		list_for_each_entry(obj, objects, exec_list) {
+-			if (obj->gtt_space)
+-				i915_gem_object_unpin(obj);
++			struct drm_i915_gem_exec_object2 *entry;
++
++			if (!obj->gtt_space)
++				continue;
++
++			entry = obj->exec_entry;
++			if (entry->flags & __EXEC_OBJECT_HAS_FENCE) {
++				i915_gem_object_unpin_fence(obj);
++				entry->flags &= ~__EXEC_OBJECT_HAS_FENCE;
++			}
++
++			i915_gem_object_unpin(obj);
+ 		}
+ 
+ 		if (ret != -ENOSPC || retry > 1)
+@@ -600,16 +638,19 @@ i915_gem_execbuffer_reserve(struct intel_ring_buffer *ring,
+ 	} while (1);
+ 
+ err:
+-	obj = list_entry(obj->exec_list.prev,
+-			 struct drm_i915_gem_object,
+-			 exec_list);
+-	while (objects != &obj->exec_list) {
+-		if (obj->gtt_space)
+-			i915_gem_object_unpin(obj);
++	list_for_each_entry_continue_reverse(obj, objects, exec_list) {
++		struct drm_i915_gem_exec_object2 *entry;
++
++		if (!obj->gtt_space)
++			continue;
++
++		entry = obj->exec_entry;
++		if (entry->flags & __EXEC_OBJECT_HAS_FENCE) {
++			i915_gem_object_unpin_fence(obj);
++			entry->flags &= ~__EXEC_OBJECT_HAS_FENCE;
++		}
+ 
+-		obj = list_entry(obj->exec_list.prev,
+-				 struct drm_i915_gem_object,
+-				 exec_list);
++		i915_gem_object_unpin(obj);
+ 	}
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 0770671..fc9bc19 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -2041,6 +2041,8 @@ intel_pin_and_fence_fb_obj(struct drm_device *dev,
+ 		ret = i915_gem_object_get_fence(obj, pipelined);
+ 		if (ret)
+ 			goto err_unpin;
++
++		i915_gem_object_pin_fence(obj);
+ 	}
+ 
+ 	dev_priv->mm.interruptible = true;
+@@ -2053,6 +2055,12 @@ err_interruptible:
+ 	return ret;
+ }
+ 
++void intel_unpin_fb_obj(struct drm_i915_gem_object *obj)
++{
++	i915_gem_object_unpin_fence(obj);
++	i915_gem_object_unpin(obj);
++}
++
+ static int i9xx_update_plane(struct drm_crtc *crtc, struct drm_framebuffer *fb,
+ 			     int x, int y)
+ {
+@@ -2284,7 +2292,7 @@ intel_pipe_set_base(struct drm_crtc *crtc, int x, int y,
+ 	ret = intel_pipe_set_base_atomic(crtc, crtc->fb, x, y,
+ 					 LEAVE_ATOMIC_MODE_SET);
+ 	if (ret) {
+-		i915_gem_object_unpin(to_intel_framebuffer(crtc->fb)->obj);
++		intel_unpin_fb_obj(to_intel_framebuffer(crtc->fb)->obj);
+ 		mutex_unlock(&dev->struct_mutex);
+ 		DRM_ERROR("failed to update base address\n");
+ 		return ret;
+@@ -2292,7 +2300,7 @@ intel_pipe_set_base(struct drm_crtc *crtc, int x, int y,
+ 
+ 	if (old_fb) {
+ 		intel_wait_for_vblank(dev, intel_crtc->pipe);
+-		i915_gem_object_unpin(to_intel_framebuffer(old_fb)->obj);
++		intel_unpin_fb_obj(to_intel_framebuffer(old_fb)->obj);
+ 	}
+ 
+ 	mutex_unlock(&dev->struct_mutex);
+@@ -3355,7 +3363,7 @@ static void intel_crtc_disable(struct drm_crtc *crtc)
+ 
+ 	if (crtc->fb) {
+ 		mutex_lock(&dev->struct_mutex);
+-		i915_gem_object_unpin(to_intel_framebuffer(crtc->fb)->obj);
++		intel_unpin_fb_obj(to_intel_framebuffer(crtc->fb)->obj);
+ 		mutex_unlock(&dev->struct_mutex);
+ 	}
+ }
+@@ -7158,7 +7166,7 @@ static void intel_unpin_work_fn(struct work_struct *__work)
+ 		container_of(__work, struct intel_unpin_work, work);
+ 
+ 	mutex_lock(&work->dev->struct_mutex);
+-	i915_gem_object_unpin(work->old_fb_obj);
++	intel_unpin_fb_obj(work->old_fb_obj);
+ 	drm_gem_object_unreference(&work->pending_flip_obj->base);
+ 	drm_gem_object_unreference(&work->old_fb_obj->base);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 1348705..9cec6c3 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -374,6 +374,7 @@ extern void intel_init_emon(struct drm_device *dev);
+ extern int intel_pin_and_fence_fb_obj(struct drm_device *dev,
+ 				      struct drm_i915_gem_object *obj,
+ 				      struct intel_ring_buffer *pipelined);
++extern void intel_unpin_fb_obj(struct drm_i915_gem_object *obj);
+ 
+ extern int intel_framebuffer_init(struct drm_device *dev,
+ 				  struct intel_framebuffer *ifb,
+diff --git a/drivers/gpu/drm/i915/intel_sprite.c b/drivers/gpu/drm/i915/intel_sprite.c
+index d13989f..ad3bd92 100644
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@ -503,7 +503,7 @@ intel_update_plane(struct drm_plane *plane, struct drm_crtc *crtc,
+ 			intel_wait_for_vblank(dev, to_intel_crtc(crtc)->pipe);
+ 			mutex_lock(&dev->struct_mutex);
+ 		}
+-		i915_gem_object_unpin(old_obj);
++		intel_unpin_fb_obj(old_obj);
+ 	}
+ 
+ out_unlock:
+@@ -530,7 +530,7 @@ intel_disable_plane(struct drm_plane *plane)
+ 		goto out;
+ 
+ 	mutex_lock(&dev->struct_mutex);
+-	i915_gem_object_unpin(intel_plane->obj);
++	intel_unpin_fb_obj(intel_plane->obj);
+ 	intel_plane->obj = NULL;
+ 	mutex_unlock(&dev->struct_mutex);
+ out:
+

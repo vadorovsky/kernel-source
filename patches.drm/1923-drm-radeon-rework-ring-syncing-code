@@ -1,0 +1,498 @@
+From 220907d9835ce5181b9f782c862b1ee7a4d24c23 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <deathsimple@vodafone.de>
+Date: Thu, 10 May 2012 16:46:43 +0200
+Subject: drm/radeon: rework ring syncing code
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 220907d9835ce5181b9f782c862b1ee7a4d24c23
+Patch-mainline: v3.6-rc1
+
+Move inter ring syncing with semaphores into the
+existing ring allocations, with that we need to
+lock the ring mutex only once.
+
+Signed-off-by: Christian König <deathsimple@vodafone.de>
+Reviewed-by: Jerome Glisse <jglisse@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/evergreen_blit_kms.c |    3 +-
+ drivers/gpu/drm/radeon/r600.c               |    5 +-
+ drivers/gpu/drm/radeon/r600_blit_kms.c      |   24 ++++++++-
+ drivers/gpu/drm/radeon/radeon.h             |    6 +-
+ drivers/gpu/drm/radeon/radeon_asic.h        |    5 +-
+ drivers/gpu/drm/radeon/radeon_cs.c          |   38 +++-----------
+ drivers/gpu/drm/radeon/radeon_ring.c        |   30 +++++++++--
+ drivers/gpu/drm/radeon/radeon_semaphore.c   |   71 +++++++++-----------------
+ drivers/gpu/drm/radeon/radeon_test.c        |    6 +--
+ drivers/gpu/drm/radeon/radeon_ttm.c         |   20 --------
+ 10 files changed, 92 insertions(+), 116 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/evergreen_blit_kms.c b/drivers/gpu/drm/radeon/evergreen_blit_kms.c
+index 1e96bd4..e512560 100644
+--- a/drivers/gpu/drm/radeon/evergreen_blit_kms.c
++++ b/drivers/gpu/drm/radeon/evergreen_blit_kms.c
+@@ -622,7 +622,8 @@ int evergreen_blit_init(struct radeon_device *rdev)
+ 	rdev->r600_blit.primitives.draw_auto = draw_auto;
+ 	rdev->r600_blit.primitives.set_default_state = set_default_state;
+ 
+-	rdev->r600_blit.ring_size_common = 55; /* shaders + def state */
++	rdev->r600_blit.ring_size_common = 8; /* sync semaphore */
++	rdev->r600_blit.ring_size_common += 55; /* shaders + def state */
+ 	rdev->r600_blit.ring_size_common += 16; /* fence emit for VB IB */
+ 	rdev->r600_blit.ring_size_common += 5; /* done copy */
+ 	rdev->r600_blit.ring_size_common += 16; /* fence emit for done copy */
+diff --git a/drivers/gpu/drm/radeon/r600.c b/drivers/gpu/drm/radeon/r600.c
+index a80e61e..aced97b 100644
+--- a/drivers/gpu/drm/radeon/r600.c
++++ b/drivers/gpu/drm/radeon/r600.c
+@@ -2311,15 +2311,16 @@ int r600_copy_blit(struct radeon_device *rdev,
+ 		   unsigned num_gpu_pages,
+ 		   struct radeon_fence **fence)
+ {
++	struct radeon_semaphore *sem = NULL;
+ 	struct radeon_sa_bo *vb = NULL;
+ 	int r;
+ 
+-	r = r600_blit_prepare_copy(rdev, num_gpu_pages, &vb);
++	r = r600_blit_prepare_copy(rdev, num_gpu_pages, fence, &vb, &sem);
+ 	if (r) {
+ 		return r;
+ 	}
+ 	r600_kms_blit_copy(rdev, src_offset, dst_offset, num_gpu_pages, vb);
+-	r600_blit_done_copy(rdev, fence, vb);
++	r600_blit_done_copy(rdev, fence, vb, sem);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/gpu/drm/radeon/r600_blit_kms.c b/drivers/gpu/drm/radeon/r600_blit_kms.c
+index 02f4eeb..2b8d641 100644
+--- a/drivers/gpu/drm/radeon/r600_blit_kms.c
++++ b/drivers/gpu/drm/radeon/r600_blit_kms.c
+@@ -512,7 +512,8 @@ int r600_blit_init(struct radeon_device *rdev)
+ 	rdev->r600_blit.primitives.draw_auto = draw_auto;
+ 	rdev->r600_blit.primitives.set_default_state = set_default_state;
+ 
+-	rdev->r600_blit.ring_size_common = 40; /* shaders + def state */
++	rdev->r600_blit.ring_size_common = 8; /* sync semaphore */
++	rdev->r600_blit.ring_size_common += 40; /* shaders + def state */
+ 	rdev->r600_blit.ring_size_common += 5; /* done copy */
+ 	rdev->r600_blit.ring_size_common += 16; /* fence emit for done copy */
+ 
+@@ -666,7 +667,8 @@ static unsigned r600_blit_create_rect(unsigned num_gpu_pages,
+ 
+ 
+ int r600_blit_prepare_copy(struct radeon_device *rdev, unsigned num_gpu_pages,
+-			   struct radeon_sa_bo **vb)
++			   struct radeon_fence **fence, struct radeon_sa_bo **vb,
++			   struct radeon_semaphore **sem)
+ {
+ 	struct radeon_ring *ring = &rdev->ring[RADEON_RING_TYPE_GFX_INDEX];
+ 	int r;
+@@ -689,22 +691,37 @@ int r600_blit_prepare_copy(struct radeon_device *rdev, unsigned num_gpu_pages,
+ 		return r;
+ 	}
+ 
++	r = radeon_semaphore_create(rdev, sem);
++	if (r) {
++		radeon_sa_bo_free(rdev, vb, NULL);
++		return r;
++	}
++
+ 	/* calculate number of loops correctly */
+ 	ring_size = num_loops * dwords_per_loop;
+ 	ring_size += rdev->r600_blit.ring_size_common;
+ 	r = radeon_ring_lock(rdev, ring, ring_size);
+ 	if (r) {
+ 		radeon_sa_bo_free(rdev, vb, NULL);
++		radeon_semaphore_free(rdev, sem, NULL);
+ 		return r;
+ 	}
+ 
++	if (radeon_fence_need_sync(*fence, RADEON_RING_TYPE_GFX_INDEX)) {
++		radeon_semaphore_sync_rings(rdev, *sem, (*fence)->ring,
++					    RADEON_RING_TYPE_GFX_INDEX);
++		radeon_fence_note_sync(*fence, RADEON_RING_TYPE_GFX_INDEX);
++	} else {
++		radeon_semaphore_free(rdev, sem, NULL);
++	}
++
+ 	rdev->r600_blit.primitives.set_default_state(rdev);
+ 	rdev->r600_blit.primitives.set_shaders(rdev);
+ 	return 0;
+ }
+ 
+ void r600_blit_done_copy(struct radeon_device *rdev, struct radeon_fence **fence,
+-			 struct radeon_sa_bo *vb)
++			 struct radeon_sa_bo *vb, struct radeon_semaphore *sem)
+ {
+ 	struct radeon_ring *ring = &rdev->ring[RADEON_RING_TYPE_GFX_INDEX];
+ 	int r;
+@@ -717,6 +734,7 @@ void r600_blit_done_copy(struct radeon_device *rdev, struct radeon_fence **fence
+ 
+ 	radeon_ring_unlock_commit(rdev, ring);
+ 	radeon_sa_bo_free(rdev, &vb, *fence);
++	radeon_semaphore_free(rdev, &sem, *fence);
+ }
+ 
+ void r600_kms_blit_copy(struct radeon_device *rdev,
+diff --git a/drivers/gpu/drm/radeon/radeon.h b/drivers/gpu/drm/radeon/radeon.h
+index 33a72dc..4563e50 100644
+--- a/drivers/gpu/drm/radeon/radeon.h
++++ b/drivers/gpu/drm/radeon/radeon.h
+@@ -470,10 +470,9 @@ void radeon_semaphore_emit_wait(struct radeon_device *rdev, int ring,
+ 				struct radeon_semaphore *semaphore);
+ int radeon_semaphore_sync_rings(struct radeon_device *rdev,
+ 				struct radeon_semaphore *semaphore,
+-				bool sync_to[RADEON_NUM_RINGS],
+-				int dst_ring);
++				int signaler, int waiter);
+ void radeon_semaphore_free(struct radeon_device *rdev,
+-			   struct radeon_semaphore *semaphore,
++			   struct radeon_semaphore **semaphore,
+ 			   struct radeon_fence *fence);
+ 
+ /*
+@@ -653,6 +652,7 @@ struct radeon_ib {
+ 	struct radeon_fence		*fence;
+ 	unsigned			vm_id;
+ 	bool				is_const_ib;
++	struct radeon_fence		*sync_to[RADEON_NUM_RINGS];
+ 	struct radeon_semaphore		*semaphore;
+ };
+ 
+diff --git a/drivers/gpu/drm/radeon/radeon_asic.h b/drivers/gpu/drm/radeon/radeon_asic.h
+index 8cdf075..94c427a 100644
+--- a/drivers/gpu/drm/radeon/radeon_asic.h
++++ b/drivers/gpu/drm/radeon/radeon_asic.h
+@@ -363,9 +363,10 @@ int r600_hdmi_buffer_status_changed(struct drm_encoder *encoder);
+ void r600_hdmi_update_audio_settings(struct drm_encoder *encoder);
+ /* r600 blit */
+ int r600_blit_prepare_copy(struct radeon_device *rdev, unsigned num_gpu_pages,
+-			   struct radeon_sa_bo **vb);
++			   struct radeon_fence **fence, struct radeon_sa_bo **vb,
++			   struct radeon_semaphore **sem);
+ void r600_blit_done_copy(struct radeon_device *rdev, struct radeon_fence **fence,
+-			 struct radeon_sa_bo *vb);
++			 struct radeon_sa_bo *vb, struct radeon_semaphore *sem);
+ void r600_kms_blit_copy(struct radeon_device *rdev,
+ 			u64 src_gpu_addr, u64 dst_gpu_addr,
+ 			unsigned num_gpu_pages,
+diff --git a/drivers/gpu/drm/radeon/radeon_cs.c b/drivers/gpu/drm/radeon/radeon_cs.c
+index 142f894..dd3e234 100644
+--- a/drivers/gpu/drm/radeon/radeon_cs.c
++++ b/drivers/gpu/drm/radeon/radeon_cs.c
+@@ -115,36 +115,20 @@ static int radeon_cs_get_ring(struct radeon_cs_parser *p, u32 ring, s32 priority
+ 	return 0;
+ }
+ 
+-static int radeon_cs_sync_rings(struct radeon_cs_parser *p)
++static void radeon_cs_sync_rings(struct radeon_cs_parser *p)
+ {
+-	bool sync_to_ring[RADEON_NUM_RINGS] = { };
+-	bool need_sync = false;
+-	int i, r;
++	int i;
+ 
+ 	for (i = 0; i < p->nrelocs; i++) {
+-		struct radeon_fence *fence;
++		struct radeon_fence *a, *b;
+ 
+ 		if (!p->relocs[i].robj || !p->relocs[i].robj->tbo.sync_obj)
+ 			continue;
+ 
+-		fence = p->relocs[i].robj->tbo.sync_obj;
+-		if (fence->ring != p->ring && !radeon_fence_signaled(fence)) {
+-			sync_to_ring[fence->ring] = true;
+-			need_sync = true;
+-		}
+-	}
+-
+-	if (!need_sync) {
+-		return 0;
+-	}
+-
+-	r = radeon_semaphore_create(p->rdev, &p->ib.semaphore);
+-	if (r) {
+-		return r;
++		a = p->relocs[i].robj->tbo.sync_obj;
++		b = p->ib.sync_to[a->ring];
++		p->ib.sync_to[a->ring] = radeon_fence_later(a, b);
+ 	}
+-
+-	return radeon_semaphore_sync_rings(p->rdev, p->ib.semaphore,
+-					   sync_to_ring, p->ring);
+ }
+ 
+ /* XXX: note that this is called from the legacy UMS CS ioctl as well */
+@@ -368,10 +352,7 @@ static int radeon_cs_ib_chunk(struct radeon_device *rdev,
+ 		DRM_ERROR("Invalid command stream !\n");
+ 		return r;
+ 	}
+-	r = radeon_cs_sync_rings(parser);
+-	if (r) {
+-		DRM_ERROR("Failed to synchronize rings !\n");
+-	}
++	radeon_cs_sync_rings(parser);
+ 	parser->ib.vm_id = 0;
+ 	r = radeon_ib_schedule(rdev, &parser->ib);
+ 	if (r) {
+@@ -468,10 +449,7 @@ static int radeon_cs_ib_vm_chunk(struct radeon_device *rdev,
+ 	if (r) {
+ 		goto out;
+ 	}
+-	r = radeon_cs_sync_rings(parser);
+-	if (r) {
+-		DRM_ERROR("Failed to synchronize rings !\n");
+-	}
++	radeon_cs_sync_rings(parser);
+ 
+ 	if ((rdev->family >= CHIP_TAHITI) &&
+ 	    (parser->chunk_const_ib_idx != -1)) {
+diff --git a/drivers/gpu/drm/radeon/radeon_ring.c b/drivers/gpu/drm/radeon/radeon_ring.c
+index dd506c2..0826e77 100644
+--- a/drivers/gpu/drm/radeon/radeon_ring.c
++++ b/drivers/gpu/drm/radeon/radeon_ring.c
+@@ -42,7 +42,7 @@ int radeon_debugfs_sa_init(struct radeon_device *rdev);
+ int radeon_ib_get(struct radeon_device *rdev, int ring,
+ 		  struct radeon_ib *ib, unsigned size)
+ {
+-	int r;
++	int i, r;
+ 
+ 	r = radeon_sa_bo_new(rdev, &rdev->ring_tmp_bo, &ib->sa_bo, size, 256, true);
+ 	if (r) {
+@@ -50,20 +50,26 @@ int radeon_ib_get(struct radeon_device *rdev, int ring,
+ 		return r;
+ 	}
+ 
++	r = radeon_semaphore_create(rdev, &ib->semaphore);
++	if (r) {
++		return r;
++	}
++
+ 	ib->ring = ring;
+ 	ib->fence = NULL;
+ 	ib->ptr = radeon_sa_bo_cpu_addr(ib->sa_bo);
+ 	ib->gpu_addr = radeon_sa_bo_gpu_addr(ib->sa_bo);
+ 	ib->vm_id = 0;
+ 	ib->is_const_ib = false;
+-	ib->semaphore = NULL;
++	for (i = 0; i < RADEON_NUM_RINGS; ++i)
++		ib->sync_to[i] = NULL;
+ 
+ 	return 0;
+ }
+ 
+ void radeon_ib_free(struct radeon_device *rdev, struct radeon_ib *ib)
+ {
+-	radeon_semaphore_free(rdev, ib->semaphore, ib->fence);
++	radeon_semaphore_free(rdev, &ib->semaphore, ib->fence);
+ 	radeon_sa_bo_free(rdev, &ib->sa_bo, ib->fence);
+ 	radeon_fence_unref(&ib->fence);
+ }
+@@ -71,7 +77,8 @@ void radeon_ib_free(struct radeon_device *rdev, struct radeon_ib *ib)
+ int radeon_ib_schedule(struct radeon_device *rdev, struct radeon_ib *ib)
+ {
+ 	struct radeon_ring *ring = &rdev->ring[ib->ring];
+-	int r = 0;
++	bool need_sync = false;
++	int i, r = 0;
+ 
+ 	if (!ib->length_dw || !ring->ready) {
+ 		/* TODO: Nothings in the ib we should report. */
+@@ -80,11 +87,24 @@ int radeon_ib_schedule(struct radeon_device *rdev, struct radeon_ib *ib)
+ 	}
+ 
+ 	/* 64 dwords should be enough for fence too */
+-	r = radeon_ring_lock(rdev, ring, 64);
++	r = radeon_ring_lock(rdev, ring, 64 + RADEON_NUM_RINGS * 8);
+ 	if (r) {
+ 		dev_err(rdev->dev, "scheduling IB failed (%d).\n", r);
+ 		return r;
+ 	}
++	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
++		struct radeon_fence *fence = ib->sync_to[i];
++		if (radeon_fence_need_sync(fence, ib->ring)) {
++			need_sync = true;
++			radeon_semaphore_sync_rings(rdev, ib->semaphore,
++						    fence->ring, ib->ring);
++			radeon_fence_note_sync(fence, ib->ring);
++		}
++	}
++	/* immediately free semaphore when we don't need to sync */
++	if (!need_sync) {
++		radeon_semaphore_free(rdev, &ib->semaphore, NULL);
++	}
+ 	radeon_ring_ib_execute(rdev, ib->ring, ib);
+ 	r = radeon_fence_emit(rdev, &ib->fence, ib->ring);
+ 	if (r) {
+diff --git a/drivers/gpu/drm/radeon/radeon_semaphore.c b/drivers/gpu/drm/radeon/radeon_semaphore.c
+index e2ace5d..7cc78de 100644
+--- a/drivers/gpu/drm/radeon/radeon_semaphore.c
++++ b/drivers/gpu/drm/radeon/radeon_semaphore.c
+@@ -68,70 +68,49 @@ void radeon_semaphore_emit_wait(struct radeon_device *rdev, int ring,
+ 	radeon_semaphore_ring_emit(rdev, ring, &rdev->ring[ring], semaphore, true);
+ }
+ 
++/* caller must hold ring lock */
+ int radeon_semaphore_sync_rings(struct radeon_device *rdev,
+ 				struct radeon_semaphore *semaphore,
+-				bool sync_to[RADEON_NUM_RINGS],
+-				int dst_ring)
++				int signaler, int waiter)
+ {
+-	int i = 0, r;
++	int r;
+ 
+-	mutex_lock(&rdev->ring_lock);
+-	r = radeon_ring_alloc(rdev, &rdev->ring[dst_ring], RADEON_NUM_RINGS * 8);
+-	if (r) {
+-		goto error;
++	/* no need to signal and wait on the same ring */
++	if (signaler == waiter) {
++		return 0;
+ 	}
+ 
+-	for (i = 0; i < RADEON_NUM_RINGS; ++i) {
+-		/* no need to sync to our own or unused rings */
+-		if (!sync_to[i] || i == dst_ring)
+-			continue;
+-
+-		/* prevent GPU deadlocks */
+-		if (!rdev->ring[i].ready) {
+-			dev_err(rdev->dev, "Trying to sync to a disabled ring!");
+-			r = -EINVAL;
+-			goto error;
+-		}
+-
+-		r = radeon_ring_alloc(rdev, &rdev->ring[i], 8);
+-		if (r) {
+-			goto error;
+-		}
+-
+-		radeon_semaphore_emit_signal(rdev, i, semaphore);
+-		radeon_semaphore_emit_wait(rdev, dst_ring, semaphore);
++	/* prevent GPU deadlocks */
++	if (!rdev->ring[signaler].ready) {
++		dev_err(rdev->dev, "Trying to sync to a disabled ring!");
++		return -EINVAL;
++	}
+ 
+-		radeon_ring_commit(rdev, &rdev->ring[i]);
++	r = radeon_ring_alloc(rdev, &rdev->ring[signaler], 8);
++	if (r) {
++		return r;
+ 	}
++	radeon_semaphore_emit_signal(rdev, signaler, semaphore);
++	radeon_ring_commit(rdev, &rdev->ring[signaler]);
+ 
+-	radeon_ring_commit(rdev, &rdev->ring[dst_ring]);
+-	mutex_unlock(&rdev->ring_lock);
++	/* we assume caller has already allocated space on waiters ring */
++	radeon_semaphore_emit_wait(rdev, waiter, semaphore);
+ 
+ 	return 0;
+-
+-error:
+-	/* unlock all locks taken so far */
+-	for (--i; i >= 0; --i) {
+-		if (sync_to[i] || i == dst_ring) {
+-			radeon_ring_undo(&rdev->ring[i]);
+-		}
+-	}
+-	radeon_ring_undo(&rdev->ring[dst_ring]);
+-	mutex_unlock(&rdev->ring_lock);
+-	return r;
+ }
+ 
+ void radeon_semaphore_free(struct radeon_device *rdev,
+-			   struct radeon_semaphore *semaphore,
++			   struct radeon_semaphore **semaphore,
+ 			   struct radeon_fence *fence)
+ {
+-	if (semaphore == NULL) {
++	if (semaphore == NULL || *semaphore == NULL) {
+ 		return;
+ 	}
+-	if (semaphore->waiters > 0) {
++	if ((*semaphore)->waiters > 0) {
+ 		dev_err(rdev->dev, "semaphore %p has more waiters than signalers,"
+-			" hardware lockup imminent!\n", semaphore);
++			" hardware lockup imminent!\n", *semaphore);
+ 	}
+-	radeon_sa_bo_free(rdev, &semaphore->sa_bo, fence);
+-	kfree(semaphore);
++	radeon_sa_bo_free(rdev, &(*semaphore)->sa_bo, fence);
++	kfree(*semaphore);
++	*semaphore = NULL;
+ }
+diff --git a/drivers/gpu/drm/radeon/radeon_test.c b/drivers/gpu/drm/radeon/radeon_test.c
+index 47e1535..a94f66f 100644
+--- a/drivers/gpu/drm/radeon/radeon_test.c
++++ b/drivers/gpu/drm/radeon/radeon_test.c
+@@ -303,8 +303,7 @@ void radeon_test_ring_sync(struct radeon_device *rdev,
+ 	}
+ 
+ out_cleanup:
+-	if (semaphore)
+-		radeon_semaphore_free(rdev, semaphore, NULL);
++	radeon_semaphore_free(rdev, &semaphore, NULL);
+ 
+ 	if (fence1)
+ 		radeon_fence_unref(&fence1);
+@@ -422,8 +421,7 @@ void radeon_test_ring_sync2(struct radeon_device *rdev,
+ 	}
+ 
+ out_cleanup:
+-	if (semaphore)
+-		radeon_semaphore_free(rdev, semaphore, NULL);
++	radeon_semaphore_free(rdev, &semaphore, NULL);
+ 
+ 	if (fenceA)
+ 		radeon_fence_unref(&fenceA);
+diff --git a/drivers/gpu/drm/radeon/radeon_ttm.c b/drivers/gpu/drm/radeon/radeon_ttm.c
+index 2d36bdd..c43035c 100644
+--- a/drivers/gpu/drm/radeon/radeon_ttm.c
++++ b/drivers/gpu/drm/radeon/radeon_ttm.c
+@@ -223,7 +223,6 @@ static int radeon_move_blit(struct ttm_buffer_object *bo,
+ 	struct radeon_device *rdev;
+ 	uint64_t old_start, new_start;
+ 	struct radeon_fence *fence;
+-	struct radeon_semaphore *sem = NULL;
+ 	int r, ridx;
+ 
+ 	rdev = radeon_get_rdev(bo->bdev);
+@@ -262,31 +261,12 @@ static int radeon_move_blit(struct ttm_buffer_object *bo,
+ 
+ 	/* sync other rings */
+ 	fence = bo->sync_obj;
+-	if (fence && fence->ring != ridx
+-	    && !radeon_fence_signaled(fence)) {
+-		bool sync_to_ring[RADEON_NUM_RINGS] = { };
+-		sync_to_ring[fence->ring] = true;
+-
+-		r = radeon_semaphore_create(rdev, &sem);
+-		if (r) {
+-			return r;
+-		}
+-
+-		r = radeon_semaphore_sync_rings(rdev, sem, sync_to_ring, ridx);
+-		if (r) {
+-			radeon_semaphore_free(rdev, sem, NULL);
+-			return r;
+-		}
+-	}
+-
+-	fence = NULL;
+ 	r = radeon_copy(rdev, old_start, new_start,
+ 			new_mem->num_pages * (PAGE_SIZE / RADEON_GPU_PAGE_SIZE), /* GPU pages */
+ 			&fence);
+ 	/* FIXME: handle copy error */
+ 	r = ttm_bo_move_accel_cleanup(bo, (void *)fence, NULL,
+ 				      evict, no_wait_reserve, no_wait_gpu, new_mem);
+-	radeon_semaphore_free(rdev, sem, fence);
+ 	radeon_fence_unref(&fence);
+ 	return r;
+ }
+

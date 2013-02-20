@@ -1,0 +1,208 @@
+From 52d39a21350531063bf8f4f704101bd371ea5d7d Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Wed, 15 Feb 2012 11:25:37 +0000
+Subject: drm/i915: Record the in-flight requests at the time of a hang
+Git-commit: 52d39a21350531063bf8f4f704101bd371ea5d7d
+Patch-mainline: v3.4-rc1
+
+Being able to tally the list of outstanding requests with the sequence
+of commands in the ringbuffer is often useful evidence with respect to
+driver corruption.
+
+Note that since this is the umpteenth per-ring data structure to be added
+to the error state, I've coallesced the nearby loops (the ringbuffer and
+batchbuffer) into a single structure along with the list of requests.  A
+later task would be to refactor the ring register state into the same
+structure.
+
+v2: Fix pretty printing of requests so that they are parsed correctly by
+intel_error_decode and use the 0x%08x format for seqno for consistency
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_debugfs.c |   24 ++++++++----
+ drivers/gpu/drm/i915/i915_drv.h     |   17 ++++++--
+ drivers/gpu/drm/i915/i915_irq.c     |   73 ++++++++++++++++++++++++----------
+ 3 files changed, 79 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_debugfs.c b/drivers/gpu/drm/i915/i915_debugfs.c
+index ae73288..45876e5 100644
+--- a/drivers/gpu/drm/i915/i915_debugfs.c
++++ b/drivers/gpu/drm/i915/i915_debugfs.c
+@@ -738,7 +738,7 @@ static int i915_error_state(struct seq_file *m, void *unused)
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
+ 	struct drm_i915_error_state *error;
+ 	unsigned long flags;
+-	int i, page, offset, elt;
++	int i, j, page, offset, elt;
+ 
+ 	spin_lock_irqsave(&dev_priv->error_lock, flags);
+ 	if (!dev_priv->first_error) {
+@@ -778,10 +778,10 @@ static int i915_error_state(struct seq_file *m, void *unused)
+ 				    error->pinned_bo,
+ 				    error->pinned_bo_count);
+ 
+-	for (i = 0; i < ARRAY_SIZE(error->batchbuffer); i++) {
+-		if (error->batchbuffer[i]) {
+-			struct drm_i915_error_object *obj = error->batchbuffer[i];
++	for (i = 0; i < ARRAY_SIZE(error->ring); i++) {
++		struct drm_i915_error_object *obj;
+ 
++		if ((obj = error->ring[i].batchbuffer)) {
+ 			seq_printf(m, "%s --- gtt_offset = 0x%08x\n",
+ 				   dev_priv->ring[i].name,
+ 				   obj->gtt_offset);
+@@ -793,11 +793,19 @@ static int i915_error_state(struct seq_file *m, void *unused)
+ 				}
+ 			}
+ 		}
+-	}
+ 
+-	for (i = 0; i < ARRAY_SIZE(error->ringbuffer); i++) {
+-		if (error->ringbuffer[i]) {
+-			struct drm_i915_error_object *obj = error->ringbuffer[i];
++		if (error->ring[i].num_requests) {
++			seq_printf(m, "%s --- %d requests\n",
++				   dev_priv->ring[i].name,
++				   error->ring[i].num_requests);
++			for (j = 0; j < error->ring[i].num_requests; j++) {
++				seq_printf(m, "  seqno 0x%08x, emitted %ld\n",
++					   error->ring[i].requests[j].seqno,
++					   error->ring[i].requests[j].jiffies);
++			}
++		}
++
++		if ((obj = error->ring[i].ringbuffer)) {
+ 			seq_printf(m, "%s --- ringbuffer = 0x%08x\n",
+ 				   dev_priv->ring[i].name,
+ 				   obj->gtt_offset);
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 0e4c073..5622ec8 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -174,11 +174,18 @@ struct drm_i915_error_state {
+ 	u32 faddr[I915_NUM_RINGS];
+ 	u64 fence[I915_MAX_NUM_FENCES];
+ 	struct timeval time;
+-	struct drm_i915_error_object {
+-		int page_count;
+-		u32 gtt_offset;
+-		u32 *pages[0];
+-	} *ringbuffer[I915_NUM_RINGS], *batchbuffer[I915_NUM_RINGS];
++	struct drm_i915_error_ring {
++		struct drm_i915_error_object {
++			int page_count;
++			u32 gtt_offset;
++			u32 *pages[0];
++		} *ringbuffer, *batchbuffer;
++		struct drm_i915_error_request {
++			long jiffies;
++			u32 seqno;
++		} *requests;
++		int num_requests;
++	} ring[I915_NUM_RINGS];
+ 	struct drm_i915_error_buffer {
+ 		u32 size;
+ 		u32 name;
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index bd6168b..85504fb1 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -788,11 +788,11 @@ i915_error_state_free(struct drm_device *dev,
+ {
+ 	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(error->batchbuffer); i++)
+-		i915_error_object_free(error->batchbuffer[i]);
+-
+-	for (i = 0; i < ARRAY_SIZE(error->ringbuffer); i++)
+-		i915_error_object_free(error->ringbuffer[i]);
++	for (i = 0; i < ARRAY_SIZE(error->ring); i++) {
++		i915_error_object_free(error->ring[i].batchbuffer);
++		i915_error_object_free(error->ring[i].ringbuffer);
++		kfree(error->ring[i].requests);
++	}
+ 
+ 	kfree(error->active_bo);
+ 	kfree(error->overlay);
+@@ -934,6 +934,51 @@ static void i915_record_ring_state(struct drm_device *dev,
+ 	error->cpu_ring_tail[ring->id] = ring->tail;
+ }
+ 
++static void i915_gem_record_rings(struct drm_device *dev,
++				  struct drm_i915_error_state *error)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct drm_i915_gem_request *request;
++	int i, count;
++
++	for (i = 0; i < I915_NUM_RINGS; i++) {
++		struct intel_ring_buffer *ring = &dev_priv->ring[i];
++
++		if (ring->obj == NULL)
++			continue;
++
++		i915_record_ring_state(dev, error, ring);
++
++		error->ring[i].batchbuffer =
++			i915_error_first_batchbuffer(dev_priv, ring);
++
++		error->ring[i].ringbuffer =
++			i915_error_object_create(dev_priv, ring->obj);
++
++		count = 0;
++		list_for_each_entry(request, &ring->request_list, list)
++			count++;
++
++		error->ring[i].num_requests = count;
++		error->ring[i].requests =
++			kmalloc(count*sizeof(struct drm_i915_error_request),
++				GFP_ATOMIC);
++		if (error->ring[i].requests == NULL) {
++			error->ring[i].num_requests = 0;
++			continue;
++		}
++
++		count = 0;
++		list_for_each_entry(request, &ring->request_list, list) {
++			struct drm_i915_error_request *erq;
++
++			erq = &error->ring[i].requests[count++];
++			erq->seqno = request->seqno;
++			erq->jiffies = request->emitted_jiffies;
++		}
++	}
++}
++
+ /**
+  * i915_capture_error_state - capture an error record for later analysis
+  * @dev: drm device
+@@ -977,24 +1022,8 @@ static void i915_capture_error_state(struct drm_device *dev)
+ 		error->done_reg = I915_READ(DONE_REG);
+ 	}
+ 
+-	i915_record_ring_state(dev, error, &dev_priv->ring[RCS]);
+-	if (HAS_BLT(dev))
+-		i915_record_ring_state(dev, error, &dev_priv->ring[BCS]);
+-	if (HAS_BSD(dev))
+-		i915_record_ring_state(dev, error, &dev_priv->ring[VCS]);
+-
+ 	i915_gem_record_fences(dev, error);
+-
+-	/* Record the active batch and ring buffers */
+-	for (i = 0; i < I915_NUM_RINGS; i++) {
+-		error->batchbuffer[i] =
+-			i915_error_first_batchbuffer(dev_priv,
+-						     &dev_priv->ring[i]);
+-
+-		error->ringbuffer[i] =
+-			i915_error_object_create(dev_priv,
+-						 dev_priv->ring[i].obj);
+-	}
++	i915_gem_record_rings(dev, error);
+ 
+ 	/* Record buffers on the active and pinned lists. */
+ 	error->active_bo = NULL;
+

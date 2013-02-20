@@ -1,0 +1,153 @@
+From 3bb73aba1ed5198a2c1dfaac4f3c95459930d84a Mon Sep 17 00:00:00 2001
+From: Chris Wilson <chris@chris-wilson.co.uk>
+Date: Fri, 20 Jul 2012 12:40:59 +0100
+Subject: drm/i915: Allow late allocation of request for i915_add_request()
+Git-commit: 3bb73aba1ed5198a2c1dfaac4f3c95459930d84a
+Patch-mainline: v3.7-rc1
+
+Request preallocation was added to i915_add_request() in order to
+support the overlay. However, not all users care and can quite happily
+ignore the failure to allocate the request as they will simply repeat
+the request in the future.
+
+By pushing the allocation down into i915_add_request(), we can then
+remove some rather ugly error handling in the callers.
+
+v2: Nullify request->file_priv otherwise we chase a garbage pointer
+when retiring requests.
+
+Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h            |    6 ++--
+ drivers/gpu/drm/i915/i915_gem.c            |   44 +++++++++++-----------------
+ drivers/gpu/drm/i915/i915_gem_execbuffer.c |    7 +----
+ 3 files changed, 21 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index 2c0d840..1f5f5ff 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1358,9 +1358,9 @@ void i915_gem_init_ppgtt(struct drm_device *dev);
+ void i915_gem_cleanup_ringbuffer(struct drm_device *dev);
+ int __must_check i915_gpu_idle(struct drm_device *dev);
+ int __must_check i915_gem_idle(struct drm_device *dev);
+-int __must_check i915_add_request(struct intel_ring_buffer *ring,
+-				  struct drm_file *file,
+-				  struct drm_i915_gem_request *request);
++int i915_add_request(struct intel_ring_buffer *ring,
++		     struct drm_file *file,
++		     struct drm_i915_gem_request *request);
+ int __must_check i915_wait_seqno(struct intel_ring_buffer *ring,
+ 				 uint32_t seqno);
+ int i915_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 4be0960..771b8ba 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1597,7 +1597,12 @@ i915_add_request(struct intel_ring_buffer *ring,
+ 		ring->gpu_caches_dirty = false;
+ 	}
+ 
+-	BUG_ON(request == NULL);
++	if (request == NULL) {
++		request = kmalloc(sizeof(*request), GFP_KERNEL);
++		if (request == NULL)
++			return -ENOMEM;
++	}
++
+ 	seqno = i915_gem_next_request_seqno(ring);
+ 
+ 	/* Record the position of the start of the request so that
+@@ -1608,8 +1613,10 @@ i915_add_request(struct intel_ring_buffer *ring,
+ 	request_ring_position = intel_ring_get_tail(ring);
+ 
+ 	ret = ring->add_request(ring, &seqno);
+-	if (ret)
+-	    return ret;
++	if (ret) {
++		kfree(request);
++		return ret;
++	}
+ 
+ 	trace_i915_gem_request_add(ring, seqno);
+ 
+@@ -1619,6 +1626,7 @@ i915_add_request(struct intel_ring_buffer *ring,
+ 	request->emitted_jiffies = jiffies;
+ 	was_empty = list_empty(&ring->request_list);
+ 	list_add_tail(&request->list, &ring->request_list);
++	request->file_priv = NULL;
+ 
+ 	if (file) {
+ 		struct drm_i915_file_private *file_priv = file->driver_priv;
+@@ -1859,14 +1867,8 @@ i915_gem_retire_work_handler(struct work_struct *work)
+ 	 */
+ 	idle = true;
+ 	for_each_ring(ring, dev_priv, i) {
+-		if (ring->gpu_caches_dirty) {
+-			struct drm_i915_gem_request *request;
+-
+-			request = kzalloc(sizeof(*request), GFP_KERNEL);
+-			if (request == NULL ||
+-			    i915_add_request(ring, NULL, request))
+-			    kfree(request);
+-		}
++		if (ring->gpu_caches_dirty)
++			i915_add_request(ring, NULL, NULL);
+ 
+ 		idle &= list_empty(&ring->request_list);
+ 	}
+@@ -1913,25 +1915,13 @@ i915_gem_check_wedge(struct drm_i915_private *dev_priv,
+ static int
+ i915_gem_check_olr(struct intel_ring_buffer *ring, u32 seqno)
+ {
+-	int ret = 0;
++	int ret;
+ 
+ 	BUG_ON(!mutex_is_locked(&ring->dev->struct_mutex));
+ 
+-	if (seqno == ring->outstanding_lazy_request) {
+-		struct drm_i915_gem_request *request;
+-
+-		request = kzalloc(sizeof(*request), GFP_KERNEL);
+-		if (request == NULL)
+-			return -ENOMEM;
+-
+-		ret = i915_add_request(ring, NULL, request);
+-		if (ret) {
+-			kfree(request);
+-			return ret;
+-		}
+-
+-		BUG_ON(seqno != request->seqno);
+-	}
++	ret = 0;
++	if (seqno == ring->outstanding_lazy_request)
++		ret = i915_add_request(ring, NULL, NULL);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/i915/i915_gem_execbuffer.c b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+index 5af631e..f94ec57 100644
+--- a/drivers/gpu/drm/i915/i915_gem_execbuffer.c
++++ b/drivers/gpu/drm/i915/i915_gem_execbuffer.c
+@@ -972,16 +972,11 @@ i915_gem_execbuffer_retire_commands(struct drm_device *dev,
+ 				    struct drm_file *file,
+ 				    struct intel_ring_buffer *ring)
+ {
+-	struct drm_i915_gem_request *request;
+-
+ 	/* Unconditionally force add_request to emit a full flush. */
+ 	ring->gpu_caches_dirty = true;
+ 
+ 	/* Add a breadcrumb for the completion of the batch buffer */
+-	request = kzalloc(sizeof(*request), GFP_KERNEL);
+-	if (request == NULL || i915_add_request(ring, file, request)) {
+-		kfree(request);
+-	}
++	(void)i915_add_request(ring, file, NULL);
+ }
+ 
+ static int
+

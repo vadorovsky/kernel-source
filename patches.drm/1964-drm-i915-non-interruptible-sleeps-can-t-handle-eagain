@@ -1,0 +1,165 @@
+From d6b2c790a4742a69624e6884b48e5d72f275abd0 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Wed, 4 Jul 2012 22:54:13 +0200
+Subject: drm/i915: non-interruptible sleeps can't handle -EAGAIN
+Git-commit: d6b2c790a4742a69624e6884b48e5d72f275abd0
+Patch-mainline: v3.6-rc1
+
+So don't return -EAGAIN, even in the case of a gpu hang. Remap it to
+-EIO instead. Note that this isn't really an issue with
+interruptability, but more that we have quite a few codepaths (mostly
+around kms stuff) that simply can't handle any errors and hence not
+even -EAGAIN. Instead of adding proper failure paths so that we could
+restart these ioctls we've opted for the cheap way out of sleeping
+non-interruptibly.  Which works everywhere but when the gpu dies,
+which this patch fixes.
+
+So essentially interruptible == false means 'wait for the gpu or die
+trying'.'
+
+This patch is a bit ugly because intel_ring_begin is all non-interruptible
+and hence only returns -EIO. But as the comment in there says,
+auditing all the callsites would be a pain.
+
+To avoid duplicating code, reuse i915_gem_check_wedge in __wait_seqno
+and intel_wait_ring_buffer. Also use the opportunity to clarify the
+different cases in i915_gem_check_wedge a bit with comments.
+
+v2: Don't access dev_priv->mm.interruptible from check_wedge - we
+might not hold dev->struct_mutex, making this racy. Instead pass
+interruptible in as a parameter. I've noticed this because I've hit a
+BUG_ON(!mutex_is_locked) at the top of check_wedge. This has been
+added in
+
+commit b4aca0106c466b5a0329318203f65bac2d91b682
+Author: Ben Widawsky <ben@bwidawsk.net>
+Date:   Wed Apr 25 20:50:12 2012 -0700
+
+    drm/i915: extract some common olr+wedge code
+
+although that commit is missing any justification for this. I guess
+it's just copy&paste, because the same commit add the same BUG_ON
+check to check_olr, where it indeed makes sense.
+
+But in check_wedge everything we access is protected by other means,
+so this is superflous. And because it now gets in the way (we add a
+new caller in __wait_seqno, which can be called without
+dev->struct_mutext) let's just remove it.
+
+v3: Group all the i915_gem_check_wedge refactoring into this patch, so
+that this patch here is all about not returning -EAGAIN to callsites
+that can't handle syscall restarting.
+
+v4: Add clarification what interuptible == fales means in our code,
+requested by Ben Widawsky.
+
+v5: Fix EAGAIN mispell noticed by Chris Wilson.
+
+Reviewed-by: Ben Widawsky <ben@bwidawsk.net>
+Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+Tested-by: Chris Wilson <chris@chris-wilson.co.uk>
+Signed-Off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/i915/i915_drv.h         |    2 ++
+ drivers/gpu/drm/i915/i915_gem.c         |   26 ++++++++++++++++++--------
+ drivers/gpu/drm/i915/intel_ringbuffer.c |    6 ++++--
+ 3 files changed, 24 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
+index d839e4c..6c3a0bb 100644
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1336,6 +1336,8 @@ i915_gem_object_unpin_fence(struct drm_i915_gem_object *obj)
+ 
+ void i915_gem_retire_requests(struct drm_device *dev);
+ void i915_gem_retire_requests_ring(struct intel_ring_buffer *ring);
++int __must_check i915_gem_check_wedge(struct drm_i915_private *dev_priv,
++				      bool interruptible);
+ 
+ void i915_gem_reset(struct drm_device *dev);
+ void i915_gem_clflush_object(struct drm_i915_gem_object *obj);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 6a98c06..af6a510 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -1863,11 +1863,10 @@ i915_gem_retire_work_handler(struct work_struct *work)
+ 	mutex_unlock(&dev->struct_mutex);
+ }
+ 
+-static int
+-i915_gem_check_wedge(struct drm_i915_private *dev_priv)
++int
++i915_gem_check_wedge(struct drm_i915_private *dev_priv,
++		     bool interruptible)
+ {
+-	BUG_ON(!mutex_is_locked(&dev_priv->dev->struct_mutex));
+-
+ 	if (atomic_read(&dev_priv->mm.wedged)) {
+ 		struct completion *x = &dev_priv->error_completion;
+ 		bool recovery_complete;
+@@ -1878,7 +1877,16 @@ i915_gem_check_wedge(struct drm_i915_private *dev_priv)
+ 		recovery_complete = x->done > 0;
+ 		spin_unlock_irqrestore(&x->wait.lock, flags);
+ 
+-		return recovery_complete ? -EIO : -EAGAIN;
++		/* Non-interruptible callers can't handle -EAGAIN, hence return
++		 * -EIO unconditionally for these. */
++		if (!interruptible)
++			return -EIO;
++
++		/* Recovery complete, but still wedged means reset failure. */
++		if (recovery_complete)
++			return -EIO;
++
++		return -EAGAIN;
+ 	}
+ 
+ 	return 0;
+@@ -1932,6 +1940,7 @@ static int __wait_seqno(struct intel_ring_buffer *ring, u32 seqno,
+ 	unsigned long timeout_jiffies;
+ 	long end;
+ 	bool wait_forever = true;
++	int ret;
+ 
+ 	if (i915_seqno_passed(ring->get_seqno(ring), seqno))
+ 		return 0;
+@@ -1963,8 +1972,9 @@ static int __wait_seqno(struct intel_ring_buffer *ring, u32 seqno,
+ 			end = wait_event_timeout(ring->irq_queue, EXIT_COND,
+ 						 timeout_jiffies);
+ 
+-		if (atomic_read(&dev_priv->mm.wedged))
+-			end = -EAGAIN;
++		ret = i915_gem_check_wedge(dev_priv, interruptible);
++		if (ret)
++			end = ret;
+ 	} while (end == 0 && wait_forever);
+ 
+ 	getrawmonotonic(&now);
+@@ -2004,7 +2014,7 @@ i915_wait_seqno(struct intel_ring_buffer *ring, uint32_t seqno)
+ 
+ 	BUG_ON(seqno == 0);
+ 
+-	ret = i915_gem_check_wedge(dev_priv);
++	ret = i915_gem_check_wedge(dev_priv, dev_priv->mm.interruptible);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index dce4d1a..cd35ad4 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -1228,8 +1228,10 @@ int intel_wait_ring_buffer(struct intel_ring_buffer *ring, int n)
+ 		}
+ 
+ 		msleep(1);
+-		if (atomic_read(&dev_priv->mm.wedged))
+-			return -EAGAIN;
++
++		ret = i915_gem_check_wedge(dev_priv, dev_priv->mm.interruptible);
++		if (ret)
++			return ret;
+ 	} while (!time_after(jiffies, end));
+ 	trace_i915_ring_wait_end(ring);
+ 	return -EBUSY;
+

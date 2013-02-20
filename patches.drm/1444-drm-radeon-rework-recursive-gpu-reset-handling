@@ -1,0 +1,188 @@
+From 6c6f478370eccfbfafbdc6fc55c0def03e58f124 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Christian=20K=C3=B6nig?= <deathsimple@vodafone.de>
+Date: Wed, 2 May 2012 15:11:19 +0200
+Subject: drm/radeon: rework recursive gpu reset handling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: 6c6f478370eccfbfafbdc6fc55c0def03e58f124
+Patch-mainline: v3.6-rc1
+
+Instead of all this humpy pumpy with recursive
+mutex (which also fixes only halve of the problem)
+move the actual gpu reset out of the fence code,
+return -EDEADLK and then reset the gpu in the
+calling ioctl function.
+
+v2: Split removal of radeon_mutex into separate patch.
+    Return -EAGAIN if reset is successful.
+
+Signed-off-by: Christian König <deathsimple@vodafone.de>
+Reviewed-by: Jerome Glisse <jglisse@redhat.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Acked-by: Michal Srb <msrb@suse.com>
+---
+ drivers/gpu/drm/radeon/radeon_cs.c     |   13 +++++++++++++
+ drivers/gpu/drm/radeon/radeon_device.c |    5 -----
+ drivers/gpu/drm/radeon/radeon_fence.c  |   10 +++-------
+ drivers/gpu/drm/radeon/radeon_gem.c    |   16 ++++++++++++++++
+ 4 files changed, 32 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/gpu/drm/radeon/radeon_cs.c b/drivers/gpu/drm/radeon/radeon_cs.c
+index 24fb001..02eee4b 100644
+--- a/drivers/gpu/drm/radeon/radeon_cs.c
++++ b/drivers/gpu/drm/radeon/radeon_cs.c
+@@ -496,6 +496,16 @@ out:
+ 	return r;
+ }
+ 
++static int radeon_cs_handle_lockup(struct radeon_device *rdev, int r)
++{
++	if (r == -EDEADLK) {
++		r = radeon_gpu_reset(rdev);
++		if (!r)
++			r = -EAGAIN;
++	}
++	return r;
++}
++
+ int radeon_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ {
+ 	struct radeon_device *rdev = dev->dev_private;
+@@ -517,6 +527,7 @@ int radeon_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 	if (r) {
+ 		DRM_ERROR("Failed to initialize parser !\n");
+ 		radeon_cs_parser_fini(&parser, r);
++		r = radeon_cs_handle_lockup(rdev, r);
+ 		radeon_mutex_unlock(&rdev->cs_mutex);
+ 		return r;
+ 	}
+@@ -525,6 +536,7 @@ int radeon_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		if (r != -ERESTARTSYS)
+ 			DRM_ERROR("Failed to parse relocation %d!\n", r);
+ 		radeon_cs_parser_fini(&parser, r);
++		r = radeon_cs_handle_lockup(rdev, r);
+ 		radeon_mutex_unlock(&rdev->cs_mutex);
+ 		return r;
+ 	}
+@@ -538,6 +550,7 @@ int radeon_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 	}
+ out:
+ 	radeon_cs_parser_fini(&parser, r);
++	r = radeon_cs_handle_lockup(rdev, r);
+ 	radeon_mutex_unlock(&rdev->cs_mutex);
+ 	return r;
+ }
+diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
+index 89be94b..d18f0c4 100644
+--- a/drivers/gpu/drm/radeon/radeon_device.c
++++ b/drivers/gpu/drm/radeon/radeon_device.c
+@@ -986,9 +986,6 @@ int radeon_gpu_reset(struct radeon_device *rdev)
+ 	int r;
+ 	int resched;
+ 
+-	/* Prevent CS ioctl from interfering */
+-	radeon_mutex_lock(&rdev->cs_mutex);
+-
+ 	radeon_save_bios_scratch_regs(rdev);
+ 	/* block TTM */
+ 	resched = ttm_bo_lock_delayed_workqueue(&rdev->mman.bdev);
+@@ -1003,8 +1000,6 @@ int radeon_gpu_reset(struct radeon_device *rdev)
+ 		ttm_bo_unlock_delayed_workqueue(&rdev->mman.bdev, resched);
+ 	}
+ 
+-	radeon_mutex_unlock(&rdev->cs_mutex);
+-
+ 	if (r) {
+ 		/* bad news, how to tell it to userspace ? */
+ 		dev_info(rdev->dev, "GPU reset failed\n");
+diff --git a/drivers/gpu/drm/radeon/radeon_fence.c b/drivers/gpu/drm/radeon/radeon_fence.c
+index aadd73a..5bb78bf 100644
+--- a/drivers/gpu/drm/radeon/radeon_fence.c
++++ b/drivers/gpu/drm/radeon/radeon_fence.c
+@@ -244,6 +244,8 @@ int radeon_fence_wait(struct radeon_fence *fence, bool intr)
+ 			/* change sequence value on all rings, so nobody else things there is a lockup */
+ 			for (i = 0; i < RADEON_NUM_RINGS; ++i)
+ 				rdev->fence_drv[i].last_seq -= 0x10000;
++
++			rdev->fence_drv[fence->ring].last_activity = jiffies;
+ 			write_unlock_irqrestore(&rdev->fence_lock, irq_flags);
+ 
+ 			if (radeon_ring_is_lockup(rdev, fence->ring, &rdev->ring[fence->ring])) {
+@@ -254,13 +256,7 @@ int radeon_fence_wait(struct radeon_fence *fence, bool intr)
+ 
+ 				/* mark the ring as not ready any more */
+ 				rdev->ring[fence->ring].ready = false;
+-				r = radeon_gpu_reset(rdev);
+-				if (r)
+-					return r;
+-
+-				write_lock_irqsave(&rdev->fence_lock, irq_flags);
+-				rdev->fence_drv[fence->ring].last_activity = jiffies;
+-				write_unlock_irqrestore(&rdev->fence_lock, irq_flags);
++				return -EDEADLK;
+ 			}
+ 		}
+ 	}
+diff --git a/drivers/gpu/drm/radeon/radeon_gem.c b/drivers/gpu/drm/radeon/radeon_gem.c
+index c7008b5..e15cb1f 100644
+--- a/drivers/gpu/drm/radeon/radeon_gem.c
++++ b/drivers/gpu/drm/radeon/radeon_gem.c
+@@ -154,6 +154,17 @@ void radeon_gem_object_close(struct drm_gem_object *obj,
+ 	radeon_bo_unreserve(rbo);
+ }
+ 
++static int radeon_gem_handle_lockup(struct radeon_device *rdev, int r)
++{
++	if (r == -EDEADLK) {
++		radeon_mutex_lock(&rdev->cs_mutex);
++		r = radeon_gpu_reset(rdev);
++		if (!r)
++			r = -EAGAIN;
++		radeon_mutex_unlock(&rdev->cs_mutex);
++	}
++	return r;
++}
+ 
+ /*
+  * GEM ioctls.
+@@ -210,12 +221,14 @@ int radeon_gem_create_ioctl(struct drm_device *dev, void *data,
+ 					args->initial_domain, false,
+ 					false, &gobj);
+ 	if (r) {
++		r = radeon_gem_handle_lockup(rdev, r);
+ 		return r;
+ 	}
+ 	r = drm_gem_handle_create(filp, gobj, &handle);
+ 	/* drop reference from allocate - handle holds it now */
+ 	drm_gem_object_unreference_unlocked(gobj);
+ 	if (r) {
++		r = radeon_gem_handle_lockup(rdev, r);
+ 		return r;
+ 	}
+ 	args->handle = handle;
+@@ -245,6 +258,7 @@ int radeon_gem_set_domain_ioctl(struct drm_device *dev, void *data,
+ 	r = radeon_gem_set_domain(gobj, args->read_domains, args->write_domain);
+ 
+ 	drm_gem_object_unreference_unlocked(gobj);
++	r = radeon_gem_handle_lockup(robj->rdev, r);
+ 	return r;
+ }
+ 
+@@ -301,6 +315,7 @@ int radeon_gem_busy_ioctl(struct drm_device *dev, void *data,
+ 		break;
+ 	}
+ 	drm_gem_object_unreference_unlocked(gobj);
++	r = radeon_gem_handle_lockup(robj->rdev, r);
+ 	return r;
+ }
+ 
+@@ -322,6 +337,7 @@ int radeon_gem_wait_idle_ioctl(struct drm_device *dev, void *data,
+ 	if (robj->rdev->asic->ioctl_wait_idle)
+ 		robj->rdev->asic->ioctl_wait_idle(robj->rdev, robj);
+ 	drm_gem_object_unreference_unlocked(gobj);
++	r = radeon_gem_handle_lockup(robj->rdev, r);
+ 	return r;
+ }
+ 
+
