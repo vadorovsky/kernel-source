@@ -27,56 +27,64 @@ This fixes at least one known DoS/softlockup of the backend domain.
 Signed-off-by: Ian Campbell <ian.campbell@citrix.com>
 Signed-off-by: Jan Beulich <jbeulich@suse.com>
 
+From http://xenbits.xen.org/hg/linux-2.6.18-xen.hg/rev/ff0befcaac09
+From: xen-devel@lists.xen.org
+Patch-mainline: n/a
+Subject: netback: fix shutting down the ring if it contains garbage
+
+Using rtnl_lock() in tasklet context is not permitted.
+
+This undoes the part of 1219:5108c6901b30 that split off
+xenvif_carrier_off() from netif_disconnect().
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+
 --- sle11sp2.orig/drivers/xen/netback/common.h	2012-01-03 00:00:00.000000000 +0100
-+++ sle11sp2/drivers/xen/netback/common.h	2013-01-24 12:10:07.000000000 +0100
-@@ -203,6 +203,9 @@ int netif_be_start_xmit(struct sk_buff *
- struct net_device_stats *netif_be_get_stats(struct net_device *dev);
- irqreturn_t netif_be_int(int irq, void *dev_id, struct pt_regs *regs);
++++ sle11sp2/drivers/xen/netback/common.h	2013-02-15 13:22:52.000000000 +0100
+@@ -77,6 +77,8 @@ typedef struct netif_st {
+ 	u8 can_queue:1;	/* can queue packets for receiver? */
+ 	u8 copying_receiver:1;	/* copy packets to receiver?       */
  
-+/* Prevent the device from generating any further traffic. */
-+void xenvif_carrier_off(netif_t *netif);
++	u8 busted:1;
 +
- static inline int netbk_can_queue(struct net_device *dev)
+ 	/* Allow netif_be_start_xmit() to peek ahead in the rx request ring. */
+ 	RING_IDX rx_req_cons_peek;
+ 
+@@ -194,7 +196,8 @@ int netif_map(struct backend_info *be, g
+ void netif_xenbus_init(void);
+ 
+ #define netif_schedulable(netif)				\
+-	(netif_running((netif)->dev) && netback_carrier_ok(netif))
++	(likely(!(netif)->busted) &&				\
++	 netif_running((netif)->dev) &&	netback_carrier_ok(netif))
+ 
+ void netif_schedule_work(netif_t *netif);
+ void netif_deschedule_work(netif_t *netif);
+--- sle11sp2.orig/drivers/xen/netback/interface.c	2013-02-18 09:50:59.000000000 +0100
++++ sle11sp2/drivers/xen/netback/interface.c	2013-02-15 13:22:52.000000000 +0100
+@@ -56,6 +56,10 @@ module_param_named(queue_length, netbk_q
+ 
+ static void __netif_up(netif_t *netif)
  {
- 	netif_t *netif = netdev_priv(dev);
---- sle11sp2.orig/drivers/xen/netback/interface.c	2013-01-24 12:06:04.000000000 +0100
-+++ sle11sp2/drivers/xen/netback/interface.c	2013-01-24 12:10:07.000000000 +0100
-@@ -347,19 +347,23 @@ err_rx:
- 	return err;
++	if (netif->busted) {
++		netif->busted = 0;
++		enable_irq(netif->irq);
++	}
+ 	enable_irq(netif->irq);
+ 	netif_schedule_work(netif);
  }
+--- sle11sp2.orig/drivers/xen/netback/netback.c	2013-02-18 09:50:59.000000000 +0100
++++ sle11sp2/drivers/xen/netback/netback.c	2013-02-15 13:22:52.000000000 +0100
+@@ -853,7 +853,7 @@ void netif_schedule_work(netif_t *netif)
+ 	RING_FINAL_CHECK_FOR_REQUESTS(&netif->tx, more_to_do);
+ #endif
  
-+void xenvif_carrier_off(netif_t *netif)
-+{
-+	rtnl_lock();
-+	netback_carrier_off(netif);
-+	netif_carrier_off(netif->dev); /* discard queued packets */
-+	if (netif_running(netif->dev))
-+		__netif_down(netif);
-+	rtnl_unlock();
-+	netif_put(netif);
-+}
-+
- void netif_disconnect(struct backend_info *be)
- {
- 	netif_t *netif = be->netif;
- 
--	if (netback_carrier_ok(netif)) {
--		rtnl_lock();
--		netback_carrier_off(netif);
--		netif_carrier_off(netif->dev); /* discard queued packets */
--		if (netif_running(netif->dev))
--			__netif_down(netif);
--		rtnl_unlock();
--		netif_put(netif);
--	}
-+	if (netback_carrier_ok(netif))
-+		xenvif_carrier_off(netif);
- 
- 	atomic_dec(&netif->refcnt);
- 	wait_event(netif->waiting_to_free, atomic_read(&netif->refcnt) == 0);
---- sle11sp2.orig/drivers/xen/netback/netback.c	2013-01-24 12:06:04.000000000 +0100
-+++ sle11sp2/drivers/xen/netback/netback.c	2013-01-24 12:10:07.000000000 +0100
-@@ -1028,6 +1028,14 @@ static void netbk_tx_err(netif_t *netif,
+-	if (more_to_do) {
++	if (more_to_do && likely(!netif->busted)) {
+ 		add_to_net_schedule_list_tail(netif);
+ 		maybe_schedule_tx_action();
+ 	}
+@@ -1028,6 +1028,16 @@ static void netbk_tx_err(netif_t *netif,
  	netif_put(netif);
  }
  
@@ -84,14 +92,16 @@ Signed-off-by: Jan Beulich <jbeulich@suse.com>
 +{
 +	printk(KERN_ERR "%s: fatal error; disabling device\n",
 +	       netif->dev->name);
-+	xenvif_carrier_off(netif);
++	netif->busted = 1;
++	disable_irq(netif->irq);
++	netif_deschedule_work(netif);
 +	netif_put(netif);
 +}
 +
  static int netbk_count_requests(netif_t *netif, netif_tx_request_t *first,
  				netif_tx_request_t *txp, int work_to_do)
  {
-@@ -1039,19 +1047,25 @@ static int netbk_count_requests(netif_t 
+@@ -1039,19 +1049,25 @@ static int netbk_count_requests(netif_t 
  
  	do {
  		if (frags >= work_to_do) {
@@ -120,7 +130,7 @@ Signed-off-by: Jan Beulich <jbeulich@suse.com>
  			return -frags;
  		}
  
-@@ -1059,8 +1073,9 @@ static int netbk_count_requests(netif_t 
+@@ -1059,8 +1075,9 @@ static int netbk_count_requests(netif_t 
  		frags++;
  
  		if (unlikely((txp->offset + txp->size) > PAGE_SIZE)) {
@@ -132,7 +142,7 @@ Signed-off-by: Jan Beulich <jbeulich@suse.com>
  			return -frags;
  		}
  	} while ((txp++)->flags & NETTXF_more_data);
-@@ -1203,7 +1218,9 @@ int netbk_get_extras(netif_t *netif, str
+@@ -1203,7 +1220,9 @@ int netbk_get_extras(netif_t *netif, str
  
  	do {
  		if (unlikely(work_to_do-- <= 0)) {
@@ -143,7 +153,7 @@ Signed-off-by: Jan Beulich <jbeulich@suse.com>
  			return -EBADR;
  		}
  
-@@ -1212,7 +1229,9 @@ int netbk_get_extras(netif_t *netif, str
+@@ -1212,7 +1231,9 @@ int netbk_get_extras(netif_t *netif, str
  		if (unlikely(!extra.type ||
  			     extra.type >= XEN_NETIF_EXTRA_TYPE_MAX)) {
  			netif->tx.req_cons = ++cons;
@@ -154,7 +164,7 @@ Signed-off-by: Jan Beulich <jbeulich@suse.com>
  			return -EINVAL;
  		}
  
-@@ -1223,16 +1242,21 @@ int netbk_get_extras(netif_t *netif, str
+@@ -1223,16 +1244,21 @@ int netbk_get_extras(netif_t *netif, str
  	return work_to_do;
  }
  
@@ -179,7 +189,7 @@ Signed-off-by: Jan Beulich <jbeulich@suse.com>
  		return -EINVAL;
  	}
  
-@@ -1267,9 +1291,25 @@ static void net_tx_action(unsigned long 
+@@ -1267,9 +1293,30 @@ static void net_tx_action(unsigned long 
  		!list_empty(&net_schedule_list)) {
  		/* Get a netif from the list with work to do. */
  		netif = poll_net_schedule_list();
@@ -192,6 +202,11 @@ Signed-off-by: Jan Beulich <jbeulich@suse.com>
  		if (!netif)
  			continue;
  
++		if (unlikely(netif->busted)) {
++			netif_put(netif);
++			continue;
++		}
++
 +		if (netif->tx.sring->req_prod - netif->tx.req_cons >
 +		    NET_TX_RING_SIZE) {
 +			printk(KERN_ERR "%s: Impossible number of requests. "
@@ -205,7 +220,7 @@ Signed-off-by: Jan Beulich <jbeulich@suse.com>
  		RING_FINAL_CHECK_FOR_REQUESTS(&netif->tx, work_to_do);
  		if (!work_to_do) {
  			netif_put(netif);
-@@ -1321,17 +1361,14 @@ static void net_tx_action(unsigned long 
+@@ -1321,17 +1368,14 @@ static void net_tx_action(unsigned long 
  			work_to_do = netbk_get_extras(netif, extras,
  						      work_to_do);
  			i = netif->tx.req_cons;
@@ -226,7 +241,7 @@ Signed-off-by: Jan Beulich <jbeulich@suse.com>
  		i += ret;
  
  		if (unlikely(txreq.size < ETH_HLEN)) {
-@@ -1342,10 +1379,10 @@ static void net_tx_action(unsigned long 
+@@ -1342,10 +1386,10 @@ static void net_tx_action(unsigned long 
  
  		/* No crossing a page as the payload mustn't fragment. */
  		if (unlikely((txreq.offset + txreq.size) > PAGE_SIZE)) {
@@ -241,7 +256,7 @@ Signed-off-by: Jan Beulich <jbeulich@suse.com>
  			continue;
  		}
  
-@@ -1370,9 +1407,9 @@ static void net_tx_action(unsigned long 
+@@ -1370,9 +1414,9 @@ static void net_tx_action(unsigned long 
  			struct netif_extra_info *gso;
  			gso = &extras[XEN_NETIF_EXTRA_TYPE_GSO - 1];
  
