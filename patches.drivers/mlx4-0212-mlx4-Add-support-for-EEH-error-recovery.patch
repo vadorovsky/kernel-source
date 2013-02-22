@@ -1,0 +1,224 @@
+From: Kleber Sacilotto de Souza <klebers@linux.vnet.ibm.com>
+Date: Fri, 20 Jul 2012 09:55:43 +0000
+Subject: mlx4: Add support for EEH error recovery
+Patch-mainline: v3.6-rc1
+Git-commit: 57dbf29a54bda5773f9ed1d00e3cc633294259da
+References: bnc#786036 FATE#314304
+
+Currently the mlx4 drivers don't have the necessary callbacks to
+implement EEH errors detection and recovery, so the PCI layer uses the
+probe and remove callbacks to try to recover the device after an error on
+the bus. However, these callbacks have race conditions with the internal
+catastrophic error recovery functions, which will also detect the error
+and this can cause the system to crash if both EEH and catas functions
+try to reset the device.
+
+This patch adds the necessary error recovery callbacks and makes sure
+that the internal catastrophic error functions will not try to reset the
+device in such scenarios. It also adds some calls to
+pci_channel_offline() to suppress reads/writes on the bus when the slot
+cannot accept I/O operations so we prevent unnecessary accesses to the
+bus and speed up the device removal.
+
+Signed-off-by: Kleber Sacilotto de Souza <klebers@linux.vnet.ibm.com>
+Acked-by: Shlomo Pongratz <shlomop@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx4/catas.c |   27 ++++++++++-----
+ drivers/net/ethernet/mellanox/mlx4/cmd.c   |   49 +++++++++++++++++++++++++++--
+ drivers/net/ethernet/mellanox/mlx4/main.c  |   30 +++++++++++++++++
+ 3 files changed, 94 insertions(+), 12 deletions(-)
+--- a/drivers/net/ethernet/mellanox/mlx4/catas.c
++++ b/drivers/net/ethernet/mellanox/mlx4/catas.c
+@@ -69,16 +69,21 @@ static void poll_catas(unsigned long dev
+ 	struct mlx4_priv *priv = mlx4_priv(dev);
+ 
+ 	if (readl(priv->catas_err.map)) {
+-		dump_err_buf(dev);
++		/* If the device is off-line, we cannot try to recover it */
++		if (pci_channel_offline(dev->pdev))
++			mod_timer(&priv->catas_err.timer,
++				  round_jiffies(jiffies + MLX4_CATAS_POLL_INTERVAL));
++		else {
++			dump_err_buf(dev);
++			mlx4_dispatch_event(dev, MLX4_DEV_EVENT_CATASTROPHIC_ERROR, 0);
++
++			if (internal_err_reset) {
++				spin_lock(&catas_lock);
++				list_add(&priv->catas_err.list, &catas_list);
++				spin_unlock(&catas_lock);
+ 
+-		mlx4_dispatch_event(dev, MLX4_DEV_EVENT_CATASTROPHIC_ERROR, 0);
+-
+-		if (internal_err_reset) {
+-			spin_lock(&catas_lock);
+-			list_add(&priv->catas_err.list, &catas_list);
+-			spin_unlock(&catas_lock);
+-
+-			queue_work(mlx4_wq, &catas_work);
++				queue_work(mlx4_wq, &catas_work);
++			}
+ 		}
+ 	} else
+ 		mod_timer(&priv->catas_err.timer,
+@@ -100,6 +105,10 @@ static void catas_reset(struct work_stru
+ 	list_for_each_entry_safe(priv, tmppriv, &tlist, catas_err.list) {
+ 		struct pci_dev *pdev = priv->dev.pdev;
+ 
++		/* If the device is off-line, we cannot reset it */
++		if (pci_channel_offline(pdev))
++			continue;
++
+ 		ret = mlx4_restart_one(priv->dev.pdev);
+ 		/* 'priv' now is not valid */
+ 		if (ret)
+--- a/drivers/net/ethernet/mellanox/mlx4/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+@@ -295,7 +295,12 @@ int mlx4_comm_cmd(struct mlx4_dev *dev,
+ 
+ static int cmd_pending(struct mlx4_dev *dev)
+ {
+-	u32 status = readl(mlx4_priv(dev)->cmd.hcr + HCR_STATUS_OFFSET);
++	u32 status;
++
++	if (pci_channel_offline(dev->pdev))
++		return -EIO;
++
++	status = readl(mlx4_priv(dev)->cmd.hcr + HCR_STATUS_OFFSET);
+ 
+ 	return (status & swab32(1 << HCR_GO_BIT)) ||
+ 		(mlx4_priv(dev)->cmd.toggle ==
+@@ -313,11 +318,29 @@ static int mlx4_cmd_post(struct mlx4_dev
+ 
+ 	mutex_lock(&cmd->hcr_mutex);
+ 
++	if (pci_channel_offline(dev->pdev)) {
++		/*
++		 * Device is going through error recovery
++		 * and cannot accept commands.
++		 */
++		ret = -EIO;
++		goto out;
++	}
++
+ 	end = jiffies;
+ 	if (event)
+ 		end += msecs_to_jiffies(GO_BIT_TIMEOUT_MSECS);
+ 
+ 	while (cmd_pending(dev)) {
++		if (pci_channel_offline(dev->pdev)) {
++			/*
++			 * Device is going through error recovery
++			 * and cannot accept commands.
++			 */
++			ret = -EIO;
++			goto out;
++		}
++
+ 		if (time_after_eq(jiffies, end)) {
+ 			mlx4_err(dev, "%s:cmd_pending failed\n", __func__);
+ 			goto out;
+@@ -430,14 +453,33 @@ static int mlx4_cmd_poll(struct mlx4_dev
+ 
+ 	down(&priv->cmd.poll_sem);
+ 
++	if (pci_channel_offline(dev->pdev)) {
++		/*
++		 * Device is going through error recovery
++		 * and cannot accept commands.
++		 */
++		err = -EIO;
++		goto out;
++	}
++
+ 	err = mlx4_cmd_post(dev, in_param, out_param ? *out_param : 0,
+ 			    in_modifier, op_modifier, op, CMD_POLL_TOKEN, 0);
+ 	if (err)
+ 		goto out;
+ 
+ 	end = msecs_to_jiffies(timeout) + jiffies;
+-	while (cmd_pending(dev) && time_before(jiffies, end))
++	while (cmd_pending(dev) && time_before(jiffies, end)) {
++		if (pci_channel_offline(dev->pdev)) {
++			/*
++			 * Device is going through error recovery
++			 * and cannot accept commands.
++			 */
++			err = -EIO;
++			goto out;
++		}
++
+ 		cond_resched();
++	}
+ 
+ 	if (cmd_pending(dev)) {
+ 		err = -ETIMEDOUT;
+@@ -531,6 +573,9 @@ int __mlx4_cmd(struct mlx4_dev *dev, u64
+ 	       int out_is_imm, u32 in_modifier, u8 op_modifier,
+ 	       u16 op, unsigned long timeout, int native)
+ {
++	if (pci_channel_offline(dev->pdev))
++		return -EIO;
++
+ 	if (!mlx4_is_mfunc(dev) || (native && mlx4_is_master(dev))) {
+ 		if (mlx4_priv(dev)->cmd.use_events)
+ 			return mlx4_cmd_wait(dev, in_param, out_param,
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@ -1857,6 +1857,9 @@ static int mlx4_get_ownership(struct mlx
+ 	void __iomem *owner;
+ 	u32 ret;
+ 
++	if (pci_channel_offline(dev->pdev))
++		return -EIO;
++
+ 	owner = ioremap(pci_resource_start(dev->pdev, 0) + MLX4_OWNER_BASE,
+ 			MLX4_OWNER_SIZE);
+ 	if (!owner) {
+@@ -1873,6 +1876,9 @@ static void mlx4_free_ownership(struct m
+ {
+ 	void __iomem *owner;
+ 
++	if (pci_channel_offline(dev->pdev))
++		return;
++
+ 	owner = ioremap(pci_resource_start(dev->pdev, 0) + MLX4_OWNER_BASE,
+ 			MLX4_OWNER_SIZE);
+ 	if (!owner) {
+@@ -2321,11 +2327,33 @@ static DEFINE_PCI_DEVICE_TABLE(mlx4_pci_
+ 
+ MODULE_DEVICE_TABLE(pci, mlx4_pci_table);
+ 
++static pci_ers_result_t mlx4_pci_err_detected(struct pci_dev *pdev,
++					      pci_channel_state_t state)
++{
++	mlx4_remove_one(pdev);
++
++	return state == pci_channel_io_perm_failure ?
++		PCI_ERS_RESULT_DISCONNECT : PCI_ERS_RESULT_NEED_RESET;
++}
++
++static pci_ers_result_t mlx4_pci_slot_reset(struct pci_dev *pdev)
++{
++	int ret = __mlx4_init_one(pdev, NULL);
++
++	return ret ? PCI_ERS_RESULT_DISCONNECT : PCI_ERS_RESULT_RECOVERED;
++}
++
++static struct pci_error_handlers mlx4_err_handler = {
++	.error_detected = mlx4_pci_err_detected,
++	.slot_reset     = mlx4_pci_slot_reset,
++};
++
+ static struct pci_driver mlx4_driver = {
+ 	.name		= DRV_NAME,
+ 	.id_table	= mlx4_pci_table,
+ 	.probe		= mlx4_init_one,
+-	.remove		= __devexit_p(mlx4_remove_one)
++	.remove		= __devexit_p(mlx4_remove_one),
++	.err_handler    = &mlx4_err_handler,
+ };
+ 
+ static int __init mlx4_verify_params(void)
