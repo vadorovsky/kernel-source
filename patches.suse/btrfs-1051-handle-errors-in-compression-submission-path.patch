@@ -1,0 +1,129 @@
+From: Josef Bacik <jbacik@fusionio.com>
+Date: Wed, 6 Feb 2013 16:49:15 -0500
+Patch-mainline: 3.8
+Git-commit: 3e04e7f10b68999e0d8321516ea19d9d5b044dee
+References: FATE#312888
+Subject: [PATCH] Btrfs: handle errors in compression submission path
+
+I noticed we would deadlock if we aborted a transaction while doing
+compressed io.  This is because we don't unlock our pages if something goes
+horribly wrong.  To fix this we need to make sure that we call
+extent_clear_unlock_delalloc in order to unlock all the pages.  If we have
+to cow in the async submission thread we need to make sure to unlock our
+locked_page as the cow error path will not unlock the locked page as it
+depends on the caller to unlock that page.  With this patch we no longer
+deadlock on the page lock when we have an aborted transaction.  Thanks,
+
+Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/inode.c |   38 ++++++++++++++++++++++++++++----------
+ 1 file changed, 28 insertions(+), 10 deletions(-)
+
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -607,7 +607,7 @@ static noinline int submit_compressed_ex
+ 	if (list_empty(&async_cow->extents))
+ 		return 0;
+ 
+-
++again:
+ 	while (!list_empty(&async_cow->extents)) {
+ 		async_extent = list_entry(async_cow->extents.next,
+ 					  struct async_extent, list);
+@@ -647,6 +647,8 @@ retry:
+ 						  async_extent->ram_size - 1,
+ 						  btrfs_get_extent,
+ 						  WB_SYNC_ALL);
++			else if (ret)
++				unlock_page(async_cow->locked_page);
+ 			kfree(async_extent);
+ 			cond_resched();
+ 			continue;
+@@ -671,6 +673,7 @@ retry:
+ 
+ 		if (ret) {
+ 			int i;
++
+ 			for (i = 0; i < async_extent->nr_pages; i++) {
+ 				WARN_ON(async_extent->pages[i]->mapping);
+ 				page_cache_release(async_extent->pages[i]);
+@@ -678,12 +681,10 @@ retry:
+ 			kfree(async_extent->pages);
+ 			async_extent->nr_pages = 0;
+ 			async_extent->pages = NULL;
+-			unlock_extent(io_tree, async_extent->start,
+-				      async_extent->start +
+-				      async_extent->ram_size - 1);
++
+ 			if (ret == -ENOSPC)
+ 				goto retry;
+-			goto out_free; /* JDM: Requeue? */
++			goto out_free;
+ 		}
+ 
+ 		/*
+@@ -695,7 +696,8 @@ retry:
+ 					async_extent->ram_size - 1, 0);
+ 
+ 		em = alloc_extent_map();
+-		BUG_ON(!em); /* -ENOMEM */
++		if (!em)
++			goto out_free_reserve;
+ 		em->start = async_extent->start;
+ 		em->len = async_extent->ram_size;
+ 		em->orig_start = em->start;
+@@ -727,6 +729,9 @@ retry:
+ 						async_extent->ram_size - 1, 0);
+ 		}
+ 
++		if (ret)
++			goto out_free_reserve;
++
+ 		ret = btrfs_add_ordered_extent_compress(inode,
+ 						async_extent->start,
+ 						ins.objectid,
+@@ -734,7 +739,8 @@ retry:
+ 						ins.offset,
+ 						BTRFS_ORDERED_COMPRESSED,
+ 						async_extent->compress_type);
+-		BUG_ON(ret); /* -ENOMEM */
++		if (ret)
++			goto out_free_reserve;
+ 
+ 		/*
+ 		 * clear dirty, set writeback and unlock the pages.
+@@ -755,18 +761,30 @@ retry:
+ 				    ins.objectid,
+ 				    ins.offset, async_extent->pages,
+ 				    async_extent->nr_pages);
+-
+-		BUG_ON(ret); /* -ENOMEM */
+ 		alloc_hint = ins.objectid + ins.offset;
+ 		kfree(async_extent);
++		if (ret)
++			goto out;
+ 		cond_resched();
+ 	}
+ 	ret = 0;
+ out:
+ 	return ret;
++out_free_reserve:
++	btrfs_free_reserved_extent(root, ins.objectid, ins.offset);
+ out_free:
++	extent_clear_unlock_delalloc(inode, &BTRFS_I(inode)->io_tree,
++				     async_extent->start,
++				     async_extent->start +
++				     async_extent->ram_size - 1,
++				     NULL, EXTENT_CLEAR_UNLOCK_PAGE |
++				     EXTENT_CLEAR_UNLOCK |
++				     EXTENT_CLEAR_DELALLOC |
++				     EXTENT_CLEAR_DIRTY |
++				     EXTENT_SET_WRITEBACK |
++				     EXTENT_END_WRITEBACK);
+ 	kfree(async_extent);
+-	goto out;
++	goto again;
+ }
+ 
+ static u64 get_extent_allocation_hint(struct inode *inode, u64 start,

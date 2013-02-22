@@ -1,0 +1,198 @@
+From: Miao Xie <miaox@cn.fujitsu.com>
+Date: Wed, 19 Dec 2012 06:59:51 +0000
+Patch-mainline: 3.8
+Git-commit: 0e8c36a9fd8169a8b96c2ddc8446894bcd07b6b1
+References: FATE#312888
+Subject: [PATCH] Btrfs: fix lots of orphan inodes when the space is not
+ enough
+
+We're running into having 50-100 orphans left over with xfstests 83
+because of ENOSPC when trying to start the transaction for the inode update.
+But in fact, it makes no sense in updating the inode for the new size while
+we're deleting the stupid thing. This patch fixes this problem.
+
+Reported-by: Josef Bacik <jbacik@fusionio.com>
+Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/delayed-inode.c |   90 ++++++++++++++++++++++++++++++++++++++++-------
+ fs/btrfs/delayed-inode.h |    1 
+ fs/btrfs/inode.c         |   11 +++--
+ 3 files changed, 85 insertions(+), 17 deletions(-)
+
+--- a/fs/btrfs/delayed-inode.c
++++ b/fs/btrfs/delayed-inode.c
+@@ -1065,32 +1065,25 @@ static void btrfs_release_delayed_inode(
+ 	}
+ }
+ 
+-static int btrfs_update_delayed_inode(struct btrfs_trans_handle *trans,
+-				      struct btrfs_root *root,
+-				      struct btrfs_path *path,
+-				      struct btrfs_delayed_node *node)
++static int __btrfs_update_delayed_inode(struct btrfs_trans_handle *trans,
++					struct btrfs_root *root,
++					struct btrfs_path *path,
++					struct btrfs_delayed_node *node)
+ {
+ 	struct btrfs_key key;
+ 	struct btrfs_inode_item *inode_item;
+ 	struct extent_buffer *leaf;
+ 	int ret;
+ 
+-	mutex_lock(&node->mutex);
+-	if (!node->inode_dirty) {
+-		mutex_unlock(&node->mutex);
+-		return 0;
+-	}
+-
+ 	key.objectid = node->inode_id;
+ 	btrfs_set_key_type(&key, BTRFS_INODE_ITEM_KEY);
+ 	key.offset = 0;
++
+ 	ret = btrfs_lookup_inode(trans, root, path, &key, 1);
+ 	if (ret > 0) {
+ 		btrfs_release_path(path);
+-		mutex_unlock(&node->mutex);
+ 		return -ENOENT;
+ 	} else if (ret < 0) {
+-		mutex_unlock(&node->mutex);
+ 		return ret;
+ 	}
+ 
+@@ -1105,11 +1098,28 @@ static int btrfs_update_delayed_inode(st
+ 
+ 	btrfs_delayed_inode_release_metadata(root, node);
+ 	btrfs_release_delayed_inode(node);
+-	mutex_unlock(&node->mutex);
+ 
+ 	return 0;
+ }
+ 
++static inline int btrfs_update_delayed_inode(struct btrfs_trans_handle *trans,
++					     struct btrfs_root *root,
++					     struct btrfs_path *path,
++					     struct btrfs_delayed_node *node)
++{
++	int ret;
++
++	mutex_lock(&node->mutex);
++	if (!node->inode_dirty) {
++		mutex_unlock(&node->mutex);
++		return 0;
++	}
++
++	ret = __btrfs_update_delayed_inode(trans, root, path, node);
++	mutex_unlock(&node->mutex);
++	return ret;
++}
++
+ static inline int
+ __btrfs_commit_inode_delayed_items(struct btrfs_trans_handle *trans,
+ 				   struct btrfs_path *path,
+@@ -1229,6 +1239,60 @@ int btrfs_commit_inode_delayed_items(str
+ 
+ 	return ret;
+ }
++
++int btrfs_commit_inode_delayed_inode(struct inode *inode)
++{
++	struct btrfs_trans_handle *trans;
++	struct btrfs_delayed_node *delayed_node = btrfs_get_delayed_node(inode);
++	struct btrfs_path *path;
++	struct btrfs_block_rsv *block_rsv;
++	int ret;
++
++	if (!delayed_node)
++		return 0;
++
++	mutex_lock(&delayed_node->mutex);
++	if (!delayed_node->inode_dirty) {
++		mutex_unlock(&delayed_node->mutex);
++		btrfs_release_delayed_node(delayed_node);
++		return 0;
++	}
++	mutex_unlock(&delayed_node->mutex);
++
++	trans = btrfs_join_transaction(delayed_node->root);
++	if (IS_ERR(trans)) {
++		ret = PTR_ERR(trans);
++		goto out;
++	}
++
++	path = btrfs_alloc_path();
++	if (!path) {
++		ret = -ENOMEM;
++		goto trans_out;
++	}
++	path->leave_spinning = 1;
++
++	block_rsv = trans->block_rsv;
++	trans->block_rsv = &delayed_node->root->fs_info->delayed_block_rsv;
++
++	mutex_lock(&delayed_node->mutex);
++	if (delayed_node->inode_dirty)
++		ret = __btrfs_update_delayed_inode(trans, delayed_node->root,
++						   path, delayed_node);
++	else
++		ret = 0;
++	mutex_unlock(&delayed_node->mutex);
++
++	btrfs_free_path(path);
++	trans->block_rsv = block_rsv;
++trans_out:
++	btrfs_end_transaction(trans, delayed_node->root);
++	btrfs_btree_balance_dirty(delayed_node->root);
++out:
++	btrfs_release_delayed_node(delayed_node);
++
++	return ret;
++}
+ 
+ void btrfs_remove_delayed_node(struct inode *inode)
+ {
+--- a/fs/btrfs/delayed-inode.h
++++ b/fs/btrfs/delayed-inode.h
+@@ -117,6 +117,7 @@ int btrfs_commit_inode_delayed_items(str
+ /* Used for evicting the inode. */
+ void btrfs_remove_delayed_node(struct inode *inode);
+ void btrfs_kill_delayed_inode_items(struct inode *inode);
++int btrfs_commit_inode_delayed_inode(struct inode *inode);
+ 
+ 
+ int btrfs_delayed_update_inode(struct btrfs_trans_handle *trans,
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -3903,6 +3903,12 @@ void btrfs_evict_inode(struct inode *ino
+ 		goto no_delete;
+ 	}
+ 
++	ret = btrfs_commit_inode_delayed_inode(inode);
++	if (ret) {
++		btrfs_orphan_del(NULL, inode);
++		goto no_delete;
++	}
++
+ 	rsv = btrfs_alloc_block_rsv(root, BTRFS_BLOCK_RSV_TEMP);
+ 	if (!rsv) {
+ 		btrfs_orphan_del(NULL, inode);
+@@ -3940,7 +3946,7 @@ void btrfs_evict_inode(struct inode *ino
+ 			goto no_delete;
+ 		}
+ 
+-		trans = btrfs_start_transaction_lflush(root, 1);
++		trans = btrfs_join_transaction(root);
+ 		if (IS_ERR(trans)) {
+ 			btrfs_orphan_del(NULL, inode);
+ 			btrfs_free_block_rsv(root, rsv);
+@@ -3954,9 +3960,6 @@ void btrfs_evict_inode(struct inode *ino
+ 			break;
+ 
+ 		trans->block_rsv = &root->fs_info->trans_block_rsv;
+-		ret = btrfs_update_inode(trans, root, inode);
+-		BUG_ON(ret);
+-
+ 		btrfs_end_transaction(trans, root);
+ 		trans = NULL;
+ 		btrfs_btree_balance_dirty(root);

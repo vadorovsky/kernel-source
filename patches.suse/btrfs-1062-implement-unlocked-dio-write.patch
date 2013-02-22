@@ -1,0 +1,120 @@
+From: Miao Xie <miaox@cn.fujitsu.com>
+Date: Fri, 8 Feb 2013 07:04:11 +0000
+Patch-mainline: 3.8
+Git-commit: 38851cc19adbfa1def2b47106d8050a80e0a3673
+References: FATE#312888
+Subject: [PATCH] Btrfs: implement unlocked dio write
+
+This idea is from ext4. By this patch, we can make the dio write parallel,
+and improve the performance. But because we can not update isize without
+i_mutex, the unlocked dio write just can be done in front of the EOF.
+
+We needn't worry about the race between dio write and truncate, because the
+truncate need wait untill all the dio write end.
+
+And we also needn't worry about the race between dio write and punch hole,
+because we have extent lock to protect our operation.
+
+I ran fio to test the performance of this feature.
+
+== Hardware ==
+CPU: Intel(R) Core(TM)2 Duo CPU     E7500  @ 2.93GHz
+Mem: 2GB
+SSD: Intel X25-M 120GB (Test Partition: 60GB)
+
+== config file ==
+[global]
+ioengine=psync
+direct=1
+bs=4k
+size=32G
+runtime=60
+directory=/mnt/btrfs/
+filename=testfile
+group_reporting
+thread
+
+[file1]
+numjobs=1 # 2 4
+rw=randwrite
+
+== result (KBps) ==
+write	1	2	4
+lock	24936	24738	24726
+nolock	24962	30866	32101
+
+== result (iops) ==
+write	1	2	4
+lock	6234	6184	6181
+nolock	6240	7716	8025
+
+Signed-off-by: Miao Xie <miaox@cn.fujitsu.com>
+Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/inode.c |   35 +++++++++++++++++++++++------------
+ 1 file changed, 23 insertions(+), 12 deletions(-)
+
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -6684,28 +6684,36 @@ static ssize_t btrfs_direct_IO(int rw, s
+ 	struct inode *inode = file->f_mapping->host;
+ 	size_t count = 0;
+ 	int flags = 0;
+-	bool wakeup = false;
++	bool wakeup = true;
++	bool relock = false;
+ 	ssize_t ret;
+ 
+ 	if (check_direct_IO(BTRFS_I(inode)->root, rw, iocb, iov,
+ 			    offset, nr_segs))
+ 		return 0;
+ 
++	atomic_inc(&inode->i_dio_count);
++	smp_mb__after_atomic_inc();
++
+ 	if (rw & WRITE) {
+ 		count = iov_length(iov, nr_segs);
++		/*
++		 * If the write DIO is beyond the EOF, we need update
++		 * the isize, but it is protected by i_mutex. So we can
++		 * not unlock the i_mutex at this case.
++		 */
++		if (offset + count <= inode->i_size) {
++			mutex_unlock(&inode->i_mutex);
++			relock = true;
++		}
+ 		ret = btrfs_delalloc_reserve_space(inode, count);
+ 		if (ret)
+-			return ret;
+-	} else {
+-		atomic_inc(&inode->i_dio_count);
+-		smp_mb__after_atomic_inc();
+-		if (unlikely(test_bit(BTRFS_INODE_READDIO_NEED_LOCK,
+-				      &BTRFS_I(inode)->runtime_flags))) {
+-			inode_dio_done(inode);
+-			flags = DIO_LOCKING | DIO_SKIP_HOLES;
+-		} else {
+-			wakeup = true;
+-		}
++			goto out;
++	} else if (unlikely(test_bit(BTRFS_INODE_READDIO_NEED_LOCK,
++				     &BTRFS_I(inode)->runtime_flags))) {
++		inode_dio_done(inode);
++		flags = DIO_LOCKING | DIO_SKIP_HOLES;
++		wakeup = false;
+ 	}
+ 
+ 	ret = __blockdev_direct_IO(rw, iocb, inode,
+@@ -6724,8 +6732,11 @@ static ssize_t btrfs_direct_IO(int rw, s
+ 		}
+ 		btrfs_delalloc_release_metadata(inode, 0);
+ 	}
++out:
+ 	if (wakeup)
+ 		inode_dio_done(inode);
++	if (relock)
++		mutex_lock(&inode->i_mutex);
+ 
+ 	return ret;
+ }
