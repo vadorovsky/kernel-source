@@ -1,0 +1,245 @@
+From: Or Gerlitz <ogerlitz@mellanox.com>
+Date: Wed, 11 Jan 2012 19:02:17 +0200
+Subject: mlx4_core: Allow dynamic MTU configuration for IB ports
+Patch-mainline: v3.4-rc1
+Git-commit: 096335b3f9830b90d13aee77252cf6f5f12a258c
+References: bnc#786036 FATE#314304
+
+Set the MTU for IB ports in the driver instead of using the firmware
+default of 2KB (the driver defaults to 4KB).  Allow for dynamic mtu
+configuration through a new, per-port sysfs entry.
+
+Since there's a dependency between the port MTU and the max number of
+HW VLs the port can support, apply a mim/max approach, using a loop
+that goes down from the highest possible number of VLs to the lowest,
+using the firmware return status to know whether the requested number
+of VLs is possible with a given MTU.
+
+For now, as with the dynamic link type change / VPI support, the sysfs
+entry to change the mtu is exposed only when NOT running in SR-IOV
+mode.  To allow changing the MTU for the master in SR-IOV mode,
+primary-function-initiated FLR (Function Level Reset) needs to be
+implemented.
+
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx4/main.c |  117 +++++++++++++++++++++++++++++-
+ drivers/net/ethernet/mellanox/mlx4/mlx4.h |    2 
+ drivers/net/ethernet/mellanox/mlx4/port.c |   25 +++++-
+ include/linux/mlx4/device.h               |    1 
+ 4 files changed, 141 insertions(+), 4 deletions(-)
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@ -696,6 +696,99 @@ out:
+ 	return err ? err : count;
+ }
+ 
++enum ibta_mtu {
++	IB_MTU_256  = 1,
++	IB_MTU_512  = 2,
++	IB_MTU_1024 = 3,
++	IB_MTU_2048 = 4,
++	IB_MTU_4096 = 5
++};
++
++static inline int int_to_ibta_mtu(int mtu)
++{
++	switch (mtu) {
++	case 256:  return IB_MTU_256;
++	case 512:  return IB_MTU_512;
++	case 1024: return IB_MTU_1024;
++	case 2048: return IB_MTU_2048;
++	case 4096: return IB_MTU_4096;
++	default: return -1;
++	}
++}
++
++static inline int ibta_mtu_to_int(enum ibta_mtu mtu)
++{
++	switch (mtu) {
++	case IB_MTU_256:  return  256;
++	case IB_MTU_512:  return  512;
++	case IB_MTU_1024: return 1024;
++	case IB_MTU_2048: return 2048;
++	case IB_MTU_4096: return 4096;
++	default: return -1;
++	}
++}
++
++static ssize_t show_port_ib_mtu(struct device *dev,
++			     struct device_attribute *attr,
++			     char *buf)
++{
++	struct mlx4_port_info *info = container_of(attr, struct mlx4_port_info,
++						   port_mtu_attr);
++	struct mlx4_dev *mdev = info->dev;
++
++	if (mdev->caps.port_type[info->port] == MLX4_PORT_TYPE_ETH)
++		mlx4_warn(mdev, "port level mtu is only used for IB ports\n");
++
++	sprintf(buf, "%d\n",
++			ibta_mtu_to_int(mdev->caps.port_ib_mtu[info->port]));
++	return strlen(buf);
++}
++
++static ssize_t set_port_ib_mtu(struct device *dev,
++			     struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct mlx4_port_info *info = container_of(attr, struct mlx4_port_info,
++						   port_mtu_attr);
++	struct mlx4_dev *mdev = info->dev;
++	struct mlx4_priv *priv = mlx4_priv(mdev);
++	int err, port, mtu, ibta_mtu = -1;
++
++	if (mdev->caps.port_type[info->port] == MLX4_PORT_TYPE_ETH) {
++		mlx4_warn(mdev, "port level mtu is only used for IB ports\n");
++		return -EINVAL;
++	}
++
++	err = sscanf(buf, "%d", &mtu);
++	if (err > 0)
++		ibta_mtu = int_to_ibta_mtu(mtu);
++
++	if (err <= 0 || ibta_mtu < 0) {
++		mlx4_err(mdev, "%s is invalid IBTA mtu\n", buf);
++		return -EINVAL;
++	}
++
++	mdev->caps.port_ib_mtu[info->port] = ibta_mtu;
++
++	mlx4_stop_sense(mdev);
++	mutex_lock(&priv->port_mutex);
++	mlx4_unregister_device(mdev);
++	for (port = 1; port <= mdev->caps.num_ports; port++) {
++		mlx4_CLOSE_PORT(mdev, port);
++		err = mlx4_SET_PORT(mdev, port);
++		if (err) {
++			mlx4_err(mdev, "Failed to set port %d, "
++				      "aborting\n", port);
++			goto err_set_port;
++		}
++	}
++	err = mlx4_register_device(mdev);
++err_set_port:
++	mutex_unlock(&priv->port_mutex);
++	mlx4_start_sense(mdev);
++	return err ? err : count;
++}
++
+ static int mlx4_load_fw(struct mlx4_dev *dev)
+ {
+ 	struct mlx4_priv *priv = mlx4_priv(dev);
+@@ -1415,7 +1508,10 @@ static int mlx4_setup_hca(struct mlx4_de
+ 					  "ib capabilities (%d). Continuing "
+ 					  "with caps = 0\n", port, err);
+ 			dev->caps.ib_port_def_cap[port] = ib_port_default_caps;
+-
++			if (mlx4_is_mfunc(dev))
++				dev->caps.port_ib_mtu[port] = IB_MTU_2048;
++			else
++				dev->caps.port_ib_mtu[port] = IB_MTU_4096;
+ 			err = mlx4_check_ext_port_caps(dev, port);
+ 			if (err)
+ 				mlx4_warn(dev, "failed to get port %d extended "
+@@ -1577,6 +1673,24 @@ static int mlx4_init_port_info(struct ml
+ 		info->port = -1;
+ 	}
+ 
++	sprintf(info->dev_mtu_name, "mlx4_port%d_mtu", port);
++	info->port_mtu_attr.attr.name = info->dev_mtu_name;
++	if (mlx4_is_mfunc(dev))
++		info->port_mtu_attr.attr.mode = S_IRUGO;
++	else {
++		info->port_mtu_attr.attr.mode = S_IRUGO | S_IWUSR;
++		info->port_mtu_attr.store     = set_port_ib_mtu;
++	}
++	info->port_mtu_attr.show      = show_port_ib_mtu;
++	sysfs_attr_init(&info->port_mtu_attr.attr);
++
++	err = device_create_file(&dev->pdev->dev, &info->port_mtu_attr);
++	if (err) {
++		mlx4_err(dev, "Failed to create mtu file for port %d\n", port);
++		device_remove_file(&info->dev->pdev->dev, &info->port_attr);
++		info->port = -1;
++	}
++
+ 	return err;
+ }
+ 
+@@ -1586,6 +1700,7 @@ static void mlx4_cleanup_port_info(struc
+ 		return;
+ 
+ 	device_remove_file(&info->dev->pdev->dev, &info->port_attr);
++	device_remove_file(&info->dev->pdev->dev, &info->port_mtu_attr);
+ }
+ 
+ static int mlx4_init_steering(struct mlx4_dev *dev)
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+@@ -681,6 +681,8 @@ struct mlx4_port_info {
+ 	char			dev_name[16];
+ 	struct device_attribute port_attr;
+ 	enum mlx4_port_type	tmp_type;
++	char			dev_mtu_name[16];
++	struct device_attribute port_mtu_attr;
+ 	struct mlx4_mac_table	mac_table;
+ 	struct radix_tree_root	mac_tree;
+ 	struct mlx4_vlan_table	vlan_table;
+--- a/drivers/net/ethernet/mellanox/mlx4/port.c
++++ b/drivers/net/ethernet/mellanox/mlx4/port.c
+@@ -763,10 +763,18 @@ int mlx4_SET_PORT_wrapper(struct mlx4_de
+ 				    vhcr->op_modifier, inbox);
+ }
+ 
++/* bit locations for set port command with zero op modifier */
++enum {
++	MLX4_SET_PORT_VL_CAP	 = 4, /* bits 7:4 */
++	MLX4_SET_PORT_MTU_CAP	 = 12, /* bits 15:12 */
++	MLX4_CHANGE_PORT_VL_CAP	 = 21,
++	MLX4_CHANGE_PORT_MTU_CAP = 22,
++};
++
+ int mlx4_SET_PORT(struct mlx4_dev *dev, u8 port)
+ {
+ 	struct mlx4_cmd_mailbox *mailbox;
+-	int err;
++	int err, vl_cap;
+ 
+ 	if (dev->caps.port_type[port] == MLX4_PORT_TYPE_ETH)
+ 		return 0;
+@@ -778,8 +786,19 @@ int mlx4_SET_PORT(struct mlx4_dev *dev,
+ 	memset(mailbox->buf, 0, 256);
+ 
+ 	((__be32 *) mailbox->buf)[1] = dev->caps.ib_port_def_cap[port];
+-	err = mlx4_cmd(dev, mailbox->dma, port, 0, MLX4_CMD_SET_PORT,
+-		       MLX4_CMD_TIME_CLASS_B, MLX4_CMD_WRAPPED);
++
++	/* IB VL CAP enum isn't used by the firmware, just numerical values */
++	for (vl_cap = 8; vl_cap >= 1; vl_cap >>= 1) {
++		((__be32 *) mailbox->buf)[0] = cpu_to_be32(
++			(1 << MLX4_CHANGE_PORT_MTU_CAP) |
++			(1 << MLX4_CHANGE_PORT_VL_CAP)  |
++			(dev->caps.port_ib_mtu[port] << MLX4_SET_PORT_MTU_CAP) |
++			(vl_cap << MLX4_SET_PORT_VL_CAP));
++		err = mlx4_cmd(dev, mailbox->dma, port, 0, MLX4_CMD_SET_PORT,
++				MLX4_CMD_TIME_CLASS_B, MLX4_CMD_WRAPPED);
++		if (err != -ENOMEM)
++			break;
++	}
+ 
+ 	mlx4_free_cmd_mailbox(dev, mailbox);
+ 	return err;
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@ -310,6 +310,7 @@ struct mlx4_caps {
+ 	enum mlx4_port_type	possible_type[MLX4_MAX_PORTS + 1];
+ 	u32			max_counters;
+ 	u8			ext_port_cap[MLX4_MAX_PORTS + 1];
++	u8			port_ib_mtu[MLX4_MAX_PORTS + 1];
+ };
+ 
+ struct mlx4_buf_list {
