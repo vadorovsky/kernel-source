@@ -1,0 +1,606 @@
+From: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Date: Fri, 3 Aug 2012 08:40:43 +0000
+Subject: mlx4: Implement QP paravirtualization and maintain phys_pkey_cache
+ for smp_snoop
+Patch-mainline: v3.7-rc1
+Git-commit: 54679e148287f0ca1bdd09264c908bacb9f19b3f
+References: bnc#786036 FATE#314304
+
+This requires:
+
+1. Replacing the paravirtualized P_Key index (inserted by the guest)
+   with the real P_Key index.
+
+2. For UD QPs, placing the guest's true source GID index in the
+   address path structure mgid field, and setting the ud_force_mgid
+   bit so that the mgid is taken from the QP context and not from the
+   WQE when posting sends.
+
+3. For UC and RC QPs, placing the guest's true source GID index in the
+   address path structure mgid field.
+
+4. For tunnel and proxy QPs, setting the Q_Key value reserved for that
+   proxy/tunnel pair.
+
+Since not all the above adjustments occur in all the QP transitions,
+the QP transitions require separate wrapper functions.
+
+Secondly, initialize the P_Key virtualization table to its default
+values: Master virtualized table is 1-1 with the real P_Key table,
+guest virtualized table has P_Key index 0 mapped to the real P_Key
+index 0, and all the other P_Key indices mapped to the reserved
+(invalid) P_Key at index 127.
+
+Finally, add logic in smp_snoop for maintaining the phys_P_Key_cache.
+and generating events on the master only if a P_Key actually changed.
+
+Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/infiniband/hw/mlx4/mad.c                      |   33 ++
+ drivers/infiniband/hw/mlx4/main.c                     |   35 ++
+ drivers/net/ethernet/mellanox/mlx4/cmd.c              |   12 
+ drivers/net/ethernet/mellanox/mlx4/main.c             |   11 
+ drivers/net/ethernet/mellanox/mlx4/mlx4.h             |   47 +++
+ drivers/net/ethernet/mellanox/mlx4/resource_tracker.c |  217 +++++++++++++++++-
+ include/linux/mlx4/device.h                           |    3 
+ 7 files changed, 344 insertions(+), 14 deletions(-)
+--- a/drivers/infiniband/hw/mlx4/mad.c
++++ b/drivers/infiniband/hw/mlx4/mad.c
+@@ -184,6 +184,10 @@ static void smp_snoop(struct ib_device *
+ {
+ 	struct ib_port_info *pinfo;
+ 	u16 lid;
++	__be16 *base;
++	u32 bn, pkey_change_bitmap;
++	int i;
++
+ 
+ 	struct mlx4_ib_dev *dev = to_mdev(ibdev);
+ 	if ((mad->mad_hdr.mgmt_class == IB_MGMT_CLASS_SUBN_LID_ROUTED ||
+@@ -208,8 +212,33 @@ static void smp_snoop(struct ib_device *
+ 			break;
+ 
+ 		case IB_SMP_ATTR_PKEY_TABLE:
+-			mlx4_ib_dispatch_event(dev, port_num,
+-					       IB_EVENT_PKEY_CHANGE);
++			if (!mlx4_is_mfunc(dev->dev)) {
++				mlx4_ib_dispatch_event(dev, port_num,
++						       IB_EVENT_PKEY_CHANGE);
++				break;
++			}
++
++			bn  = be32_to_cpu(((struct ib_smp *)mad)->attr_mod) & 0xFFFF;
++			base = (__be16 *) &(((struct ib_smp *)mad)->data[0]);
++			pkey_change_bitmap = 0;
++			for (i = 0; i < 32; i++) {
++				pr_debug("PKEY[%d] = x%x\n",
++					 i + bn*32, be16_to_cpu(base[i]));
++				if (be16_to_cpu(base[i]) !=
++				    dev->pkeys.phys_pkey_cache[port_num - 1][i + bn*32]) {
++					pkey_change_bitmap |= (1 << i);
++					dev->pkeys.phys_pkey_cache[port_num - 1][i + bn*32] =
++						be16_to_cpu(base[i]);
++				}
++			}
++			pr_debug("PKEY Change event: port=%d, "
++				 "block=0x%x, change_bitmap=0x%x\n",
++				 port_num, bn, pkey_change_bitmap);
++
++			if (pkey_change_bitmap)
++				mlx4_ib_dispatch_event(dev, port_num,
++						       IB_EVENT_PKEY_CHANGE);
++
+ 			break;
+ 
+ 		case IB_SMP_ATTR_GUID_INFO:
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -1144,6 +1144,38 @@ static int mlx4_ib_netdev_event(struct n
+ 	return NOTIFY_DONE;
+ }
+ 
++static void init_pkeys(struct mlx4_ib_dev *ibdev)
++{
++	int port;
++	int slave;
++	int i;
++
++	if (mlx4_is_master(ibdev->dev)) {
++		for (slave = 0; slave <= ibdev->dev->num_vfs; ++slave) {
++			for (port = 1; port <= ibdev->dev->caps.num_ports; ++port) {
++				for (i = 0;
++				     i < ibdev->dev->phys_caps.pkey_phys_table_len[port];
++				     ++i) {
++					ibdev->pkeys.virt2phys_pkey[slave][port - 1][i] =
++					/* master has the identity virt2phys pkey mapping */
++						(slave == mlx4_master_func_num(ibdev->dev) || !i) ? i :
++							ibdev->dev->phys_caps.pkey_phys_table_len[port] - 1;
++					mlx4_sync_pkey_table(ibdev->dev, slave, port, i,
++							     ibdev->pkeys.virt2phys_pkey[slave][port - 1][i]);
++				}
++			}
++		}
++		/* initialize pkey cache */
++		for (port = 1; port <= ibdev->dev->caps.num_ports; ++port) {
++			for (i = 0;
++			     i < ibdev->dev->phys_caps.pkey_phys_table_len[port];
++			     ++i)
++				ibdev->pkeys.phys_pkey_cache[port-1][i] =
++					(i) ? 0 : 0xFFFF;
++		}
++	}
++}
++
+ static void mlx4_ib_alloc_eqs(struct mlx4_dev *dev, struct mlx4_ib_dev *ibdev)
+ {
+ 	char name[32];
+@@ -1408,6 +1440,9 @@ static void *mlx4_ib_add(struct mlx4_dev
+ 
+ 	ibdev->ib_active = true;
+ 
++	if (mlx4_is_mfunc(ibdev->dev))
++		init_pkeys(ibdev);
++
+ 	return ibdev;
+ 
+ err_notif:
+--- a/drivers/net/ethernet/mellanox/mlx4/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+@@ -949,7 +949,7 @@ static struct mlx4_cmd_info cmd_info[] =
+ 		.out_is_imm = false,
+ 		.encode_slave_id = false,
+ 		.verify = NULL,
+-		.wrapper = mlx4_GEN_QP_wrapper
++		.wrapper = mlx4_INIT2INIT_QP_wrapper
+ 	},
+ 	{
+ 		.opcode = MLX4_CMD_INIT2RTR_QP,
+@@ -967,7 +967,7 @@ static struct mlx4_cmd_info cmd_info[] =
+ 		.out_is_imm = false,
+ 		.encode_slave_id = false,
+ 		.verify = NULL,
+-		.wrapper = mlx4_GEN_QP_wrapper
++		.wrapper = mlx4_RTR2RTS_QP_wrapper
+ 	},
+ 	{
+ 		.opcode = MLX4_CMD_RTS2RTS_QP,
+@@ -976,7 +976,7 @@ static struct mlx4_cmd_info cmd_info[] =
+ 		.out_is_imm = false,
+ 		.encode_slave_id = false,
+ 		.verify = NULL,
+-		.wrapper = mlx4_GEN_QP_wrapper
++		.wrapper = mlx4_RTS2RTS_QP_wrapper
+ 	},
+ 	{
+ 		.opcode = MLX4_CMD_SQERR2RTS_QP,
+@@ -985,7 +985,7 @@ static struct mlx4_cmd_info cmd_info[] =
+ 		.out_is_imm = false,
+ 		.encode_slave_id = false,
+ 		.verify = NULL,
+-		.wrapper = mlx4_GEN_QP_wrapper
++		.wrapper = mlx4_SQERR2RTS_QP_wrapper
+ 	},
+ 	{
+ 		.opcode = MLX4_CMD_2ERR_QP,
+@@ -1012,7 +1012,7 @@ static struct mlx4_cmd_info cmd_info[] =
+ 		.out_is_imm = false,
+ 		.encode_slave_id = false,
+ 		.verify = NULL,
+-		.wrapper = mlx4_GEN_QP_wrapper
++		.wrapper = mlx4_SQD2SQD_QP_wrapper
+ 	},
+ 	{
+ 		.opcode = MLX4_CMD_SQD2RTS_QP,
+@@ -1021,7 +1021,7 @@ static struct mlx4_cmd_info cmd_info[] =
+ 		.out_is_imm = false,
+ 		.encode_slave_id = false,
+ 		.verify = NULL,
+-		.wrapper = mlx4_GEN_QP_wrapper
++		.wrapper = mlx4_SQD2RTS_QP_wrapper
+ 	},
+ 	{
+ 		.opcode = MLX4_CMD_2RST_QP,
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@ -474,6 +474,17 @@ int mlx4_get_parav_qkey(struct mlx4_dev
+ }
+ EXPORT_SYMBOL(mlx4_get_parav_qkey);
+ 
++void mlx4_sync_pkey_table(struct mlx4_dev *dev, int slave, int port, int i, int val)
++{
++	struct mlx4_priv *priv = container_of(dev, struct mlx4_priv, dev);
++
++	if (!mlx4_is_master(dev))
++		return;
++
++	priv->virt2phys_pkey[slave][port - 1][i] = val;
++}
++EXPORT_SYMBOL(mlx4_sync_pkey_table);
++
+ int mlx4_is_slave_active(struct mlx4_dev *dev, int slave)
+ {
+ 	struct mlx4_priv *priv = mlx4_priv(dev);
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4.h
+@@ -807,6 +807,8 @@ struct mlx4_priv {
+ 	struct io_mapping	*bf_mapping;
+ 	int			reserved_mtts;
+ 	int			fs_hash_mode;
++	u8 virt2phys_pkey[MLX4_MFUNC_MAX][MLX4_MAX_PORTS][MLX4_MAX_PORT_PKEYS];
++
+ };
+ 
+ static inline struct mlx4_priv *mlx4_priv(struct mlx4_dev *dev)
+@@ -1011,16 +1013,61 @@ int mlx4_RST2INIT_QP_wrapper(struct mlx4
+ 			     struct mlx4_cmd_mailbox *inbox,
+ 			     struct mlx4_cmd_mailbox *outbox,
+ 			     struct mlx4_cmd_info *cmd);
++int mlx4_INIT2INIT_QP_wrapper(struct mlx4_dev *dev, int slave,
++			      struct mlx4_vhcr *vhcr,
++			      struct mlx4_cmd_mailbox *inbox,
++			      struct mlx4_cmd_mailbox *outbox,
++			      struct mlx4_cmd_info *cmd);
+ int mlx4_INIT2RTR_QP_wrapper(struct mlx4_dev *dev, int slave,
+ 			     struct mlx4_vhcr *vhcr,
+ 			     struct mlx4_cmd_mailbox *inbox,
+ 			     struct mlx4_cmd_mailbox *outbox,
+ 			     struct mlx4_cmd_info *cmd);
++int mlx4_RTR2RTS_QP_wrapper(struct mlx4_dev *dev, int slave,
++			    struct mlx4_vhcr *vhcr,
++			    struct mlx4_cmd_mailbox *inbox,
++			    struct mlx4_cmd_mailbox *outbox,
++			    struct mlx4_cmd_info *cmd);
++int mlx4_RTS2RTS_QP_wrapper(struct mlx4_dev *dev, int slave,
++			    struct mlx4_vhcr *vhcr,
++			    struct mlx4_cmd_mailbox *inbox,
++			    struct mlx4_cmd_mailbox *outbox,
++			    struct mlx4_cmd_info *cmd);
++int mlx4_SQERR2RTS_QP_wrapper(struct mlx4_dev *dev, int slave,
++			      struct mlx4_vhcr *vhcr,
++			      struct mlx4_cmd_mailbox *inbox,
++			      struct mlx4_cmd_mailbox *outbox,
++			      struct mlx4_cmd_info *cmd);
++int mlx4_2ERR_QP_wrapper(struct mlx4_dev *dev, int slave,
++			 struct mlx4_vhcr *vhcr,
++			 struct mlx4_cmd_mailbox *inbox,
++			 struct mlx4_cmd_mailbox *outbox,
++			 struct mlx4_cmd_info *cmd);
++int mlx4_RTS2SQD_QP_wrapper(struct mlx4_dev *dev, int slave,
++			    struct mlx4_vhcr *vhcr,
++			    struct mlx4_cmd_mailbox *inbox,
++			    struct mlx4_cmd_mailbox *outbox,
++			    struct mlx4_cmd_info *cmd);
++int mlx4_SQD2SQD_QP_wrapper(struct mlx4_dev *dev, int slave,
++			    struct mlx4_vhcr *vhcr,
++			    struct mlx4_cmd_mailbox *inbox,
++			    struct mlx4_cmd_mailbox *outbox,
++			    struct mlx4_cmd_info *cmd);
++int mlx4_SQD2RTS_QP_wrapper(struct mlx4_dev *dev, int slave,
++			    struct mlx4_vhcr *vhcr,
++			    struct mlx4_cmd_mailbox *inbox,
++			    struct mlx4_cmd_mailbox *outbox,
++			    struct mlx4_cmd_info *cmd);
+ int mlx4_2RST_QP_wrapper(struct mlx4_dev *dev, int slave,
+ 			 struct mlx4_vhcr *vhcr,
+ 			 struct mlx4_cmd_mailbox *inbox,
+ 			 struct mlx4_cmd_mailbox *outbox,
+ 			 struct mlx4_cmd_info *cmd);
++int mlx4_QUERY_QP_wrapper(struct mlx4_dev *dev, int slave,
++			  struct mlx4_vhcr *vhcr,
++			  struct mlx4_cmd_mailbox *inbox,
++			  struct mlx4_cmd_mailbox *outbox,
++			  struct mlx4_cmd_info *cmd);
+ 
+ int mlx4_GEN_EQE(struct mlx4_dev *dev, int slave, struct mlx4_eqe *eqe);
+ 
+--- a/drivers/net/ethernet/mellanox/mlx4/resource_tracker.c
++++ b/drivers/net/ethernet/mellanox/mlx4/resource_tracker.c
+@@ -242,6 +242,15 @@ static int res_tracker_insert(struct rb_
+ 	return 0;
+ }
+ 
++enum qp_transition {
++	QP_TRANS_INIT2RTR,
++	QP_TRANS_RTR2RTS,
++	QP_TRANS_RTS2RTS,
++	QP_TRANS_SQERR2RTS,
++	QP_TRANS_SQD2SQD,
++	QP_TRANS_SQD2RTS
++};
++
+ /* For Debug uses */
+ static const char *ResourceType(enum mlx4_resource rt)
+ {
+@@ -308,14 +317,41 @@ void mlx4_free_resource_tracker(struct m
+ 	}
+ }
+ 
+-static void update_ud_gid(struct mlx4_dev *dev,
+-			  struct mlx4_qp_context *qp_ctx, u8 slave)
++static void update_pkey_index(struct mlx4_dev *dev, int slave,
++			      struct mlx4_cmd_mailbox *inbox)
++{
++	u8 sched = *(u8 *)(inbox->buf + 64);
++	u8 orig_index = *(u8 *)(inbox->buf + 35);
++	u8 new_index;
++	struct mlx4_priv *priv = mlx4_priv(dev);
++	int port;
++
++	port = (sched >> 6 & 1) + 1;
++
++	new_index = priv->virt2phys_pkey[slave][port - 1][orig_index];
++	*(u8 *)(inbox->buf + 35) = new_index;
++
++	mlx4_dbg(dev, "port = %d, orig pkey index = %d, "
++		 "new pkey index = %d\n", port, orig_index, new_index);
++}
++
++static void update_gid(struct mlx4_dev *dev, struct mlx4_cmd_mailbox *inbox,
++		       u8 slave)
+ {
+-	u32 ts = (be32_to_cpu(qp_ctx->flags) >> 16) & 0xff;
++	struct mlx4_qp_context	*qp_ctx = inbox->buf + 8;
++	enum mlx4_qp_optpar	optpar = be32_to_cpu(*(__be32 *) inbox->buf);
++	u32			ts = (be32_to_cpu(qp_ctx->flags) >> 16) & 0xff;
+ 
+ 	if (MLX4_QP_ST_UD == ts)
+ 		qp_ctx->pri_path.mgid_index = 0x80 | slave;
+ 
++	if (MLX4_QP_ST_RC == ts || MLX4_QP_ST_UC == ts) {
++		if (optpar & MLX4_QP_OPTPAR_PRIMARY_ADDR_PATH)
++			qp_ctx->pri_path.mgid_index = slave & 0x7F;
++		if (optpar & MLX4_QP_OPTPAR_ALT_ADDR_PATH)
++			qp_ctx->alt_path.mgid_index = slave & 0x7F;
++	}
++
+ 	mlx4_dbg(dev, "slave %d, new gid index: 0x%x ",
+ 		slave, qp_ctx->pri_path.mgid_index);
+ }
+@@ -1107,6 +1143,11 @@ static int valid_reserved(struct mlx4_de
+ 		(mlx4_is_master(dev) || mlx4_is_guest_proxy(dev, slave, qpn));
+ }
+ 
++static int fw_reserved(struct mlx4_dev *dev, int qpn)
++{
++	return qpn < dev->caps.reserved_qps_cnt[MLX4_QP_REGION_FW];
++}
++
+ static int qp_alloc_res(struct mlx4_dev *dev, int slave, int op, int cmd,
+ 			u64 in_param, u64 *out_param)
+ {
+@@ -1144,7 +1185,7 @@ static int qp_alloc_res(struct mlx4_dev
+ 		if (err)
+ 			return err;
+ 
+-		if (!valid_reserved(dev, slave, qpn)) {
++		if (!fw_reserved(dev, qpn)) {
+ 			err = __mlx4_qp_alloc_icm(dev, qpn, 0);
+ 			if (err) {
+ 				res_abort_move(dev, slave, RES_QP, qpn);
+@@ -1497,7 +1538,7 @@ static int qp_free_res(struct mlx4_dev *
+ 		if (err)
+ 			return err;
+ 
+-		if (!valid_reserved(dev, slave, qpn))
++		if (!fw_reserved(dev, qpn))
+ 			__mlx4_qp_free_icm(dev, qpn);
+ 
+ 		res_end_move(dev, slave, RES_QP, qpn);
+@@ -1937,6 +1978,19 @@ static u32 qp_get_srqn(struct mlx4_qp_co
+ 	return be32_to_cpu(qpc->srqn) & 0x1ffffff;
+ }
+ 
++static void adjust_proxy_tun_qkey(struct mlx4_dev *dev, struct mlx4_vhcr *vhcr,
++				  struct mlx4_qp_context *context)
++{
++	u32 qpn = vhcr->in_modifier & 0xffffff;
++	u32 qkey = 0;
++
++	if (mlx4_get_parav_qkey(dev, qpn, &qkey))
++		return;
++
++	/* adjust qkey in qp context */
++	context->qkey = cpu_to_be32(qkey);
++}
++
+ int mlx4_RST2INIT_QP_wrapper(struct mlx4_dev *dev, int slave,
+ 			     struct mlx4_vhcr *vhcr,
+ 			     struct mlx4_cmd_mailbox *inbox,
+@@ -1989,6 +2043,8 @@ int mlx4_RST2INIT_QP_wrapper(struct mlx4
+ 			goto ex_put_scq;
+ 	}
+ 
++	adjust_proxy_tun_qkey(dev, vhcr, qpc);
++	update_pkey_index(dev, slave, inbox);
+ 	err = mlx4_DMA_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
+ 	if (err)
+ 		goto ex_put_srq;
+@@ -2134,6 +2190,48 @@ static int get_containing_mtt(struct mlx
+ 	return err;
+ }
+ 
++static int verify_qp_parameters(struct mlx4_dev *dev,
++				struct mlx4_cmd_mailbox *inbox,
++				enum qp_transition transition, u8 slave)
++{
++	u32			qp_type;
++	struct mlx4_qp_context	*qp_ctx;
++	enum mlx4_qp_optpar	optpar;
++
++	qp_ctx  = inbox->buf + 8;
++	qp_type	= (be32_to_cpu(qp_ctx->flags) >> 16) & 0xff;
++	optpar	= be32_to_cpu(*(__be32 *) inbox->buf);
++
++	switch (qp_type) {
++	case MLX4_QP_ST_RC:
++	case MLX4_QP_ST_UC:
++		switch (transition) {
++		case QP_TRANS_INIT2RTR:
++		case QP_TRANS_RTR2RTS:
++		case QP_TRANS_RTS2RTS:
++		case QP_TRANS_SQD2SQD:
++		case QP_TRANS_SQD2RTS:
++			if (slave != mlx4_master_func_num(dev))
++				/* slaves have only gid index 0 */
++				if (optpar & MLX4_QP_OPTPAR_PRIMARY_ADDR_PATH)
++					if (qp_ctx->pri_path.mgid_index)
++						return -EINVAL;
++				if (optpar & MLX4_QP_OPTPAR_ALT_ADDR_PATH)
++					if (qp_ctx->alt_path.mgid_index)
++						return -EINVAL;
++			break;
++		default:
++			break;
++		}
++
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
+ int mlx4_WRITE_MTT_wrapper(struct mlx4_dev *dev, int slave,
+ 			   struct mlx4_vhcr *vhcr,
+ 			   struct mlx4_cmd_mailbox *inbox,
+@@ -2621,16 +2719,123 @@ out:
+ 	return err;
+ }
+ 
++int mlx4_INIT2INIT_QP_wrapper(struct mlx4_dev *dev, int slave,
++			      struct mlx4_vhcr *vhcr,
++			      struct mlx4_cmd_mailbox *inbox,
++			      struct mlx4_cmd_mailbox *outbox,
++			      struct mlx4_cmd_info *cmd)
++{
++	struct mlx4_qp_context *context = inbox->buf + 8;
++	adjust_proxy_tun_qkey(dev, vhcr, context);
++	update_pkey_index(dev, slave, inbox);
++	return mlx4_GEN_QP_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
++}
++
+ int mlx4_INIT2RTR_QP_wrapper(struct mlx4_dev *dev, int slave,
+ 			     struct mlx4_vhcr *vhcr,
+ 			     struct mlx4_cmd_mailbox *inbox,
+ 			     struct mlx4_cmd_mailbox *outbox,
+ 			     struct mlx4_cmd_info *cmd)
+ {
++	int err;
+ 	struct mlx4_qp_context *qpc = inbox->buf + 8;
+ 
+-	update_ud_gid(dev, qpc, (u8)slave);
++	err = verify_qp_parameters(dev, inbox, QP_TRANS_INIT2RTR, slave);
++	if (err)
++		return err;
++
++	update_pkey_index(dev, slave, inbox);
++	update_gid(dev, inbox, (u8)slave);
++	adjust_proxy_tun_qkey(dev, vhcr, qpc);
++
++	return mlx4_GEN_QP_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
++}
++
++int mlx4_RTR2RTS_QP_wrapper(struct mlx4_dev *dev, int slave,
++			    struct mlx4_vhcr *vhcr,
++			    struct mlx4_cmd_mailbox *inbox,
++			    struct mlx4_cmd_mailbox *outbox,
++			    struct mlx4_cmd_info *cmd)
++{
++	int err;
++	struct mlx4_qp_context *context = inbox->buf + 8;
++
++	err = verify_qp_parameters(dev, inbox, QP_TRANS_RTR2RTS, slave);
++	if (err)
++		return err;
++
++	update_pkey_index(dev, slave, inbox);
++	update_gid(dev, inbox, (u8)slave);
++	adjust_proxy_tun_qkey(dev, vhcr, context);
++	return mlx4_GEN_QP_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
++}
++
++int mlx4_RTS2RTS_QP_wrapper(struct mlx4_dev *dev, int slave,
++			    struct mlx4_vhcr *vhcr,
++			    struct mlx4_cmd_mailbox *inbox,
++			    struct mlx4_cmd_mailbox *outbox,
++			    struct mlx4_cmd_info *cmd)
++{
++	int err;
++	struct mlx4_qp_context *context = inbox->buf + 8;
++
++	err = verify_qp_parameters(dev, inbox, QP_TRANS_RTS2RTS, slave);
++	if (err)
++		return err;
++
++	update_pkey_index(dev, slave, inbox);
++	update_gid(dev, inbox, (u8)slave);
++	adjust_proxy_tun_qkey(dev, vhcr, context);
++	return mlx4_GEN_QP_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
++}
++
++
++int mlx4_SQERR2RTS_QP_wrapper(struct mlx4_dev *dev, int slave,
++			      struct mlx4_vhcr *vhcr,
++			      struct mlx4_cmd_mailbox *inbox,
++			      struct mlx4_cmd_mailbox *outbox,
++			      struct mlx4_cmd_info *cmd)
++{
++	struct mlx4_qp_context *context = inbox->buf + 8;
++	adjust_proxy_tun_qkey(dev, vhcr, context);
++	return mlx4_GEN_QP_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
++}
++
++int mlx4_SQD2SQD_QP_wrapper(struct mlx4_dev *dev, int slave,
++			    struct mlx4_vhcr *vhcr,
++			    struct mlx4_cmd_mailbox *inbox,
++			    struct mlx4_cmd_mailbox *outbox,
++			    struct mlx4_cmd_info *cmd)
++{
++	int err;
++	struct mlx4_qp_context *context = inbox->buf + 8;
++
++	err = verify_qp_parameters(dev, inbox, QP_TRANS_SQD2SQD, slave);
++	if (err)
++		return err;
++
++	adjust_proxy_tun_qkey(dev, vhcr, context);
++	update_gid(dev, inbox, (u8)slave);
++	update_pkey_index(dev, slave, inbox);
++	return mlx4_GEN_QP_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
++}
++
++int mlx4_SQD2RTS_QP_wrapper(struct mlx4_dev *dev, int slave,
++			    struct mlx4_vhcr *vhcr,
++			    struct mlx4_cmd_mailbox *inbox,
++			    struct mlx4_cmd_mailbox *outbox,
++			    struct mlx4_cmd_info *cmd)
++{
++	int err;
++	struct mlx4_qp_context *context = inbox->buf + 8;
++
++	err = verify_qp_parameters(dev, inbox, QP_TRANS_SQD2RTS, slave);
++	if (err)
++		return err;
+ 
++	adjust_proxy_tun_qkey(dev, vhcr, context);
++	update_gid(dev, inbox, (u8)slave);
++	update_pkey_index(dev, slave, inbox);
+ 	return mlx4_GEN_QP_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
+ }
+ 
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@ -942,6 +942,9 @@ int mlx4_flow_attach(struct mlx4_dev *de
+ 		     struct mlx4_net_trans_rule *rule, u64 *reg_id);
+ int mlx4_flow_detach(struct mlx4_dev *dev, u64 reg_id);
+ 
++void mlx4_sync_pkey_table(struct mlx4_dev *dev, int slave, int port,
++			  int i, int val);
++
+ int mlx4_get_parav_qkey(struct mlx4_dev *dev, u32 qpn, u32 *qkey);
+ 
+ #endif /* MLX4_DEVICE_H */
