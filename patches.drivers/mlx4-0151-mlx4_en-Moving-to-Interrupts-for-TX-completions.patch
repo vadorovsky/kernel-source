@@ -1,0 +1,217 @@
+From: Yevgeny Petrilin <yevgenyp@mellanox.co.il>
+Date: Mon, 23 Apr 2012 02:18:39 +0000
+Subject: mlx4_en: Moving to Interrupts for TX completions
+Patch-mainline: v3.5-rc1
+Git-commit: e22979d96a55d24bc43247341a052ec1b3a7fda6
+References: bnc#786036 FATE#314304
+
+Moving to interrupts instead of polling fpr TX completions
+Avoiding situations where skb can be held in by the driver for
+a long time (till timer expires).
+The change is also necessary for supporting BQL.
+
+Removing comp_lock that was required because we could handle TX
+completions from several contexts: Interrupts, timer, polling.
+Now there is only interrupts
+
+Signed-off-by: Yevgeny Petrilin <yevgenyp@mellanox.co.il>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Amir Vadai <amirv@mellanox.com>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx4/en_cq.c     |   14 +----
+ drivers/net/ethernet/mellanox/mlx4/en_netdev.c |    4 +
+ drivers/net/ethernet/mellanox/mlx4/en_tx.c     |   59 -------------------------
+ drivers/net/ethernet/mellanox/mlx4/mlx4_en.h   |    6 --
+ 4 files changed, 9 insertions(+), 74 deletions(-)
+--- a/drivers/net/ethernet/mellanox/mlx4/en_cq.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_cq.c
+@@ -124,11 +124,7 @@ int mlx4_en_activate_cq(struct mlx4_en_p
+ 	cq->mcq.comp  = cq->is_tx ? mlx4_en_tx_irq : mlx4_en_rx_irq;
+ 	cq->mcq.event = mlx4_en_cq_event;
+ 
+-	if (cq->is_tx) {
+-		init_timer(&cq->timer);
+-		cq->timer.function = mlx4_en_poll_tx_cq;
+-		cq->timer.data = (unsigned long) cq;
+-	} else {
++	if (!cq->is_tx) {
+ 		netif_napi_add(cq->dev, &cq->napi, mlx4_en_poll_rx_cq, 64);
+ 		napi_enable(&cq->napi);
+ 	}
+@@ -151,16 +147,12 @@ void mlx4_en_destroy_cq(struct mlx4_en_p
+ 
+ void mlx4_en_deactivate_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq)
+ {
+-	struct mlx4_en_dev *mdev = priv->mdev;
+-
+-	if (cq->is_tx)
+-		del_timer(&cq->timer);
+-	else {
++	if (!cq->is_tx) {
+ 		napi_disable(&cq->napi);
+ 		netif_napi_del(&cq->napi);
+ 	}
+ 
+-	mlx4_cq_free(mdev->dev, &cq->mcq);
++	mlx4_cq_free(priv->mdev->dev, &cq->mcq);
+ }
+ 
+ /* Set rx cq moderation parameters */
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -664,6 +664,10 @@ int mlx4_en_start_port(struct net_device
+ 			mlx4_en_deactivate_cq(priv, cq);
+ 			goto tx_err;
+ 		}
++
++		/* Arm CQ for TX completions */
++		mlx4_en_arm_cq(priv, cq);
++
+ 		/* Set initial ownership of all Tx TXBBs to SW (1) */
+ 		for (j = 0; j < tx_ring->buf_size; j += STAMP_STRIDE)
+ 			*((u32 *) (tx_ring->buf + j)) = 0xffffffff;
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -67,8 +67,6 @@ int mlx4_en_create_tx_ring(struct mlx4_e
+ 
+ 	inline_thold = min(inline_thold, MAX_INLINE);
+ 
+-	spin_lock_init(&ring->comp_lock);
+-
+ 	tmp = size * sizeof(struct mlx4_en_tx_info);
+ 	ring->tx_info = vmalloc(tmp);
+ 	if (!ring->tx_info)
+@@ -377,41 +375,12 @@ void mlx4_en_tx_irq(struct mlx4_cq *mcq)
+ {
+ 	struct mlx4_en_cq *cq = container_of(mcq, struct mlx4_en_cq, mcq);
+ 	struct mlx4_en_priv *priv = netdev_priv(cq->dev);
+-	struct mlx4_en_tx_ring *ring = &priv->tx_ring[cq->ring];
+ 
+-	if (!spin_trylock(&ring->comp_lock))
+-		return;
+ 	mlx4_en_process_tx_cq(cq->dev, cq);
+-	mod_timer(&cq->timer, jiffies + 1);
+-	spin_unlock(&ring->comp_lock);
++	mlx4_en_arm_cq(priv, cq);
+ }
+ 
+ 
+-void mlx4_en_poll_tx_cq(unsigned long data)
+-{
+-	struct mlx4_en_cq *cq = (struct mlx4_en_cq *) data;
+-	struct mlx4_en_priv *priv = netdev_priv(cq->dev);
+-	struct mlx4_en_tx_ring *ring = &priv->tx_ring[cq->ring];
+-	u32 inflight;
+-
+-	INC_PERF_COUNTER(priv->pstats.tx_poll);
+-
+-	if (!spin_trylock_irq(&ring->comp_lock)) {
+-		mod_timer(&cq->timer, jiffies + MLX4_EN_TX_POLL_TIMEOUT);
+-		return;
+-	}
+-	mlx4_en_process_tx_cq(cq->dev, cq);
+-	inflight = (u32) (ring->prod - ring->cons - ring->last_nr_txbb);
+-
+-	/* If there are still packets in flight and the timer has not already
+-	 * been scheduled by the Tx routine then schedule it here to guarantee
+-	 * completion processing of these packets */
+-	if (inflight && priv->port_up)
+-		mod_timer(&cq->timer, jiffies + MLX4_EN_TX_POLL_TIMEOUT);
+-
+-	spin_unlock_irq(&ring->comp_lock);
+-}
+-
+ static struct mlx4_en_tx_desc *mlx4_en_bounce_to_desc(struct mlx4_en_priv *priv,
+ 						      struct mlx4_en_tx_ring *ring,
+ 						      u32 index,
+@@ -440,25 +409,6 @@ static struct mlx4_en_tx_desc *mlx4_en_b
+ 	return ring->buf + index * TXBB_SIZE;
+ }
+ 
+-static inline void mlx4_en_xmit_poll(struct mlx4_en_priv *priv, int tx_ind)
+-{
+-	struct mlx4_en_cq *cq = &priv->tx_cq[tx_ind];
+-	struct mlx4_en_tx_ring *ring = &priv->tx_ring[tx_ind];
+-	unsigned long flags;
+-
+-	/* If we don't have a pending timer, set one up to catch our recent
+-	   post in case the interface becomes idle */
+-	if (!timer_pending(&cq->timer))
+-		mod_timer(&cq->timer, jiffies + MLX4_EN_TX_POLL_TIMEOUT);
+-
+-	/* Poll the CQ every mlx4_en_TX_MODER_POLL packets */
+-	if ((++ring->poll_cnt & (MLX4_EN_TX_POLL_MODER - 1)) == 0)
+-		if (spin_trylock_irqsave(&ring->comp_lock, flags)) {
+-			mlx4_en_process_tx_cq(priv->dev, cq);
+-			spin_unlock_irqrestore(&ring->comp_lock, flags);
+-		}
+-}
+-
+ static int is_inline(struct sk_buff *skb, void **pfrag)
+ {
+ 	void *ptr;
+@@ -590,7 +540,6 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff
+ 	struct mlx4_en_priv *priv = netdev_priv(dev);
+ 	struct mlx4_en_dev *mdev = priv->mdev;
+ 	struct mlx4_en_tx_ring *ring;
+-	struct mlx4_en_cq *cq;
+ 	struct mlx4_en_tx_desc *tx_desc;
+ 	struct mlx4_wqe_data_seg *data;
+ 	struct skb_frag_struct *frag;
+@@ -638,9 +587,6 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff
+ 		ring->blocked = 1;
+ 		priv->port_stats.queue_stopped++;
+ 
+-		/* Use interrupts to find out when queue opened */
+-		cq = &priv->tx_cq[tx_ind];
+-		mlx4_en_arm_cq(priv, cq);
+ 		return NETDEV_TX_BUSY;
+ 	}
+ 
+@@ -788,9 +734,6 @@ netdev_tx_t mlx4_en_xmit(struct sk_buff
+ 		iowrite32be(ring->doorbell_qpn, ring->bf.uar->map + MLX4_SEND_DOORBELL);
+ 	}
+ 
+-	/* Poll CQ here */
+-	mlx4_en_xmit_poll(priv, tx_ind);
+-
+ 	return NETDEV_TX_OK;
+ 
+ tx_drop:
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -122,7 +122,7 @@ enum {
+ #define MLX4_EN_RX_COAL_TARGET	44
+ #define MLX4_EN_RX_COAL_TIME	0x10
+ 
+-#define MLX4_EN_TX_COAL_PKTS	5
++#define MLX4_EN_TX_COAL_PKTS	16
+ #define MLX4_EN_TX_COAL_TIME	0x80
+ 
+ #define MLX4_EN_RX_RATE_LOW		400000
+@@ -255,7 +255,6 @@ struct mlx4_en_tx_ring {
+ 	unsigned long bytes;
+ 	unsigned long packets;
+ 	unsigned long tx_csum;
+-	spinlock_t comp_lock;
+ 	struct mlx4_bf bf;
+ 	bool bf_enabled;
+ };
+@@ -308,8 +307,6 @@ struct mlx4_en_cq {
+ 	spinlock_t              lock;
+ 	struct net_device      *dev;
+ 	struct napi_struct	napi;
+-	/* Per-core Tx cq processing support */
+-	struct timer_list timer;
+ 	int size;
+ 	int buf_size;
+ 	unsigned vector;
+@@ -529,7 +526,6 @@ void mlx4_en_deactivate_cq(struct mlx4_e
+ int mlx4_en_set_cq_moder(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq);
+ int mlx4_en_arm_cq(struct mlx4_en_priv *priv, struct mlx4_en_cq *cq);
+ 
+-void mlx4_en_poll_tx_cq(unsigned long data);
+ void mlx4_en_tx_irq(struct mlx4_cq *mcq);
+ u16 mlx4_en_select_queue(struct net_device *dev, struct sk_buff *skb);
+ netdev_tx_t mlx4_en_xmit(struct sk_buff *skb, struct net_device *dev);
