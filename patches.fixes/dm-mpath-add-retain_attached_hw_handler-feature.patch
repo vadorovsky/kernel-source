@@ -1,0 +1,172 @@
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Fri, 27 Jul 2012 15:08:04 +0100
+Subject: dm mpath: add retain_attached_hw_handler feature
+Git-commit: a58a935d5a1b2ad267017a68c3a1bca26226cc76
+References: FATE#314163
+Patch-Mainline: v3.6
+
+A SCSI device handler might get attached to a device during the
+initial device scan.  We do not necessarily want to override
+this when loading a multipath table, so this patch adds a new
+multipath feature argument "retain_attached_hw_handler".
+
+During SCSI device scan all loaded SCSI device handlers will be
+consulted for a match (via scsi_dh's provided .match).  If a match is
+found that device handler will be attached.  We need a way to have
+userspace multipathd's provided 'hw_handler' not override the already
+attached hardware handler.
+
+When specifying the new feature 'retain_attached_hw_handler' multipath
+will use the currently attached hardware handler instead of trying to
+attach the one specified during table load.  If no hardware handler is
+attached the specified hardware handler will still be used.
+
+Leverages scsi_dh_attach's ability to increment the scsi_dh's reference
+count if the same scsi_dh name is provided when attaching - currently
+attached scsi_dh name is determined with scsi_dh_attached_handler_name.
+
+Depends upon commit 7e8a74b177f17d100916b6ad415450f7c9508691
+("[SCSI] scsi_dh: add scsi_dh_attached_handler_name").
+
+Backported to SLES11 SP3.
+
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Tested-by: Babu Moger <babu.moger@netapp.com>
+Reviewed-by: Chandra Seetharaman <sekharan@us.ibm.com>
+Signed-off-by: Alasdair G Kergon <agk@redhat.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/md/dm-mpath.c |   53 ++++++++++++++++++++++++++++++++++++++++--------
+ 1 files changed, 44 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/md/dm-mpath.c b/drivers/md/dm-mpath.c
+index 8672b35..389aa0b 100644
+--- a/drivers/md/dm-mpath.c
++++ b/drivers/md/dm-mpath.c
+@@ -57,8 +57,6 @@ struct priority_group {
+ 	struct list_head pgpaths;
+ };
+ 
+-#define FEATURE_NO_PARTITIONS 1
+-
+ /* Multipath context */
+ struct multipath {
+ 	struct list_head list;
+@@ -87,11 +85,12 @@ struct multipath {
+ 	unsigned queue_io:1;		/* Must we queue all I/O? */
+ 	unsigned queue_if_no_path:1;	/* Queue I/O if last path fails? */
+ 	unsigned saved_queue_if_no_path:1; /* Saved state during suspension */
++	unsigned no_partitions:1;       /* Do not call kpartx on this device */
++	unsigned retain_attached_hw_handler:1; /* If there's already a hw_handler present, don't change it. */
+ 
+ 	unsigned pg_init_retries;	/* Number of times to retry pg_init */
+ 	unsigned pg_init_count;		/* Number of times pg_init called */
+ 	unsigned pg_init_delay_msecs;	/* Number of msecs before pg_init retry */
+-	unsigned features;		/* Additional selected features */
+ 
+ 	unsigned queue_size;
+ 	struct work_struct process_queued_ios;
+@@ -577,6 +576,8 @@ static struct pgpath *parse_path(struct dm_arg_set *as, struct path_selector *ps
+ 	struct pgpath *p;
+ 	const char *path;
+ 	struct multipath *m = ti->private;
++	struct request_queue *q = NULL;
++	const char *attached_handler_name;
+ 
+ 	/* we need at least a path arg */
+ 	if (as->argc < 1) {
+@@ -619,9 +620,34 @@ static struct pgpath *parse_path(struct dm_arg_set *as, struct path_selector *ps
+ 	}
+ 
+ 	if (p->path.dev) {
+-		struct request_queue *q = bdev_get_queue(p->path.dev->bdev);
++		q = bdev_get_queue(p->path.dev->bdev);
++
++		if (m->retain_attached_hw_handler) {
++			attached_handler_name = scsi_dh_attached_handler_name(q, GFP_KERNEL);
++			if (attached_handler_name) {
++				/*
++				 * Reset hw_handler_name to match the
++				 * attached handler and clear any
++				 * hw_handler_params associated with the
++				 * ignored handler.
++				 *
++				 * NB. This modifies the table line to
++				 * show the actual handler instead of
++				 * the original table passed in.
++				 */
++				kfree(m->hw_handler_name);
++				m->hw_handler_name = attached_handler_name;
++
++				kfree(m->hw_handler_params);
++				m->hw_handler_params = NULL;
++			}
++		}
+ 
+ 		if (m->hw_handler_name) {
++			/*
++			 * Increments scsi_dh reference, even when using an
++			 * already-attached handler.
++			 */
+ 			r = scsi_dh_attach(q, m->hw_handler_name);
+ 			if (r == -EBUSY) {
+ 				/*
+@@ -801,7 +827,7 @@ static int parse_features(struct dm_arg_set *as, struct multipath *m)
+ 	const char *arg_name;
+ 
+ 	static struct dm_arg _args[] = {
+-		{0, 5, "invalid number of feature args"},
++		{0, 6, "invalid number of feature args"},
+ 		{1, 50, "pg_init_retries must be between 1 and 50"},
+ 		{0, 60000, "pg_init_delay_msecs must be between 0 and 60000"},
+ 	};
+@@ -828,9 +854,15 @@ static int parse_features(struct dm_arg_set *as, struct multipath *m)
+ 		}
+ 
+ 		if (!strcasecmp(arg_name, "no_partitions")) {
+-			m->features |= FEATURE_NO_PARTITIONS;
++			m->no_partitions = 1;
+ 			continue;
+ 		}
++
++		if (!strcasecmp(arg_name, "retain_attached_hw_handler")) {
++			m->retain_attached_hw_handler = 1;
++			continue;
++		}
++
+ 		if (!strcasecmp(arg_name, "pg_init_retries") &&
+ 		    (argc >= 1)) {
+ 			r = dm_read_arg(_args + 1, as, &m->pg_init_retries, &ti->error);
+@@ -1426,15 +1458,18 @@ static int multipath_status(struct dm_target *ti, status_type_t type,
+ 		DMEMIT("%u ", m->queue_if_no_path +
+ 			      (m->pg_init_retries > 0) * 2 +
+ 			      (m->pg_init_delay_msecs != DM_PG_INIT_DELAY_DEFAULT) * 2 +
+-			      (m->features & FEATURE_NO_PARTITIONS));
++			      m->no_partitions +
++			      m->retain_attached_hw_handler);
+ 		if (m->queue_if_no_path)
+ 			DMEMIT("queue_if_no_path ");
+ 		if (m->pg_init_retries)
+ 			DMEMIT("pg_init_retries %u ", m->pg_init_retries);
+ 		if (m->pg_init_delay_msecs != DM_PG_INIT_DELAY_DEFAULT)
+ 			DMEMIT("pg_init_delay_msecs %u ", m->pg_init_delay_msecs);
+-		if (m->features & FEATURE_NO_PARTITIONS)
++		if (m->no_partitions)
+ 			DMEMIT("no_partitions ");
++		if (m->retain_attached_hw_handler)
++			DMEMIT("retain_attached_hw_handler ");
+ 	}
+ 
+ 	if (!m->hw_handler_name || type == STATUSTYPE_INFO)
+@@ -1724,7 +1759,7 @@ out:
+  *---------------------------------------------------------------*/
+ static struct target_type multipath_target = {
+ 	.name = "multipath",
+-	.version = {1, 4, 0},
++	.version = {1, 5, 0},
+ 	.module = THIS_MODULE,
+ 	.ctr = multipath_ctr,
+ 	.dtr = multipath_dtr,
+-- 
+1.7.4.2
+
