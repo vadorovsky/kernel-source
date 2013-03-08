@@ -1,0 +1,209 @@
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 14 Dec 2011 00:33:40 +0100
+Subject: block: reorder elevator switch sequence
+Git-commit: f8fc877d3c1f10457d0d73d8540a0c51a1fa718a
+References: bnc#778477
+Patch-Mainline: v3.3
+
+Elevator switch sequence first attached the new elevator, then tried
+registering it (sysfs) and if that failed attached back the old
+elevator.  However, sysfs registration doesn't require the elevator to
+be attached, so there is no reason to do the "detach, attach new,
+register, maybe re-attach old" sequence.  It can just do "register,
+detach, attach".
+
+* elevator_init_queue() is updated to set ->elevator_data directly and
+  return 0 / -errno.  This allows elevator_exit() on an unattached
+  elevator.
+
+* __elv_unregister_queue() which was necessary to unregister
+  unattached q is removed in favor of __elv_register_queue() which can
+  register unattached q.
+
+* elevator_attach() becomes a single assignment and obscures more then
+  it helps.  Dropped.
+
+This will help cleaning up io_context handling across elevator switch.
+
+This patch doesn't introduce visible behavior change.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Acked-by: Hannes Reinecke <hare@suse.de>
+---
+ block/elevator.c |   91 ++++++++++++++++++++++--------------------------------
+ 1 file changed, 37 insertions(+), 54 deletions(-)
+
+diff --git a/block/elevator.c b/block/elevator.c
+index d7c812a..0610be0 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -168,17 +168,13 @@ static struct elevator_type *elevator_get(const char *name)
+ 	return e;
+ }
+ 
+-static void *elevator_init_queue(struct request_queue *q,
+-				 struct elevator_queue *eq)
++static int elevator_init_queue(struct request_queue *q,
++			       struct elevator_queue *eq)
+ {
+-	return eq->ops->elevator_init_fn(q);
+-}
+-
+-static void elevator_attach(struct request_queue *q, struct elevator_queue *eq,
+-			   void *data)
+-{
+-	q->elevator = eq;
+-	eq->elevator_data = data;
++	eq->elevator_data = eq->ops->elevator_init_fn(q);
++	if (eq->elevator_data)
++		return 0;
++	return -ENOMEM;
+ }
+ 
+ static char chosen_elevator[ELV_NAME_MAX];
+@@ -241,7 +237,7 @@ int elevator_init(struct request_queue *q, char *name)
+ {
+ 	struct elevator_type *e = NULL;
+ 	struct elevator_queue *eq;
+-	void *data;
++	int err;
+ 
+ 	if (unlikely(q->elevator))
+ 		return 0;
+@@ -278,13 +274,13 @@ int elevator_init(struct request_queue *q, char *name)
+ 	if (!eq)
+ 		return -ENOMEM;
+ 
+-	data = elevator_init_queue(q, eq);
+-	if (!data) {
++	err = elevator_init_queue(q, eq);
++	if (err) {
+ 		kobject_put(&eq->kobj);
+-		return -ENOMEM;
++		return err;
+ 	}
+ 
+-	elevator_attach(q, eq, data);
++	q->elevator = eq;
+ 	return 0;
+ }
+ EXPORT_SYMBOL(elevator_init);
+@@ -858,9 +854,8 @@ static struct kobj_type elv_ktype = {
+ 	.release	= elevator_release,
+ };
+ 
+-int elv_register_queue(struct request_queue *q)
++int __elv_register_queue(struct request_queue *q, struct elevator_queue *e)
+ {
+-	struct elevator_queue *e = q->elevator;
+ 	int error;
+ 
+ 	error = kobject_add(&e->kobj, &q->kobj, "%s", "iosched");
+@@ -878,19 +873,22 @@ int elv_register_queue(struct request_queue *q)
+ 	}
+ 	return error;
+ }
+-EXPORT_SYMBOL(elv_register_queue);
+ 
+-static void __elv_unregister_queue(struct elevator_queue *e)
++int elv_register_queue(struct request_queue *q)
+ {
+-	kobject_uevent(&e->kobj, KOBJ_REMOVE);
+-	kobject_del(&e->kobj);
+-	e->registered = 0;
++	return __elv_register_queue(q, q->elevator);
+ }
++EXPORT_SYMBOL(elv_register_queue);
+ 
+ void elv_unregister_queue(struct request_queue *q)
+ {
+-	if (q)
+-		__elv_unregister_queue(q->elevator);
++	if (q) {
++		struct elevator_queue *e = q->elevator;
++
++		kobject_uevent(&e->kobj, KOBJ_REMOVE);
++		kobject_del(&e->kobj);
++		e->registered = 0;
++	}
+ }
+ EXPORT_SYMBOL(elv_unregister_queue);
+ 
+@@ -946,50 +944,36 @@ EXPORT_SYMBOL_GPL(elv_unregister);
+ static int elevator_switch(struct request_queue *q, struct elevator_type *new_e)
+ {
+ 	struct elevator_queue *old_elevator, *e;
+-	void *data;
+ 	int err;
+ 
+-	/*
+-	 * Allocate new elevator
+-	 */
++	/* allocate new elevator */
+ 	e = elevator_alloc(q, new_e);
+ 	if (!e)
+ 		return -ENOMEM;
+ 
+-	data = elevator_init_queue(q, e);
+-	if (!data) {
++	err = elevator_init_queue(q, e);
++	if (err) {
+ 		kobject_put(&e->kobj);
+-		return -ENOMEM;
++		return err;
+ 	}
+ 
+-	/*
+-	 * Turn on BYPASS and drain all requests w/ elevator private data
+-	 */
++	/* turn on BYPASS and drain all requests w/ elevator private data */
+ 	elv_quiesce_start(q);
+ 
+-	/*
+-	 * Remember old elevator.
+-	 */
+-	old_elevator = q->elevator;
+-
+-	/*
+-	 * attach and start new elevator
+-	 */
+-	spin_lock_irq(q->queue_lock);
+-	elevator_attach(q, e, data);
+-	spin_unlock_irq(q->queue_lock);
+-
+-	if (old_elevator->registered) {
+-		__elv_unregister_queue(old_elevator);
+-
+-		err = elv_register_queue(q);
++	/* unregister old queue, register new one and kill old elevator */
++	if (q->elevator->registered) {
++		elv_unregister_queue(q);
++		err = __elv_register_queue(q, e);
+ 		if (err)
+ 			goto fail_register;
+ 	}
+ 
+-	/*
+-	 * finally exit old elevator and turn off BYPASS.
+-	 */
++	/* done, replace the old one with new one and turn off BYPASS */
++	spin_lock_irq(q->queue_lock);
++	old_elevator = q->elevator;
++	q->elevator = e;
++	spin_unlock_irq(q->queue_lock);
++
+ 	elevator_exit(old_elevator);
+ 	elv_quiesce_end(q);
+ 
+@@ -1003,7 +987,6 @@ fail_register:
+ 	 * one again (along with re-adding the sysfs dir)
+ 	 */
+ 	elevator_exit(e);
+-	q->elevator = old_elevator;
+ 	elv_register_queue(q);
+ 	elv_quiesce_end(q);
+ 
+-- 
+1.7.10.4
+
