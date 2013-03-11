@@ -1,0 +1,308 @@
+From 20afbda209d708be66944907966486d0c1331cb8 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Tue, 11 Dec 2012 14:05:07 +0100
+Subject: [PATCH] drm/i915: Fixup hpd irq register setup ordering
+Git-commit: 20afbda209d708be66944907966486d0c1331cb8
+Patch-mainline: 3.9-rc1
+References: bnc#806406
+
+For GMCH platforms we set up the hpd irq registers in the irq
+postinstall hook. But since we only enable the irq sources we actually
+need in PORT_HOTPLUG_EN/STATUS, taking dev_priv->hotplug_supported_mask
+into account, no hpd interrupt sources is enabled since
+
+commit 52d7ecedac3f96fb562cb482c139015372728638
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Sat Dec 1 21:03:22 2012 +0100
+
+    drm/i915: reorder setup sequence to have irqs for output setup
+
+Wrongly set-up interrupts also lead to broken hw-based load-detection
+on at least GM45, resulting in ghost VGA/TV-out outputs.
+
+To fix this, delay the hotplug register setup until after all outputs
+are set up, by moving it into a new dev_priv->display.hpd_irq_callback.
+We might also move the PCH_SPLIT platforms to such a setup eventually.
+
+Another funny part is that we need to delay the fbdev initial config
+probing until after the hpd regs are setup, for otherwise it'll detect
+ghost outputs. But we can only enable the hpd interrupt handling
+itself (and the output polling) _after_ that initial scan, due to
+massive locking brain-damage in the fbdev setup code. Add a big
+comment to explain this cute little dragon lair.
+
+V2: Encapsulate all the fbdev handling by wrapping the move call into
+intel_fbdev_initial_config in intel_fb.c. Requested by Chris Wilson.
+
+V3: Applied bikeshed from Jesse Barnes.
+
+V4: Imre Deak noticed that we also need to call intel_hpd_init after
+the drm_irqinstall calls in the gpu reset and resume paths - otherwise
+hotplug will be broken. Also improve the comment a bit about why
+hpd_init needs to be called before we set up the initial fbdev config.
+
+Bugzilla: Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=54943
+Reported-by: Chris Wilson <chris@chris-wilson.co.uk>
+Reviewed-by: Jesse Barnes <jbarnes@virtuousgeek.org> (v3)
+Reviewed-by: Imre Deak <imre.deak@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_dma.c  |   15 +++++++++
+ drivers/gpu/drm/i915/i915_drv.c  |    2 +
+ drivers/gpu/drm/i915/i915_drv.h  |    2 +
+ drivers/gpu/drm/i915/i915_irq.c  |   63 ++++++++++++++++++++++++++++++---------
+ drivers/gpu/drm/i915/intel_drv.h |    1 
+ drivers/gpu/drm/i915/intel_fb.c  |   10 +++++-
+ 6 files changed, 79 insertions(+), 14 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_dma.c
++++ b/drivers/gpu/drm/i915/i915_dma.c
+@@ -1322,6 +1322,21 @@ static int i915_load_modeset_init(struct
+ 		goto cleanup_gem;
+ 
+ 	/* Only enable hotplug handling once the fbdev is fully set up. */
++	intel_hpd_init(dev);
++
++	/*
++	 * Some ports require correctly set-up hpd registers for detection to
++	 * work properly (leading to ghost connected connector status), e.g. VGA
++	 * on gm45.  Hence we can only set up the initial fbdev config after hpd
++	 * irqs are fully enabled. Now we should scan for the initial config
++	 * only once hotplug handling is enabled, but due to screwed-up locking
++	 * around kms/fbdev init we can't protect the fdbev initial config
++	 * scanning against hotplug events. Hence do this first and ignore the
++	 * tiny window where we will loose hotplug notifactions.
++	 */
++	intel_fbdev_initial_config(dev);
++
++	/* Only enable hotplug handling once the fbdev is fully set up. */
+ 	dev_priv->enable_hotplug_processing = true;
+ 
+ 	drm_kms_helper_poll_init(dev);
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -572,6 +572,7 @@ static int __i915_drm_thaw(struct drm_de
+ 		mutex_unlock(&dev->mode_config.mutex);
+ 
+ 		drm_irq_install(dev);
++		intel_hpd_init(dev);
+ 	}
+ 
+ 	intel_opregion_init(dev);
+@@ -877,6 +878,7 @@ int i915_reset(struct drm_device *dev)
+ 
+ 		drm_irq_uninstall(dev);
+ 		drm_irq_install(dev);
++		intel_hpd_init(dev);
+ 	} else {
+ 		mutex_unlock(&dev->struct_mutex);
+ 	}
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -297,6 +297,7 @@ struct drm_i915_display_funcs {
+ 			  struct drm_i915_gem_object *obj);
+ 	int (*update_plane)(struct drm_crtc *crtc, struct drm_framebuffer *fb,
+ 			    int x, int y);
++	void (*hpd_irq_setup)(struct drm_device *dev);
+ 	/* clock updates for mode set */
+ 	/* cursor updates */
+ 	/* render clock increase/decrease */
+@@ -1358,6 +1359,7 @@ void i915_hangcheck_elapsed(unsigned lon
+ void i915_handle_error(struct drm_device *dev, bool wedged);
+ 
+ extern void intel_irq_init(struct drm_device *dev);
++extern void intel_hpd_init(struct drm_device *dev);
+ extern void intel_gt_init(struct drm_device *dev);
+ extern void intel_gt_reset(struct drm_device *dev);
+ 
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -2009,7 +2009,6 @@ static int valleyview_irq_postinstall(st
+ {
+ 	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
+ 	u32 enable_mask;
+-	u32 hotplug_en = I915_READ(PORT_HOTPLUG_EN);
+ 	u32 pipestat_enable = PLANE_FLIP_DONE_INT_EN_VLV;
+ 	u32 render_irqs;
+ 	u16 msid;
+@@ -2038,6 +2037,9 @@ static int valleyview_irq_postinstall(st
+ 	msid |= (1<<14);
+ 	pci_write_config_word(dev_priv->dev->pdev, 0x98, msid);
+ 
++	I915_WRITE(PORT_HOTPLUG_EN, 0);
++	POSTING_READ(PORT_HOTPLUG_EN);
++
+ 	I915_WRITE(VLV_IMR, dev_priv->irq_mask);
+ 	I915_WRITE(VLV_IER, enable_mask);
+ 	I915_WRITE(VLV_IIR, 0xffffffff);
+@@ -2067,6 +2069,15 @@ static int valleyview_irq_postinstall(st
+ #endif
+ 
+ 	I915_WRITE(VLV_MASTER_IER, MASTER_INTERRUPT_ENABLE);
++
++	return 0;
++}
++
++static void valleyview_hpd_irq_setup(struct drm_device *dev)
++{
++	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
++	u32 hotplug_en = I915_READ(PORT_HOTPLUG_EN);
++
+ 	/* Note HDMI and DP share bits */
+ 	if (dev_priv->hotplug_supported_mask & HDMIB_HOTPLUG_INT_STATUS)
+ 		hotplug_en |= HDMIB_HOTPLUG_INT_EN;
+@@ -2084,8 +2095,6 @@ static int valleyview_irq_postinstall(st
+ 	}
+ 
+ 	I915_WRITE(PORT_HOTPLUG_EN, hotplug_en);
+-
+-	return 0;
+ }
+ 
+ static void valleyview_irq_uninstall(struct drm_device *dev)
+@@ -2315,6 +2324,9 @@ static int i915_irq_postinstall(struct d
+ 		I915_USER_INTERRUPT;
+ 
+ 	if (I915_HAS_HOTPLUG(dev)) {
++		I915_WRITE(PORT_HOTPLUG_EN, 0);
++		POSTING_READ(PORT_HOTPLUG_EN);
++
+ 		/* Enable in IER... */
+ 		enable_mask |= I915_DISPLAY_PORT_INTERRUPT;
+ 		/* and unmask in IMR */
+@@ -2325,8 +2337,18 @@ static int i915_irq_postinstall(struct d
+ 	I915_WRITE(IER, enable_mask);
+ 	POSTING_READ(IER);
+ 
++	intel_opregion_enable_asle(dev);
++
++	return 0;
++}
++
++static void i915_hpd_irq_setup(struct drm_device *dev)
++{
++	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
++	u32 hotplug_en;
++
+ 	if (I915_HAS_HOTPLUG(dev)) {
+-		u32 hotplug_en = I915_READ(PORT_HOTPLUG_EN);
++		hotplug_en = I915_READ(PORT_HOTPLUG_EN);
+ 
+ 		if (dev_priv->hotplug_supported_mask & HDMIB_HOTPLUG_INT_STATUS)
+ 			hotplug_en |= HDMIB_HOTPLUG_INT_EN;
+@@ -2347,10 +2369,6 @@ static int i915_irq_postinstall(struct d
+ 
+ 		I915_WRITE(PORT_HOTPLUG_EN, hotplug_en);
+ 	}
+-
+-	intel_opregion_enable_asle(dev);
+-
+-	return 0;
+ }
+ 
+ static irqreturn_t i915_irq_handler(int irq, void *arg)
+@@ -2510,7 +2528,6 @@ static void i965_irq_preinstall(struct d
+ static int i965_irq_postinstall(struct drm_device *dev)
+ {
+ 	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
+-	u32 hotplug_en;
+ 	u32 enable_mask;
+ 	u32 error_mask;
+ 
+@@ -2552,6 +2569,19 @@ static int i965_irq_postinstall(struct d
+ 	I915_WRITE(IER, enable_mask);
+ 	POSTING_READ(IER);
+ 
++	I915_WRITE(PORT_HOTPLUG_EN, 0);
++	POSTING_READ(PORT_HOTPLUG_EN);
++
++	intel_opregion_enable_asle(dev);
++
++	return 0;
++}
++
++static void i965_hpd_irq_setup(struct drm_device *dev)
++{
++	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
++	u32 hotplug_en;
++
+ 	/* Note HDMI and DP share hotplug bits */
+ 	hotplug_en = 0;
+ 	if (dev_priv->hotplug_supported_mask & HDMIB_HOTPLUG_INT_STATUS)
+@@ -2586,10 +2616,6 @@ static int i965_irq_postinstall(struct d
+ 	/* Ignore TV since it's buggy */
+ 
+ 	I915_WRITE(PORT_HOTPLUG_EN, hotplug_en);
+-
+-	intel_opregion_enable_asle(dev);
+-
+-	return 0;
+ }
+ 
+ static irqreturn_t i965_irq_handler(int irq, void *arg)
+@@ -2768,6 +2794,7 @@ void intel_irq_init(struct drm_device *d
+ 		dev->driver->irq_uninstall = valleyview_irq_uninstall;
+ 		dev->driver->enable_vblank = valleyview_enable_vblank;
+ 		dev->driver->disable_vblank = valleyview_disable_vblank;
++		dev_priv->display.hpd_irq_setup = valleyview_hpd_irq_setup;
+ 	} else if (IS_IVYBRIDGE(dev) || IS_HASWELL(dev)) {
+ 		/* Share pre & uninstall handlers with ILK/SNB */
+ 		dev->driver->irq_handler = ivybridge_irq_handler;
+@@ -2794,13 +2821,23 @@ void intel_irq_init(struct drm_device *d
+ 			dev->driver->irq_postinstall = i915_irq_postinstall;
+ 			dev->driver->irq_uninstall = i915_irq_uninstall;
+ 			dev->driver->irq_handler = i915_irq_handler;
++			dev_priv->display.hpd_irq_setup = i915_hpd_irq_setup;
+ 		} else {
+ 			dev->driver->irq_preinstall = i965_irq_preinstall;
+ 			dev->driver->irq_postinstall = i965_irq_postinstall;
+ 			dev->driver->irq_uninstall = i965_irq_uninstall;
+ 			dev->driver->irq_handler = i965_irq_handler;
++			dev_priv->display.hpd_irq_setup = i965_hpd_irq_setup;
+ 		}
+ 		dev->driver->enable_vblank = i915_enable_vblank;
+ 		dev->driver->disable_vblank = i915_disable_vblank;
+ 	}
+ }
++
++void intel_hpd_init(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	if (dev_priv->display.hpd_irq_setup)
++		dev_priv->display.hpd_irq_setup(dev);
++}
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -591,6 +591,7 @@ extern int intel_framebuffer_init(struct
+ 				  struct drm_mode_fb_cmd2 *mode_cmd,
+ 				  struct drm_i915_gem_object *obj);
+ extern int intel_fbdev_init(struct drm_device *dev);
++extern void intel_fbdev_initial_config(struct drm_device *dev);
+ extern void intel_fbdev_fini(struct drm_device *dev);
+ extern void intel_fbdev_set_suspend(struct drm_device *dev, int state);
+ extern void intel_prepare_page_flip(struct drm_device *dev, int plane);
+--- a/drivers/gpu/drm/i915/intel_fb.c
++++ b/drivers/gpu/drm/i915/intel_fb.c
+@@ -243,10 +243,18 @@ int intel_fbdev_init(struct drm_device *
+ 	}
+ 
+ 	drm_fb_helper_single_add_all_connectors(&ifbdev->helper);
+-	drm_fb_helper_initial_config(&ifbdev->helper, 32);
++
+ 	return 0;
+ }
+ 
++void intel_fbdev_initial_config(struct drm_device *dev)
++{
++	drm_i915_private_t *dev_priv = dev->dev_private;
++
++	/* Due to peculiar init order wrt to hpd handling this is separate. */
++	drm_fb_helper_initial_config(&dev_priv->fbdev->helper, 32);
++}
++
+ void intel_fbdev_fini(struct drm_device *dev)
+ {
+ 	drm_i915_private_t *dev_priv = dev->dev_private;
