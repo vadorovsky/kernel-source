@@ -1,0 +1,147 @@
+From 44498aea293b37af1d463acd9658cdce1ecdf427 Mon Sep 17 00:00:00 2001
+From: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Date: Fri, 22 Feb 2013 17:05:28 -0300
+Subject: [PATCH] drm/i915: also disable south interrupts when handling them
+Git-commit: 44498aea293b37af1d463acd9658cdce1ecdf427
+Patch-mainline: 3.9-rc2
+
+From the docs:
+
+  "IIR can queue up to two interrupt events. When the IIR is cleared,
+  it will set itself again after one clock if a second event was
+  stored."
+
+  "Only the rising edge of the PCH Display interrupt will cause the
+  North Display IIR (DEIIR) PCH Display Interrupt even bit to be set,
+  so all PCH Display Interrupts, including back to back interrupts,
+  must be cleared before a new PCH Display interrupt can cause DEIIR
+  to be set".
+
+The current code works fine because we don't get many interrupts, but
+if we enable the PCH FIFO underrun interrupts we'll start getting so
+many interrupts that at some point new PCH interrupts won't cause
+DEIIR to be set.
+
+The initial implementation I tried was to turn the code that checks
+SDEIIR into a loop, but we can still get interrupts even after the
+loop is done (and before the irq handler finishes), so we have to
+either disable the interrupts or mask them. In the end I concluded
+that just disabling the PCH interrupts is enough, you don't even need
+the loop, so this is what this patch implements. I've tested it and it
+passes the 2 "PCH FIFO underrun interrupt storms" I can reproduce:
+the "ironlake_crtc_disable" case and the "wrong watermarks" case.
+
+In other words, here's how to reproduce the problem fixed by this
+Patch: 1 - Enable PCH FIFO underrun interrupts (SERR_INT on SNB+)  2 - Boot the machine  3 - While booting we'll get tons of PCH FIFO underrun interrupts  4 - Plug a new monitor  5 - Run xrandr, notice it won't detect the new monitor  6 - Read SDEIIR and notice it's not 0 while DEIIR is 0
+
+Q: Can't we just clear DEIIR before SDEIIR?
+A: It doesn't work. SDEIIR has to be completely cleared (including the
+interrupts stored on its back queue) before it can flip DEIIR's bit to
+1 again, and even while you're clearing it you'll be getting more and
+more interrupts.
+
+Q: Why does it work by just disabling+enabling the south interrupts?
+A: Because when we re-enable them, if there's something on the SDEIIR
+register (maybe an interrupt stored on the queue), the re-enabling
+will make DEIIR's bit flip to 1, and since we'll already have
+interrupts enabled we'll get another interrupt, then run our irq
+handler again to process the "back" interrupts.
+
+V2: Even bigger commit message, added code comments.
+
+Note that this fixes missed dp aux irqs which have been reported for
+3.9-rc1. This regression has been introduced by switching to
+irq-driven dp aux transactions with
+
+commit 9ee32fea5fe810ec06af3a15e4c65478de56d4f5
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Sat Dec 1 13:53:48 2012 +0100
+
+    drm/i915: irq-drive the dp aux communication
+
+References: http://www.mail-archive.com/intel-gfx@lists.freedesktop.org/msg18588.html
+References: https://lkml.org/lkml/2013/2/26/769
+Tested-by: Imre Deak <imre.deak@intel.com>
+Reported-by: Sedat Dilek <sedat.dilek@gmail.com>
+Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+[danvet: Pimp commit message with references for the dp aux irq
+timeout regression this fixes.]
+
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_irq.c |   26 ++++++++++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -701,7 +701,7 @@ static irqreturn_t ivybridge_irq_handler
+ {
+ 	struct drm_device *dev = (struct drm_device *) arg;
+ 	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
+-	u32 de_iir, gt_iir, de_ier, pm_iir;
++	u32 de_iir, gt_iir, de_ier, pm_iir, sde_ier;
+ 	irqreturn_t ret = IRQ_NONE;
+ 	int i;
+ 
+@@ -711,6 +711,15 @@ static irqreturn_t ivybridge_irq_handler
+ 	de_ier = I915_READ(DEIER);
+ 	I915_WRITE(DEIER, de_ier & ~DE_MASTER_IRQ_CONTROL);
+ 
++	/* Disable south interrupts. We'll only write to SDEIIR once, so further
++	 * interrupts will will be stored on its back queue, and then we'll be
++	 * able to process them after we restore SDEIER (as soon as we restore
++	 * it, we'll get an interrupt if SDEIIR still has something to process
++	 * due to its back queue). */
++	sde_ier = I915_READ(SDEIER);
++	I915_WRITE(SDEIER, 0);
++	POSTING_READ(SDEIER);
++
+ 	gt_iir = I915_READ(GTIIR);
+ 	if (gt_iir) {
+ 		snb_gt_irq_handler(dev, dev_priv, gt_iir);
+@@ -759,6 +768,8 @@ static irqreturn_t ivybridge_irq_handler
+ 
+ 	I915_WRITE(DEIER, de_ier);
+ 	POSTING_READ(DEIER);
++	I915_WRITE(SDEIER, sde_ier);
++	POSTING_READ(SDEIER);
+ 
+ 	return ret;
+ }
+@@ -778,7 +789,7 @@ static irqreturn_t ironlake_irq_handler(
+ 	struct drm_device *dev = (struct drm_device *) arg;
+ 	drm_i915_private_t *dev_priv = (drm_i915_private_t *) dev->dev_private;
+ 	int ret = IRQ_NONE;
+-	u32 de_iir, gt_iir, de_ier, pm_iir;
++	u32 de_iir, gt_iir, de_ier, pm_iir, sde_ier;
+ 
+ 	atomic_inc(&dev_priv->irq_received);
+ 
+@@ -787,6 +798,15 @@ static irqreturn_t ironlake_irq_handler(
+ 	I915_WRITE(DEIER, de_ier & ~DE_MASTER_IRQ_CONTROL);
+ 	POSTING_READ(DEIER);
+ 
++	/* Disable south interrupts. We'll only write to SDEIIR once, so further
++	 * interrupts will will be stored on its back queue, and then we'll be
++	 * able to process them after we restore SDEIER (as soon as we restore
++	 * it, we'll get an interrupt if SDEIIR still has something to process
++	 * due to its back queue). */
++	sde_ier = I915_READ(SDEIER);
++	I915_WRITE(SDEIER, 0);
++	POSTING_READ(SDEIER);
++
+ 	de_iir = I915_READ(DEIIR);
+ 	gt_iir = I915_READ(GTIIR);
+ 	pm_iir = I915_READ(GEN6_PMIIR);
+@@ -849,6 +869,8 @@ static irqreturn_t ironlake_irq_handler(
+ done:
+ 	I915_WRITE(DEIER, de_ier);
+ 	POSTING_READ(DEIER);
++	I915_WRITE(SDEIER, sde_ier);
++	POSTING_READ(SDEIER);
+ 
+ 	return ret;
+ }
