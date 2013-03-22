@@ -1,0 +1,144 @@
+From e5ea20eb80f5962f054875b4f71aa696298d24d9 Mon Sep 17 00:00:00 2001
+From: Andrew Honig <ahonig@google.com>
+Date: Mon, 11 Mar 2013 15:10:03 -0600
+Subject: KVM: Convert MSR_KVM_SYSTEM_TIME to use gfn_to_hva_cache_init
+Patch-mainline: Not yet, Embargo lifted 2013-03-18
+References: bnc#806980 CVE-2013-1797
+
+There is a potential use after free issue with the handling of
+MSR_KVM_SYSTEM_TIME.  If the guest specifies a GPA in a movable or removable
+memory such as frame buffers then KVM might continue to write to that
+address even after it's removed via KVM_SET_USER_MEMORY_REGION.  KVM pins
+the page in memory so it's unlikely to cause an issue, but if the user
+space component re-purposes the memory previously used for the guest, then
+the guest will be able to corrupt that memory.
+
+Tested: Tested against kvmclock unit test
+
+Signed-off-by: Andrew Honig <ahonig@google.com>
+Acked-by: Bruce Rogers <brogers@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |    4 +--
+ arch/x86/kvm/x86.c              |   44 +++++++++++++++++-----------------------
+ 2 files changed, 21 insertions(+), 27 deletions(-)
+
+Index: b/arch/x86/include/asm/kvm_host.h
+===================================================================
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -394,8 +394,8 @@ struct kvm_vcpu_arch {
+ 	gpa_t time;
+ 	struct pvclock_vcpu_time_info hv_clock;
+ 	unsigned int hw_tsc_khz;
+-	unsigned int time_offset;
+-	struct page *time_page;
++	struct gfn_to_hva_cache pv_time;
++	bool pv_time_enabled;
+ 	u64 last_guest_tsc;
+ 	u64 last_kernel_ns;
+ 	u64 last_tsc_nsec;
+Index: b/arch/x86/kvm/x86.c
+===================================================================
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1163,10 +1163,10 @@ static int kvm_guest_time_update(struct
+ {
+ 	unsigned long flags;
+ 	struct kvm_vcpu_arch *vcpu = &v->arch;
+-	void *shared_kaddr;
+ 	unsigned long this_tsc_khz;
+ 	s64 kernel_ns, max_kernel_ns;
+ 	u64 tsc_timestamp;
++	struct pvclock_vcpu_time_info guest_hv_clock;
+ 
+ 	/* Keep irq disabled to prevent changes to the clock */
+ 	local_irq_save(flags);
+@@ -1199,7 +1199,7 @@ static int kvm_guest_time_update(struct
+ 
+ 	local_irq_restore(flags);
+ 
+-	if (!vcpu->time_page)
++	if (!vcpu->pv_time_enabled)
+ 		return 0;
+ 
+ 	/*
+@@ -1257,15 +1257,14 @@ static int kvm_guest_time_update(struct
+ 	 */
+ 	vcpu->hv_clock.version += 2;
+ 
+-	shared_kaddr = kmap_atomic(vcpu->time_page, KM_USER0);
+-
+-	memcpy(shared_kaddr + vcpu->time_offset, &vcpu->hv_clock,
+-	       sizeof(vcpu->hv_clock));
+-
+-	kunmap_atomic(shared_kaddr, KM_USER0);
++	if (unlikely(kvm_read_guest_cached(v->kvm, &vcpu->pv_time,
++		&guest_hv_clock, sizeof(guest_hv_clock)))) {
++		return -EFAULT;
++	}
+ 
+-	mark_page_dirty(v->kvm, vcpu->time >> PAGE_SHIFT);
+-	return 0;
++	return kvm_write_guest_cached(v->kvm, &vcpu->pv_time,
++					&vcpu->hv_clock,
++					sizeof(vcpu->hv_clock));
+ }
+ 
+ static bool msr_mtrr_valid(unsigned msr)
+@@ -1554,10 +1553,7 @@ static int kvm_pv_enable_async_pf(struct
+ 
+ static void kvmclock_reset(struct kvm_vcpu *vcpu)
+ {
+-	if (vcpu->arch.time_page) {
+-		kvm_release_page_dirty(vcpu->arch.time_page);
+-		vcpu->arch.time_page = NULL;
+-	}
++	vcpu->arch.pv_time_enabled = false;
+ }
+ 
+ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+@@ -1633,6 +1629,7 @@ int kvm_set_msr_common(struct kvm_vcpu *
+ 		break;
+ 	case MSR_KVM_SYSTEM_TIME_NEW:
+ 	case MSR_KVM_SYSTEM_TIME: {
++		u64 gpa_offset;
+ 		kvmclock_reset(vcpu);
+ 
+ 		vcpu->arch.time = data;
+@@ -1642,21 +1639,17 @@ int kvm_set_msr_common(struct kvm_vcpu *
+ 		if (!(data & 1))
+ 			break;
+ 
+-		/* ...but clean it before doing the actual write */
+-		vcpu->arch.time_offset = data & ~(PAGE_MASK | 1);
++		gpa_offset = data & ~(PAGE_MASK | 1);
+ 
+ 		/* Check that the address is 32-byte aligned. */
+-		if (vcpu->arch.time_offset &
+-				(sizeof(struct pvclock_vcpu_time_info) - 1))
++		if (gpa_offset & (sizeof(struct pvclock_vcpu_time_info) - 1))
+ 			break;
+ 
+-		vcpu->arch.time_page =
+-				gfn_to_page(vcpu->kvm, data >> PAGE_SHIFT);
+-
+-		if (is_error_page(vcpu->arch.time_page)) {
+-			kvm_release_page_clean(vcpu->arch.time_page);
+-			vcpu->arch.time_page = NULL;
+-		}
++		if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		     &vcpu->arch.pv_time, data & ~1ULL))
++			vcpu->arch.pv_time_enabled = false;
++		else
++			vcpu->arch.pv_time_enabled = true;
+ 		break;
+ 	}
+ 	case MSR_KVM_ASYNC_PF_EN:
+@@ -6459,6 +6452,7 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *
+ 		goto fail_free_mce_banks;
+ 
+ 	vcpu->arch.ia32_tsc_adjust_msr = 0x0;
++	vcpu->arch.pv_time_enabled = false;
+ 	kvm_async_pf_hash_reset(vcpu);
+ 
+ 	return 0;

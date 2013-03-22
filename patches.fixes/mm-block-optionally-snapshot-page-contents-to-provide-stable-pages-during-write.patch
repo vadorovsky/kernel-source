@@ -1,0 +1,229 @@
+From: "Darrick J. Wong" <darrick.wong@oracle.com>
+Date: Thu, 21 Feb 2013 16:42:55 -0800
+Subject: [PATCH] block: optionally snapshot page contents to provide stable
+ pages during write
+
+References: Only enable stable page writes when necessary (bnc#807517)
+Patch-mainline: Yes (v3.9)
+Git-commit: ffecfd1a72fccfcee3dabb99b9ecba9735318f90
+
+This provides a band-aid to provide stable page writes on jbd without
+needing to backport the fixed locking and page writeback bit handling
+schemes of jbd2.  The band-aid works by using bounce buffers to snapshot
+page contents instead of waiting.
+
+For those wondering about the ext3 bandage -- fixing the jbd locking
+(which was done as part of ext4dev years ago) is a lot of surgery, and
+setting PG_writeback on data pages when we actually hold the page lock
+dropped ext3 performance by nearly an order of magnitude.  If we're
+going to migrate iscsi and raid to use stable page writes, the
+complaints about high latency will likely return.  We might as well
+centralize their page snapshotting thing to one place.
+
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Tested-by: Andy Lutomirski <luto@amacapital.net>
+Cc: Adrian Hunter <adrian.hunter@intel.com>
+Cc: Artem Bityutskiy <dedekind1@gmail.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Mark Fasheh <mfasheh@suse.com>
+Cc: Steven Whitehouse <swhiteho@redhat.com>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Eric Van Hensbergen <ericvh@gmail.com>
+Cc: Ron Minnich <rminnich@sandia.gov>
+Cc: Latchesar Ionkov <lucho@ionkov.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ block/blk-core.c    |  8 +++++---
+ fs/ext3/super.c     |  1 +
+ include/linux/fs.h  |  1 +
+ mm/Kconfig          | 13 +++++++++++++
+ mm/bounce.c         | 48 ++++++++++++++++++++++++++++++++++++++++++++----
+ mm/page-writeback.c |  4 ++++
+ 6 files changed, 68 insertions(+), 7 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 6ff7b4f..9e66051 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1230,6 +1230,11 @@ static int __make_request(struct request_queue *q, struct bio *bio)
+ 	 */
+ 	blk_queue_bounce(q, &bio);
+ 
++	if (bio_integrity_enabled(bio) && bio_integrity_prep(bio)) {
++		bio_endio(bio, -EIO);
++		return;
++	}
++
+ 	if (bio->bi_rw & (REQ_FLUSH | REQ_FUA)) {
+ 		spin_lock_irq(q->queue_lock);
+ 		where = ELEVATOR_INSERT_FLUSH;
+@@ -1512,9 +1517,6 @@ static inline void __generic_make_request(struct bio *bio)
+ 		 */
+ 		blk_partition_remap(bio);
+ 
+-		if (bio_integrity_enabled(bio) && bio_integrity_prep(bio))
+-			goto end_io;
+-
+ 		if (old_sector != -1)
+ 			trace_block_bio_remap(q, bio, old_dev, old_sector);
+ 
+diff --git a/fs/ext3/super.c b/fs/ext3/super.c
+index 32d0288..7b26ef6 100644
+--- a/fs/ext3/super.c
++++ b/fs/ext3/super.c
+@@ -2084,6 +2084,7 @@ static int ext3_fill_super (struct super_block *sb, void *data, int silent)
+ 		test_opt(sb,DATA_FLAGS) == EXT3_MOUNT_JOURNAL_DATA ? "journal":
+ 		test_opt(sb,DATA_FLAGS) == EXT3_MOUNT_ORDERED_DATA ? "ordered":
+ 		"writeback");
++	sb->s_flags |= MS_SNAP_STABLE;
+ 
+ 	return 0;
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index c372305..ffb77ba 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -211,6 +211,7 @@ struct inodes_stat_t {
+ #define MS_KERNMOUNT	(1<<22) /* this is a kern_mount call */
+ #define MS_I_VERSION	(1<<23) /* Update inode I_version field */
+ #define MS_STRICTATIME	(1<<24) /* Always perform atime updates */
++#define MS_SNAP_STABLE	(1<<27) /* Snapshot pages during writeback, if needed */
+ #define MS_NOSEC	(1<<28)
+ #define MS_BORN		(1<<29)
+ #define MS_ACTIVE	(1<<30)
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 4cc40b7..4dd9459 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -210,6 +210,19 @@ config BOUNCE
+ 	def_bool y
+ 	depends on BLOCK && MMU && (ZONE_DMA || HIGHMEM)
+ 
++# On the 'tile' arch, USB OHCI needs the bounce pool since tilegx will often
++# have more than 4GB of memory, but we don't currently use the IOTLB to present
++# a 32-bit address to OHCI.  So we need to use a bounce pool instead.
++#
++# We also use the bounce pool to provide stable page writes for jbd.  jbd
++# initiates buffer writeback without locking the page or setting PG_writeback,
++# and fixing that behavior (a second time; jbd2 doesn't have this problem) is
++# a major rework effort.  Instead, use the bounce buffer to snapshot pages
++# (until jbd goes away).  The only jbd user is ext3.
++config NEED_BOUNCE_POOL
++	bool
++	default y if (TILE && USB_OHCI_HCD) || (BLK_DEV_INTEGRITY && JBD)
++
+ config NR_QUICK
+ 	int
+ 	depends on QUICKLIST
+diff --git a/mm/bounce.c b/mm/bounce.c
+index 1481de6..56977ce 100644
+--- a/mm/bounce.c
++++ b/mm/bounce.c
+@@ -177,8 +177,45 @@ static void bounce_end_io_read_isa(struct bio *bio, int err)
+ 	__bounce_end_io_read(bio, isa_page_pool, err);
+ }
+ 
++#ifdef CONFIG_NEED_BOUNCE_POOL
++static int must_snapshot_stable_pages(struct request_queue *q, struct bio *bio)
++{
++	struct page *page;
++	struct backing_dev_info *bdi;
++	struct address_space *mapping;
++	struct bio_vec *from;
++	int i;
++
++	if (bio_data_dir(bio) != WRITE)
++		return 0;
++
++	if (!bdi_cap_stable_pages_required(&q->backing_dev_info))
++		return 0;
++
++	/*
++	 * Based on the first page that has a valid mapping, decide whether or
++	 * not we have to employ bounce buffering to guarantee stable pages.
++	 */
++	bio_for_each_segment(from, bio, i) {
++		page = from->bv_page;
++		mapping = page_mapping(page);
++		if (!mapping)
++			continue;
++		bdi = mapping->backing_dev_info;
++		return mapping->host->i_sb->s_flags & MS_SNAP_STABLE;
++	}
++
++	return 0;
++}
++#else
++static int must_snapshot_stable_pages(struct request_queue *q, struct bio *bio)
++{
++	return 0;
++}
++#endif /* CONFIG_NEED_BOUNCE_POOL */
++
+ static void __blk_queue_bounce(struct request_queue *q, struct bio **bio_orig,
+-			       mempool_t *pool)
++			       mempool_t *pool, int force)
+ {
+ 	struct page *page;
+ 	struct bio *bio = NULL;
+@@ -191,7 +228,7 @@ static void __blk_queue_bounce(struct request_queue *q, struct bio **bio_orig,
+ 		/*
+ 		 * is destination page below bounce pfn?
+ 		 */
+-		if (page_to_pfn(page) <= queue_bounce_pfn(q))
++		if (page_to_pfn(page) <= queue_bounce_pfn(q) && !force)
+ 			continue;
+ 
+ 		/*
+@@ -269,6 +306,7 @@ static void __blk_queue_bounce(struct request_queue *q, struct bio **bio_orig,
+ 
+ void blk_queue_bounce(struct request_queue *q, struct bio **bio_orig)
+ {
++	int must_bounce;
+ 	mempool_t *pool;
+ 
+ 	/*
+@@ -277,13 +315,15 @@ void blk_queue_bounce(struct request_queue *q, struct bio **bio_orig)
+ 	if (!bio_has_data(*bio_orig))
+ 		return;
+ 
++	must_bounce = must_snapshot_stable_pages(q, *bio_orig);
++
+ 	/*
+ 	 * for non-isa bounce case, just check if the bounce pfn is equal
+ 	 * to or bigger than the highest pfn in the system -- in that case,
+ 	 * don't waste time iterating over bio segments
+ 	 */
+ 	if (!(q->bounce_gfp & GFP_DMA)) {
+-		if (queue_bounce_pfn(q) >= blk_max_pfn)
++		if (queue_bounce_pfn(q) >= blk_max_pfn && !must_bounce)
+ 			return;
+ 		pool = page_pool;
+ 	} else {
+@@ -294,7 +334,7 @@ void blk_queue_bounce(struct request_queue *q, struct bio **bio_orig)
+ 	/*
+ 	 * slow path
+ 	 */
+-	__blk_queue_bounce(q, bio_orig, pool);
++	__blk_queue_bounce(q, bio_orig, pool, must_bounce);
+ }
+ 
+ EXPORT_SYMBOL(blk_queue_bounce);
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index c6c9147..5d84f3c 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -1469,6 +1469,10 @@ void wait_for_stable_page(struct page *page)
+ 
+ 	if (!bdi_cap_stable_pages_required(bdi))
+ 		return;
++#ifdef CONFIG_NEED_BOUNCE_POOL
++	if (mapping->host->i_sb->s_flags & MS_SNAP_STABLE)
++		return;
++#endif /* CONFIG_NEED_BOUNCE_POOL */
+ 
+ 	wait_on_page_writeback(page);
+ }
