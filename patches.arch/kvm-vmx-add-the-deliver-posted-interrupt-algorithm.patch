@@ -1,0 +1,212 @@
+From: Yang Zhang <yang.z.zhang@Intel.com>
+Date: Thu, 11 Apr 2013 19:25:15 +0800
+Subject: [PATCH 6/7] KVM: VMX: Add the deliver posted interrupt algorithm
+References: fate#313618
+Git-commit: a20ed54d6e470bf0d28921b7aadb6ca0da0ff0c3
+Patch-mainline: Queued in subsystem maintainer repo
+
+Only deliver the posted interrupt when target vcpu is running
+and there is no previous interrupt pending in pir.
+
+Signed-off-by: Yang Zhang <yang.z.zhang@Intel.com>
+Reviewed-by: Gleb Natapov <gleb@redhat.com>
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Acked-by: Bruce Rogers <brogers@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |    2 +
+ arch/x86/kvm/lapic.c            |   13 ++++++++
+ arch/x86/kvm/lapic.h            |    1 
+ arch/x86/kvm/svm.c              |    6 +++
+ arch/x86/kvm/vmx.c              |   64 +++++++++++++++++++++++++++++++++++++++-
+ virt/kvm/kvm_main.c             |    1 
+ 6 files changed, 86 insertions(+), 1 deletion(-)
+
+Index: b/arch/x86/include/asm/kvm_host.h
+===================================================================
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -627,6 +627,8 @@ struct kvm_x86_ops {
+ 	void (*hwapic_isr_update)(struct kvm *kvm, int isr);
+ 	void (*load_eoi_exitmap)(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap);
+ 	void (*set_virtual_x2apic_mode)(struct kvm_vcpu *vcpu, bool set);
++	void (*deliver_posted_interrupt)(struct kvm_vcpu *vcpu, int vector);
++	void (*sync_pir_to_irr)(struct kvm_vcpu *vcpu);
+ 	int (*set_tss_addr)(struct kvm *kvm, unsigned int addr);
+ 	int (*get_tdp_level)(void);
+ 	u64 (*get_mt_mask)(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio);
+Index: b/arch/x86/kvm/lapic.c
+===================================================================
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -362,6 +362,19 @@ static u8 count_vectors(void *bitmap)
+ 	return count;
+ }
+ 
++void kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir)
++{
++	u32 i, pir_val;
++	struct kvm_lapic *apic = vcpu->arch.apic;
++
++	for (i = 0; i <= 7; i++) {
++		pir_val = xchg(&pir[i], 0);
++		if (pir_val)
++			*((u32 *)(apic->regs + APIC_IRR + i * 0x10)) |= pir_val;
++	}
++}
++EXPORT_SYMBOL_GPL(kvm_apic_update_irr);
++
+ static inline int apic_test_and_set_irr(int vec, struct kvm_lapic *apic)
+ {
+ 	apic->irr_pending = true;
+Index: b/arch/x86/kvm/lapic.h
+===================================================================
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -35,6 +35,7 @@ u64 kvm_lapic_get_base(struct kvm_vcpu *
+ void kvm_apic_set_version(struct kvm_vcpu *vcpu);
+ 
+ void kvm_apic_update_tmr(struct kvm_vcpu *vcpu, u32 *tmr);
++void kvm_apic_update_irr(struct kvm_vcpu *vcpu, u32 *pir);
+ int kvm_apic_match_physical_addr(struct kvm_lapic *apic, u16 dest);
+ int kvm_apic_match_logical_addr(struct kvm_lapic *apic, u8 mda);
+ int kvm_apic_set_irq(struct kvm_vcpu *vcpu, struct kvm_lapic_irq *irq,
+Index: b/arch/x86/kvm/svm.c
+===================================================================
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -3564,6 +3564,11 @@ static void svm_hwapic_isr_update(struct
+ 	return;
+ }
+ 
++static void svm_sync_pir_to_irr(struct kvm_vcpu *vcpu)
++{
++	return;
++}
++
+ static int svm_nmi_allowed(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+@@ -4350,6 +4355,7 @@ static struct kvm_x86_ops svm_x86_ops =
+ 	.vm_has_apicv = svm_vm_has_apicv,
+ 	.load_eoi_exitmap = svm_load_eoi_exitmap,
+ 	.hwapic_isr_update = svm_hwapic_isr_update,
++	.sync_pir_to_irr = svm_sync_pir_to_irr,
+ 
+ 	.set_tss_addr = svm_set_tss_addr,
+ 	.get_tdp_level = get_npt_level,
+Index: b/arch/x86/kvm/vmx.c
+===================================================================
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -367,6 +367,23 @@ struct pi_desc {
+ 	u32 rsvd[7];
+ } __aligned(64);
+ 
++static bool pi_test_and_set_on(struct pi_desc *pi_desc)
++{
++	return test_and_set_bit(POSTED_INTR_ON,
++			(unsigned long *)&pi_desc->control);
++}
++
++static bool pi_test_and_clear_on(struct pi_desc *pi_desc)
++{
++	return test_and_clear_bit(POSTED_INTR_ON,
++			(unsigned long *)&pi_desc->control);
++}
++
++static int pi_test_and_set_pir(int vector, struct pi_desc *pi_desc)
++{
++	return test_and_set_bit(vector, (unsigned long *)pi_desc->pir);
++}
++
+ struct vcpu_vmx {
+ 	struct kvm_vcpu       vcpu;
+ 	unsigned long         host_rsp;
+@@ -622,6 +639,7 @@ static void kvm_cpu_vmxon(u64 addr);
+ static void kvm_cpu_vmxoff(void);
+ static void vmx_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3);
+ static int vmx_set_tss_addr(struct kvm *kvm, unsigned int addr);
++static void vmx_sync_pir_to_irr_dummy(struct kvm_vcpu *vcpu);
+ 
+ static DEFINE_PER_CPU(struct vmcs *, vmxarea);
+ static DEFINE_PER_CPU(struct vmcs *, current_vmcs);
+@@ -2669,8 +2687,11 @@ static __init int hardware_setup(void)
+ 
+ 	if (enable_apicv)
+ 		kvm_x86_ops->update_cr8_intercept = NULL;
+-	else
++	else {
+ 		kvm_x86_ops->hwapic_irr_update = NULL;
++		kvm_x86_ops->deliver_posted_interrupt = NULL;
++		kvm_x86_ops->sync_pir_to_irr = vmx_sync_pir_to_irr_dummy;
++	}
+ 
+ 	if (nested)
+ 		nested_vmx_setup_ctls_msrs();
+@@ -3744,6 +3765,45 @@ static int vmx_vm_has_apicv(struct kvm *
+ }
+ 
+ /*
++ * Send interrupt to vcpu via posted interrupt way.
++ * 1. If target vcpu is running(non-root mode), send posted interrupt
++ * notification to vcpu and hardware will sync PIR to vIRR atomically.
++ * 2. If target vcpu isn't running(root mode), kick it to pick up the
++ * interrupt from PIR in next vmentry.
++ */
++static void vmx_deliver_posted_interrupt(struct kvm_vcpu *vcpu, int vector)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++	int r;
++
++	if (pi_test_and_set_pir(vector, &vmx->pi_desc))
++		return;
++
++	r = pi_test_and_set_on(&vmx->pi_desc);
++	kvm_make_request(KVM_REQ_EVENT, vcpu);
++	if (!r && (vcpu->mode == IN_GUEST_MODE))
++		apic->send_IPI_mask(get_cpu_mask(vcpu->cpu),
++				POSTED_INTR_VECTOR);
++	else
++		kvm_vcpu_kick(vcpu);
++}
++
++static void vmx_sync_pir_to_irr(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_vmx *vmx = to_vmx(vcpu);
++
++	if (!pi_test_and_clear_on(&vmx->pi_desc))
++		return;
++
++	kvm_apic_update_irr(vcpu, vmx->pi_desc.pir);
++}
++
++static void vmx_sync_pir_to_irr_dummy(struct kvm_vcpu *vcpu)
++{
++	return;
++}
++
++/*
+  * Set up the vmcs's constant host-state fields, i.e., host-state fields that
+  * will not change in the lifetime of the guest.
+  * Note that host-state that does change is set elsewhere. E.g., host-state
+@@ -7462,6 +7522,8 @@ static struct kvm_x86_ops vmx_x86_ops =
+ 	.load_eoi_exitmap = vmx_load_eoi_exitmap,
+ 	.hwapic_irr_update = vmx_hwapic_irr_update,
+ 	.hwapic_isr_update = vmx_hwapic_isr_update,
++	.sync_pir_to_irr = vmx_sync_pir_to_irr,
++	.deliver_posted_interrupt = vmx_deliver_posted_interrupt,
+ 
+ 	.set_tss_addr = vmx_set_tss_addr,
+ 	.get_tdp_level = get_ept_level,
+Index: b/virt/kvm/kvm_main.c
+===================================================================
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -626,6 +626,7 @@ static int kvm_create_dirty_bitmap(struc
+ 	memslot->dirty_bitmap_head = memslot->dirty_bitmap;
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(kvm_vcpu_kick);
+ #endif /* !CONFIG_S390 */
+ 
+ /*
