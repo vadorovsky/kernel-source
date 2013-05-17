@@ -1,0 +1,310 @@
+From: Mel Gorman <mgorman@suse.de>
+Date: Wed, 10 Oct 2012 20:58:51 +0100
+Subject: [PATCH] mm: compaction: cache if a pageblock was scanned and no pages
+ were isolated
+
+References: Cache compaction pfns for faster compaction cycles (bnc#816451)
+Patch-mainline: Yes (v3.7-rc1)
+Git-commit: bb13ffeb9f6bfeb301443994dfbf29f91117dfb3
+
+When compaction was implemented it was known that scanning could
+potentially be excessive.  The ideal was that a counter be maintained for
+each pageblock but maintaining this information would incur a severe
+penalty due to a shared writable cache line.  It has reached the point
+where the scanning costs are a serious problem, particularly on
+long-lived systems where a large process starts and allocates a large
+number of THPs at the same time.
+
+Instead of using a shared counter, this patch adds another bit to the
+pageblock flags called PG_migrate_skip.  If a pageblock is scanned by
+either migrate or free scanner and 0 pages were isolated, the pageblock is
+marked to be skipped in the future.  When scanning, this bit is checked
+before any scanning takes place and the block skipped if set.
+
+The main difficulty with a patch like this is "when to ignore the cached
+information?" If it's ignored too often, the scanning rates will still be
+excessive.  If the information is too stale then allocations will fail
+that might have otherwise succeeded.  In this patch
+
+o CMA always ignores the information
+o If the migrate and free scanner meet then the cached information will
+  be discarded if it's at least 5 seconds since the last time the cache
+  was discarded
+o If there are a large number of allocation failures, discard the cache.
+
+The time-based heuristic is very clumsy but there are few choices for a
+better event.  Depending solely on multiple allocation failures still
+allows excessive scanning when THP allocations are failing in quick
+succession due to memory pressure.  Waiting until memory pressure is
+relieved would cause compaction to continually fail instead of using
+reclaim/compaction to try allocate the page.  The time-based mechanism is
+clumsy but a better option is not obvious.
+
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Acked-by: Rik van Riel <riel@redhat.com>
+Cc: Richard Davies <richard@arachsys.com>
+Cc: Shaohua Li <shli@kernel.org>
+Cc: Avi Kivity <avi@redhat.com>
+Acked-by: Rafael Aquini <aquini@redhat.com>
+Cc: Fengguang Wu <fengguang.wu@intel.com>
+Cc: Michal Nazarewicz <mina86@mina86.com>
+Cc: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+Cc: Kyungmin Park <kyungmin.park@samsung.com>
+Cc: Mark Brown <broonie@opensource.wolfsonmicro.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/mmzone.h          |   3 ++
+ include/linux/pageblock-flags.h |  19 ++++++-
+ mm/compaction.c                 | 106 ++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 121 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 436a8c7..7c1ded33 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -329,6 +329,9 @@ struct zone {
+ 	 */
+ 	spinlock_t		lock;
+ 	int                     all_unreclaimable; /* All pages pinned */
++#if defined CONFIG_COMPACTION || defined CONFIG_CMA
++	unsigned long		compact_blockskip_expire;
++#endif
+ #ifdef CONFIG_MEMORY_HOTPLUG
+ 	/* see spanned/present_pages for more description */
+ 	seqlock_t		span_seqlock;
+diff --git a/include/linux/pageblock-flags.h b/include/linux/pageblock-flags.h
+index 19ef95d..be655e4 100644
+--- a/include/linux/pageblock-flags.h
++++ b/include/linux/pageblock-flags.h
+@@ -30,6 +30,9 @@ enum pageblock_bits {
+ 	PB_migrate,
+ 	PB_migrate_end = PB_migrate + 3 - 1,
+ 			/* 3 bits required for migrate types */
++#ifdef CONFIG_COMPACTION
++	PB_migrate_skip,/* If set the block is skipped by compaction */
++#endif /* CONFIG_COMPACTION */
+ 	NR_PAGEBLOCK_BITS
+ };
+ 
+@@ -65,10 +68,22 @@ unsigned long get_pageblock_flags_group(struct page *page,
+ void set_pageblock_flags_group(struct page *page, unsigned long flags,
+ 					int start_bitidx, int end_bitidx);
+ 
++#ifdef CONFIG_COMPACTION
++#define get_pageblock_skip(page) \
++			get_pageblock_flags_group(page, PB_migrate_skip,     \
++							PB_migrate_skip)
++#define clear_pageblock_skip(page) \
++			set_pageblock_flags_group(page, 0, PB_migrate_skip,  \
++							PB_migrate_skip)
++#define set_pageblock_skip(page) \
++			set_pageblock_flags_group(page, 1, PB_migrate_skip,  \
++							PB_migrate_skip)
++#endif /* CONFIG_COMPACTION */
++
+ #define get_pageblock_flags(page) \
+-			get_pageblock_flags_group(page, 0, NR_PAGEBLOCK_BITS-1)
++			get_pageblock_flags_group(page, 0, PB_migrate_end)
+ #define set_pageblock_flags(page, flags) \
+ 			set_pageblock_flags_group(page, flags,	\
+-						  0, NR_PAGEBLOCK_BITS-1)
++						  0, PB_migrate_end)
+ 
+ #endif	/* PAGEBLOCK_FLAGS_H */
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 428c961..5f8e949 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -70,6 +70,76 @@ static inline bool migrate_async_suitable(int migratetype)
+ 	return migratetype == MIGRATE_MOVABLE;
+ }
+ 
++#ifdef CONFIG_COMPACTION
++/* Returns true if the pageblock should be scanned for pages to isolate. */
++static inline bool isolation_suitable(struct compact_control *cc,
++					struct page *page)
++{
++	return !get_pageblock_skip(page);
++}
++
++/*
++ * This function is called to clear all cached information on pageblocks that
++ * should be skipped for page isolation when the migrate and free page scanner
++ * meet.
++ */
++static void reset_isolation_suitable(struct zone *zone)
++{
++	unsigned long start_pfn = zone->zone_start_pfn;
++	unsigned long end_pfn = zone->zone_start_pfn + zone->spanned_pages;
++	unsigned long pfn;
++
++	/*
++	 * Do not reset more than once every five seconds. If allocations are
++	 * failing sufficiently quickly to allow this to happen then continually
++	 * scanning for compaction is not going to help. The choice of five
++	 * seconds is arbitrary but will mitigate excessive scanning.
++	 */
++	if (time_before(jiffies, zone->compact_blockskip_expire))
++		return;
++	zone->compact_blockskip_expire = jiffies + (HZ * 5);
++
++	/* Walk the zone and mark every pageblock as suitable for isolation */
++	for (pfn = start_pfn; pfn < end_pfn; pfn += pageblock_nr_pages) {
++		struct page *page;
++
++		cond_resched();
++
++		if (!pfn_valid(pfn))
++			continue;
++
++		page = pfn_to_page(pfn);
++		if (zone != page_zone(page))
++			continue;
++
++		clear_pageblock_skip(page);
++	}
++}
++
++/*
++ * If no pages were isolated then mark this pageblock to be skipped in the
++ * future. The information is later cleared by reset_isolation_suitable().
++ */
++static void update_pageblock_skip(struct page *page, unsigned long nr_isolated)
++{
++	if (!page)
++		return;
++
++	if (!nr_isolated)
++		set_pageblock_skip(page);
++}
++#else
++static inline bool isolation_suitable(struct compact_control *cc,
++					struct page *page)
++{
++	return true;
++}
++
++static void update_pageblock_skip(struct page *page, unsigned long nr_isolated)
++{
++}
++#endif /* CONFIG_COMPACTION */
++
+ static inline bool should_release_lock(spinlock_t *lock)
+ {
+ 	return need_resched() || spin_is_contended(lock);
+@@ -143,7 +213,7 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
+ {
+ 	unsigned long zone_end_pfn, end_pfn;
+ 	int nr_scanned = 0, total_isolated = 0;
+-	struct page *cursor;
++	struct page *cursor, *valid_page = NULL;
+ 	unsigned long flags;
+ 	bool locked = false;
+ 
+@@ -166,6 +236,8 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
+ 		nr_scanned++;
+ 		if (!pfn_valid_within(blockpfn))
+ 			continue;
++		if (!valid_page)
++			valid_page = page;
+ 		if (!PageBuddy(page))
+ 			continue;
+ 
+@@ -205,6 +277,10 @@ static unsigned long isolate_freepages_block(struct compact_control *cc,
+ 		}
+ 	}
+ 
++	/* Update the pageblock-skip if the whole pageblock was scanned */
++	if (blockpfn == end_pfn)
++		update_pageblock_skip(valid_page, total_isolated);
++
+ 	trace_mm_compaction_isolate_freepages(nr_scanned, total_isolated);
+ 	if (locked)
+ 		spin_unlock_irqrestore(&cc->zone->lock, flags);
+@@ -265,6 +341,10 @@ static void isolate_freepages(struct zone *zone,
+ 		if (!suitable_migration_target(page))
+ 			continue;
+ 
++		/* If isolation recently failed, do not retry */
++		if (!isolation_suitable(cc, page))
++			continue;
++
+ 		/* Found a block suitable for isolating free pages from */
+ 		isolated = isolate_freepages_block(cc, pfn, freelist);
+ 		nr_freepages += isolated;
+@@ -340,6 +420,7 @@ static isolate_migrate_t isolate_migratepages(struct zone *zone,
+ 	isolate_mode_t mode = ISOLATE_ACTIVE|ISOLATE_INACTIVE;
+ 	unsigned long flags;
+ 	bool locked = false;
++	struct page *page = NULL, *valid_page = NULL;
+ 
+ 	/* Do not scan outside zone boundaries */
+ 	low_pfn = max(cc->migrate_pfn, zone->zone_start_pfn);
+@@ -372,8 +453,6 @@ static isolate_migrate_t isolate_migratepages(struct zone *zone,
+ 	/* Time to isolate some pages for migration */
+ 	cond_resched();
+ 	for (; low_pfn < end_pfn; low_pfn++) {
+-		struct page *page;
+-
+ 		/* give a chance to irqs before checking need_resched() */
+ 		if (locked && !((low_pfn+1) % SWAP_CLUSTER_MAX)) {
+ 			if (should_release_lock(&zone->lru_lock)) {
+@@ -410,6 +489,14 @@ static isolate_migrate_t isolate_migratepages(struct zone *zone,
+ 		if (page_zone(page) != zone)
+ 			continue;
+ 
++		if (!valid_page)
++			valid_page = page;
++
++		/* If isolation recently failed, do not retry */
++		pageblock_nr = low_pfn >> pageblock_order;
++		if (!isolation_suitable(cc, page))
++			goto next_pageblock;
++
+ 		/* Skip if free */
+ 		if (PageBuddy(page))
+ 			continue;
+@@ -419,7 +506,6 @@ static isolate_migrate_t isolate_migratepages(struct zone *zone,
+ 		 * migration is optimistic to see if the minimum amount of work
+ 		 * satisfies the allocation
+ 		 */
+-		pageblock_nr = low_pfn >> pageblock_order;
+ 		if (!cc->sync && last_pageblock_nr != pageblock_nr &&
+ 		    !migrate_async_suitable(get_pageblock_migratetype(page))) {
+ 			goto next_pageblock;
+@@ -493,6 +579,10 @@ next_pageblock:
+ 	if (locked)
+ 		spin_unlock_irqrestore(&zone->lru_lock, flags);
+ 
++	/* Update the pageblock-skip if the whole pageblock was scanned */
++	if (low_pfn == end_pfn)
++		update_pageblock_skip(valid_page, nr_isolated);
++
+ 	trace_mm_compaction_isolate_migratepages(nr_scanned, nr_isolated);
+ 
+ 	return ISOLATE_SUCCESS;
+@@ -554,8 +644,10 @@ static int compact_finished(struct zone *zone,
+ 		return COMPACT_PARTIAL;
+ 
+ 	/* Compaction run completes if the migrate and free scanner meet */
+-	if (cc->free_pfn <= cc->migrate_pfn)
++	if (cc->free_pfn <= cc->migrate_pfn) {
++		reset_isolation_suitable(cc->zone);
+ 		return COMPACT_COMPLETE;
++	}
+ 
+ 	/*
+ 	 * order == -1 is expected when compacting via
+@@ -655,6 +747,10 @@ static int compact_zone(struct zone *zone, struct compact_control *cc)
+ 	cc->free_pfn = cc->migrate_pfn + zone->spanned_pages;
+ 	cc->free_pfn &= ~(pageblock_nr_pages-1);
+ 
++	/* Clear pageblock skip if there are numerous alloc failures */
++	if (zone->compact_defer_shift == COMPACT_MAX_DEFER_SHIFT)
++		reset_isolation_suitable(zone);
++
+ 	migrate_prep_local();
+ 
+ 	while ((ret = compact_finished(zone, cc)) == COMPACT_CONTINUE) {
