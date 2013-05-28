@@ -1,0 +1,111 @@
+From 6fb8a90aa3f2319a25f3396b1e9273300f8903b8 Mon Sep 17 00:00:00 2001
+From: Carlos Maiolino <cmaiolino@redhat.com>
+Date: Fri, 10 Aug 2012 15:01:51 -0300
+Subject: [PATCH] xfs: fix race while discarding buffers [V4]
+Git-commit: 6fb8a90aa3f2319a25f3396b1e9273300f8903b8
+Patch-mainline: v3.6-rc7
+References: bnc#815356 (comment 36)
+
+While xfs_buftarg_shrink() is freeing buffers from the dispose list (filled with
+buffers from lru list), there is a possibility to have xfs_buf_stale() racing
+with it, and removing buffers from dispose list before xfs_buftarg_shrink() does
+it.
+
+This happens because xfs_buftarg_shrink() handle the dispose list without
+locking and the test condition in xfs_buf_stale() checks for the buffer being in
+*any* list:
+
+if (!list_empty(&bp->b_lru))
+
+If the buffer happens to be on dispose list, this causes the buffer counter of
+lru list (btp->bt_lru_nr) to be decremented twice (once in xfs_buftarg_shrink()
+and another in xfs_buf_stale()) causing a wrong account usage of the lru list.
+
+This may cause xfs_buftarg_shrink() to return a wrong value to the memory
+shrinker shrink_slab(), and such account error may also cause an underflowed
+value to be returned; since the counter is lower than the current number of
+items in the lru list, a decrement may happen when the counter is 0, causing
+an underflow on the counter.
+
+The fix uses a new flag field (and a new buffer flag) to serialize buffer
+handling during the shrink process. The new flag field has been designed to use
+btp->bt_lru_lock/unlock instead of xfs_buf_lock/unlock mechanism.
+
+dchinner, sandeen, aquini and aris also deserve credits for this.
+
+Signed-off-by: Carlos Maiolino <cmaiolino@redhat.com>
+Reviewed-by: Ben Myers <bpm@sgi.com>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Ben Myers <bpm@sgi.com>
+Acked-by: Jan Kara <jack@suse.cz>
+
+---
+ fs/xfs/xfs_buf.c |  5 ++++-
+ fs/xfs/xfs_buf.h | 41 ++++++++++++++++++++++++-----------------
+ 2 files changed, 28 insertions(+), 18 deletions(-)
+
+Index: linux-3.0-SLE11-SP2-xfs_buf_stale/fs/xfs/linux-2.6/xfs_buf.c
+===================================================================
+--- linux-3.0-SLE11-SP2-xfs_buf_stale.orig/fs/xfs/linux-2.6/xfs_buf.c
++++ linux-3.0-SLE11-SP2-xfs_buf_stale/fs/xfs/linux-2.6/xfs_buf.c
+@@ -109,6 +109,7 @@ xfs_buf_lru_add(
+ 		atomic_inc(&bp->b_hold);
+ 		list_add_tail(&bp->b_lru, &btp->bt_lru);
+ 		btp->bt_lru_nr++;
++		bp->b_lru_flags &= ~_XBF_LRU_DISPOSE;
+ 	}
+ 	spin_unlock(&btp->bt_lru_lock);
+ }
+@@ -157,7 +158,8 @@ xfs_buf_stale(
+ 		struct xfs_buftarg *btp = bp->b_target;
+ 
+ 		spin_lock(&btp->bt_lru_lock);
+-		if (!list_empty(&bp->b_lru)) {
++		if (!list_empty(&bp->b_lru) &&
++		    !(bp->b_lru_flags & _XBF_LRU_DISPOSE)) {
+ 			list_del_init(&bp->b_lru);
+ 			btp->bt_lru_nr--;
+ 			atomic_dec(&bp->b_hold);
+@@ -1468,6 +1470,7 @@ xfs_buftarg_shrink(
+ 		 */
+ 		list_move(&bp->b_lru, &dispose);
+ 		btp->bt_lru_nr--;
++		bp->b_lru_flags |= _XBF_LRU_DISPOSE;
+ 	}
+ 	spin_unlock(&btp->bt_lru_lock);
+ 
+Index: linux-3.0-SLE11-SP2-xfs_buf_stale/fs/xfs/linux-2.6/xfs_buf.h
+===================================================================
+--- linux-3.0-SLE11-SP2-xfs_buf_stale.orig/fs/xfs/linux-2.6/xfs_buf.h
++++ linux-3.0-SLE11-SP2-xfs_buf_stale/fs/xfs/linux-2.6/xfs_buf.h
+@@ -65,6 +65,7 @@ typedef enum {
+ #define	_XBF_RUN_QUEUES	(1 << 19)/* run block device task queue	*/
+ #define	_XBF_KMEM	(1 << 20)/* backed by heap memory */
+ #define _XBF_DELWRI_Q	(1 << 21)/* buffer on delwri queue */
++#define _XBF_LRU_DISPOSE (1 << 24)/* buffer being discarded */
+ 
+ typedef unsigned int xfs_buf_flags_t;
+ 
+@@ -84,7 +85,8 @@ typedef unsigned int xfs_buf_flags_t;
+ 	{ _XBF_PAGES,		"PAGES" }, \
+ 	{ _XBF_RUN_QUEUES,	"RUN_QUEUES" }, \
+ 	{ _XBF_KMEM,		"KMEM" }, \
+-	{ _XBF_DELWRI_Q,	"DELWRI_Q" }
++	{ _XBF_DELWRI_Q,	"DELWRI_Q" }, \
++	{ _XBF_LRU_DISPOSE,	"LRU_DISPOSE" }
+ 
+ typedef enum {
+ 	XBT_FORCE_SLEEP = 0,
+@@ -139,7 +141,12 @@ typedef struct xfs_buf {
+ 	xfs_buf_flags_t		b_flags;	/* status flags */
+ 	struct semaphore	b_sema;		/* semaphore for lockables */
+ 
++	/*
++	 * concurrent access to b_lru and b_lru_flags are protected by
++	 * bt_lru_lock and not by b_sema
++	 */
+ 	struct list_head	b_lru;		/* lru list */
++	xfs_buf_flags_t		b_lru_flags;	/* internal lru status flags */
+ 	wait_queue_head_t	b_waiters;	/* unpin waiters */
+ 	struct list_head	b_list;
+ 	struct xfs_perag	*b_pag;		/* contains rbtree root */
