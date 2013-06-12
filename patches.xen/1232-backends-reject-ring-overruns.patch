@@ -1,0 +1,409 @@
+From http://xenbits.xen.org/hg/linux-2.6.18-xen.hg/rev/8806dfb939d4
+From: xen-devel@lists.xen.org
+Patch-mainline: n/a
+Subject: backends: Check for insane amounts of requests on the ring
+
+Check that the ring does not have an insane amount of requests
+(more than there could fit on the ring).
+
+If we detect this case we will stop processing the requests
+and wait until the XenBus disconnects the ring.
+
+The existing check RING_REQUEST_CONS_OVERFLOW which checks for how
+many responses we have created in the past (rsp_prod_pvt) vs
+requests consumed (req_cons) and whether said difference is greater or
+equal to the size of the ring, does not catch this case.
+
+Wha the condition does check if there is a need to process more
+as we still have a backlog of responses to finish. Note that both
+of those values (rsp_prod_pvt and req_cons) are not exposed on the
+shared ring.
+
+To understand this problem a mini crash course in ring protocol
+response/request updates is in place.
+
+There are four entries: req_prod and rsp_prod; req_event and rsp_event
+to track the ring entries. We are only concerned about the first two -
+which set the tone of this bug.
+
+The req_prod is a value incremented by frontend for each request put
+on the ring. Conversely the rsp_prod is a value incremented by the backend
+for each response put on the ring (rsp_prod gets set by rsp_prod_pvt when
+pushing the responses on the ring).  Both values can
+wrap and are modulo the size of the ring (in block case that is 32).
+Please see RING_GET_REQUEST and RING_GET_RESPONSE for the more details.
+
+The culprit here is that if the difference between the
+req_prod and req_cons is greater than the ring size we have a problem.
+Fortunately for us, the '__do_block_io_op' loop:
+
+	rc = blk_rings->common.req_cons;
+	rp = blk_rings->common.sring->req_prod;
+
+	while (rc != rp) {
+
+		..
+		blk_rings->common.req_cons = ++rc; /* before make_response() */
+
+	}
+
+will loop up to the point when rc == rp. The macros inside of the
+loop (RING_GET_REQUEST) is smart and is indexing based on the modulo
+of the ring size. If the frontend has provided a bogus req_prod value
+we will loop until the 'rc == rp' - which means we could be processing
+already processed requests (or responses) often.
+
+The reason the RING_REQUEST_CONS_OVERFLOW is not helping here is
+b/c it only tracks how many responses we have internally produced
+and whether we would should process more. The astute reader will
+notice that the macro RING_REQUEST_CONS_OVERFLOW provides two
+arguments - more on this later.
+
+For example, if we were to enter this function with these values:
+
+       	blk_rings->common.sring->req_prod =  X+31415 (X is the value from
+		the last time __do_block_io_op was called).
+        blk_rings->common.req_cons = X
+        blk_rings->common.rsp_prod_pvt = X
+
+The RING_REQUEST_CONS_OVERFLOW(&blk_rings->common, blk_rings->common.req_cons)
+is doing:
+
+	req_cons - sring->rsp_prod_pvt >= 32
+
+Which is,
+	X - X >= 32 or 0 >= 32
+
+And that is false, so we continue on looping (this bug).
+
+If we re-use said macro RING_REQUEST_CONS_OVERFLOW and pass in the rp
+instead (sring->req_prod) of rc, the this macro can do the check:
+
+     req_prod - sring->rsp_prov_pvt >= 32
+
+Which is,
+       X + 31415 - X >= 32 , or 31415 >= 32
+
+which is true, so we can error out and break out of the function.
+
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+
+Extend the blkback-only upstream patch to other affected backends.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+
+From http://xenbits.xen.org/hg/linux-2.6.18-xen.hg/rev/3963ee36b5d8
+From: xen-devel@lists.xen.org
+Patch-mainline: n/a
+Subject: backends: fix off by one in check of number of requests on the ring
+
+Other than for the "rc" check, where a delta >= RING_SIZE() is bogus,
+for "rp" only deltas > RING_SIZE() are, and hence we can't re-use
+RING_REQUEST_CONS_OVERFLOW().
+
+While at it, also adjust the values printed to actually be meaningful
+should these checks ever trigger: Print the values participating in the
+calculation, not an unrelated one.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+
+--- sle11sp3.orig/drivers/xen/blkback/blkback.c	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/blkback/blkback.c	2013-06-11 12:11:44.000000000 +0200
+@@ -229,8 +229,18 @@ int blkif_schedule(void *arg)
+ 		blkif->waiting_reqs = 0;
+ 		smp_mb(); /* clear flag *before* checking for work */
+ 
+-		if (do_block_io_op(blkif))
++		switch (do_block_io_op(blkif)) {
++		case 1:
+ 			blkif->waiting_reqs = 1;
++		case 0:
++			break;
++		case -EACCES:
++			wait_event_interruptible(blkif->shutdown_wq,
++						 kthread_should_stop());
++			break;
++		default:
++			BUG();
++		}
+ 		unplug_queue(blkif);
+ 
+ 		if (log_stats && time_after(jiffies, blkif->st_print))
+@@ -320,6 +330,15 @@ static int _do_block_io_op(blkif_t *blki
+ 	rp = blk_rings->common.sring->req_prod;
+ 	rmb(); /* Ensure we see queued requests up to 'rp'. */
+ 
++	if (RING_REQUEST_PROD_OVERFLOW(&blk_rings->common, rp)) {
++		rc = blk_rings->common.rsp_prod_pvt;
++		printk(KERN_WARNING "blkback:"
++		       " Dom%d provided bogus ring requests (%#x - %#x = %u)."
++		       " Halting ring processing on dev=%04x\n",
++		       blkif->domid, rp, rc, rp - rc, blkif->vbd.pdevice);
++		return -EACCES;
++	}
++
+ 	while (rc != rp) {
+ 		if (RING_REQUEST_CONS_OVERFLOW(&blk_rings->common, rc))
+ 			break;
+--- sle11sp3.orig/drivers/xen/blkback/common.h	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/blkback/common.h	2013-06-07 10:13:37.000000000 +0200
+@@ -89,6 +89,7 @@ typedef struct blkif_st {
+ 	int                 st_wr_sect;
+ 
+ 	wait_queue_head_t waiting_to_free;
++	wait_queue_head_t shutdown_wq;
+ } blkif_t;
+ 
+ struct backend_info
+--- sle11sp3.orig/drivers/xen/blkback/interface.c	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/blkback/interface.c	2013-06-07 10:13:37.000000000 +0200
+@@ -51,6 +51,7 @@ blkif_t *blkif_alloc(domid_t domid)
+ 	init_waitqueue_head(&blkif->wq);
+ 	blkif->st_print = jiffies;
+ 	init_waitqueue_head(&blkif->waiting_to_free);
++	init_waitqueue_head(&blkif->shutdown_wq);
+ 
+ 	return blkif;
+ }
+@@ -106,6 +107,7 @@ void blkif_disconnect(blkif_t *blkif)
+ 	if (blkif->xenblkd) {
+ 		kthread_stop(blkif->xenblkd);
+ 		blkif->xenblkd = NULL;
++		wake_up(&blkif->shutdown_wq);
+ 	}
+ 
+ 	atomic_dec(&blkif->refcnt);
+--- sle11sp3.orig/drivers/xen/blktap/blktap.c	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/blktap/blktap.c	2013-06-11 12:12:39.000000000 +0200
+@@ -659,6 +659,7 @@ static int blktap_release(struct inode *
+ 		if (info->blkif->xenblkd != NULL) {
+ 			kthread_stop(info->blkif->xenblkd);
+ 			info->blkif->xenblkd = NULL;
++			wake_up(&info->blkif->shutdown_wq);
+ 		}
+ 		info->status = CLEANSHUTDOWN;
+ 	}
+@@ -1160,8 +1161,18 @@ int tap_blkif_schedule(void *arg)
+ 		blkif->waiting_reqs = 0;
+ 		smp_mb(); /* clear flag *before* checking for work */
+ 
+-		if (do_block_io_op(blkif))
++		switch (do_block_io_op(blkif)) {
++		case 1:
+ 			blkif->waiting_reqs = 1;
++		case 0:
++			break;
++		case -EACCES:
++			wait_event_interruptible(blkif->shutdown_wq,
++						 kthread_should_stop());
++			break;
++		default:
++			BUG();
++		}
+ 
+ 		if (log_stats && time_after(jiffies, blkif->st_print))
+ 			print_stats(blkif);
+@@ -1319,6 +1330,15 @@ static int _do_block_io_op(blkif_t *blki
+ 		return 0;
+ 	}
+ 
++	if (RING_REQUEST_PROD_OVERFLOW(&blk_rings->common, rp)) {
++		rc = blk_rings->common.rsp_prod_pvt;
++		printk(KERN_WARNING "blktap:"
++		       " Dom%d provided bogus ring requests (%#x - %#x = %u)."
++		       " Halting ring processing on tap%d\n",
++		       blkif->domid, rp, rc, rp - rc, info->minor);
++		return -EACCES;
++	}
++
+ 	while (rc != rp) {
+ 		
+ 		if (RING_FULL(&info->ufe_ring)) {
+--- sle11sp3.orig/drivers/xen/blktap/common.h	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/blktap/common.h	2013-06-07 10:13:37.000000000 +0200
+@@ -77,6 +77,7 @@ typedef struct blkif_st {
+ 	int                 st_wr_sect;
+ 
+ 	wait_queue_head_t waiting_to_free;
++	wait_queue_head_t shutdown_wq;
+ 
+ 	int		dev_num;
+ 	uint64_t        sectors;
+--- sle11sp3.orig/drivers/xen/blktap/interface.c	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/blktap/interface.c	2013-06-07 10:13:37.000000000 +0200
+@@ -51,6 +51,7 @@ blkif_t *tap_alloc_blkif(domid_t domid)
+ 	init_waitqueue_head(&blkif->wq);
+ 	blkif->st_print = jiffies;
+ 	init_waitqueue_head(&blkif->waiting_to_free);
++	init_waitqueue_head(&blkif->shutdown_wq);
+ 
+ 	return blkif;
+ }
+--- sle11sp3.orig/drivers/xen/blktap/xenbus.c	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/blktap/xenbus.c	2013-06-07 10:13:37.000000000 +0200
+@@ -187,8 +187,11 @@ static int blktap_remove(struct xenbus_d
+ 		be->backend_watch.node = NULL;
+ 	}
+ 	if (be->blkif) {
+-		if (be->blkif->xenblkd)
++		if (be->blkif->xenblkd) {
+ 			kthread_stop(be->blkif->xenblkd);
++			be->blkif->xenblkd = NULL;
++			wake_up(&be->blkif->shutdown_wq);
++		}
+ 		signal_tapdisk(be->blkif->dev_num);
+ 		tap_blkif_free(be->blkif, dev);
+ 		tap_blkif_kmem_cache_free(be->blkif);
+@@ -340,6 +343,7 @@ static void blkif_disconnect(blkif_t *bl
+ 	if (blkif->xenblkd) {
+ 		kthread_stop(blkif->xenblkd);
+ 		blkif->xenblkd = NULL;
++		wake_up(&blkif->shutdown_wq);
+ 	}
+ 
+ 	/* idempotent */
+--- sle11sp3.orig/drivers/xen/scsiback/common.h	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/scsiback/common.h	2013-06-07 10:13:37.000000000 +0200
+@@ -92,6 +92,7 @@ struct vscsibk_info {
+ 	struct task_struct *kthread;
+ 	wait_queue_head_t waiting_to_free;
+ 	wait_queue_head_t wq;
++	wait_queue_head_t shutdown_wq;
+ 	unsigned int waiting_reqs;
+ 	struct page **mmap_pages;
+ 
+--- sle11sp3.orig/drivers/xen/scsiback/interface.c	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/scsiback/interface.c	2013-06-07 10:13:37.000000000 +0200
+@@ -55,6 +55,7 @@ struct vscsibk_info *vscsibk_info_alloc(
+ 	spin_lock_init(&info->ring_lock);
+ 	atomic_set(&info->nr_unreplied_reqs, 0);
+ 	init_waitqueue_head(&info->wq);
++	init_waitqueue_head(&info->shutdown_wq);
+ 	init_waitqueue_head(&info->waiting_to_free);
+ 
+ 	return info;
+@@ -102,6 +103,7 @@ void scsiback_disconnect(struct vscsibk_
+ 	if (info->kthread) {
+ 		kthread_stop(info->kthread);
+ 		info->kthread = NULL;
++		wake_up(&info->shutdown_wq);
+ 	}
+ 
+ 	wait_event(info->waiting_to_free, 
+--- sle11sp3.orig/drivers/xen/scsiback/scsiback.c	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/scsiback/scsiback.c	2013-06-11 12:13:31.000000000 +0200
+@@ -589,6 +589,15 @@ static int _scsiback_do_cmd_fn(struct vs
+ 	rp = ring->sring->req_prod;
+ 	rmb();
+ 
++	if (RING_REQUEST_PROD_OVERFLOW(ring, rp)) {
++		rc = ring->rsp_prod_pvt;
++		printk(KERN_WARNING "scsiback:"
++		       " Dom%d provided bogus ring requests (%#x - %#x = %u)."
++		       " Halting ring processing\n",
++		       info->domid, rp, rc, rp - rc);
++		return -EACCES;
++	}
++
+ 	while ((rc != rp)) {
+ 		if (RING_REQUEST_CONS_OVERFLOW(ring, rc))
+ 			break;
+@@ -669,8 +678,18 @@ int scsiback_schedule(void *data)
+ 		info->waiting_reqs = 0;
+ 		smp_mb();
+ 
+-		if (scsiback_do_cmd_fn(info))
++		switch (scsiback_do_cmd_fn(info)) {
++		case 1:
+ 			info->waiting_reqs = 1;
++		case 0:
++			break;
++		case -EACCES:
++			wait_event_interruptible(info->shutdown_wq,
++						 kthread_should_stop());
++			break;
++		default:
++			BUG();
++		}
+ 	}
+ 
+ 	return 0;
+--- sle11sp3.orig/drivers/xen/usbback/interface.c	2013-06-07 10:12:50.000000000 +0200
++++ sle11sp3/drivers/xen/usbback/interface.c	2013-06-07 10:13:37.000000000 +0200
+@@ -89,6 +89,7 @@ usbif_t *usbif_alloc(domid_t domid, unsi
+ 	atomic_set(&usbif->refcnt, 0);
+ 	init_waitqueue_head(&usbif->wq);
+ 	init_waitqueue_head(&usbif->waiting_to_free);
++	init_waitqueue_head(&usbif->shutdown_wq);
+ 	spin_lock_init(&usbif->stub_lock);
+ 	INIT_LIST_HEAD(&usbif->stub_list);
+ 	spin_lock_init(&usbif->addr_lock);
+@@ -155,6 +156,7 @@ void usbif_disconnect(usbif_t *usbif)
+ 	if (usbif->xenusbd) {
+ 		kthread_stop(usbif->xenusbd);
+ 		usbif->xenusbd = NULL;
++		wake_up(&usbif->shutdown_wq);
+ 	}
+ 
+ 	spin_lock_irqsave(&usbif->stub_lock, flags);
+--- sle11sp3.orig/drivers/xen/usbback/usbback.c	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/usbback/usbback.c	2013-06-11 12:14:16.000000000 +0200
+@@ -979,6 +979,15 @@ static int usbbk_start_submit_urb(usbif_
+ 	rp = urb_ring->sring->req_prod;
+ 	rmb();
+ 
++	if (RING_REQUEST_PROD_OVERFLOW(urb_ring, rp)) {
++		rc = urb_ring->rsp_prod_pvt;
++		printk(KERN_WARNING "usbback:"
++		       " Dom%d provided bogus ring requests (%#x - %#x = %u)."
++		       " Halting ring processing on dev=%#x\n",
++		       usbif->domid, rp, rc, rp - rc, usbif->handle);
++		return -EACCES;
++	}
++
+ 	while (rc != rp) {
+ 		if (RING_REQUEST_CONS_OVERFLOW(urb_ring, rc)) {
+ 			if(printk_ratelimit())
+@@ -1052,8 +1061,18 @@ int usbbk_schedule(void *arg)
+ 		usbif->waiting_reqs = 0;
+ 		smp_mb();
+ 
+-		if (usbbk_start_submit_urb(usbif))
++		switch (usbbk_start_submit_urb(usbif)) {
++		case 1:
+ 			usbif->waiting_reqs = 1;
++		case 0:
++			break;
++		case -EACCES:
++			wait_event_interruptible(usbif->shutdown_wq,
++						 kthread_should_stop());
++			break;
++		default:
++			BUG();
++		}
+ 	}
+ 
+ 	usbif->xenusbd = NULL;
+--- sle11sp3.orig/drivers/xen/usbback/usbback.h	2013-06-07 10:12:51.000000000 +0200
++++ sle11sp3/drivers/xen/usbback/usbback.h	2013-06-07 10:13:37.000000000 +0200
+@@ -99,6 +99,7 @@ typedef struct usbif_st {
+ 	unsigned int waiting_reqs;
+ 	wait_queue_head_t waiting_to_free;
+ 	wait_queue_head_t wq;
++	wait_queue_head_t shutdown_wq;
+ } usbif_t;
+ 
+ struct vusb_port_id {
+--- sle11sp3.orig/include/xen/interface/io/ring.h	2013-06-11 12:23:23.000000000 +0200
++++ sle11sp3/include/xen/interface/io/ring.h	2013-06-11 10:14:44.000000000 +0200
+@@ -236,6 +236,10 @@ typedef struct __name##_back_ring __name
+ #define RING_REQUEST_CONS_OVERFLOW(_r, _cons)				\
+     (((_cons) - (_r)->rsp_prod_pvt) >= RING_SIZE(_r))
+ 
++/* Ill-behaved frontend determination: Can there be this many requests? */
++#define RING_REQUEST_PROD_OVERFLOW(_r, _prod)				\
++    (((_prod) - (_r)->rsp_prod_pvt) > RING_SIZE(_r))
++
+ #define RING_PUSH_REQUESTS(_r) do {					\
+     xen_wmb(); /* back sees requests /before/ updated producer index */	\
+     (_r)->sring->req_prod = (_r)->req_prod_pvt;				\
