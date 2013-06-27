@@ -1,0 +1,126 @@
+From: Stefan Haberland <stefan.haberland@de.ibm.com>
+Subject: dasd: Fix hanging device after resume with internal error 13.
+Patch-mainline: v3.10-rc1
+Git-commit: c55768765e7b488ff20832c6ba89ea4e017a7b1b
+References: bnc#825037, LTC#94554
+
+Description:  dasd: Fix hanging device after resume with internal error 13.
+Symptom:      After suspend resume cycle the DASD devices are unresponsive
+              and the logs show internal error 13.
+Problem:      If too many CCW requests are pre-build before a suspend/resume
+              cycle the device might not get enough memory to do path 
+              verification during resume.
+Solution:     Re-queue requests to the block device request queue on suspend
+              and free pre-build CCW requests. 
+Reproduction: Do suspend/resume cycles with DASD devices attached.
+
+Signed-off-by: Stefan Haberland <stefan.haberland@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/block/dasd.c |   63 ++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 55 insertions(+), 8 deletions(-)
+
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -2684,6 +2684,26 @@ static void _dasd_wake_block_flush_cb(st
+ }
+ 
+ /*
++ * Requeue a request back to the block request queue
++ * only works for block requests
++ */
++static int _dasd_requeue_request(struct dasd_ccw_req *cqr)
++{
++	struct dasd_block *block = cqr->block;
++	struct request *req;
++	unsigned long flags;
++
++	if (!block)
++		return -EINVAL;
++	spin_lock_irqsave(&block->queue_lock, flags);
++	req = (struct request *) cqr->callback_data;
++	blk_requeue_request(block->request_queue, req);
++	spin_unlock_irqrestore(&block->queue_lock, flags);
++
++	return 0;
++}
++
++/*
+  * Go through all request on the dasd_block request queue, cancel them
+  * on the respective dasd_device, and return them to the generic
+  * block layer.
+@@ -3490,10 +3510,11 @@ EXPORT_SYMBOL_GPL(dasd_generic_verify_pa
+ 
+ int dasd_generic_pm_freeze(struct ccw_device *cdev)
+ {
++	struct dasd_device *device = dasd_device_from_cdev(cdev);
++	struct list_head freeze_queue;
+ 	struct dasd_ccw_req *cqr, *n;
++	struct dasd_ccw_req *refers;
+ 	int rc;
+-	struct list_head freeze_queue;
+-	struct dasd_device *device = dasd_device_from_cdev(cdev);
+ 
+ 	if (IS_ERR(device))
+ 		return PTR_ERR(device);
+@@ -3506,7 +3527,8 @@ int dasd_generic_pm_freeze(struct ccw_de
+ 
+ 	/* disallow new I/O  */
+ 	dasd_device_set_stop_bits(device, DASD_STOPPED_PM);
+-	/* clear active requests */
++
++	/* clear active requests and requeue them to block layer if possible */
+ 	INIT_LIST_HEAD(&freeze_queue);
+ 	spin_lock_irq(get_ccwdev_lock(cdev));
+ 	rc = 0;
+@@ -3526,7 +3548,6 @@ int dasd_generic_pm_freeze(struct ccw_de
+ 		}
+ 		list_move_tail(&cqr->devlist, &freeze_queue);
+ 	}
+-
+ 	spin_unlock_irq(get_ccwdev_lock(cdev));
+ 
+ 	list_for_each_entry_safe(cqr, n, &freeze_queue, devlist) {
+@@ -3534,12 +3555,38 @@ int dasd_generic_pm_freeze(struct ccw_de
+ 			   (cqr->status != DASD_CQR_CLEAR_PENDING));
+ 		if (cqr->status == DASD_CQR_CLEARED)
+ 			cqr->status = DASD_CQR_QUEUED;
++
++		/* requeue requests to blocklayer will only work for
++		   block device requests */
++		if (_dasd_requeue_request(cqr))
++			continue;
++
++		/* remove requests from device and block queue */
++		list_del_init(&cqr->devlist);
++		while (cqr->refers != NULL) {
++			refers = cqr->refers;
++			/* remove the request from the block queue */
++			list_del(&cqr->blocklist);
++			/* free the finished erp request */
++			dasd_free_erp_request(cqr, cqr->memdev);
++			cqr = refers;
++		}
++		if (cqr->block)
++			list_del_init(&cqr->blocklist);
++		cqr->block->base->discipline->free_cp(
++			cqr, (struct request *) cqr->callback_data);
+ 	}
+-	/* move freeze_queue to start of the ccw_queue */
+-	spin_lock_irq(get_ccwdev_lock(cdev));
+-	list_splice_tail(&freeze_queue, &device->ccw_queue);
+-	spin_unlock_irq(get_ccwdev_lock(cdev));
+ 
++	/*
++	 * if requests remain then they are internal request
++	 * and go back to the device queue
++	 */
++	if (!list_empty(&freeze_queue)) {
++		/* move freeze_queue to start of the ccw_queue */
++		spin_lock_irq(get_ccwdev_lock(cdev));
++		list_splice_tail(&freeze_queue, &device->ccw_queue);
++		spin_unlock_irq(get_ccwdev_lock(cdev));
++	}
+ 	dasd_put_device(device);
+ 	return rc;
+ }
