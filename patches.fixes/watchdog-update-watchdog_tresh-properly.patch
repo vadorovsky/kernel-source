@@ -1,0 +1,168 @@
+From: Michal Hocko <mhocko@suse.cz>
+Subject: watchdog: update watchdog_tresh properly
+Patch-mainline: no, will have a different fix
+References: bnc#829357
+
+watchdog_tresh controls how often nmi perf event counter checks per-cpu
+hrtimer_interrupts counter and blows up if the counter hasn't changed since the
+last check. The counter is updated by per-cpu watchdog_hrtimer hrtimer which is
+scheduled with 2/5 watchdog_thresh period which guarantees that hrtimer is
+scheduled at least 2 times per the main period. Both hrtimer and perf event
+are started together when the watchdog is enabled.
+
+So far so good. But...
+
+But what happens when watchdog_thresh is updated from sysctl handler?
+
+proc_dowatchdog will call watchdog_enable_all_cpus which simply tries to enable
+watchdog on every cpu. watchdog_nmi_enable then finds out that the perf event
+is in > PERF_EVENT_STATE_OFF state so no initialization is done. Same applies
+to the soft lockup kernel thread.
+
+The problem, however, is that while the perf event is ticking with the period
+configured when it has been set up hrtimer reprograms itself by using the
+_current_ value of the watchdog_thresh (see get_sample_period).
+
+This might result in an ear riping dissonance if the watchdog_thresh is
+increased and if the system is configured to panic on the lockup then even a
+nice kaBOOOM rather than a noisy and spurious warnings.
+
+This patch fixes the issue by updating both nmi perf even counter and
+hrtimers if the threshold value has changed.
+
+The nmi one is disabled and then reinitialized from scratch. This
+has an unpleasant side effect that the allocation of the new event might
+fail theoretically so the hard lockup detector would be disabled for
+such cpus. On the other hand such a memory allocation failure is very
+unlikely because the original event is deallocated right before.
+It would be much nicer if we just changed perf event period but there
+doesn't seem to be any API to do that right now.
+It is also unfortunate that perf_event_alloc uses GFP_KERNEL allocation
+unconditionally so we cannot use on_each_cpu() and do the same thing
+from the per-cpu context. The update from the current CPU should be
+safe because perf_event_disable removes the event atomically before
+it clears the per-cpu watchdog_ev so it cannot change anything under
+running handler feet.
+
+The hrtimer is simply restarted (thanks to Don Zickus who has pointed
+this out) if it is queued because we cannot rely it will fire&adopt
+to the new sampling period before a new nmi event triggers (when the
+treshold is decreased).
+
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+
+---
+ kernel/watchdog.c |   73 ++++++++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 52 insertions(+), 21 deletions(-)
+
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@ -352,18 +352,33 @@ static int watchdog(void *unused)
+ 
+ 
+ #ifdef CONFIG_HARDLOCKUP_DETECTOR
++static void watchdog_nmi_disable(int cpu)
++{
++	struct perf_event *event = per_cpu(watchdog_ev, cpu);
++
++	if (event) {
++		perf_event_disable(event);
++		per_cpu(watchdog_ev, cpu) = NULL;
++
++		/* should be in cleanup, but blocks oprofile */
++		perf_event_release_kernel(event);
++	}
++	return;
++}
++
+ static int watchdog_nmi_enable(int cpu)
+ {
+ 	struct perf_event_attr *wd_attr;
+ 	struct perf_event *event = per_cpu(watchdog_ev, cpu);
+ 
+ 	/* is it already setup and enabled? */
+-	if (event && event->state > PERF_EVENT_STATE_OFF)
+-		goto out;
+-
+-	/* it is setup but not enabled */
+-	if (event != NULL)
+-		goto out_enable;
++	if (event) {
++		if (event->state > PERF_EVENT_STATE_OFF)
++			watchdog_nmi_disable(cpu);
++		else
++			/* it is setup but not enabled */
++			goto out_enable;
++	}
+ 
+ 	/* Try to register using hardware perf events */
+ 	wd_attr = &wd_hw_attr;
+@@ -389,23 +404,8 @@ out_save:
+ 	per_cpu(watchdog_ev, cpu) = event;
+ out_enable:
+ 	perf_event_enable(per_cpu(watchdog_ev, cpu));
+-out:
+ 	return 0;
+ }
+-
+-static void watchdog_nmi_disable(int cpu)
+-{
+-	struct perf_event *event = per_cpu(watchdog_ev, cpu);
+-
+-	if (event) {
+-		perf_event_disable(event);
+-		per_cpu(watchdog_ev, cpu) = NULL;
+-
+-		/* should be in cleanup, but blocks oprofile */
+-		perf_event_release_kernel(event);
+-	}
+-	return;
+-}
+ #else
+ static int watchdog_nmi_enable(int cpu) { return 0; }
+ static void watchdog_nmi_disable(int cpu) { return; }
+@@ -421,6 +421,35 @@ static void watchdog_prepare_cpu(int cpu
+ 	hrtimer->function = watchdog_timer_fn;
+ }
+ 
++static void restart_watchdog_hrtimer(void *info)
++{
++	struct hrtimer *hrtimer = &__raw_get_cpu_var(watchdog_hrtimer);
++	int ret;
++
++	/*
++	 * No need to cancel and restart hrtimer if it is currently executing
++	 * because it will reprogram itself with the new period now.
++	 * We should never see it unqueued here because we are running per-cpu
++	 * with interrupts disabled.
++	 */
++	ret = hrtimer_try_to_cancel(hrtimer);
++	if (ret == 1)
++		hrtimer_start(hrtimer, ns_to_ktime(get_sample_period()),
++				HRTIMER_MODE_REL_PINNED);
++
++}
++
++static void update_watchdog_hrtimer(int cpu)
++{
++	struct call_single_data data = {.func = restart_watchdog_hrtimer};
++
++	/*
++	 * Hrtimer will adopt the new period on the next tick but this
++	 * might be late already so we have to restart the timer as well.
++	 */
++	__smp_call_function_single(cpu, &data, 1);
++}
++
+ static int watchdog_enable(int cpu)
+ {
+ 	struct task_struct *p = per_cpu(softlockup_watchdog, cpu);
+@@ -450,6 +479,8 @@ static int watchdog_enable(int cpu)
+ 		per_cpu(watchdog_touch_ts, cpu) = 0;
+ 		per_cpu(softlockup_watchdog, cpu) = p;
+ 		wake_up_process(p);
++	} else {
++		update_watchdog_hrtimer(cpu);
+ 	}
+ 
+ out:
