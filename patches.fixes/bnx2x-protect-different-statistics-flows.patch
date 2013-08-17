@@ -1,0 +1,204 @@
+From: Dmitry Kravkov <dmitry@broadcom.com>
+Date: Tue, 13 Aug 2013 02:24:59 +0300
+Subject: bnx2x: protect different statistics flows
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/davem/net.git
+Git-commit: 507393eb2909ddf39edf3f8f4cd0fd914b720006
+References: bnc#814336
+
+Add locking to protect different statistics flows from
+running simultaneously.
+This in order to serialize statistics requests sent to FW,
+otherwise two outstanding queries may cause FW assert.
+
+Signed-off-by: Dmitry Kravkov <dmitry@broadcom.com>
+Signed-off-by: Ariel Elior <ariele@broadcom.com>
+Signed-off-by: Eilon Greenstein <eilong@broadcom.com>
+Acked-by: Neal Cardwell <ncardwell@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/bnx2x/bnx2x.h       |    3 +
+ drivers/net/bnx2x/bnx2x_main.c  |    1 
+ drivers/net/bnx2x/bnx2x_stats.c |   64 +++++++++++++++++++++++++++++++++-------
+ 3 files changed, 57 insertions(+), 11 deletions(-)
+--- a/drivers/net/bnx2x/bnx2x.h
++++ b/drivers/net/bnx2x/bnx2x.h
+@@ -1523,6 +1523,9 @@ struct bnx2x {
+ 
+ 	/* priority to cos mapping */
+ 	u8					prio_to_cos[8];
++
++	bool					stats_started;
++	struct semaphore			stats_sema;
+ };
+ 
+ /* Tx queues may be less or equal to Rx queues */
+--- a/drivers/net/bnx2x/bnx2x_main.c
++++ b/drivers/net/bnx2x/bnx2x_main.c
+@@ -10082,6 +10082,7 @@ static int __devinit bnx2x_init_bp(struc
+ 	mutex_init(&bp->port.phy_mutex);
+ 	mutex_init(&bp->fw_mb_mutex);
+ 	spin_lock_init(&bp->stats_lock);
++	sema_init(&bp->stats_sema, 1);
+ #ifdef BCM_CNIC
+ 	mutex_init(&bp->cnic_mutex);
+ #endif
+--- a/drivers/net/bnx2x/bnx2x_stats.c
++++ b/drivers/net/bnx2x/bnx2x_stats.c
+@@ -142,7 +142,8 @@ static int bnx2x_stats_comp(struct bnx2x
+  * Statistics service functions
+  */
+ 
+-static void bnx2x_stats_pmf_update(struct bnx2x *bp)
++/* should be called under stats_sema */
++static void __bnx2x_stats_pmf_update(struct bnx2x *bp)
+ {
+ 	struct dmae_command *dmae;
+ 	u32 opcode;
+@@ -438,7 +439,8 @@ static void bnx2x_func_stats_init(struct
+ 	*stats_comp = 0;
+ }
+ 
+-static void bnx2x_stats_start(struct bnx2x *bp)
++/* should be called under stats_sema */
++static void __bnx2x_stats_start(struct bnx2x *bp)
+ {
+ 	if (bp->port.pmf)
+ 		bnx2x_port_stats_init(bp);
+@@ -448,19 +450,43 @@ static void bnx2x_stats_start(struct bnx
+ 
+ 	bnx2x_hw_stats_post(bp);
+ 	bnx2x_storm_stats_post(bp);
++
++	bp->stats_started = true;
++}
++
++static void bnx2x_stats_start(struct bnx2x *bp)
++{
++	if (down_timeout(&bp->stats_sema, HZ/10))
++		BNX2X_ERR("Unable to acquire stats lock\n");
++	__bnx2x_stats_start(bp);
++	up(&bp->stats_sema);
+ }
+ 
+ static void bnx2x_stats_pmf_start(struct bnx2x *bp)
+ {
++	if (down_timeout(&bp->stats_sema, HZ/10))
++		BNX2X_ERR("Unable to acquire stats lock\n");
+ 	bnx2x_stats_comp(bp);
+-	bnx2x_stats_pmf_update(bp);
+-	bnx2x_stats_start(bp);
++	__bnx2x_stats_pmf_update(bp);
++	__bnx2x_stats_start(bp);
++	up(&bp->stats_sema);
++}
++
++static void bnx2x_stats_pmf_update(struct bnx2x *bp)
++{
++	if (down_timeout(&bp->stats_sema, HZ/10))
++		BNX2X_ERR("Unable to acquire stats lock\n");
++	__bnx2x_stats_pmf_update(bp);
++	up(&bp->stats_sema);
+ }
+ 
+ static void bnx2x_stats_restart(struct bnx2x *bp)
+ {
++	if (down_timeout(&bp->stats_sema, HZ/10))
++		BNX2X_ERR("Unable to acquire stats lock\n");
+ 	bnx2x_stats_comp(bp);
+-	bnx2x_stats_start(bp);
++	__bnx2x_stats_start(bp);
++	up(&bp->stats_sema);
+ }
+ 
+ static void bnx2x_bmac_stats_update(struct bnx2x *bp)
+@@ -770,9 +796,7 @@ static int bnx2x_storm_stats_update(stru
+ 	/* Make sure we use the value of the counter
+ 	 * used for sending the last stats ramrod.
+ 	 */
+-	spin_lock_bh(&bp->stats_lock);
+ 	cur_stats_counter = bp->stats_counter - 1;
+-	spin_unlock_bh(&bp->stats_lock);
+ 
+ 	/* are storm stats valid? */
+ 	if (le16_to_cpu(counters->xstats_counter) != cur_stats_counter) {
+@@ -1169,11 +1193,17 @@ static void bnx2x_stats_update(struct bn
+ {
+ 	u32 *stats_comp = bnx2x_sp(bp, stats_comp);
+ 
+-	if (bnx2x_edebug_stats_stopped(bp))
++	/* we run update from timer context, so give up
++	 * if somebody is in the middle of transition
++	 */
++	if (down_trylock(&bp->stats_sema))
+ 		return;
+ 
++	if (bnx2x_edebug_stats_stopped(bp) || !bp->stats_started)
++		goto out;
++
+ 	if (*stats_comp != DMAE_COMP_VAL)
+-		return;
++		goto out;
+ 
+ 	if (bp->port.pmf)
+ 		bnx2x_hw_stats_update(bp);
+@@ -1183,7 +1213,7 @@ static void bnx2x_stats_update(struct bn
+ 			BNX2X_ERR("storm stats were not updated for 3 times\n");
+ 			bnx2x_panic();
+ 		}
+-		return;
++		goto out;
+ 	}
+ 
+ 	bnx2x_net_stats_update(bp);
+@@ -1240,6 +1270,9 @@ static void bnx2x_stats_update(struct bn
+ 
+ 	bnx2x_hw_stats_post(bp);
+ 	bnx2x_storm_stats_post(bp);
++
++out:
++	up(&bp->stats_sema);
+ }
+ 
+ static void bnx2x_port_stats_stop(struct bnx2x *bp)
+@@ -1305,6 +1338,11 @@ static void bnx2x_stats_stop(struct bnx2
+ {
+ 	int update = 0;
+ 
++	if (down_timeout(&bp->stats_sema, HZ/10))
++		BNX2X_ERR("Unable to acquire stats lock\n");
++
++	bp->stats_started = false;
++
+ 	bnx2x_stats_comp(bp);
+ 
+ 	if (bp->port.pmf)
+@@ -1321,6 +1359,8 @@ static void bnx2x_stats_stop(struct bnx2
+ 		bnx2x_hw_stats_post(bp);
+ 		bnx2x_stats_comp(bp);
+ 	}
++
++	up(&bp->stats_sema);
+ }
+ 
+ static void bnx2x_stats_do_nothing(struct bnx2x *bp)
+@@ -1349,15 +1389,17 @@ static const struct {
+ void bnx2x_stats_handle(struct bnx2x *bp, enum bnx2x_stats_event event)
+ {
+ 	enum bnx2x_stats_state state;
++	void (*action)(struct bnx2x *bp);
+ 	if (unlikely(bp->panic))
+ 		return;
+ 
+ 	spin_lock_bh(&bp->stats_lock);
+ 	state = bp->stats_state;
+ 	bp->stats_state = bnx2x_stats_stm[state][event].next_state;
++	action = bnx2x_stats_stm[state][event].action;
+ 	spin_unlock_bh(&bp->stats_lock);
+ 
+-	bnx2x_stats_stm[state][event].action(bp);
++	action(bp);
+ 
+ 	if ((event != STATS_EVENT_UPDATE) || netif_msg_timer(bp))
+ 		DP(BNX2X_MSG_STATS, "state %d -> event %d -> state %d\n",
