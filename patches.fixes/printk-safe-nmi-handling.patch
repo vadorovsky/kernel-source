@@ -1,0 +1,229 @@
+From: Michal Hocko <mhocko@suse.cz>
+Subject: printk: NMI safe printk
+Patch-mainline: not yet
+References: bnc#831949
+
+"Never ever even think about calling printk from NMI context", they said. Yes,
+calling anything from NMI that uses locks internally and it might be called
+from outside of NMI context as well is broken by definition. Printk is one such
+example. Unfortunately there are circumstances when calling printk from NMI is
+very useful. E.g. all WARN.*(in_nmi()) would be much more helpful if they
+didn't lockup the machine.
+
+Another example would be arch_trigger_all_cpu_backtrace for x86 which uses NMI
+to dump traces on all CPU (either triggered by sysrq+l or from RCU stall
+detector).
+
+This patch prevents from deadlock on logbuf_lock by using trylock rather than
+spin_lock and falling back into delayed message dumping from NMI context. It
+uses NMI specific ring buffer to store the message and relies on the current
+logbuf_lock holder to copy the content from the nmi_log_buf to the standard
+log_buf after it is done with its own business.
+
+In order to synchronize parallel printks from NMI context there was a new lock
+introduced. This one is held only from the NMI context and it doesn't nest into
+any other lock so it is safe against deadlocks.
+
+handle_nmi_delayed_printk which is responsible for nmi->regular ring buffer
+copying has to be prepared to race with ongoing NMI updating the NMI ring
+buffer. This is possible because emit_nmi_log_char only updates the finger to
+the end of the buffer.  nmi_log_start is updated only from !NMI context with
+log_buf held.
+
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+
+---
+ kernel/printk.c |  124 ++++++++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 111 insertions(+), 13 deletions(-)
+
+--- a/kernel/printk.c
++++ b/kernel/printk.c
+@@ -102,6 +102,15 @@ static int console_locked, console_suspe
+  */
+ static DEFINE_SPINLOCK(logbuf_lock);
+ 
++/*
++ * nmi_logbuf_lock protects nmi_log_buf, log_start and log_end from NNI context
++ * when logbuf_lock is held to synchronize NMI contexts which try to do printk
++ * at the same time. NEVER EVER take this lock outside of NMI context.
++ * non NMI consumer of nmi_log_buf has to take logbuf_lock and be careful about
++ * racing with NMI context (see handle_nmi_delayed_printk).
++ */
++static DEFINE_SPINLOCK(nmi_logbuf_lock);
++
+ #define LOG_BUF_MASK (log_buf_len-1)
+ #define __LOG_BUF(buf, idx) (buf[(idx) & LOG_BUF_MASK])
+ #define LOG_BUF(idx) (__LOG_BUF(log_buf, idx))
+@@ -698,6 +707,18 @@ static void emit_log_char(char c)
+ 		logged_chars++;
+ }
+ 
++static void emit_nmi_log_char(char c)
++{
++	__LOG_BUF(nmi_log_buf, nmi_log_end) = c;
++	/*
++	 * Make sure that the buffer content is visible before nmi_log_end
++	 * for out of lock access so that we can be sure that the content
++	 * is up-to-date
++	 */
++	smp_wmb();
++	nmi_log_end++;
++}
++
+ /*
+  * Zap console related locks when oopsing. Only zap at most once
+  * every 10 seconds, to leave time for slow consoles to print a
+@@ -835,6 +856,7 @@ static const char recursion_bug_msg [] =
+ static int recursion_bug;
+ static int new_text_line = 1;
+ static char printk_buf[1024];
++static char nmi_printk_buf[1024];
+ 
+ int printk_delay_msec __read_mostly;
+ 
+@@ -850,13 +872,50 @@ static inline void printk_delay(void)
+ 	}
+ }
+ 
+-static int finish_printk(char *msg, int printed_len)
++/*
++ * Called from non-NMI context to move nmi ring buffer into the regular printk
++ * ring buffer
++ */
++static void handle_nmi_delayed_printk(void)
++{
++	unsigned end_idx, start_idx, idx;
++
++	end_idx = ACCESS_ONCE(nmi_log_end);
++	start_idx = ACCESS_ONCE(nmi_log_start);
++
++	if (likely(end_idx == start_idx))
++		return;
++
++	spin_lock(&logbuf_lock);
++	for (idx = nmi_log_start; ; idx++) {
++		/*
++		 * nmi_log_end might be updated from NMI context. Make
++		 * sure we refetch a new value every loop invocation
++		 */
++		end_idx = ACCESS_ONCE(nmi_log_end);
++		if (idx == end_idx)
++			break;
++
++		/* Make sure the ring buffer doesn't overflow */
++		if (end_idx - idx > log_buf_len)
++			idx = end_idx - log_buf_len;
++
++		smp_rmb();
++		emit_log_char(__LOG_BUF(nmi_log_buf, idx));
++	}
++	/* Nobody touches nmi_log_buf except for us and we are locked */
++	nmi_log_start = idx;
++	if (console_trylock_for_printk(smp_processor_id()))
++		console_unlock();
++}
++
++static int finish_printk(char *msg, int printed_len, bool nmi_ring)
+ {
+ 	int current_log_level = default_message_loglevel;
+ 	char *msg_start = msg;
+ 	size_t plen;
+ 	char special;
+-	void (*emit_char)(char c) = emit_log_char;
++	void (*emit_char)(char c) = (nmi_ring) ? emit_nmi_log_char : emit_log_char;
+ 
+ 	/* TODO new_text_line needs a special handling for nmi_ring */
+ 
+@@ -939,6 +998,7 @@ asmlinkage int vprintk(const char *fmt,
+ 	int this_cpu;
+ 	char *buf = printk_buf;
+ 	unsigned buf_len = sizeof(printk_buf);
++	bool in_nmi_delayed_printk = false;
+ 
+ 	boot_delay_msec();
+ 	printk_delay();
+@@ -951,7 +1011,7 @@ asmlinkage int vprintk(const char *fmt,
+ 	/*
+ 	 * Ouch, printk recursed into itself!
+ 	 */
+-	if (unlikely(printk_cpu == this_cpu)) {
++	if (!in_nmi() && unlikely(printk_cpu == this_cpu)) {
+ 		/*
+ 		 * If a crash is occurring during printk() on this CPU,
+ 		 * then try to get the crash message out but make sure
+@@ -967,18 +1027,43 @@ asmlinkage int vprintk(const char *fmt,
+ 	}
+ 
+ 	lockdep_off();
+-	spin_lock(&logbuf_lock);
+-	printk_cpu = this_cpu;
+-
+-	if (recursion_bug) {
+-		recursion_bug = 0;
+-		strcpy(printk_buf, recursion_bug_msg);
+-		printed_len = strlen(recursion_bug_msg);
++	/*
++	 * Make sure we are not going to deadlock when we managed to preempt the
++	 * currently running printk from NMI. Copy the current message into nmi
++	 * ring buffer and let the current lock owner to print the message after
++	 * he is back on CPU.
++	 */
++	if (!spin_trylock(&logbuf_lock)) {
++		if (!in_nmi()) {
++			spin_lock(&logbuf_lock);
++		} else {
++			if (!nmi_log_buf) {
++				lockdep_on();
++				goto out_restore_irqs;
++			}
++			/*
++			 * The lock is allowed to be taken only from NMI context
++			 * to synchronize NMI printk callers.
++			 */
++			spin_lock(&nmi_logbuf_lock);
++			buf = nmi_printk_buf;
++			buf_len = sizeof(nmi_printk_buf);
++			in_nmi_delayed_printk = true;
++		}
+ 	}
++	if (!in_nmi_delayed_printk) {
++		printk_cpu = this_cpu;
++		if (recursion_bug) {
++			recursion_bug = 0;
++			strcpy(buf, recursion_bug_msg);
++			printed_len = strlen(recursion_bug_msg);
++		}
++	}
++
+ 	/* Emit the output into the temporary buffer */
+ 	printed_len += vscnprintf(buf + printed_len,
+ 				  buf_len - printed_len, fmt, args);
+-	printed_len = finish_printk(buf, printed_len);
++	printed_len = finish_printk(buf, printed_len, in_nmi_delayed_printk);
+ 
+ 	/*
+ 	 * Try to acquire and then immediately release the
+@@ -990,8 +1075,21 @@ asmlinkage int vprintk(const char *fmt,
+ 	 * will release 'logbuf_lock' regardless of whether it
+ 	 * actually gets the semaphore or not.
+ 	 */
+-	if (console_trylock_for_printk(this_cpu))
+-		console_unlock();
++	if (!in_nmi_delayed_printk) {
++		if (console_trylock_for_printk(this_cpu))
++			console_unlock();
++
++		/*
++		 * We are calling this outside of the lock just to make sure
++		 * that the printk which raced with NMI had a chance to do
++		 * some progress since it has been interrupted.
++		 * Do not try to handle pending NMI messages from NMI as
++		 * we would need to take logbuf_lock and we could deadlock.
++		 */
++		if (!in_nmi())
++			handle_nmi_delayed_printk();
++	} else
++		spin_unlock(&nmi_logbuf_lock);
+ 
+ 	lockdep_on();
+ out_restore_irqs:
