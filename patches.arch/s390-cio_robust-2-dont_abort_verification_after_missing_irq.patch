@@ -1,0 +1,142 @@
+From: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Subject: s390/cio: dont abort verification after missing irq
+Patch-mainline: v3.9-rc1
+Git-commit: 69f5576f6c8c9d0f0b3670ee7c807a194b4c40f4
+References: bnc#837741,LTC#97048
+
+Do not abort path verification when waiting for an interrupt timed out.
+Use path_noirq_mask to keep track of the paths used for this (also
+maintain a path_notoper_mask for debugging purposes). If the timeout
+happend to be during an operation where we query or alter the state of
+path groups set the pgid_unknown flag.
+
+With this change we allow usage of devices which have such ill-behaved
+paths (if at least one path is operational).
+
+Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/cio/device_pgid.c |   48 ++++++++++++++++++++++++++++++++---------
+ drivers/s390/cio/io_sch.h      |    5 ++++
+ 2 files changed, 43 insertions(+), 10 deletions(-)
+
+--- a/drivers/s390/cio/device_pgid.c
++++ b/drivers/s390/cio/device_pgid.c
+@@ -102,10 +102,20 @@ static void nop_callback(struct ccw_devi
+ 	struct subchannel *sch = to_subchannel(cdev->dev.parent);
+ 	struct ccw_request *req = &cdev->private->req;
+ 
+-	if (rc == 0)
++	switch (rc) {
++	case 0:
+ 		sch->vpm |= req->lpm;
+-	else if (rc != -EACCES)
++		break;
++	case -ETIME:
++		cdev->private->path_noirq_mask |= req->lpm;
++		break;
++	case -EACCES:
++		cdev->private->path_notoper_mask |= req->lpm;
++		break;
++	default:
+ 		goto err;
++	}
++	/* Continue on the next path. */
+ 	req->lpm >>= 1;
+ 	nop_do(cdev);
+ 	return;
+@@ -174,7 +184,12 @@ static void spid_callback(struct ccw_dev
+ 	case 0:
+ 		sch->vpm |= req->lpm & sch->opm;
+ 		break;
++	case -ETIME:
++		cdev->private->flags.pgid_unknown = 1;
++		cdev->private->path_noirq_mask |= req->lpm;
++		break;
+ 	case -EACCES:
++		cdev->private->path_notoper_mask |= req->lpm;
+ 		break;
+ 	case -EOPNOTSUPP:
+ 		if (cdev->private->flags.mpath) {
+@@ -404,10 +419,21 @@ static void snid_callback(struct ccw_dev
+ {
+ 	struct ccw_request *req = &cdev->private->req;
+ 
+-	if (rc == 0)
++	switch (rc) {
++	case 0:
+ 		cdev->private->pgid_valid_mask |= req->lpm;
+-	else if (rc != -EACCES)
++		break;
++	case -ETIME:
++		cdev->private->flags.pgid_unknown = 1;
++		cdev->private->path_noirq_mask |= req->lpm;
++		break;
++	case -EACCES:
++		cdev->private->path_notoper_mask |= req->lpm;
++		break;
++	default:
+ 		goto err;
++	}
++	/* Continue on the next path. */
+ 	req->lpm >>= 1;
+ 	snid_do(cdev);
+ 	return;
+@@ -427,6 +453,13 @@ static void verify_start(struct ccw_devi
+ 
+ 	sch->vpm = 0;
+ 	sch->lpm = sch->schib.pmcw.pam;
++
++	/* Initialize PGID data. */
++	memset(cdev->private->pgid, 0, sizeof(cdev->private->pgid));
++	cdev->private->pgid_valid_mask = 0;
++	cdev->private->pgid_todo_mask = sch->schib.pmcw.pam;
++	cdev->private->path_notoper_mask = 0;
++
+ 	/* Initialize request data. */
+ 	memset(req, 0, sizeof(*req));
+ 	req->timeout	= PGID_TIMEOUT;
+@@ -459,14 +492,8 @@ static void verify_start(struct ccw_devi
+  */
+ void ccw_device_verify_start(struct ccw_device *cdev)
+ {
+-	struct subchannel *sch = to_subchannel(cdev->dev.parent);
+-
+ 	CIO_TRACE_EVENT(4, "vrfy");
+ 	CIO_HEX_EVENT(4, &cdev->private->dev_id, sizeof(cdev->private->dev_id));
+-	/* Initialize PGID data. */
+-	memset(cdev->private->pgid, 0, sizeof(cdev->private->pgid));
+-	cdev->private->pgid_valid_mask = 0;
+-	cdev->private->pgid_todo_mask = sch->schib.pmcw.pam;
+ 	/*
+ 	 * Initialize pathgroup and multipath state with target values.
+ 	 * They may change in the course of path verification.
+@@ -474,6 +501,7 @@ void ccw_device_verify_start(struct ccw_
+ 	cdev->private->flags.pgroup = cdev->private->options.pgroup;
+ 	cdev->private->flags.mpath = cdev->private->options.mpath;
+ 	cdev->private->flags.doverify = 0;
++	cdev->private->path_noirq_mask = 0;
+ 	verify_start(cdev);
+ }
+ 
+--- a/drivers/s390/cio/io_sch.h
++++ b/drivers/s390/cio/io_sch.h
+@@ -123,6 +123,10 @@ struct ccw_device_private {
+ 	u8 pgid_valid_mask;	/* mask of valid PGIDs */
+ 	u8 pgid_todo_mask;	/* mask of PGIDs to be adjusted */
+ 	u8 pgid_reset_mask;	/* mask of PGIDs which were reset */
++	u8 path_noirq_mask;	/* mask of paths for which no irq was
++				   received */
++	u8 path_notoper_mask;	/* mask of paths which were found
++				   not operable */
+ 	u8 path_gone_mask;	/* mask of paths, that became unavailable */
+ 	u8 path_new_mask;	/* mask of paths, that became available */
+ 	struct {
+@@ -142,6 +146,7 @@ struct ccw_device_private {
+ 		unsigned int resuming:1;    /* recognition while resume */
+ 		unsigned int pgroup:1;	    /* pathgroup is set up */
+ 		unsigned int mpath:1;	    /* multipathing is set up */
++		unsigned int pgid_unknown:1;/* unknown pgid state */
+ 		unsigned int initialized:1; /* set if initial reference held */
+ 	} __attribute__((packed)) flags;
+ 	unsigned long intparm;	/* user interruption parameter */
