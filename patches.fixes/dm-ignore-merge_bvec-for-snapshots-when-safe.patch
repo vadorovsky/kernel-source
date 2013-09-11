@@ -1,0 +1,159 @@
+Git-commit: d5b9dd04bd74b774b8e8d93ced7a0d15ad403fa9
+From: Mikulas Patocka <mpatocka@redhat.com>
+Date: Tue, 2 Aug 2011 12:32:04 +0100
+Subject: [PATCH] dm: ignore merge_bvec for snapshots when safe
+Patch-mainline: v3.1
+References: bnc#820848
+
+Add a new flag DMF_MERGE_IS_OPTIONAL to struct mapped_device to indicate
+whether the device can accept bios larger than the size its merge
+function returns.  When set, use this to send large bios to snapshots
+which can split them if necessary.  Snapshot I/O may be significantly
+fragmented and this approach seems to improve peformance.
+
+Before the patch, dm_set_device_limits restricted bio size to page size
+if the underlying device had a merge function and the target didn't
+provide a merge function.  After the patch, dm_set_device_limits
+restricts bio size to page size if the underlying device has a merge
+function, doesn't have DMF_MERGE_IS_OPTIONAL flag and the target doesn't
+provide a merge function.
+
+The snapshot target can't provide a merge function because when the merge
+function is called, it is impossible to determine where the bio will be
+remapped.  Previously this led us to impose a 4k limit, which we can
+now remove if the snapshot store is located on a device without a merge
+function.  Together with another patch for optimizing full chunk writes,
+it improves performance from 29MB/s to 40MB/s when writing to the
+filesystem on snapshot store.
+
+If the snapshot store is placed on a non-dm device with a merge function
+(such as md-raid), device mapper still limits all bios to page size.
+
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Alasdair G Kergon <agk@redhat.com>
+Acked-by: NeilBrown <neilb@suse.de>
+
+---
+ drivers/md/dm-table.c |    3 --
+ drivers/md/dm.c       |   61 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/md/dm.h       |    2 +
+ 3 files changed, 64 insertions(+), 2 deletions(-)
+
+--- linux-3.0-SLE11-SP2.orig/drivers/md/dm-table.c
++++ linux-3.0-SLE11-SP2/drivers/md/dm-table.c
+@@ -551,8 +551,7 @@ int dm_set_device_limits(struct dm_targe
+ 	 * If not we'll force DM to use PAGE_SIZE or
+ 	 * smaller I/O, just to be safe.
+ 	 */
+-
+-	if (q->merge_bvec_fn && !ti->type->merge)
++	if (dm_queue_merge_is_compulsory(q) && !ti->type->merge)
+ 		blk_limits_max_hw_sectors(limits,
+ 					  (unsigned int) (PAGE_SIZE >> 9));
+ 	return 0;
+--- linux-3.0-SLE11-SP2.orig/drivers/md/dm.c
++++ linux-3.0-SLE11-SP2/drivers/md/dm.c
+@@ -112,6 +112,7 @@ EXPORT_SYMBOL_GPL(dm_get_rq_mapinfo);
+ #define DMF_FREEING 3
+ #define DMF_DELETING 4
+ #define DMF_NOFLUSH_SUSPENDING 5
++#define DMF_MERGE_IS_OPTIONAL 6
+ 
+ /*
+  * Work processed by per-device workqueue.
+@@ -2037,6 +2038,59 @@ static void __set_size(struct mapped_dev
+ }
+ 
+ /*
++ * Return 1 if the queue has a compulsory merge_bvec_fn function.
++ *
++ * If this function returns 0, then the device is either a non-dm
++ * device without a merge_bvec_fn, or it is a dm device that is
++ * able to split any bios it receives that are too big.
++ */
++int dm_queue_merge_is_compulsory(struct request_queue *q)
++{
++	struct mapped_device *dev_md;
++
++	if (!q->merge_bvec_fn)
++		return 0;
++
++	if (q->make_request_fn == dm_request) {
++		dev_md = q->queuedata;
++		if (test_bit(DMF_MERGE_IS_OPTIONAL, &dev_md->flags))
++			return 0;
++	}
++
++	return 1;
++}
++
++static int dm_device_merge_is_compulsory(struct dm_target *ti,
++					 struct dm_dev *dev, sector_t start,
++					 sector_t len, void *data)
++{
++	struct block_device *bdev = dev->bdev;
++	struct request_queue *q = bdev_get_queue(bdev);
++
++	return dm_queue_merge_is_compulsory(q);
++}
++
++/*
++ * Return 1 if it is acceptable to ignore merge_bvec_fn based
++ * on the properties of the underlying devices.
++ */
++static int dm_table_merge_is_optional(struct dm_table *table)
++{
++	unsigned i = 0;
++	struct dm_target *ti;
++
++	while (i < dm_table_get_num_targets(table)) {
++		ti = dm_table_get_target(table, i++);
++
++		if (ti->type->iterate_devices &&
++		    ti->type->iterate_devices(ti, dm_device_merge_is_compulsory, NULL))
++			return 0;
++	}
++
++	return 1;
++}
++
++/*
+  * Returns old map, which caller must destroy.
+  */
+ static struct dm_table *__bind(struct mapped_device *md, struct dm_table *t,
+@@ -2046,6 +2100,7 @@ static struct dm_table *__bind(struct ma
+ 	struct request_queue *q = md->queue;
+ 	sector_t size;
+ 	unsigned long flags;
++	int merge_is_optional;
+ 
+ 	size = dm_table_get_size(t);
+ 
+@@ -2071,10 +2126,16 @@ static struct dm_table *__bind(struct ma
+ 
+ 	__bind_mempools(md, t);
+ 
++	merge_is_optional = dm_table_merge_is_optional(t);
++
+ 	write_lock_irqsave(&md->map_lock, flags);
+ 	old_map = md->map;
+ 	md->map = t;
+ 	dm_table_set_restrictions(t, q, limits);
++	if (merge_is_optional)
++		set_bit(DMF_MERGE_IS_OPTIONAL, &md->flags);
++	else
++		clear_bit(DMF_MERGE_IS_OPTIONAL, &md->flags);
+ 	write_unlock_irqrestore(&md->map_lock, flags);
+ 
+ 	dm_table_get(md->map);
+--- linux-3.0-SLE11-SP2.orig/drivers/md/dm.h
++++ linux-3.0-SLE11-SP2/drivers/md/dm.h
+@@ -66,6 +66,8 @@ int dm_table_alloc_md_mempools(struct dm
+ void dm_table_free_md_mempools(struct dm_table *t);
+ struct dm_md_mempools *dm_table_get_md_mempools(struct dm_table *t);
+ 
++int dm_queue_merge_is_compulsory(struct request_queue *q);
++
+ void dm_lock_md_type(struct mapped_device *md);
+ void dm_unlock_md_type(struct mapped_device *md);
+ void dm_set_md_type(struct mapped_device *md, unsigned type);
