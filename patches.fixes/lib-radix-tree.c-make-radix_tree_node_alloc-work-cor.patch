@@ -1,0 +1,227 @@
+From 5e4c0d974139a98741b829b27cf38dc8f9284490 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 11 Sep 2013 14:26:05 -0700
+Subject: [PATCH] lib/radix-tree.c: make radix_tree_node_alloc() work correctly
+ within interrupt
+Git-commit: 5e4c0d974139a98741b829b27cf38dc8f9284490
+Patch-mainline: 3.12-rc1
+References: bnc#763463
+
+With users of radix_tree_preload() run from interrupt (block/blk-ioc.c is
+one such possible user), the following race can happen:
+
+radix_tree_preload()
+...
+radix_tree_insert()
+  radix_tree_node_alloc()
+    if (rtp->nr) {
+      ret = rtp->nodes[rtp->nr - 1];
+<interrupt>
+...
+radix_tree_preload()
+...
+radix_tree_insert()
+  radix_tree_node_alloc()
+    if (rtp->nr) {
+      ret = rtp->nodes[rtp->nr - 1];
+
+And we give out one radix tree node twice.  That clearly results in radix
+tree corruption with different results (usually OOPS) depending on which
+two users of radix tree race.
+
+We fix the problem by making radix_tree_node_alloc() always allocate fresh
+radix tree nodes when in interrupt.  Using preloading when in interrupt
+doesn't make sense since all the allocations have to be atomic anyway and
+we cannot steal nodes from process-context users because some users rely
+on radix_tree_insert() succeeding after radix_tree_preload().
+in_interrupt() check is somewhat ugly but we cannot simply key off passed
+gfp_mask as that is acquired from root_gfp_mask() and thus the same for
+all preload users.
+
+Another part of the fix is to avoid node preallocation in
+radix_tree_preload() when passed gfp_mask doesn't allow waiting.  Again,
+preallocation in such case doesn't make sense and when preallocation would
+happen in interrupt we could possibly leak some allocated nodes.  However,
+some users of radix_tree_preload() require following radix_tree_insert()
+to succeed.  To avoid unexpected effects for these users,
+radix_tree_preload() only warns if passed gfp mask doesn't allow waiting
+and we provide a new function radix_tree_maybe_preload() for those users
+which get different gfp mask from different call sites and which are
+prepared to handle radix_tree_insert() failure.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Cc: Jens Axboe <jaxboe@fusionio.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+Index: linux-3.0-SLE11-SP2/fs/fscache/page.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/fs/fscache/page.c
++++ linux-3.0-SLE11-SP2/fs/fscache/page.c
+@@ -767,7 +767,7 @@ int __fscache_write_page(struct fscache_
+ 			       fscache_release_write_op);
+ 	op->op.flags = FSCACHE_OP_ASYNC | (1 << FSCACHE_OP_WAITING);
+ 
+-	ret = radix_tree_preload(gfp & ~__GFP_HIGHMEM);
++	ret = radix_tree_maybe_preload(gfp & ~__GFP_HIGHMEM);
+ 	if (ret < 0)
+ 		goto nomem_free;
+ 
+Index: linux-3.0-SLE11-SP2/include/linux/radix-tree.h
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/include/linux/radix-tree.h
++++ linux-3.0-SLE11-SP2/include/linux/radix-tree.h
+@@ -232,6 +232,7 @@ unsigned long radix_tree_next_hole(struc
+ unsigned long radix_tree_prev_hole(struct radix_tree_root *root,
+ 				unsigned long index, unsigned long max_scan);
+ int radix_tree_preload(gfp_t gfp_mask);
++int radix_tree_maybe_preload(gfp_t gfp_mask);
+ void radix_tree_init(void);
+ void *radix_tree_tag_set(struct radix_tree_root *root,
+ 			unsigned long index, unsigned int tag);
+Index: linux-3.0-SLE11-SP2/lib/radix-tree.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/lib/radix-tree.c
++++ linux-3.0-SLE11-SP2/lib/radix-tree.c
+@@ -31,6 +31,7 @@
+ #include <linux/string.h>
+ #include <linux/bitops.h>
+ #include <linux/rcupdate.h>
++#include <linux/hardirq.h>		/* in_interrupt() */
+ 
+ 
+ #ifdef __KERNEL__
+@@ -171,7 +172,12 @@ radix_tree_node_alloc(struct radix_tree_
+ 	struct radix_tree_node *ret = NULL;
+ 	gfp_t gfp_mask = root_gfp_mask(root);
+ 
+-	if (!(gfp_mask & __GFP_WAIT)) {
++	/*
++	 * Preload code isn't irq safe and it doesn't make sence to use
++	 * preloading in the interrupt anyway as all the allocations have to
++	 * be atomic. So just do normal allocation when in interrupt.
++	 */
++	if (!(gfp_mask & __GFP_WAIT) && !in_interrupt()) {
+ 		struct radix_tree_preload *rtp;
+ 
+ 		/*
+@@ -228,7 +234,7 @@ radix_tree_node_free(struct radix_tree_n
+  * To make use of this facility, the radix tree must be initialised without
+  * __GFP_WAIT being passed to INIT_RADIX_TREE().
+  */
+-int radix_tree_preload(gfp_t gfp_mask)
++static int __radix_tree_preload(gfp_t gfp_mask)
+ {
+ 	struct radix_tree_preload *rtp;
+ 	struct radix_tree_node *node;
+@@ -252,9 +258,40 @@ int radix_tree_preload(gfp_t gfp_mask)
+ out:
+ 	return ret;
+ }
++
++/*
++ * Load up this CPU's radix_tree_node buffer with sufficient objects to
++ * ensure that the addition of a single element in the tree cannot fail.  On
++ * success, return zero, with preemption disabled.  On error, return -ENOMEM
++ * with preemption not disabled.
++ *
++ * To make use of this facility, the radix tree must be initialised without
++ * __GFP_WAIT being passed to INIT_RADIX_TREE().
++ */
++int radix_tree_preload(gfp_t gfp_mask)
++{
++	/* Warn on non-sensical use... */
++	WARN_ON_ONCE(!(gfp_mask & __GFP_WAIT));
++	return __radix_tree_preload(gfp_mask);
++}
+ EXPORT_SYMBOL(radix_tree_preload);
+ 
+ /*
++ * The same as above function, except we don't guarantee preloading happens.
++ * We do it, if we decide it helps. On success, return zero with preemption
++ * disabled. On error, return -ENOMEM with preemption not disabled.
++ */
++int radix_tree_maybe_preload(gfp_t gfp_mask)
++{
++	if (gfp_mask & __GFP_WAIT)
++		return __radix_tree_preload(gfp_mask);
++	/* Preloading doesn't help anything with this gfp mask, skip it */
++	preempt_disable();
++	return 0;
++}
++EXPORT_SYMBOL(radix_tree_maybe_preload);
++
++/*
+  *	Return the maximum key which can be store into a
+  *	radix tree with height HEIGHT.
+  */
+Index: linux-3.0-SLE11-SP2/mm/filemap.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/mm/filemap.c
++++ linux-3.0-SLE11-SP2/mm/filemap.c
+@@ -402,7 +402,7 @@ int replace_page_cache_page(struct page
+ 	VM_BUG_ON(!PageLocked(new));
+ 	VM_BUG_ON(new->mapping);
+ 
+-	error = radix_tree_preload(gfp_mask & ~__GFP_HIGHMEM);
++	error = radix_tree_maybe_preload(gfp_mask & ~__GFP_HIGHMEM);
+ 	if (!error) {
+ 		struct address_space *mapping = old->mapping;
+ 		void (*freepage)(struct page *);
+@@ -457,7 +457,7 @@ int add_to_page_cache_locked(struct page
+ 	if (error)
+ 		goto out;
+ 
+-	error = radix_tree_preload(gfp_mask & ~__GFP_HIGHMEM);
++	error = radix_tree_maybe_preload(gfp_mask & ~__GFP_HIGHMEM);
+ 	if (error == 0) {
+ 		page_cache_get(page);
+ 		page->mapping = mapping;
+Index: linux-3.0-SLE11-SP2/mm/shmem.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/mm/shmem.c
++++ linux-3.0-SLE11-SP2/mm/shmem.c
+@@ -1313,7 +1313,7 @@ repeat:
+ 	 * Try to preload while we can wait, to not make a habit of
+ 	 * draining atomic reserves; but don't latch on to this cpu.
+ 	 */
+-	error = radix_tree_preload(gfp & GFP_RECLAIM_MASK);
++	error = radix_tree_maybe_preload(gfp & GFP_RECLAIM_MASK);
+ 	if (error)
+ 		goto out;
+ 	radix_tree_preload_end();
+Index: linux-3.0-SLE11-SP2/mm/swap_state.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/mm/swap_state.c
++++ linux-3.0-SLE11-SP2/mm/swap_state.c
+@@ -109,7 +109,7 @@ int add_to_swap_cache(struct page *page,
+ {
+ 	int error;
+ 
+-	error = radix_tree_preload(gfp_mask);
++	error = radix_tree_maybe_preload(gfp_mask);
+ 	if (!error) {
+ 		error = __add_to_swap_cache(page, entry);
+ 		radix_tree_preload_end();
+@@ -307,7 +307,7 @@ struct page *read_swap_cache_async(swp_e
+ 		/*
+ 		 * call radix_tree_preload() while we can wait.
+ 		 */
+-		err = radix_tree_preload(gfp_mask & GFP_KERNEL);
++		err = radix_tree_maybe_preload(gfp_mask & GFP_KERNEL);
+ 		if (err)
+ 			break;
+ 
+Index: linux-3.0-SLE11-SP2/block/cfq-iosched.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/block/cfq-iosched.c
++++ linux-3.0-SLE11-SP2/block/cfq-iosched.c
+@@ -3148,7 +3148,7 @@ static int cfq_cic_link(struct cfq_data
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	ret = radix_tree_preload(gfp_mask);
++	ret = radix_tree_maybe_preload(gfp_mask);
+ 	if (!ret) {
+ 		cic->ioc = ioc;
+ 		cic->key = cfqd;
