@@ -1,0 +1,540 @@
+From 36b71a8bfbc92e1ba164e9aec840c0180ee933b5 Mon Sep 17 00:00:00 2001
+From: David Teigland <teigland@redhat.com>
+Date: Thu, 26 Jul 2012 12:44:30 -0500
+Subject: [PATCH] dlm: fix deadlock between dlm_send and dlm_controld
+Patch-mainline: v3.7
+Git-commit: 36b71a8bfbc92e1ba164e9aec840c0180ee933b5
+References: bnc#827670
+
+A deadlock sometimes occurs between dlm_controld closing
+a lowcomms connection through configfs and dlm_send looking
+up the address for a new connection in configfs.
+
+dlm_controld does a configfs rmdir which calls
+dlm_lowcomms_close which waits for dlm_send to
+cancel work on the workqueues.
+
+The dlm_send workqueue thread has called
+tcp_connect_to_sock which calls dlm_nodeid_to_addr
+which does a configfs lookup and blocks on a lock
+held by dlm_controld in the rmdir path.
+
+The solution here is to save the node addresses within
+the lowcomms code so that the lowcomms workqueue does
+not need to step through configfs to get a node address.
+
+dlm_controld:
+wait_for_completion+0x1d/0x20
+__cancel_work_timer+0x1b3/0x1e0
+cancel_work_sync+0x10/0x20
+dlm_lowcomms_close+0x4c/0xb0 [dlm]
+drop_comm+0x22/0x60 [dlm]
+client_drop_item+0x26/0x50 [configfs]
+configfs_rmdir+0x180/0x230 [configfs]
+vfs_rmdir+0xbd/0xf0
+do_rmdir+0x103/0x120
+sys_rmdir+0x16/0x20
+
+dlm_send:
+mutex_lock+0x2b/0x50
+get_comm+0x34/0x140 [dlm]
+dlm_nodeid_to_addr+0x18/0xd0 [dlm]
+tcp_connect_to_sock+0xf4/0x2d0 [dlm]
+process_send_sockets+0x1d2/0x260 [dlm]
+worker_thread+0x170/0x2a0
+
+Signed-off-by: David Teigland <teigland@redhat.com>
+Signed-off-by: Mark Fasheh <mfasheh@suse.de>
+---
+ fs/dlm/config.c   |  79 ++++-----------------
+ fs/dlm/config.h   |   2 -
+ fs/dlm/lowcomms.c | 205 +++++++++++++++++++++++++++++++++++++++++++++++-------
+ fs/dlm/lowcomms.h |   2 +
+ fs/dlm/main.c     |   2 +
+ 5 files changed, 200 insertions(+), 90 deletions(-)
+
+Index: linux-3.0-bnc827670/fs/dlm/config.c
+===================================================================
+--- linux-3.0-bnc827670.orig/fs/dlm/config.c
++++ linux-3.0-bnc827670/fs/dlm/config.c
+@@ -704,6 +704,7 @@ static ssize_t comm_local_write(struct d
+ static ssize_t comm_addr_write(struct dlm_comm *cm, const char *buf, size_t len)
+ {
+ 	struct sockaddr_storage *addr;
++	int rv;
+ 
+ 	if (len != sizeof(struct sockaddr_storage))
+ 		return -EINVAL;
+@@ -716,6 +717,13 @@ static ssize_t comm_addr_write(struct dl
+ 		return -ENOMEM;
+ 
+ 	memcpy(addr, buf, len);
++
++	rv = dlm_lowcomms_addr(cm->nodeid, addr, len);
++	if (rv) {
++		kfree(addr);
++		return rv;
++	}
++
+ 	cm->addr[cm->addr_count++] = addr;
+ 	return len;
+ }
+@@ -785,34 +793,7 @@ static void put_space(struct dlm_space *
+ 	config_item_put(&sp->group.cg_item);
+ }
+ 
+-static int addr_compare(struct sockaddr_storage *x, struct sockaddr_storage *y)
+-{
+-	switch (x->ss_family) {
+-	case AF_INET: {
+-		struct sockaddr_in *sinx = (struct sockaddr_in *)x;
+-		struct sockaddr_in *siny = (struct sockaddr_in *)y;
+-		if (sinx->sin_addr.s_addr != siny->sin_addr.s_addr)
+-			return 0;
+-		if (sinx->sin_port != siny->sin_port)
+-			return 0;
+-		break;
+-	}
+-	case AF_INET6: {
+-		struct sockaddr_in6 *sinx = (struct sockaddr_in6 *)x;
+-		struct sockaddr_in6 *siny = (struct sockaddr_in6 *)y;
+-		if (!ipv6_addr_equal(&sinx->sin6_addr, &siny->sin6_addr))
+-			return 0;
+-		if (sinx->sin6_port != siny->sin6_port)
+-			return 0;
+-		break;
+-	}
+-	default:
+-		return 0;
+-	}
+-	return 1;
+-}
+-
+-static struct dlm_comm *get_comm(int nodeid, struct sockaddr_storage *addr)
++static struct dlm_comm *get_comm(int nodeid)
+ {
+ 	struct config_item *i;
+ 	struct dlm_comm *cm = NULL;
+@@ -826,19 +807,11 @@ static struct dlm_comm *get_comm(int nod
+ 	list_for_each_entry(i, &comm_list->cg_children, ci_entry) {
+ 		cm = config_item_to_comm(i);
+ 
+-		if (nodeid) {
+-			if (cm->nodeid != nodeid)
+-				continue;
+-			found = 1;
+-			config_item_get(i);
+-			break;
+-		} else {
+-			if (!cm->addr_count || !addr_compare(cm->addr[0], addr))
+-				continue;
+-			found = 1;
+-			config_item_get(i);
+-			break;
+-		}
++		if (cm->nodeid != nodeid)
++			continue;
++		found = 1;
++		config_item_get(i);
++		break;
+ 	}
+ 	mutex_unlock(&clusters_root.subsys.su_mutex);
+ 
+@@ -941,28 +914,6 @@ int dlm_node_weight(char *lsname, int no
+ 	return w;
+ }
+ 
+-int dlm_nodeid_to_addr(int nodeid, struct sockaddr_storage *addr)
+-{
+-	struct dlm_comm *cm = get_comm(nodeid, NULL);
+-	if (!cm)
+-		return -EEXIST;
+-	if (!cm->addr_count)
+-		return -ENOENT;
+-	memcpy(addr, cm->addr[0], sizeof(*addr));
+-	put_comm(cm);
+-	return 0;
+-}
+-
+-int dlm_addr_to_nodeid(struct sockaddr_storage *addr, int *nodeid)
+-{
+-	struct dlm_comm *cm = get_comm(0, addr);
+-	if (!cm)
+-		return -EEXIST;
+-	*nodeid = cm->nodeid;
+-	put_comm(cm);
+-	return 0;
+-}
+-
+ int dlm_our_nodeid(void)
+ {
+ 	return local_comm ? local_comm->nodeid : 0;
+Index: linux-3.0-bnc827670/fs/dlm/config.h
+===================================================================
+--- linux-3.0-bnc827670.orig/fs/dlm/config.h
++++ linux-3.0-bnc827670/fs/dlm/config.h
+@@ -38,8 +38,6 @@ void dlm_config_exit(void);
+ int dlm_node_weight(char *lsname, int nodeid);
+ int dlm_nodeid_list(char *lsname, int **ids_out, int *ids_count_out,
+ 		    int **new_out, int *new_count_out);
+-int dlm_nodeid_to_addr(int nodeid, struct sockaddr_storage *addr);
+-int dlm_addr_to_nodeid(struct sockaddr_storage *addr, int *nodeid);
+ int dlm_our_nodeid(void);
+ int dlm_our_addr(struct sockaddr_storage *addr, int num);
+ 
+Index: linux-3.0-bnc827670/fs/dlm/lowcomms.c
+===================================================================
+--- linux-3.0-bnc827670.orig/fs/dlm/lowcomms.c
++++ linux-3.0-bnc827670/fs/dlm/lowcomms.c
+@@ -140,6 +140,16 @@ struct writequeue_entry {
+ 	struct connection *con;
+ };
+ 
++struct dlm_node_addr {
++	struct list_head list;
++	int nodeid;
++	int addr_count;
++	struct sockaddr_storage *addr[DLM_MAX_ADDR_COUNT];
++};
++
++static LIST_HEAD(dlm_node_addrs);
++static DEFINE_SPINLOCK(dlm_node_addrs_spin);
++
+ static struct sockaddr_storage *dlm_local_addr[DLM_MAX_ADDR_COUNT];
+ static int dlm_local_count;
+ 
+@@ -263,31 +273,146 @@ static struct connection *assoc2con(int
+ 	return NULL;
+ }
+ 
+-static int nodeid_to_addr(int nodeid, struct sockaddr *retaddr)
++static struct dlm_node_addr *find_node_addr(int nodeid)
++{
++	struct dlm_node_addr *na;
++
++	list_for_each_entry(na, &dlm_node_addrs, list) {
++		if (na->nodeid == nodeid)
++			return na;
++	}
++	return NULL;
++}
++
++static int addr_compare(struct sockaddr_storage *x, struct sockaddr_storage *y)
++{
++	switch (x->ss_family) {
++	case AF_INET: {
++		struct sockaddr_in *sinx = (struct sockaddr_in *)x;
++		struct sockaddr_in *siny = (struct sockaddr_in *)y;
++		if (sinx->sin_addr.s_addr != siny->sin_addr.s_addr)
++			return 0;
++		if (sinx->sin_port != siny->sin_port)
++			return 0;
++		break;
++	}
++	case AF_INET6: {
++		struct sockaddr_in6 *sinx = (struct sockaddr_in6 *)x;
++		struct sockaddr_in6 *siny = (struct sockaddr_in6 *)y;
++		if (!ipv6_addr_equal(&sinx->sin6_addr, &siny->sin6_addr))
++			return 0;
++		if (sinx->sin6_port != siny->sin6_port)
++			return 0;
++		break;
++	}
++	default:
++		return 0;
++	}
++	return 1;
++}
++
++static int nodeid_to_addr(int nodeid, struct sockaddr_storage *sas_out,
++			  struct sockaddr *sa_out)
+ {
+-	struct sockaddr_storage addr;
+-	int error;
++	struct sockaddr_storage sas;
++	struct dlm_node_addr *na;
+ 
+ 	if (!dlm_local_count)
+ 		return -1;
+ 
+-	error = dlm_nodeid_to_addr(nodeid, &addr);
+-	if (error)
+-		return error;
++	spin_lock(&dlm_node_addrs_spin);
++	na = find_node_addr(nodeid);
++	if (na && na->addr_count)
++		memcpy(&sas, na->addr[0], sizeof(struct sockaddr_storage));
++	spin_unlock(&dlm_node_addrs_spin);
++
++	if (!na)
++		return -EEXIST;
++
++	if (!na->addr_count)
++		return -ENOENT;
++
++	if (sas_out)
++		memcpy(sas_out, &sas, sizeof(struct sockaddr_storage));
++
++	if (!sa_out)
++		return 0;
+ 
+ 	if (dlm_local_addr[0]->ss_family == AF_INET) {
+-		struct sockaddr_in *in4  = (struct sockaddr_in *) &addr;
+-		struct sockaddr_in *ret4 = (struct sockaddr_in *) retaddr;
++		struct sockaddr_in *in4  = (struct sockaddr_in *) &sas;
++		struct sockaddr_in *ret4 = (struct sockaddr_in *) sa_out;
+ 		ret4->sin_addr.s_addr = in4->sin_addr.s_addr;
+ 	} else {
+-		struct sockaddr_in6 *in6  = (struct sockaddr_in6 *) &addr;
+-		struct sockaddr_in6 *ret6 = (struct sockaddr_in6 *) retaddr;
++		struct sockaddr_in6 *in6  = (struct sockaddr_in6 *) &sas;
++		struct sockaddr_in6 *ret6 = (struct sockaddr_in6 *) sa_out;
+ 		ipv6_addr_copy(&ret6->sin6_addr, &in6->sin6_addr);
+ 	}
+ 
+ 	return 0;
+ }
+ 
++static int addr_to_nodeid(struct sockaddr_storage *addr, int *nodeid)
++{
++	struct dlm_node_addr *na;
++	int rv = -EEXIST;
++
++	spin_lock(&dlm_node_addrs_spin);
++	list_for_each_entry(na, &dlm_node_addrs, list) {
++		if (!na->addr_count)
++			continue;
++
++		if (!addr_compare(na->addr[0], addr))
++			continue;
++
++		*nodeid = na->nodeid;
++		rv = 0;
++		break;
++	}
++	spin_unlock(&dlm_node_addrs_spin);
++	return rv;
++}
++
++int dlm_lowcomms_addr(int nodeid, struct sockaddr_storage *addr, int len)
++{
++	struct sockaddr_storage *new_addr;
++	struct dlm_node_addr *new_node, *na;
++
++	new_node = kzalloc(sizeof(struct dlm_node_addr), GFP_NOFS);
++	if (!new_node)
++		return -ENOMEM;
++
++	new_addr = kzalloc(sizeof(struct sockaddr_storage), GFP_NOFS);
++	if (!new_addr) {
++		kfree(new_node);
++		return -ENOMEM;
++	}
++
++	memcpy(new_addr, addr, len);
++
++	spin_lock(&dlm_node_addrs_spin);
++	na = find_node_addr(nodeid);
++	if (!na) {
++		new_node->nodeid = nodeid;
++		new_node->addr[0] = new_addr;
++		new_node->addr_count = 1;
++		list_add(&new_node->list, &dlm_node_addrs);
++		spin_unlock(&dlm_node_addrs_spin);
++		return 0;
++	}
++
++	if (na->addr_count >= DLM_MAX_ADDR_COUNT) {
++		spin_unlock(&dlm_node_addrs_spin);
++		kfree(new_addr);
++		kfree(new_node);
++		return -ENOSPC;
++	}
++
++	na->addr[na->addr_count++] = new_addr;
++	spin_unlock(&dlm_node_addrs_spin);
++	kfree(new_node);
++	return 0;
++}
++
+ /* Data available on socket or listen socket received a connect */
+ static void lowcomms_data_ready(struct sock *sk, int count_unused)
+ {
+@@ -509,7 +634,7 @@ static void process_sctp_notification(st
+ 				return;
+ 			}
+ 			make_sockaddr(&prim.ssp_addr, 0, &addr_len);
+-			if (dlm_addr_to_nodeid(&prim.ssp_addr, &nodeid)) {
++			if (addr_to_nodeid(&prim.ssp_addr, &nodeid)) {
+ 				int i;
+ 				unsigned char *b=(unsigned char *)&prim.ssp_addr;
+ 				log_print("reject connect from unknown addr");
+@@ -741,7 +866,7 @@ static int tcp_accept_from_sock(struct c
+ 
+ 	/* Get the new node's NODEID */
+ 	make_sockaddr(&peeraddr, 0, &len);
+-	if (dlm_addr_to_nodeid(&peeraddr, &nodeid)) {
++	if (addr_to_nodeid(&peeraddr, &nodeid)) {
+ 		log_print("connect from non cluster node");
+ 		sock_release(newsock);
+ 		mutex_unlock(&con->sock_mutex);
+@@ -853,7 +978,7 @@ static void sctp_init_assoc(struct conne
+ 	if (con->retries++ > MAX_CONNECT_RETRIES)
+ 		return;
+ 
+-	if (nodeid_to_addr(con->nodeid, (struct sockaddr *)&rem_addr)) {
++	if (nodeid_to_addr(con->nodeid, NULL, (struct sockaddr *)&rem_addr)) {
+ 		log_print("no address for nodeid %d", con->nodeid);
+ 		return;
+ 	}
+@@ -919,11 +1044,11 @@ static void sctp_init_assoc(struct conne
+ /* Connect a new socket to its peer */
+ static void tcp_connect_to_sock(struct connection *con)
+ {
+-	int result = -EHOSTUNREACH;
+ 	struct sockaddr_storage saddr, src_addr;
+ 	int addr_len;
+ 	struct socket *sock = NULL;
+ 	int one = 1;
++	int result;
+ 
+ 	if (con->nodeid == 0) {
+ 		log_print("attempt to connect sock 0 foiled");
+@@ -935,10 +1060,8 @@ static void tcp_connect_to_sock(struct c
+ 		goto out;
+ 
+ 	/* Some odd races can cause double-connects, ignore them */
+-	if (con->sock) {
+-		result = 0;
++	if (con->sock)
+ 		goto out;
+-	}
+ 
+ 	/* Create a socket to communicate with */
+ 	result = sock_create_kern(dlm_local_addr[0]->ss_family, SOCK_STREAM,
+@@ -947,8 +1070,11 @@ static void tcp_connect_to_sock(struct c
+ 		goto out_err;
+ 
+ 	memset(&saddr, 0, sizeof(saddr));
+-	if (dlm_nodeid_to_addr(con->nodeid, &saddr))
++	result = nodeid_to_addr(con->nodeid, &saddr, NULL);
++	if (result < 0) {
++		log_print("no address for nodeid %d", con->nodeid);
+ 		goto out_err;
++	}
+ 
+ 	sock->sk->sk_user_data = con;
+ 	con->rx_action = receive_from_sock;
+@@ -974,8 +1100,7 @@ static void tcp_connect_to_sock(struct c
+ 	kernel_setsockopt(sock, SOL_TCP, TCP_NODELAY, (char *)&one,
+ 			  sizeof(one));
+ 
+-	result =
+-		sock->ops->connect(sock, (struct sockaddr *)&saddr, addr_len,
++	result = sock->ops->connect(sock, (struct sockaddr *)&saddr, addr_len,
+ 				   O_NONBLOCK);
+ 	if (result == -EINPROGRESS)
+ 		result = 0;
+@@ -993,11 +1118,17 @@ out_err:
+ 	 * Some errors are fatal and this list might need adjusting. For other
+ 	 * errors we try again until the max number of retries is reached.
+ 	 */
+-	if (result != -EHOSTUNREACH && result != -ENETUNREACH &&
+-	    result != -ENETDOWN && result != -EINVAL
+-	    && result != -EPROTONOSUPPORT) {
++	if (result != -EHOSTUNREACH &&
++	    result != -ENETUNREACH &&
++	    result != -ENETDOWN && 
++	    result != -EINVAL &&
++	    result != -EPROTONOSUPPORT) {
++		log_print("connect %d try %d error %d", con->nodeid,
++			  con->retries, result);
++		mutex_unlock(&con->sock_mutex);
++		msleep(1000);
+ 		lowcomms_connect_sock(con);
+-		result = 0;
++		return;
+ 	}
+ out:
+ 	mutex_unlock(&con->sock_mutex);
+@@ -1405,6 +1536,7 @@ static void clean_one_writequeue(struct
+ int dlm_lowcomms_close(int nodeid)
+ {
+ 	struct connection *con;
++	struct dlm_node_addr *na;
+ 
+ 	log_print("closing connection to node %d", nodeid);
+ 	con = nodeid2con(nodeid, 0);
+@@ -1419,6 +1551,17 @@ int dlm_lowcomms_close(int nodeid)
+ 		clean_one_writequeue(con);
+ 		close_connection(con, true);
+ 	}
++
++	spin_lock(&dlm_node_addrs_spin);
++	na = find_node_addr(nodeid);
++	if (na) {
++		list_del(&na->list);
++		while (na->addr_count--)
++			kfree(na->addr[na->addr_count]);
++		kfree(na);
++	}
++	spin_unlock(&dlm_node_addrs_spin);
++
+ 	return 0;
+ }
+ 
+@@ -1564,3 +1707,17 @@ fail_unlisten:
+ out:
+ 	return error;
+ }
++
++void dlm_lowcomms_exit(void)
++{
++	struct dlm_node_addr *na, *safe;
++
++	spin_lock(&dlm_node_addrs_spin);
++	list_for_each_entry_safe(na, safe, &dlm_node_addrs, list) {
++		list_del(&na->list);
++		while (na->addr_count--)
++			kfree(na->addr[na->addr_count]);
++		kfree(na);
++	}
++	spin_unlock(&dlm_node_addrs_spin);
++}
+Index: linux-3.0-bnc827670/fs/dlm/lowcomms.h
+===================================================================
+--- linux-3.0-bnc827670.orig/fs/dlm/lowcomms.h
++++ linux-3.0-bnc827670/fs/dlm/lowcomms.h
+@@ -16,10 +16,12 @@
+ 
+ int dlm_lowcomms_start(void);
+ void dlm_lowcomms_stop(void);
++void dlm_lowcomms_exit(void);
+ int dlm_lowcomms_close(int nodeid);
+ void *dlm_lowcomms_get_buffer(int nodeid, int len, gfp_t allocation, char **ppc);
+ void dlm_lowcomms_commit_buffer(void *mh);
+ int dlm_lowcomms_connect_node(int nodeid);
++int dlm_lowcomms_addr(int nodeid, struct sockaddr_storage *addr, int len);
+ 
+ #endif				/* __LOWCOMMS_DOT_H__ */
+ 
+Index: linux-3.0-bnc827670/fs/dlm/main.c
+===================================================================
+--- linux-3.0-bnc827670.orig/fs/dlm/main.c
++++ linux-3.0-bnc827670/fs/dlm/main.c
+@@ -17,6 +17,7 @@
+ #include "user.h"
+ #include "memory.h"
+ #include "config.h"
++#include "lowcomms.h"
+ 
+ static int __init init_dlm(void)
+ {
+@@ -78,6 +79,7 @@ static void __exit exit_dlm(void)
+ 	dlm_config_exit();
+ 	dlm_memory_exit();
+ 	dlm_lockspace_exit();
++	dlm_lowcomms_exit();
+ 	dlm_unregister_debugfs();
+ }
+ 
