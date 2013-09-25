@@ -1,0 +1,136 @@
+From: Jeff Mahoney <jeffm@suse.com
+Subject: blktrace: fix race with open trace files and directory removal
+References: bnc#832292
+Patch-mainline: Posted to LKML, 24 Sep 2013
+
+By starting multiple blktrace processes on the same device, it's possible
+to permanently disable blktrace on that device. The cause is that when
+the first blktrace process to exit tears down the directory structure,
+the trace files are still held open. Debugfs removes the dentries for the
+open files just fine but the relay implementation doesn't remove the
+dentries until all of the references to the file are dropped. This means
+that if there are open files when debugfs_remove is called for the device
+directory, the directory is not empty and can't be removed. Since the
+shutdown of the blktrace structure xchg's the structure out, there's no
+way to clean up the directory and any new blktrace processes will fail
+to start because it can't create the directory.
+
+This patch uses a kref to count the relay files and only completes the
+shutdown of the blktrace structure after they've all been dropped. It's
+important to do the reference counting with an atomic (or locked) type
+since the blktrace client program is multithreaded and will release
+the files simultaneously. Only the last one should release the directory.
+
+Signed-off-by: Jeff Mahoney <jeffm@suse.com>
+---
+ include/linux/blktrace_api.h |    4 ++++
+ kernel/trace/blktrace.c      |   38 ++++++++++++++++++++++++++++++++++----
+ 2 files changed, 38 insertions(+), 4 deletions(-)
+
+--- a/include/linux/blktrace_api.h
++++ b/include/linux/blktrace_api.h
+@@ -6,6 +6,7 @@
+ #include <linux/blkdev.h>
+ #include <linux/relay.h>
+ #include <linux/compat.h>
++#include <linux/kref.h>
+ #endif
+ 
+ /*
+@@ -162,6 +163,9 @@ struct blk_trace {
+ 	struct dentry *dropped_file;
+ 	struct dentry *msg_file;
+ 	atomic_t dropped;
++#ifndef __GENKSYMS__
++	struct kref kref;
++#endif
+ };
+ 
+ extern int blk_trace_ioctl(struct block_device *, unsigned, char __user *);
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@ -275,17 +275,34 @@ record_it:
+ static struct dentry *blk_tree_root;
+ static DEFINE_MUTEX(blk_tree_mutex);
+ 
+-static void blk_trace_free(struct blk_trace *bt)
++/* This won't get called until relay_close is called */
++static void blk_trace_release(struct kref *kref)
+ {
++	struct blk_trace *bt = container_of(kref, struct blk_trace, kref);
+ 	debugfs_remove(bt->msg_file);
+ 	debugfs_remove(bt->dropped_file);
+-	relay_close(bt->rchan);
+ 	debugfs_remove(bt->dir);
+ 	free_percpu(bt->sequence);
+ 	free_percpu(bt->msg_data);
+ 	kfree(bt);
+ }
+ 
++static void blk_trace_free(struct blk_trace *bt)
++{
++	/*
++	 * The directory can't be removed until it's empty.
++	 * The debugfs files created directly can be removed while
++	 * they're open. The debugfs files created by relay won't
++	 * be removed until they've been released. This drops our
++	 * references to the files but the directory (and the rest
++	 * of the blk_trace structure) won't be cleaned up until
++	 * all of the relay files are closed by the user.
++	 */
++	relay_close(bt->rchan);
++	bt->rchan = NULL;
++	kref_put(&bt->kref, blk_trace_release);
++}
++
+ static void blk_trace_cleanup(struct blk_trace *bt)
+ {
+ 	blk_trace_free(bt);
+@@ -392,8 +409,10 @@ static int blk_subbuf_start_callback(str
+ 
+ static int blk_remove_buf_file_callback(struct dentry *dentry)
+ {
++	struct blk_trace *bt = dentry->d_parent->d_inode->i_private;
+ 	debugfs_remove(dentry);
+ 
++	kref_put(&bt->kref, blk_trace_release);
+ 	return 0;
+ }
+ 
+@@ -403,8 +422,15 @@ static struct dentry *blk_create_buf_fil
+ 						   struct rchan_buf *buf,
+ 						   int *is_global)
+ {
+-	return debugfs_create_file(filename, mode, parent, buf,
+-					&relay_file_operations);
++	struct blk_trace *bt = parent->d_inode->i_private;
++	struct dentry *dentry;
++
++	dentry = debugfs_create_file(filename, mode, parent, buf,
++				     &relay_file_operations);
++	if (dentry)
++		kref_get(&bt->kref);
++
++	return dentry;
+ }
+ 
+ static struct rchan_callbacks blk_relay_callbacks = {
+@@ -459,6 +485,8 @@ int do_blk_trace_setup(struct request_qu
+ 	if (!bt)
+ 		return -ENOMEM;
+ 
++	kref_init(&bt->kref);
++
+ 	ret = -ENOMEM;
+ 	bt->sequence = alloc_percpu(unsigned long);
+ 	if (!bt->sequence)
+@@ -485,6 +513,8 @@ int do_blk_trace_setup(struct request_qu
+ 	if (!dir)
+ 		goto err;
+ 
++	dir->d_inode->i_private = bt;
++
+ 	bt->dir = dir;
+ 	bt->dev = dev;
+ 	atomic_set(&bt->dropped, 0);
+
