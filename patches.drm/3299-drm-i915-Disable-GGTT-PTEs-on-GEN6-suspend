@@ -1,0 +1,204 @@
+From 828c79087cec61eaf4c76bb32c222fbe35ac3930 Mon Sep 17 00:00:00 2001
+From: Ben Widawsky <benjamin.widawsky@intel.com>
+Date: Wed, 16 Oct 2013 09:21:30 -0700
+Subject: [PATCH 2/2] drm/i915: Disable GGTT PTEs on GEN6+ suspend
+Git-commit: 828c79087cec61eaf4c76bb32c222fbe35ac3930
+Patch-mainline: Submitted
+References: bnc#800875
+
+Once the machine gets to a certain point in the suspend process, we
+expect the GPU to be idle. If it is not, we might corrupt memory.
+Empirically (with an early version of this patch) we have seen this is
+not the case. We cannot currently explain why the latent GPU writes
+occur.
+
+In the technical sense, this patch is a workaround in that we have an
+issue we can't explain, and the patch indirectly solves the issue.
+However, it's really better than a workaround because we understand why
+it works, and it really should be a safe thing to do in all cases.
+
+The noticeable effect other than the debug messages would be an increase
+in the suspend time. I have not measure how expensive it actually is.
+
+I think it would be good to spend further time to root cause why we're
+seeing these latent writes, but it shouldn't preclude preventing the
+fallout.
+
+Note: It should be safe (and makes some sense IMO) to also keep the
+VALID bit unset on resume when we clear_range(). I've opted not to do
+this as properly clearing those bits at some later point would be extra
+work.
+
+V2: Fix bugzilla link
+
+Bugzilla: http://bugs.freedesktop.org/show_bug.cgi?id=65496
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=59321
+Tested-by: Takashi Iwai <tiwai@suse.de>
+Tested-by: Paulo Zanoni <paulo.r.zanoni@intel.com>
+Signed-off-by: Ben Widawsky <ben@bwidawsk.net>
+Tested-by: Todd Previte <tprevite@gmail.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Acked-by: Takashi Iwai <tiwai@suse.de>
+
+---
+ drivers/gpu/drm/i915/i915_drv.c     |    5 ++
+ drivers/gpu/drm/i915/i915_drv.h     |    2 +
+ drivers/gpu/drm/i915/i915_gem_gtt.c |   64 +++++++++++++++++++++++++++++++++---
+ drivers/gpu/drm/i915/i915_reg.h     |    4 ++
+ 4 files changed, 69 insertions(+), 6 deletions(-)
+
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -515,6 +515,8 @@ static int i915_drm_freeze(struct drm_de
+ 		drm_irq_uninstall(dev);
+ 	}
+ 
++	i915_gem_suspend_gtt_mappings(dev);
++
+ 	i915_save_state(dev);
+ 
+ 	intel_opregion_fini(dev);
+@@ -634,7 +636,8 @@ static int i915_drm_thaw(struct drm_devi
+ 		mutex_lock(&dev->struct_mutex);
+ 		i915_gem_restore_gtt_mappings(dev);
+ 		mutex_unlock(&dev->struct_mutex);
+-	}
++	} else if (drm_core_check_feature(dev, DRIVER_MODESET))
++		i915_check_and_clear_faults(dev);
+ 
+ 	__i915_drm_thaw(dev);
+ 
+--- a/drivers/gpu/drm/i915/i915_drv.h
++++ b/drivers/gpu/drm/i915/i915_drv.h
+@@ -1602,6 +1602,8 @@ void i915_ppgtt_bind_object(struct i915_
+ void i915_ppgtt_unbind_object(struct i915_hw_ppgtt *ppgtt,
+ 			      struct drm_i915_gem_object *obj);
+ 
++void i915_check_and_clear_faults(struct drm_device *dev);
++void i915_gem_suspend_gtt_mappings(struct drm_device *dev);
+ void i915_gem_restore_gtt_mappings(struct drm_device *dev);
+ int __must_check i915_gem_gtt_prepare_object(struct drm_i915_gem_object *obj);
+ void i915_gem_gtt_bind_object(struct drm_i915_gem_object *obj,
+--- a/drivers/gpu/drm/i915/i915_gem_gtt.c
++++ b/drivers/gpu/drm/i915/i915_gem_gtt.c
+@@ -354,7 +354,8 @@ static void undo_idling(struct drm_i915_
+ 
+ static void i915_ggtt_clear_range(struct drm_device *dev,
+ 				 unsigned first_entry,
+-				 unsigned num_entries)
++				  unsigned num_entries,
++				  bool use_scratch)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	gtt_pte_t scratch_pte;
+@@ -373,19 +374,70 @@ static void i915_ggtt_clear_range(struct
+ 		num_entries = max_entries;
+ 
+ 	scratch_pte = pte_encode(dev, dev_priv->mm.gtt->scratch_page_dma, I915_CACHE_LLC);
++	if (!use_scratch)
++		scratch_pte &= ~GEN6_PTE_VALID;
+ 	for (i = 0; i < num_entries; i++)
+ 		iowrite32(scratch_pte, &gtt_base[i]);
+ 	readl(gtt_base);
+ }
+ 
++void i915_check_and_clear_faults(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++	struct intel_ring_buffer *ring;
++	int i;
++
++	if (INTEL_INFO(dev)->gen < 6)
++		return;
++
++	for_each_ring(ring, dev_priv, i) {
++		u32 fault_reg;
++		fault_reg = I915_READ(RING_FAULT_REG(ring));
++		if (fault_reg & RING_FAULT_VALID) {
++			DRM_DEBUG_DRIVER("Unexpected fault\n"
++					 "\tAddr: 0x%08lx\\n"
++					 "\tAddress space: %s\n"
++					 "\tSource ID: %d\n"
++					 "\tType: %d\n",
++					 fault_reg & PAGE_MASK,
++					 fault_reg & RING_FAULT_GTTSEL_MASK ? "GGTT" : "PPGTT",
++					 RING_FAULT_SRCID(fault_reg),
++					 RING_FAULT_FAULT_TYPE(fault_reg));
++			I915_WRITE(RING_FAULT_REG(ring),
++				   fault_reg & ~RING_FAULT_VALID);
++		}
++	}
++	POSTING_READ(RING_FAULT_REG(&dev_priv->ring[RCS]));
++}
++
++void i915_gem_suspend_gtt_mappings(struct drm_device *dev)
++{
++	struct drm_i915_private *dev_priv = dev->dev_private;
++
++	/* Don't bother messing with faults pre GEN6 as we have little
++	 * documentation supporting that it's a good idea.
++	 */
++	if (INTEL_INFO(dev)->gen < 6)
++		return;
++
++	i915_check_and_clear_faults(dev);
++
++	i915_ggtt_clear_range(dev, dev_priv->mm.gtt_start / PAGE_SIZE,
++			      (dev_priv->mm.gtt_end - dev_priv->mm.gtt_start) / PAGE_SIZE,
++			      false);
++}
++
+ void i915_gem_restore_gtt_mappings(struct drm_device *dev)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct drm_i915_gem_object *obj;
+ 
++	i915_check_and_clear_faults(dev);
++
+ 	/* First fill our portion of the GTT with scratch pages */
+ 	i915_ggtt_clear_range(dev, dev_priv->mm.gtt_start / PAGE_SIZE,
+-			      (dev_priv->mm.gtt_end - dev_priv->mm.gtt_start) / PAGE_SIZE);
++			      (dev_priv->mm.gtt_end - dev_priv->mm.gtt_start) / PAGE_SIZE,
++			      true);
+ 
+ 	list_for_each_entry(obj, &dev_priv->mm.bound_list, gtt_list) {
+ 		i915_gem_clflush_object(obj);
+@@ -478,7 +530,8 @@ void i915_gem_gtt_unbind_object(struct d
+ {
+ 	i915_ggtt_clear_range(obj->base.dev,
+ 			      obj->gtt_space->start >> PAGE_SHIFT,
+-			      obj->base.size >> PAGE_SHIFT);
++			      obj->base.size >> PAGE_SHIFT,
++			      true);
+ 
+ 	obj->has_global_gtt_mapping = 0;
+ }
+@@ -557,11 +610,12 @@ void i915_gem_init_global_gtt(struct drm
+ 			      hole_start, hole_end);
+ 		i915_ggtt_clear_range(dev,
+ 				      hole_start / PAGE_SIZE,
+-				      (hole_end-hole_start) / PAGE_SIZE);
++				      (hole_end-hole_start) / PAGE_SIZE,
++				      true);
+ 	}
+ 
+ 	/* And finally clear the reserved guard page */
+-	i915_ggtt_clear_range(dev, end / PAGE_SIZE - 1, 1);
++	i915_ggtt_clear_range(dev, end / PAGE_SIZE - 1, 1, true);
+ }
+ 
+ static int setup_scratch_page(struct drm_device *dev)
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -449,6 +449,10 @@
+ #define   ARB_MODE_SWIZZLE_IVB	(1<<5)
+ #define RENDER_HWS_PGA_GEN7	(0x04080)
+ #define RING_FAULT_REG(ring)	(0x4094 + 0x100*(ring)->id)
++#define   RING_FAULT_GTTSEL_MASK (1<<11)
++#define   RING_FAULT_SRCID(x)	((x >> 3) & 0xff)
++#define   RING_FAULT_FAULT_TYPE(x) ((x >> 1) & 0x3)
++#define   RING_FAULT_VALID	(1<<0)
+ #define DONE_REG		0x40b0
+ #define BSD_HWS_PGA_GEN7	(0x04180)
+ #define BLT_HWS_PGA_GEN7	(0x04280)
