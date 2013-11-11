@@ -1,0 +1,259 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: s390/airq: introduce adapter interrupt vector helper
+Patch-mainline: v3.12-rc1
+Git-commit: a9a6f0341df9a634a98aaf252c89962af77d1376
+References: bnc#848335,FATE#83037,LTC#94737
+
+The PCI code is the first user of adapter interrupts vectors.
+Add a set of helpers to airq.c to separate the adatper interrupt
+code from the PCI bits. The helpers allow for adapter interrupt
+vectors of any size.
+
+Reviewed-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ arch/s390/include/asm/airq.h |   67 ++++++++++++++++++
+ drivers/s390/cio/airq.c      |  153 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 220 insertions(+)
+
+--- a/arch/s390/include/asm/airq.h
++++ b/arch/s390/include/asm/airq.h
+@@ -11,6 +11,8 @@
+ #ifndef _ASM_S390_AIRQ_H
+ #define _ASM_S390_AIRQ_H
+ 
++#include <linux/bit_spinlock.h>
++
+ struct airq_struct {
+ 	struct hlist_node list;		/* Handler queueing. */
+ 	void (*handler)(struct airq_struct *);	/* Thin-interrupt handler */
+@@ -25,4 +27,69 @@ struct airq_struct {
+ int register_adapter_interrupt(struct airq_struct *airq);
+ void unregister_adapter_interrupt(struct airq_struct *airq);
+ 
++/* Adapter interrupt bit vector */
++struct airq_iv {
++	unsigned long *vector;	/* Adapter interrupt bit vector */
++	unsigned long *avail;	/* Allocation bit mask for the bit vector */
++	unsigned long *bitlock;	/* Lock bit mask for the bit vector */
++	unsigned long *ptr;	/* Pointer associated with each bit */
++	unsigned int *data;	/* 32 bit value associated with each bit */
++	unsigned long bits;	/* Number of bits in the vector */
++	unsigned long end;	/* Number of highest allocated bit + 1 */
++	spinlock_t lock;	/* Lock to protect alloc & free */
++};
++
++#define AIRQ_IV_ALLOC	1	/* Use an allocation bit mask */
++#define AIRQ_IV_BITLOCK	2	/* Allocate the lock bit mask */
++#define AIRQ_IV_PTR	4	/* Allocate the ptr array */
++#define AIRQ_IV_DATA	8	/* Allocate the data array */
++
++struct airq_iv *airq_iv_create(unsigned long bits, unsigned long flags);
++void airq_iv_release(struct airq_iv *iv);
++unsigned long airq_iv_alloc_bit(struct airq_iv *iv);
++void airq_iv_free_bit(struct airq_iv *iv, unsigned long bit);
++unsigned long airq_iv_scan(struct airq_iv *iv, unsigned long start,
++			   unsigned long end);
++
++static inline unsigned long airq_iv_end(struct airq_iv *iv)
++{
++	return iv->end;
++}
++
++static inline void airq_iv_lock(struct airq_iv *iv, unsigned long bit)
++{
++	const unsigned long be_to_le = BITS_PER_LONG - 1;
++	bit_spin_lock(bit ^ be_to_le, iv->bitlock);
++}
++
++static inline void airq_iv_unlock(struct airq_iv *iv, unsigned long bit)
++{
++	const unsigned long be_to_le = BITS_PER_LONG - 1;
++	bit_spin_unlock(bit ^ be_to_le, iv->bitlock);
++}
++
++static inline void airq_iv_set_data(struct airq_iv *iv, unsigned long bit,
++				    unsigned int data)
++{
++	iv->data[bit] = data;
++}
++
++static inline unsigned int airq_iv_get_data(struct airq_iv *iv,
++					    unsigned long bit)
++{
++	return iv->data[bit];
++}
++
++static inline void airq_iv_set_ptr(struct airq_iv *iv, unsigned long bit,
++				   unsigned long ptr)
++{
++	iv->ptr[bit] = ptr;
++}
++
++static inline unsigned long airq_iv_get_ptr(struct airq_iv *iv,
++					    unsigned long bit)
++{
++	return iv->ptr[bit];
++}
++
+ #endif /* _ASM_S390_AIRQ_H */
+--- a/drivers/s390/cio/airq.c
++++ b/drivers/s390/cio/airq.c
+@@ -95,3 +95,156 @@ void do_adapter_IO(u8 isc)
+ 			airq->handler(airq);
+ 	rcu_read_unlock();
+ }
++
++/**
++ * airq_iv_create - create an interrupt vector
++ * @bits: number of bits in the interrupt vector
++ * @flags: allocation flags
++ *
++ * Returns a pointer to an interrupt vector structure
++ */
++struct airq_iv *airq_iv_create(unsigned long bits, unsigned long flags)
++{
++	struct airq_iv *iv;
++	unsigned long size;
++
++	iv = kzalloc(sizeof(*iv), GFP_KERNEL);
++	if (!iv)
++		goto out;
++	iv->bits = bits;
++	size = BITS_TO_LONGS(bits) * sizeof(unsigned long);
++	iv->vector = kzalloc(size, GFP_KERNEL);
++	if (!iv->vector)
++		goto out_free;
++	if (flags & AIRQ_IV_ALLOC) {
++		iv->avail = kmalloc(size, GFP_KERNEL);
++		if (!iv->avail)
++			goto out_free;
++		memset(iv->avail, 0xff, size);
++		iv->end = 0;
++	} else
++		iv->end = bits;
++	if (flags & AIRQ_IV_BITLOCK) {
++		iv->bitlock = kzalloc(size, GFP_KERNEL);
++		if (!iv->bitlock)
++			goto out_free;
++	}
++	if (flags & AIRQ_IV_PTR) {
++		size = bits * sizeof(unsigned long);
++		iv->ptr = kzalloc(size, GFP_KERNEL);
++		if (!iv->ptr)
++			goto out_free;
++	}
++	if (flags & AIRQ_IV_DATA) {
++		size = bits * sizeof(unsigned int);
++		iv->data = kzalloc(size, GFP_KERNEL);
++		if (!iv->data)
++			goto out_free;
++	}
++	spin_lock_init(&iv->lock);
++	return iv;
++
++out_free:
++	kfree(iv->ptr);
++	kfree(iv->bitlock);
++	kfree(iv->avail);
++	kfree(iv->vector);
++	kfree(iv);
++out:
++	return NULL;
++}
++EXPORT_SYMBOL(airq_iv_create);
++
++/**
++ * airq_iv_release - release an interrupt vector
++ * @iv: pointer to interrupt vector structure
++ */
++void airq_iv_release(struct airq_iv *iv)
++{
++	kfree(iv->data);
++	kfree(iv->ptr);
++	kfree(iv->bitlock);
++	kfree(iv->vector);
++	kfree(iv->avail);
++	kfree(iv);
++}
++EXPORT_SYMBOL(airq_iv_release);
++
++/**
++ * airq_iv_alloc_bit - allocate an irq bit from an interrupt vector
++ * @iv: pointer to an interrupt vector structure
++ *
++ * Returns the bit number of the allocated irq, or -1UL if no bit
++ * is available or the AIRQ_IV_ALLOC flag has not been specified
++ */
++unsigned long airq_iv_alloc_bit(struct airq_iv *iv)
++{
++	const unsigned long be_to_le = BITS_PER_LONG - 1;
++	unsigned long bit;
++
++	if (!iv->avail)
++		return -1UL;
++	spin_lock(&iv->lock);
++	bit = find_first_bit_left(iv->avail, iv->bits);
++	if (bit < iv->bits) {
++		clear_bit(bit ^ be_to_le, iv->avail);
++		if (bit >= iv->end)
++			iv->end = bit + 1;
++	} else
++		bit = -1UL;
++	spin_unlock(&iv->lock);
++	return bit;
++
++}
++EXPORT_SYMBOL(airq_iv_alloc_bit);
++
++/**
++ * airq_iv_free_bit - free an irq bit of an interrupt vector
++ * @iv: pointer to interrupt vector structure
++ * @bit: number of the irq bit to free
++ */
++void airq_iv_free_bit(struct airq_iv *iv, unsigned long bit)
++{
++	const unsigned long be_to_le = BITS_PER_LONG - 1;
++
++	if (!iv->avail)
++		return;
++	spin_lock(&iv->lock);
++	/* Clear (possibly left over) interrupt bit */
++	clear_bit(bit ^ be_to_le, iv->vector);
++	/* Make the bit position available again */
++	set_bit(bit ^ be_to_le, iv->avail);
++	if (bit == iv->end - 1) {
++		/* Find new end of bit-field */
++		while (--iv->end > 0)
++			if (!test_bit((iv->end - 1) ^ be_to_le, iv->avail))
++				break;
++	}
++	spin_unlock(&iv->lock);
++}
++EXPORT_SYMBOL(airq_iv_free_bit);
++
++/**
++ * airq_iv_scan - scan interrupt vector for non-zero bits
++ * @iv: pointer to interrupt vector structure
++ * @start: bit number to start the search
++ * @end: bit number to end the search
++ *
++ * Returns the bit number of the next non-zero interrupt bit, or
++ * -1UL if the scan completed without finding any more any non-zero bits.
++ */
++unsigned long airq_iv_scan(struct airq_iv *iv, unsigned long start,
++			   unsigned long end)
++{
++	const unsigned long be_to_le = BITS_PER_LONG - 1;
++	unsigned long bit;
++
++	/* Find non-zero bit starting from 'ivs->next'. */
++	bit = find_next_bit_left(iv->vector, end, start);
++	if (bit >= end)
++		return -1UL;
++	/* Clear interrupt bit (find left uses big-endian bit numbers) */
++	clear_bit(bit ^ be_to_le, iv->vector);
++	return bit;
++}
++EXPORT_SYMBOL(airq_iv_scan);
