@@ -1,0 +1,535 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: s390/airq: simplify adapter interrupt code
+Patch-mainline: v3.11-rc1
+Git-commit: f4eae94f71372ea5ec1ba17a85f3aebedc516ca8
+References: bnc#848335,FATE#83037,LTC#94737
+
+There are three users of adapter interrupts: AP, QDIO and PCI. Each
+registers a single adapter interrupt with independent ISCs. Define
+a "struct airq" with the interrupt handler, a pointer and a mask for
+the local summary indicator and the ISC for the adapter interrupt
+source. Convert the indicator array with its fixed number of adapter
+interrupt sources per ISE to an array of hlists. This removes the
+limitation to 32 adapter interrupts per ISC and allows for arbitrary
+memory locations for the local summary indicator.
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ arch/s390/include/asm/airq.h    |   15 ++-
+ arch/s390/pci/pci.c             |   27 +++---
+ drivers/s390/cio/airq.c         |  168 +++++++++++++---------------------------
+ drivers/s390/cio/qdio_thinint.c |   33 +++----
+ drivers/s390/crypto/ap_bus.c    |   60 ++++++++------
+ 5 files changed, 133 insertions(+), 170 deletions(-)
+
+--- a/arch/s390/include/asm/airq.h
++++ b/arch/s390/include/asm/airq.h
+@@ -11,9 +11,18 @@
+ #ifndef _ASM_S390_AIRQ_H
+ #define _ASM_S390_AIRQ_H
+ 
+-typedef void (*adapter_int_handler_t)(void *, void *);
++struct airq_struct {
++	struct hlist_node list;		/* Handler queueing. */
++	void (*handler)(struct airq_struct *);	/* Thin-interrupt handler */
++	u8 *lsi_ptr;			/* Local-Summary-Indicator pointer */
++	u8 lsi_mask;			/* Local-Summary-Indicator mask */
++	u8 isc;				/* Interrupt-subclass */
++	u8 flags;
++};
+ 
+-void *s390_register_adapter_interrupt(adapter_int_handler_t, void *, u8);
+-void s390_unregister_adapter_interrupt(void *, u8);
++#define AIRQ_PTR_ALLOCATED	0x01
++
++int register_adapter_interrupt(struct airq_struct *airq);
++void unregister_adapter_interrupt(struct airq_struct *airq);
+ 
+ #endif /* _ASM_S390_AIRQ_H */
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@ -80,8 +80,13 @@ struct intr_bucket {
+ 
+ static struct intr_bucket *bucket;
+ 
+-/* Adapter local summary indicator */
+-static u8 *zpci_irq_si;
++/* Adapter interrupt definitions */
++static void zpci_irq_handler(struct airq_struct *airq);
++
++static struct airq_struct zpci_airq = {
++	.handler = zpci_irq_handler,
++	.isc = PCI_ISC,
++};
+ 
+ /* I/O Map */
+ static DEFINE_SPINLOCK(zpci_iomap_lock);
+@@ -433,7 +438,7 @@ static struct pci_ops pci_root_ops = {
+ /* store the last handled bit to implement fair scheduling of devices */
+ static DEFINE_PER_CPU(unsigned long, next_sbit);
+ 
+-static void zpci_irq_handler(void *dont, void *need)
++static void zpci_irq_handler(struct airq_struct *airq)
+ {
+ 	unsigned long sbit, mbit, last = 0, start = __get_cpu_var(next_sbit);
+ 	int rescan = 0, max = aisb_max;
+@@ -744,25 +749,20 @@ static int __init zpci_irq_init(void)
+ 		goto out_alloc;
+ 	}
+ 
+-	isc_register(PCI_ISC);
+-	zpci_irq_si = s390_register_adapter_interrupt(&zpci_irq_handler, NULL, PCI_ISC);
+-	if (IS_ERR(zpci_irq_si)) {
+-		rc = PTR_ERR(zpci_irq_si);
+-		zpci_irq_si = NULL;
++	rc = register_adapter_interrupt(&zpci_airq);
++	if (rc)
+ 		goto out_ai;
+-	}
++	/* Set summary to 1 to be called every time for the ISC. */
++	*zpci_airq.lsi_ptr = 1;
+ 
+ 	for_each_online_cpu(cpu)
+ 		per_cpu(next_sbit, cpu) = 0;
+ 
+ 	spin_lock_init(&bucket->lock);
+-	/* set summary to 1 to be called every time for the ISC */
+-	*zpci_irq_si = 1;
+ 	set_irq_ctrl(SIC_IRQ_MODE_SINGLE, NULL, PCI_ISC);
+ 	return 0;
+ 
+ out_ai:
+-	isc_unregister(PCI_ISC);
+ 	free_page((unsigned long) bucket->alloc);
+ out_alloc:
+ 	free_page((unsigned long) bucket->aisb);
+@@ -775,8 +775,7 @@ static void zpci_irq_exit(void)
+ {
+ 	free_page((unsigned long) bucket->alloc);
+ 	free_page((unsigned long) bucket->aisb);
+-	s390_unregister_adapter_interrupt(zpci_irq_si, PCI_ISC);
+-	isc_unregister(PCI_ISC);
++	unregister_adapter_interrupt(&zpci_airq);
+ 	kfree(bucket);
+ }
+ 
+--- a/drivers/s390/cio/airq.c
++++ b/drivers/s390/cio/airq.c
+@@ -10,142 +10,88 @@
+  */
+ 
+ #include <linux/init.h>
++#include <linux/irq.h>
++#include <linux/kernel_stat.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/rculist.h>
+ #include <linux/slab.h>
+-#include <linux/rcupdate.h>
+ 
+ #include <asm/airq.h>
+ #include <asm/isc.h>
+ 
+ #include "cio.h"
+ #include "cio_debug.h"
++#include "ioasm.h"
+ 
+-#define NR_AIRQS		32
+-#define NR_AIRQS_PER_WORD	sizeof(unsigned long)
+-#define NR_AIRQ_WORDS		(NR_AIRQS / NR_AIRQS_PER_WORD)
+-
+-union indicator_t {
+-	unsigned long word[NR_AIRQ_WORDS];
+-	unsigned char byte[NR_AIRQS];
+-} __attribute__((packed));
+-
+-struct airq_t {
+-	adapter_int_handler_t handler;
+-	void *drv_data;
+-};
+-
+-static union indicator_t indicators[MAX_ISC+1];
+-static struct airq_t *airqs[MAX_ISC+1][NR_AIRQS];
+-
+-static int register_airq(struct airq_t *airq, u8 isc)
+-{
+-	int i;
+-
+-	for (i = 0; i < NR_AIRQS; i++)
+-		if (!cmpxchg(&airqs[isc][i], NULL, airq))
+-			return i;
+-	return -ENOMEM;
+-}
++static DEFINE_SPINLOCK(airq_lists_lock);
++static struct hlist_head airq_lists[MAX_ISC+1];
+ 
+ /**
+- * s390_register_adapter_interrupt() - register adapter interrupt handler
+- * @handler: adapter handler to be registered
+- * @drv_data: driver data passed with each call to the handler
+- * @isc: isc for which the handler should be called
++ * register_adapter_interrupt() - register adapter interrupt handler
++ * @airq: pointer to adapter interrupt descriptor
+  *
+- * Returns:
+- *  Pointer to the indicator to be used on success
+- *  ERR_PTR() if registration failed
++ * Returns 0 on success, or -EINVAL.
+  */
+-void *s390_register_adapter_interrupt(adapter_int_handler_t handler,
+-				      void *drv_data, u8 isc)
++int register_adapter_interrupt(struct airq_struct *airq)
+ {
+-	struct airq_t *airq;
+-	char dbf_txt[16];
+-	int ret;
+-
+-	if (isc > MAX_ISC)
+-		return ERR_PTR(-EINVAL);
+-	airq = kmalloc(sizeof(struct airq_t), GFP_KERNEL);
+-	if (!airq) {
+-		ret = -ENOMEM;
+-		goto out;
+-	}
+-	airq->handler = handler;
+-	airq->drv_data = drv_data;
++	char dbf_txt[32];
+ 
+-	ret = register_airq(airq, isc);
+-out:
+-	snprintf(dbf_txt, sizeof(dbf_txt), "rairq:%d", ret);
++	if (!airq->handler || airq->isc > MAX_ISC)
++		return -EINVAL;
++	if (!airq->lsi_ptr) {
++		airq->lsi_ptr = kzalloc(1, GFP_KERNEL);
++		if (!airq->lsi_ptr)
++			return -ENOMEM;
++		airq->flags |= AIRQ_PTR_ALLOCATED;
++	}
++	if (!airq->lsi_mask)
++		airq->lsi_mask = 0xff;
++	snprintf(dbf_txt, sizeof(dbf_txt), "rairq:%p", airq);
+ 	CIO_TRACE_EVENT(4, dbf_txt);
+-	if (ret < 0) {
+-		kfree(airq);
+-		return ERR_PTR(ret);
+-	} else
+-		return &indicators[isc].byte[ret];
++	isc_register(airq->isc);
++	spin_lock(&airq_lists_lock);
++	hlist_add_head_rcu(&airq->list, &airq_lists[airq->isc]);
++	spin_unlock(&airq_lists_lock);
++	return 0;
+ }
+-EXPORT_SYMBOL(s390_register_adapter_interrupt);
++EXPORT_SYMBOL(register_adapter_interrupt);
+ 
+ /**
+- * s390_unregister_adapter_interrupt - unregister adapter interrupt handler
+- * @ind: indicator for which the handler is to be unregistered
+- * @isc: interruption subclass
++ * unregister_adapter_interrupt - unregister adapter interrupt handler
++ * @airq: pointer to adapter interrupt descriptor
+  */
+-void s390_unregister_adapter_interrupt(void *ind, u8 isc)
++void unregister_adapter_interrupt(struct airq_struct *airq)
+ {
+-	struct airq_t *airq;
+-	char dbf_txt[16];
+-	int i;
++	char dbf_txt[32];
+ 
+-	i = (int) ((addr_t) ind) - ((addr_t) &indicators[isc].byte[0]);
+-	snprintf(dbf_txt, sizeof(dbf_txt), "urairq:%d", i);
++	if (hlist_unhashed(&airq->list))
++		return;
++	snprintf(dbf_txt, sizeof(dbf_txt), "urairq:%p", airq);
+ 	CIO_TRACE_EVENT(4, dbf_txt);
+-	indicators[isc].byte[i] = 0;
+-	airq = xchg(&airqs[isc][i], NULL);
+-	/*
+-	 * Allow interrupts to complete. This will ensure that the airq handle
+-	 * is no longer referenced by any interrupt handler.
+-	 */
+-	synchronize_sched();
+-	kfree(airq);
++	spin_lock(&airq_lists_lock);
++	hlist_del_rcu(&airq->list);
++	spin_unlock(&airq_lists_lock);
++	synchronize_rcu();
++	isc_unregister(airq->isc);
++	if (airq->flags & AIRQ_PTR_ALLOCATED) {
++		kfree(airq->lsi_ptr);
++		airq->lsi_ptr = NULL;
++		airq->flags &= ~AIRQ_PTR_ALLOCATED;
++	}
+ }
+-EXPORT_SYMBOL(s390_unregister_adapter_interrupt);
+-
+-#define INDICATOR_MASK	(0xffUL << ((NR_AIRQS_PER_WORD - 1) * 8))
++EXPORT_SYMBOL(unregister_adapter_interrupt);
+ 
+ void do_adapter_IO(u8 isc)
+ {
+-	int w;
+-	int i;
+-	unsigned long word;
+-	struct airq_t *airq;
+-
+-	/*
+-	 * Access indicator array in word-sized chunks to minimize storage
+-	 * fetch operations.
+-	 */
+-	for (w = 0; w < NR_AIRQ_WORDS; w++) {
+-		word = indicators[isc].word[w];
+-		i = w * NR_AIRQS_PER_WORD;
+-		/*
+-		 * Check bytes within word for active indicators.
+-		 */
+-		while (word) {
+-			if (word & INDICATOR_MASK) {
+-				airq = airqs[isc][i];
+-				/* Make sure gcc reads from airqs only once. */
+-				barrier();
+-				if (likely(airq))
+-					airq->handler(&indicators[isc].byte[i],
+-						      airq->drv_data);
+-				else
+-					/*
+-					 * Reset ill-behaved indicator.
+-					 */
+-					indicators[isc].byte[i] = 0;
+-			}
+-			word <<= 8;
+-			i++;
+-		}
+-	}
++	struct airq_struct *airq;
++	struct hlist_head *head;
++	struct hlist_node *entry;
++
++	head = &airq_lists[isc];
++	rcu_read_lock();
++	hlist_for_each_entry_rcu(airq, entry, head, list)
++		if ((*airq->lsi_ptr & airq->lsi_mask) != 0)
++			airq->handler(airq);
++	rcu_read_unlock();
+ }
+--- a/drivers/s390/cio/qdio_thinint.c
++++ b/drivers/s390/cio/qdio_thinint.c
+@@ -31,8 +31,13 @@
+ static LIST_HEAD(tiq_list);
+ DEFINE_MUTEX(tiq_list_lock);
+ 
+-/* adapter local summary indicator */
+-static u8 *tiqdio_alsi;
++/* Adapter interrupt definitions */
++static void tiqdio_thinint_handler(struct airq_struct *airq);
++
++static struct airq_struct tiqdio_airq = {
++	.handler = tiqdio_thinint_handler,
++	.isc = QDIO_AIRQ_ISC,
++};
+ 
+ struct indicator_t *q_indicators;
+ 
+@@ -136,7 +141,7 @@ static inline void tiqdio_call_inq_handl
+  * @alsi: pointer to adapter local summary indicator
+  * @data: NULL
+  */
+-static void tiqdio_thinint_handler(void *alsi, void *data)
++static void tiqdio_thinint_handler(struct airq_struct *airq)
+ {
+ 	u32 si_used = clear_shared_ind();
+ 	struct qdio_q *q;
+@@ -178,7 +183,7 @@ static int set_subchannel_ind(struct qdi
+ 		scssc_area->summary_indicator_addr = 0;
+ 		scssc_area->subchannel_indicator_addr = 0;
+ 	} else {
+-		scssc_area->summary_indicator_addr = virt_to_phys(tiqdio_alsi);
++		scssc_area->summary_indicator_addr = virt_to_phys(tiqdio_airq.lsi_ptr);
+ 		scssc_area->subchannel_indicator_addr =
+ 			virt_to_phys(irq_ptr->dsci);
+ 	}
+@@ -232,14 +237,12 @@ void tiqdio_free_memory(void)
+ 
+ int __init tiqdio_register_thinints(void)
+ {
+-	isc_register(QDIO_AIRQ_ISC);
+-	tiqdio_alsi = s390_register_adapter_interrupt(&tiqdio_thinint_handler,
+-						      NULL, QDIO_AIRQ_ISC);
+-	if (IS_ERR(tiqdio_alsi)) {
+-		DBF_EVENT("RTI:%lx", PTR_ERR(tiqdio_alsi));
+-		tiqdio_alsi = NULL;
+-		isc_unregister(QDIO_AIRQ_ISC);
+-		return -ENOMEM;
++	int rc;
++
++	rc = register_adapter_interrupt(&tiqdio_airq);
++	if (rc) {
++		DBF_EVENT("RTI:%x", rc);
++		return rc;
+ 	}
+ 	return 0;
+ }
+@@ -272,9 +275,5 @@ void qdio_shutdown_thinint(struct qdio_i
+ void __exit tiqdio_unregister_thinints(void)
+ {
+ 	WARN_ON(!list_empty(&tiq_list));
+-
+-	if (tiqdio_alsi) {
+-		s390_unregister_adapter_interrupt(tiqdio_alsi, QDIO_AIRQ_ISC);
+-		isc_unregister(QDIO_AIRQ_ISC);
+-	}
++	unregister_adapter_interrupt(&tiqdio_airq);
+ }
+--- a/drivers/s390/crypto/ap_bus.c
++++ b/drivers/s390/crypto/ap_bus.c
+@@ -60,7 +60,7 @@ static inline void ap_schedule_poll_time
+ static int __ap_poll_device(struct ap_device *ap_dev, unsigned long *flags);
+ static int ap_device_remove(struct device *dev);
+ static int ap_device_probe(struct device *dev);
+-static void ap_interrupt_handler(void *unused1, void *unused2);
++static void ap_interrupt_handler(struct airq_struct *airq);
+ static void ap_reset(struct ap_device *ap_dev);
+ static void ap_config_timeout(unsigned long ptr);
+ static int ap_select_domain(void);
+@@ -108,7 +108,6 @@ static DECLARE_WAIT_QUEUE_HEAD(ap_poll_w
+ static struct task_struct *ap_poll_kthread = NULL;
+ static DEFINE_MUTEX(ap_poll_thread_mutex);
+ static DEFINE_SPINLOCK(ap_poll_timer_lock);
+-static void *ap_interrupt_indicator;
+ static struct hrtimer ap_poll_timer;
+ /* In LPAR poll with 4kHz frequency. Poll every 250000 nanoseconds.
+  * If z/VM change to 1500000 nanoseconds to adjust to z/VM polling.*/
+@@ -122,13 +121,21 @@ static int ap_suspend_flag;
+ static int user_set_domain = 0;
+ static struct bus_type ap_bus_type;
+ 
++/* Adapter interrupt definitions */
++static int ap_airq_flag;
++
++static struct airq_struct ap_airq = {
++	.handler = ap_interrupt_handler,
++	.isc = AP_ISC,
++};
++
+ /**
+  * ap_using_interrupts() - Returns non-zero if interrupt support is
+  * available.
+  */
+ static inline int ap_using_interrupts(void)
+ {
+-	return ap_interrupt_indicator != NULL;
++	return ap_airq_flag;
+ }
+ 
+ /**
+@@ -589,7 +596,7 @@ static int ap_init_queue(ap_qid_t qid)
+ 		}
+ 	}
+ 	if (rc == 0 && ap_using_interrupts()) {
+-		rc = ap_queue_enable_interruption(qid, ap_interrupt_indicator);
++		rc = ap_queue_enable_interruption(qid, ap_airq.lsi_ptr);
+ 		/* If interruption mode is supported by the machine,
+ 		* but an AP can not be enabled for interruption then
+ 		* the AP will be discarded.    */
+@@ -822,13 +829,22 @@ static int ap_bus_suspend(struct device
+ 
+ static int ap_bus_resume(struct device *dev)
+ {
+-	int rc = 0;
+ 	struct ap_device *ap_dev = to_ap_dev(dev);
++	int rc;
+ 
+ 	if (ap_suspend_flag) {
+ 		ap_suspend_flag = 0;
+-		if (!ap_interrupts_available())
+-			ap_interrupt_indicator = NULL;
++		if (ap_interrupts_available()) {
++			if (!ap_using_interrupts()) {
++				rc = register_adapter_interrupt(&ap_airq);
++				ap_airq_flag = (rc == 0);
++			}
++		} else {
++			if (ap_using_interrupts()) {
++				unregister_adapter_interrupt(&ap_airq);
++				ap_airq_flag = 0;
++			}
++		}
+ 		ap_query_configuration();
+ 		if (!user_set_domain) {
+ 			ap_domain_index = -1;
+@@ -849,7 +865,10 @@ static int ap_bus_resume(struct device *
+ 			tasklet_schedule(&ap_tasklet);
+ 		if (ap_thread_flag)
+ 			rc = ap_poll_thread_start();
+-	}
++		else
++			rc = 0;
++	} else
++		rc = 0;
+ 	if (AP_QID_QUEUE(ap_dev->qid) != ap_domain_index) {
+ 		spin_lock_bh(&ap_dev->lock);
+ 		ap_dev->qid = AP_MKQID(AP_QID_DEVICE(ap_dev->qid),
+@@ -1267,7 +1286,7 @@ out:
+ 	return rc;
+ }
+ 
+-static void ap_interrupt_handler(void *unused1, void *unused2)
++static void ap_interrupt_handler(struct airq_struct *airq)
+ {
+ 	kstat_cpu(smp_processor_id()).irqs[IOINT_APB]++;
+ 	tasklet_schedule(&ap_tasklet);
+@@ -1718,7 +1737,7 @@ static void ap_poll_all(unsigned long du
+ 	 * important that no requests on any AP get lost.
+ 	 */
+ 	if (ap_using_interrupts())
+-		xchg((u8 *)ap_interrupt_indicator, 0);
++		xchg(ap_airq.lsi_ptr, 0);
+ 	do {
+ 		flags = 0;
+ 		spin_lock(&ap_device_list_lock);
+@@ -1877,13 +1896,8 @@ int __init ap_module_init(void)
+ 		return -ENODEV;
+ 	}
+ 	if (ap_interrupts_available()) {
+-		isc_register(AP_ISC);
+-		ap_interrupt_indicator = s390_register_adapter_interrupt(
+-			&ap_interrupt_handler, NULL, AP_ISC);
+-		if (IS_ERR(ap_interrupt_indicator)) {
+-			ap_interrupt_indicator = NULL;
+-			isc_unregister(AP_ISC);
+-		}
++		rc = register_adapter_interrupt(&ap_airq);
++		ap_airq_flag = (rc == 0);
+ 	}
+ 
+ 	register_reset_call(&ap_reset_call);
+@@ -1951,10 +1965,8 @@ out_bus:
+ 	bus_unregister(&ap_bus_type);
+ out:
+ 	unregister_reset_call(&ap_reset_call);
+-	if (ap_using_interrupts()) {
+-		s390_unregister_adapter_interrupt(ap_interrupt_indicator, AP_ISC);
+-		isc_unregister(AP_ISC);
+-	}
++	if (ap_using_interrupts())
++		unregister_adapter_interrupt(&ap_airq);
+ 	return rc;
+ }
+ 
+@@ -1990,10 +2002,8 @@ void ap_module_exit(void)
+ 		bus_remove_file(&ap_bus_type, ap_bus_attrs[i]);
+ 	bus_unregister(&ap_bus_type);
+ 	unregister_reset_call(&ap_reset_call);
+-	if (ap_using_interrupts()) {
+-		s390_unregister_adapter_interrupt(ap_interrupt_indicator, AP_ISC);
+-		isc_unregister(AP_ISC);
+-	}
++	if (ap_using_interrupts())
++		unregister_adapter_interrupt(&ap_airq);
+ }
+ 
+ #ifndef CONFIG_ZCRYPT_MONOLITHIC
