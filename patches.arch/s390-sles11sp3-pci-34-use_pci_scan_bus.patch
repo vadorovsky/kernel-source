@@ -1,0 +1,223 @@
+From: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Subject: s390/pci: use pci_scan_root_bus
+Patch-mainline: v3.10-rc1
+Git-commit: 1c21351b722c9101bacdb961f5b5711669c882a0
+References: bnc#848335,FATE#83037,LTC#94737
+
+The pci config space accessors on s390 are (now) smart enough to
+figure out if a pci function is available. So instead of calling
+pci_create_root_bus and then pci_scan_single_device for each
+available function just call pci_scan_root_bus and let the pci core
+do the scanning (via config reads on all possible functions) and
+device creation.
+
+Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ arch/s390/pci/pci.c       |   54 +++++++++++++++++-----------------------------
+ arch/s390/pci/pci_clp.c   |    6 ++---
+ arch/s390/pci/pci_event.c |    4 +--
+ drivers/s390/cio/chsc.c   |    4 +--
+ 4 files changed, 27 insertions(+), 41 deletions(-)
+
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@ -626,17 +626,6 @@ void zpci_free_device(struct zpci_dev *z
+ 	kfree(zdev);
+ }
+ 
+-static void zpci_scan_devices(void)
+-{
+-	struct zpci_dev *zdev;
+-
+-	mutex_lock(&zpci_list_lock);
+-	list_for_each_entry(zdev, &zpci_list, entry)
+-		if (zdev->state == ZPCI_FN_STATE_CONFIGURED)
+-			zpci_scan_device(zdev);
+-	mutex_unlock(&zpci_list_lock);
+-}
+-
+ /*
+  * Too late for any s390 specific setup, since interrupts must be set up
+  * already which requires DMA setup too and the pci scan will access the
+@@ -845,6 +834,7 @@ int pcibios_add_device(struct pci_dev *p
+ {
+ 	struct zpci_dev *zdev = get_zdev(pdev);
+ 
++	zdev->pdev = pdev;
+ 	zpci_debug_init_device(zdev);
+ 	zpci_fmb_enable_device(zdev);
+ 	zpci_map_resources(zdev);
+@@ -852,16 +842,17 @@ int pcibios_add_device(struct pci_dev *p
+ 	return 0;
+ }
+ 
+-static int zpci_create_device_bus(struct zpci_dev *zdev)
++static int __devinit zpci_scan_bus(struct zpci_dev *zdev)
+ {
+ 	struct resource *res;
+-	LIST_HEAD(resources);
+ 	int i;
+ 
+-	zdev->bus = pci_create_bus(NULL, ZPCI_BUS_NR, &pci_root_ops, zdev);
++	zdev->bus = pci_scan_bus_parented(NULL, ZPCI_BUS_NR, &pci_root_ops, zdev);
+ 	if (!zdev->bus)
+ 		return -EIO;
+ 	zdev->bus->max_bus_speed = zdev->max_bus_speed;
++	zdev->bus->resource[0] = NULL;
++	zdev->bus->resource[1] = NULL;
+ 
+ 	/* allocate mapping entry for each used bar */
+ 	for (i = 0; i < PCI_BAR_COUNT; i++) {
+@@ -893,6 +884,7 @@ static int zpci_create_device_bus(struct
+ 		}
+ 		pci_bus_add_resource(zdev->bus, res, 0);
+ 	}
++	pci_bus_add_devices(zdev->bus);
+ 	return 0;
+ }
+ 
+@@ -944,7 +936,7 @@ int zpci_disable_device(struct zpci_dev
+ }
+ EXPORT_SYMBOL_GPL(zpci_disable_device);
+ 
+-int zpci_create_device(struct zpci_dev *zdev)
++int __devinit zpci_create_device(struct zpci_dev *zdev)
+ {
+ 	int rc;
+ 
+@@ -952,9 +944,16 @@ int zpci_create_device(struct zpci_dev *
+ 	if (rc)
+ 		goto out;
+ 
+-	rc = zpci_create_device_bus(zdev);
++	if (zdev->state == ZPCI_FN_STATE_CONFIGURED) {
++		rc = zpci_enable_device(zdev);
++		if (rc)
++			goto out_free;
++
++		zdev->state = ZPCI_FN_STATE_ONLINE;
++	}
++	rc = zpci_scan_bus(zdev);
+ 	if (rc)
+-		goto out_bus;
++		goto out_disable;
+ 
+ 	mutex_lock(&zpci_list_lock);
+ 	list_add_tail(&zdev->entry, &zpci_list);
+@@ -962,21 +961,12 @@ int zpci_create_device(struct zpci_dev *
+ 		hotplug_ops->create_slot(zdev);
+ 	mutex_unlock(&zpci_list_lock);
+ 
+-	if (zdev->state == ZPCI_FN_STATE_STANDBY)
+-		return 0;
+-
+-	rc = zpci_enable_device(zdev);
+-	if (rc)
+-		goto out_start;
+ 	return 0;
+ 
+-out_start:
+-	mutex_lock(&zpci_list_lock);
+-	list_del(&zdev->entry);
+-	if (hotplug_ops)
+-		hotplug_ops->remove_slot(zdev);
+-	mutex_unlock(&zpci_list_lock);
+-out_bus:
++out_disable:
++	if (zdev->state == ZPCI_FN_STATE_ONLINE)
++		zpci_disable_device(zdev);
++out_free:
+ 	zpci_free_domain(zdev);
+ out:
+ 	return rc;
+@@ -1003,10 +993,7 @@ int zpci_scan_device(struct zpci_dev *zd
+ 
+ 	pci_bus_add_devices(zdev->bus);
+ 
+-	/* now that pdev was added to the bus mark it as used */
+-	zdev->state = ZPCI_FN_STATE_ONLINE;
+ 	return 0;
+-
+ out:
+ 	zpci_dma_exit_device(zdev);
+ 	clp_disable_fh(zdev);
+@@ -1120,7 +1107,6 @@ static int __init pci_base_init(void)
+ 	if (rc)
+ 		goto out_find;
+ 
+-	zpci_scan_devices();
+ 	return 0;
+ 
+ out_find:
+--- a/arch/s390/pci/pci_clp.c
++++ b/arch/s390/pci/pci_clp.c
+@@ -140,7 +140,7 @@ out:
+ 	return rc;
+ }
+ 
+-int clp_add_pci_device(u32 fid, u32 fh, int configured)
++int __devinit clp_add_pci_device(u32 fid, u32 fh, int configured)
+ {
+ 	struct zpci_dev *zdev;
+ 	int rc;
+@@ -246,7 +246,7 @@ int clp_disable_fh(struct zpci_dev *zdev
+ 	return rc;
+ }
+ 
+-static void clp_check_pcifn_entry(struct clp_fh_list_entry *entry)
++static void __devinit clp_check_pcifn_entry(struct clp_fh_list_entry *entry)
+ {
+ 	int present, rc;
+ 
+@@ -279,7 +279,7 @@ static void clp_check_pcifn_entry(struct
+ 		pr_err("Failed to add fid: 0x%x\n", entry->fid);
+ }
+ 
+-int clp_find_pci_devices(void)
++int __devinit clp_find_pci_devices(void)
+ {
+ 	struct clp_req_rsp_list_pci *rrb;
+ 	u64 resume_token = 0;
+--- a/arch/s390/pci/pci_event.c
++++ b/arch/s390/pci/pci_event.c
+@@ -50,7 +50,7 @@ static void zpci_event_log_err(struct zp
+ 	dev_err(&zdev->pdev->dev, "event code: 0x%x\n", ccdf->pec);
+ }
+ 
+-static void zpci_event_log_avail(struct zpci_ccdf_avail *ccdf)
++static void __devinit zpci_event_log_avail(struct zpci_ccdf_avail *ccdf)
+ {
+ 	struct zpci_dev *zdev = get_zdev_by_fid(ccdf->fid);
+ 
+@@ -89,7 +89,7 @@ void zpci_event_error(void *data)
+ 	}
+ }
+ 
+-void zpci_event_availability(void *data)
++void __devinit zpci_event_availability(void *data)
+ {
+ 	zpci_event_log_avail(data);
+ }
+--- a/drivers/s390/cio/chsc.c
++++ b/drivers/s390/cio/chsc.c
+@@ -482,7 +482,7 @@ static void chsc_process_sei_nt0(struct
+ 	}
+ }
+ 
+-static void chsc_process_event_information(struct chsc_sei *sei, u64 ntsm)
++static void __devinit chsc_process_event_information(struct chsc_sei *sei, u64 ntsm)
+ {
+ 	do {
+ 		memset(sei, 0, sizeof(*sei));
+@@ -521,7 +521,7 @@ static void chsc_process_event_informati
+  * Note: Access to sei_page is serialized through machine check handler
+  * thread, so no need for locking.
+  */
+-static void chsc_process_crw(struct crw *crw0, struct crw *crw1, int overflow)
++static void __devinit chsc_process_crw(struct crw *crw0, struct crw *crw1, int overflow)
+ {
+ 	struct chsc_sei *sei = sei_page;
+ 
