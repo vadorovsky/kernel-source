@@ -1,0 +1,183 @@
+From: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Subject: s390/pci: fix hotplug module init
+Patch-mainline: v3.9-rc1
+Git-commit: 53923354d69e4748506bfee932b7c6b309a15c21
+References: bnc#848335,FATE#83037,LTC#94737
+
+Loading the pci hotplug module when no devices are present will fail
+but unfortunately some hotplug callbacks stay registered to the pci
+bus level. Fix this by not letting module loading fail when no pci
+devices are present and provide proper {de}registration functions
+for these callbacks.
+
+Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ arch/s390/include/asm/pci.h        |    4 +-
+ arch/s390/pci/pci.c                |   27 +++++++++++++----
+ drivers/pci/hotplug/s390_pci_hpc.c |   58 +++++++++++++++----------------------
+ 3 files changed, 49 insertions(+), 40 deletions(-)
+
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -187,9 +187,11 @@ void zpci_dma_exit(void);
+ /* Hotplug */
+ extern struct mutex zpci_list_lock;
+ extern struct list_head zpci_list;
+-extern struct pci_hp_callback_ops hotplug_ops;
+ extern unsigned int s390_pci_probe;
+ 
++void zpci_register_hp_ops(struct pci_hp_callback_ops *);
++void zpci_deregister_hp_ops(void);
++
+ /* FMB */
+ int zpci_fmb_enable_device(struct zpci_dev *);
+ int zpci_fmb_disable_device(struct zpci_dev *);
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@ -49,8 +49,7 @@ EXPORT_SYMBOL_GPL(zpci_list);
+ DEFINE_MUTEX(zpci_list_lock);
+ EXPORT_SYMBOL_GPL(zpci_list_lock);
+ 
+-struct pci_hp_callback_ops hotplug_ops;
+-EXPORT_SYMBOL_GPL(hotplug_ops);
++static struct pci_hp_callback_ops *hotplug_ops;
+ 
+ static DECLARE_BITMAP(zpci_domain, ZPCI_NR_DEVICES);
+ static DEFINE_SPINLOCK(zpci_domain_lock);
+@@ -971,8 +970,8 @@ int zpci_create_device(struct zpci_dev *
+ 
+ 	mutex_lock(&zpci_list_lock);
+ 	list_add_tail(&zdev->entry, &zpci_list);
+-	if (hotplug_ops.create_slot)
+-		hotplug_ops.create_slot(zdev);
++	if (hotplug_ops)
++		hotplug_ops->create_slot(zdev);
+ 	mutex_unlock(&zpci_list_lock);
+ 
+ 	if (zdev->state == ZPCI_FN_STATE_STANDBY)
+@@ -986,8 +985,8 @@ int zpci_create_device(struct zpci_dev *
+ out_start:
+ 	mutex_lock(&zpci_list_lock);
+ 	list_del(&zdev->entry);
+-	if (hotplug_ops.remove_slot)
+-		hotplug_ops.remove_slot(zdev);
++	if (hotplug_ops)
++		hotplug_ops->remove_slot(zdev);
+ 	mutex_unlock(&zpci_list_lock);
+ out_bus:
+ 	zpci_free_domain(zdev);
+@@ -1069,6 +1068,22 @@ static void zpci_mem_exit(void)
+ 	kmem_cache_destroy(zdev_fmb_cache);
+ }
+ 
++void zpci_register_hp_ops(struct pci_hp_callback_ops *ops)
++{
++	mutex_lock(&zpci_list_lock);
++	hotplug_ops = ops;
++	mutex_unlock(&zpci_list_lock);
++}
++EXPORT_SYMBOL_GPL(zpci_register_hp_ops);
++
++void zpci_deregister_hp_ops(void)
++{
++	mutex_lock(&zpci_list_lock);
++	hotplug_ops = NULL;
++	mutex_unlock(&zpci_list_lock);
++}
++EXPORT_SYMBOL_GPL(zpci_deregister_hp_ops);
++
+ unsigned int s390_pci_probe = 1;
+ EXPORT_SYMBOL_GPL(s390_pci_probe);
+ 
+--- a/drivers/pci/hotplug/s390_pci_hpc.c
++++ b/drivers/pci/hotplug/s390_pci_hpc.c
+@@ -172,25 +172,6 @@ error:
+ 	return -ENOMEM;
+ }
+ 
+-static int __init init_pci_slots(void)
+-{
+-	struct zpci_dev *zdev;
+-	int device = 0;
+-
+-	/*
+-	 * Create a structure for each slot, and register that slot
+-	 * with the pci_hotplug subsystem.
+-	 */
+-	mutex_lock(&zpci_list_lock);
+-	list_for_each_entry(zdev, &zpci_list, entry) {
+-		init_pci_slot(zdev);
+-		device++;
+-	}
+-
+-	mutex_unlock(&zpci_list_lock);
+-	return (device) ? 0 : -ENODEV;
+-}
+-
+ static void exit_pci_slot(struct zpci_dev *zdev)
+ {
+ 	struct list_head *tmp, *n;
+@@ -205,6 +186,26 @@ static void exit_pci_slot(struct zpci_de
+ 	}
+ }
+ 
++static struct pci_hp_callback_ops hp_ops = {
++	.create_slot = init_pci_slot,
++	.remove_slot = exit_pci_slot,
++};
++
++static void __init init_pci_slots(void)
++{
++	struct zpci_dev *zdev;
++
++	/*
++	 * Create a structure for each slot, and register that slot
++	 * with the pci_hotplug subsystem.
++	 */
++	mutex_lock(&zpci_list_lock);
++	list_for_each_entry(zdev, &zpci_list, entry) {
++		init_pci_slot(zdev);
++	}
++	mutex_unlock(&zpci_list_lock);
++}
++
+ static void __exit exit_pci_slots(void)
+ {
+ 	struct list_head *tmp, *n;
+@@ -224,28 +225,19 @@ static void __exit exit_pci_slots(void)
+ 
+ static int __init pci_hotplug_s390_init(void)
+ {
+-	/*
+-	 * Do specific initialization stuff for your driver here
+-	 * like initializing your controller hardware (if any) and
+-	 * determining the number of slots you have in the system
+-	 * right now.
+-	 */
+-
+ 	if (!s390_pci_probe)
+ 		return -EOPNOTSUPP;
+ 
+-	/* register callbacks for slot handling from arch code */
+-	mutex_lock(&zpci_list_lock);
+-	hotplug_ops.create_slot = init_pci_slot;
+-	hotplug_ops.remove_slot = exit_pci_slot;
+-	mutex_unlock(&zpci_list_lock);
+-	pr_info("registered hotplug slot callbacks\n");
+-	return init_pci_slots();
++	zpci_register_hp_ops(&hp_ops);
++	init_pci_slots();
++
++	return 0;
+ }
+ 
+ static void __exit pci_hotplug_s390_exit(void)
+ {
+ 	exit_pci_slots();
++	zpci_deregister_hp_ops();
+ }
+ 
+ module_init(pci_hotplug_s390_init);
