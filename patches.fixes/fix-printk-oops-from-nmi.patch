@@ -1,0 +1,107 @@
+From: Michal Hocko <mhocko@suse.cz>
+Subject: printk: forcibly flush nmi ringbuffer if oops is in progress
+Patch-mainline: no
+References: bnc#849675
+
+If an oops happens in the NMI context then there is nobody to flush nmi
+ringbuffer and the oops message is not printed. We do not flush the ringbuffer
+because this requires calling console_trylock_for_printk and console_unlock and
+that is not NMI safe.
+
+What we can do, though, is to zap all printk locks even from the NMI context and
+force console locking machinery to continue. We already do this when a printk
+recursion is detected. This should be safe because the system is crashing and
+there shouldn't be any printk caller by now. In case somebody manages to grab
+the logbuf_lock after zap_locks then we just bail out and hope the current holder
+(be it from NMI or regular context) finishes its work and flushes all the
+ringbuffers.
+
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+Reviewed-by: Jiri Kosina <jkosina@suse.cz>
+
+---
+ kernel/printk.c |   60 ++++++++++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 43 insertions(+), 17 deletions(-)
+
+--- a/kernel/printk.c
++++ b/kernel/printk.c
+@@ -1086,6 +1086,20 @@ asmlinkage int vprintk(const char *fmt,
+ 	printed_len = finish_printk(buf, printed_len, in_nmi_delayed_printk);
+ 
+ 	/*
++	 * Make sure to release the correct ringbuf lock from NMI context.
++	 * non-NMI context keeps the lock held for the console locking
++	 * magic.
++	 */
++	if (in_nmi()) {
++		if (!in_nmi_delayed_printk) {
++			printk_cpu = UINT_MAX;
++			spin_unlock(&logbuf_lock);
++		} else {
++			spin_unlock(&nmi_logbuf_lock);
++		}
++	}
++
++	/*
+ 	 * Try to acquire and then immediately release the
+ 	 * console semaphore. The release will do all the
+ 	 * actual magic (print out buffers, wake up klogd,
+@@ -1098,29 +1112,41 @@ asmlinkage int vprintk(const char *fmt,
+ 	 * This whole magic is not allowed from nmi context as
+ 	 * console_unlock re-takes logbuf_lock and other locks
+ 	 * from follow-up paths.
++	 *
++	 * However we have to be able to handle oopses from NMI context
++	 * as well so all the printk locks have to be forcefully dropped
++	 * just in case a holder was preempted by NMI and console magic
++	 * has to be done anyway otherwise we would loose the last messages.
+ 	 */
+-	if (!in_nmi_delayed_printk) {
+-		printk_cpu = UINT_MAX;
++	if (!in_nmi() || oops_in_progress) {
+ 		if (in_nmi()) {
+-			spin_unlock(&logbuf_lock);
+-		} else {
+-			if (console_trylock_for_printk(this_cpu))
+-				console_unlock();
+-
++			zap_locks();
+ 			/*
+-			 * We are calling this outside of the lock just to make
+-			 * sure that the printk which raced with NMI had a
+-			 * chance to do some progress since it has been
+-			 * interrupted.
+-			 * Do not try to handle pending NMI messages from NMI as
+-			 * we would need to take logbuf_lock and we could
+-			 * deadlock.
++			 * We managed to race with somebody so bail out
++			 * and hope it will flush the buffers properly
+ 			 */
+-			handle_nmi_delayed_printk();
++			if (!spin_trylock(&logbuf_lock)) {
++				lockdep_on();
++				goto out_restore_irqs;
++			}
++		} else {
++			printk_cpu = UINT_MAX;
+ 		}
+-	} else
+-		spin_unlock(&nmi_logbuf_lock);
+ 
++		if (console_trylock_for_printk(this_cpu))
++			console_unlock();
++
++		/*
++		 * We are calling this outside of the lock just to make
++		 * sure that the printk which raced with NMI had a
++		 * chance to do some progress since it has been
++		 * interrupted.
++		 * Do not try to handle pending NMI messages from NMI as
++		 * we would need to take logbuf_lock and we could
++		 * deadlock.
++		 */
++		handle_nmi_delayed_printk();
++	}
+ 	lockdep_on();
+ out_restore_irqs:
+ 	raw_local_irq_restore(flags);
