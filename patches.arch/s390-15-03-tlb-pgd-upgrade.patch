@@ -1,0 +1,207 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: kernel: correct tlb flush on page table upgrade
+Patch-mainline: not yet
+Git-commit: -
+References: bnc#847660, LTC#99268
+
+Description:  kernel: correct tlb flush on page table upgrade
+Symptom:      Unexpected program crashes, random data corruption.
+Problem:      The update of a page-table from 2 to 3, or 3 to 4 levels
+              will create a new top level page-table for the virtual
+              address space. The address-space-control element (ASCE)
+              for the virtual address space will be replaced by an ASCE
+              with the new top level page-table. Translation-lookaside
+              buffer (TLB) entries created for the virtual address space
+              are associated to the ASCE that has been in use when the
+              TLB entries have been created. The page-table upgrade code
+              misses a TLB flush for the TLB entries associated to the
+              old ASCE. If the memory of the old top level page-table is
+              used by a new process as its top level page-table the
+              stale TLB entries cause incorrect virtual address
+              translations.
+Solution:     Flush the TLB entries associated to the old ASCE on
+              page-table upgrade.
+Reproduction: Run a program in a loop that forces the memory management
+              to create a 4-level page table and exists shortly after.
+              Eventually an instance of the program will reuse a top
+              level page-table which has stale TLB entries associated
+              to it.
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ arch/s390/include/asm/processor.h |    2 --
+ arch/s390/kernel/traps.c          |    2 --
+ arch/s390/mm/fault.c              |   30 ------------------------------
+ arch/s390/mm/mmap.c               |   12 ++----------
+ arch/s390/mm/pgtable.c            |   18 ++++++++++++++++++
+ 5 files changed, 20 insertions(+), 44 deletions(-)
+
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -139,9 +139,7 @@ struct stack_frame {
+ 	regs->psw.mask	= psw_user32_bits;			\
+ 	regs->psw.addr	= new_psw | PSW_ADDR_AMODE;		\
+ 	regs->gprs[15]	= new_stackp;				\
+-	__tlb_flush_mm(current->mm);				\
+ 	crst_table_downgrade(current->mm, 1UL << 31);		\
+-	update_mm(current->mm, current);			\
+ } while (0)
+ 
+ /* Forward declaration, a strange C thing */
+--- a/arch/s390/kernel/traps.c
++++ b/arch/s390/kernel/traps.c
+@@ -50,7 +50,6 @@ int show_unhandled_signals;
+ 
+ extern pgm_check_handler_t do_protection_exception;
+ extern pgm_check_handler_t do_dat_exception;
+-extern pgm_check_handler_t do_asce_exception;
+ 
+ #define stack_pointer ({ void **sp; asm("la %0,0(15)" : "=&d" (sp)); sp; })
+ 
+@@ -668,7 +667,6 @@ void __init trap_init(void)
+         pgm_check_table[0x13] = &special_op_exception;
+ #ifdef CONFIG_64BIT
+ 	pgm_check_table[0x18] = &transaction_exception;
+-	pgm_check_table[0x38] = &do_asce_exception;
+ 	pgm_check_table[0x39] = &do_dat_exception;
+ 	pgm_check_table[0x3A] = &do_dat_exception;
+         pgm_check_table[0x3B] = &do_dat_exception;
+--- a/arch/s390/mm/fault.c
++++ b/arch/s390/mm/fault.c
+@@ -407,36 +407,6 @@ void __kprobes do_dat_exception(struct p
+ 		do_fault_error(regs, pgm_int_code & 255, trans_exc_code, fault);
+ }
+ 
+-#ifdef CONFIG_64BIT
+-void __kprobes do_asce_exception(struct pt_regs *regs, long pgm_int_code,
+-				 unsigned long trans_exc_code)
+-{
+-	struct mm_struct *mm = current->mm;
+-	struct vm_area_struct *vma;
+-
+-	if (unlikely(!user_space_fault(trans_exc_code) || in_atomic() || !mm))
+-		goto no_context;
+-
+-	down_read(&mm->mmap_sem);
+-	vma = find_vma(mm, trans_exc_code & __FAIL_ADDR_MASK);
+-	up_read(&mm->mmap_sem);
+-
+-	if (vma) {
+-		update_mm(mm, current);
+-		return;
+-	}
+-
+-	/* User mode accesses just cause a SIGSEGV */
+-	if (regs->psw.mask & PSW_MASK_PSTATE) {
+-		do_sigsegv(regs, pgm_int_code, SEGV_MAPERR, trans_exc_code);
+-		return;
+-	}
+-
+-no_context:
+-	do_no_context(regs, pgm_int_code, trans_exc_code);
+-}
+-#endif
+-
+ int __handle_fault(unsigned long uaddr, unsigned long pgm_int_code, int write)
+ {
+ 	struct pt_regs regs;
+--- a/arch/s390/mm/mmap.c
++++ b/arch/s390/mm/mmap.c
+@@ -106,18 +106,12 @@ EXPORT_SYMBOL_GPL(arch_pick_mmap_layout)
+ 
+ int s390_mmap_check(unsigned long addr, unsigned long len, unsigned long flags)
+ {
+-	int rc;
+-
+ 	if (is_compat_task() || (TASK_SIZE >= (1UL << 53)))
+ 		return 0;
+ 	if (!(flags & MAP_FIXED))
+ 		addr = 0;
+-	if ((addr + len) >= TASK_SIZE) {
+-		rc = crst_table_upgrade(current->mm, 1UL << 53);
+-		if (rc)
+-			return rc;
+-		update_mm(current->mm, current);
+-	}
++	if ((addr + len) >= TASK_SIZE)
++		return crst_table_upgrade(current->mm, 1UL << 53);
+ 	return 0;
+ }
+ 
+@@ -137,7 +131,6 @@ s390_get_unmapped_area(struct file *filp
+ 		rc = crst_table_upgrade(mm, 1UL << 53);
+ 		if (rc)
+ 			return (unsigned long) rc;
+-		update_mm(mm, current);
+ 		area = arch_get_unmapped_area(filp, addr, len, pgoff, flags);
+ 	}
+ 	return area;
+@@ -160,7 +153,6 @@ s390_get_unmapped_area_topdown(struct fi
+ 		rc = crst_table_upgrade(mm, 1UL << 53);
+ 		if (rc)
+ 			return (unsigned long) rc;
+-		update_mm(mm, current);
+ 		area = arch_get_unmapped_area_topdown(filp, addr, len,
+ 						      pgoff, flags);
+ 	}
+--- a/arch/s390/mm/pgtable.c
++++ b/arch/s390/mm/pgtable.c
+@@ -48,12 +48,23 @@ void crst_table_free(struct mm_struct *m
+ }
+ 
+ #ifdef CONFIG_64BIT
++static void __crst_table_upgrade(void *arg)
++{
++	struct mm_struct *mm = arg;
++
++	if (current->active_mm == mm)
++		update_mm(mm, current);
++	__tlb_flush_local();
++}
++
+ int crst_table_upgrade(struct mm_struct *mm, unsigned long limit)
+ {
+ 	unsigned long *table, *pgd;
+ 	unsigned long entry;
++	int flush;
+ 
+ 	BUG_ON(limit > (1UL << 53));
++	flush = 0;
+ repeat:
+ 	table = crst_table_alloc(mm);
+ 	if (!table)
+@@ -79,12 +90,15 @@ repeat:
+ 		mm->pgd = (pgd_t *) table;
+ 		mm->task_size = mm->context.asce_limit;
+ 		table = NULL;
++		flush = 1;
+ 	}
+ 	spin_unlock_bh(&mm->page_table_lock);
+ 	if (table)
+ 		crst_table_free(mm, table);
+ 	if (mm->context.asce_limit < limit)
+ 		goto repeat;
++	if (flush)
++		on_each_cpu(__crst_table_upgrade, mm, 0);
+ 	return 0;
+ }
+ 
+@@ -92,6 +106,8 @@ void crst_table_downgrade(struct mm_stru
+ {
+ 	pgd_t *pgd;
+ 
++	if (current->active_mm == mm)
++		__tlb_flush_mm(mm);
+ 	while (mm->context.asce_limit > limit) {
+ 		pgd = mm->pgd;
+ 		switch (pgd_val(*pgd) & _REGION_ENTRY_TYPE_MASK) {
+@@ -114,6 +130,8 @@ void crst_table_downgrade(struct mm_stru
+ 		mm->task_size = mm->context.asce_limit;
+ 		crst_table_free(mm, (unsigned long *) pgd);
+ 	}
++	if (current->active_mm == mm)
++		update_mm(mm, current);
+ }
+ #endif
+ 
