@@ -1,0 +1,158 @@
+Subject: sched: Use jump labels to reduce overhead when bandwidth control is inactive
+From: Paul Turner <pjt@google.com>
+Date: Mon, 7 Nov 2011 20:26:33 -0800
+Git-commit: 56f570e512eeb5b412cb3a62234adc446a8eb32b
+Patch-mainline: v3.3-rc1
+References: bnc#848336
+
+Now that the linkage of jump-labels has been fixed they show a measurable
+improvement in overhead for the enabled-but-unused case.
+
+Workload is:
+
+ 'taskset -c 0 perf stat --repeat 50 -e instructions,cycles,branches
+  bash -c "for ((i=0;i<5;i++)); do $(dirname $0)/pipe-test 20000; done"'
+
+There's a speedup for all situations:
+
+                 instructions            cycles                  branches
+ -------------------------------------------------------------------------
+ Intel Westmere
+ base            806611770               745895590               146765378
+ +jumplabel      803090165 (-0.44%)      713381840 (-4.36%)      144561130
+
+ AMD Barcelona
+ base            824657415               740055589               148855354
+ +jumplabel      821056910 (-0.44%)      737558389 (-0.34%)      146635229
+
+Signed-off-by: Paul Turner <pjt@google.com>
+Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/20111108042736.560831357@google.com
+Signed-off-by: Ingo Molnar <mingo@elte.hu>
+Acked-by: Mike Galbraith <mgalbraith@suse.de>
+
+---
+ kernel/sched.c      |   33 +++++++++++++++++++++++++++++++--
+ kernel/sched_fair.c |   15 ++++++++++++---
+ 2 files changed, 43 insertions(+), 5 deletions(-)
+
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -71,6 +71,7 @@
+ #include <linux/ctype.h>
+ #include <linux/ftrace.h>
+ #include <linux/slab.h>
++#include <linux/jump_label.h>
+ 
+ #include <asm/tlb.h>
+ #include <asm/irq_regs.h>
+@@ -499,7 +500,32 @@ static void destroy_cfs_bandwidth(struct
+ 	hrtimer_cancel(&cfs_b->period_timer);
+ 	hrtimer_cancel(&cfs_b->slack_timer);
+ }
+-#else
++
++#ifdef HAVE_JUMP_LABEL
++static struct jump_label_key __cfs_bandwidth_used;
++
++static inline bool cfs_bandwidth_used(void)
++{
++	return static_branch(&__cfs_bandwidth_used);
++}
++
++static void account_cfs_bandwidth_used(int enabled, int was_enabled)
++{
++	/* only need to count groups transitioning between enabled/!enabled */
++	if (enabled && !was_enabled)
++		jump_label_inc(&__cfs_bandwidth_used);
++	else if (!enabled && was_enabled)
++		jump_label_dec(&__cfs_bandwidth_used);
++}
++#else /* !HAVE_JUMP_LABEL */
++/* static_branch doesn't help unless supported */
++static int cfs_bandwidth_used(void)
++{
++	return 1;
++}
++static void account_cfs_bandwidth_used(int enabled, int was_enabled) {}
++#endif /* HAVE_JUMP_LABEL */
++#else /* !CONFIG_CFS_BANDWIDTH */
+ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
+ static void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b) {}
+ static void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b) {}
+@@ -9359,7 +9385,7 @@ static int __cfs_schedulable(struct task
+ 
+ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
+ {
+-	int i, ret = 0, runtime_enabled;
++	int i, ret = 0, runtime_enabled, runtime_was_enabled;
+ 	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(tg);
+ 
+ 	if (tg == &root_task_group)
+@@ -9387,6 +9413,9 @@ static int tg_set_cfs_bandwidth(struct t
+ 		goto out_unlock;
+ 
+ 	runtime_enabled = quota != RUNTIME_INF;
++	runtime_was_enabled = cfs_b->quota != RUNTIME_INF;
++	account_cfs_bandwidth_used(runtime_enabled, runtime_was_enabled);
++
+ 	raw_spin_lock_irq(&cfs_b->lock);
+ 	cfs_b->period = ns_to_ktime(period);
+ 	cfs_b->quota = quota;
+--- a/kernel/sched_fair.c
++++ b/kernel/sched_fair.c
+@@ -1416,7 +1416,7 @@ static void __account_cfs_rq_runtime(str
+ static __always_inline void account_cfs_rq_runtime(struct cfs_rq *cfs_rq,
+ 						   unsigned long delta_exec)
+ {
+-	if (!cfs_rq->runtime_enabled)
++	if (!cfs_bandwidth_used() || !cfs_rq->runtime_enabled)
+ 		return;
+ 
+ 	__account_cfs_rq_runtime(cfs_rq, delta_exec);
+@@ -1424,13 +1424,13 @@ static __always_inline void account_cfs_
+ 
+ static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq)
+ {
+-	return cfs_rq->throttled;
++	return cfs_bandwidth_used() && cfs_rq->throttled;
+ }
+ 
+ /* check whether cfs_rq, or any parent, is throttled */
+ static inline int throttled_hierarchy(struct cfs_rq *cfs_rq)
+ {
+-	return cfs_rq->throttle_count;
++	return cfs_bandwidth_used() && cfs_rq->throttle_count;
+ }
+ 
+ /*
+@@ -1751,6 +1751,9 @@ static void __return_cfs_rq_runtime(stru
+ 
+ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
++	if (!cfs_bandwidth_used())
++		return;
++
+ 	if (!cfs_rq->runtime_enabled || cfs_rq->nr_running)
+ 		return;
+ 
+@@ -1796,6 +1799,9 @@ static void do_sched_cfs_slack_timer(str
+  */
+ static void check_enqueue_throttle(struct cfs_rq *cfs_rq)
+ {
++	if (!cfs_bandwidth_used())
++		return;
++
+ 	/* an active group must be handled by the update_curr()->put() path */
+ 	if (!cfs_rq->runtime_enabled || cfs_rq->curr)
+ 		return;
+@@ -1813,6 +1819,9 @@ static void check_enqueue_throttle(struc
+ /* conditionally throttle active cfs_rq's from put_prev_entity() */
+ static void check_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
++	if (!cfs_bandwidth_used())
++		return;
++
+ 	if (likely(!cfs_rq->runtime_enabled || cfs_rq->runtime_remaining > 0))
+ 		return;
+ 
