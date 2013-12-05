@@ -1,0 +1,120 @@
+From 57302e0ddf8a210a66fd8a1a2fa50844863b5ded Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Tue, 4 Dec 2012 08:25:11 -0800
+Subject: [PATCH] vfs: avoid "attempt to access beyond end of device" warnings
+Git-commit: 57302e0ddf8a210a66fd8a1a2fa50844863b5ded
+Patch-mainline: v3.7
+References: bnc#820338
+
+The block device access simplification that avoided accessing the (racy)
+block size information (commit bbec0270bdd8: "blkdev_max_block: make
+private to fs/buffer.c") no longer checks the maximum block size in the
+block mapping path.
+
+That was _almost_ as simple as just removing the code entirely, because
+the readers and writers all check the size of the device anyway, so
+under normal circumstances it "just worked".
+
+However, the block size may be such that the end of the device may
+straddle one single buffer_head.  At which point we may still want to
+access the end of the device, but the buffer we use to access it
+partially extends past the end.
+
+The 'bd_set_size()' function intentionally sets the block size to avoid
+this, but mounting the device - or setting the block size by hand to
+some other value - can modify that block size.
+
+So instead, teach 'submit_bh()' about the special case of the buffer
+head straddling the end of the device, and turning such an access into a
+smaller IO access, avoiding the problem.
+
+This, btw, also means that unlike before, we can now access the whole
+device regardless of device block size setting.  So now, even if the
+device size is only 512-byte aligned, we can read and write even the
+last sector even when having a much bigger block size for accessing the
+rest of the device.
+
+So with this, we could now get rid of the 'bd_set_size()' block size
+code entirely - resulting in faster IO for the common case - but that
+would be a separate patch.
+
+Reported-and-tested-by: Romain Francoise <romain@orebokech.com>
+Reporeted-and-tested-by: Meelis Roos <mroos@linux.ee>
+Reported-by: Tony Luck <tony.luck@intel.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Jan Kara <jack@suse.cz>
+
+---
+ fs/buffer.c | 52 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+Index: linux-3.0-SLE11-SP2/fs/buffer.c
+===================================================================
+--- linux-3.0-SLE11-SP2.orig/fs/buffer.c
++++ linux-3.0-SLE11-SP2/fs/buffer.c
+@@ -2931,6 +2931,55 @@ static void end_bio_bh_io_sync(struct bi
+ 	bio_put(bio);
+ }
+ 
++/*
++ * This allows us to do IO even on the odd last sectors
++ * of a device, even if the bh block size is some multiple
++ * of the physical sector size.
++ *
++ * We'll just truncate the bio to the size of the device,
++ * and clear the end of the buffer head manually.
++ *
++ * Truly out-of-range accesses will turn into actual IO
++ * errors, this only handles the "we need to be able to
++ * do IO at the final sector" case.
++ */
++static void guard_bh_eod(int rw, struct bio *bio, struct buffer_head *bh)
++{
++	sector_t maxsector;
++	unsigned bytes;
++
++	maxsector = i_size_read(bio->bi_bdev->bd_inode) >> 9;
++	if (!maxsector)
++		return;
++
++	/*
++	 * If the *whole* IO is past the end of the device,
++	 * let it through, and the IO layer will turn it into
++	 * an EIO.
++	 */
++	if (unlikely(bio->bi_sector >= maxsector))
++		return;
++
++	maxsector -= bio->bi_sector;
++	bytes = bio->bi_size;
++	if (likely((bytes >> 9) <= maxsector))
++		return;
++
++	/* Uhhuh. We've got a bh that straddles the device size! */
++	bytes = maxsector << 9;
++
++	/* Truncate the bio.. */
++	bio->bi_size = bytes;
++	bio->bi_io_vec[0].bv_len = bytes;
++
++	/* ..and clear the end of the buffer for reads */
++	if (rw & READ) {
++		void *kaddr = kmap_atomic(bh->b_page);
++		memset(kaddr + bh_offset(bh) + bytes, 0, bh->b_size - bytes);
++		kunmap_atomic(kaddr);
++	}
++}
++
+ int _submit_bh(int rw, struct buffer_head *bh, unsigned long bio_flags)
+ {
+ 	struct bio *bio;
+@@ -2968,6 +3017,9 @@ int _submit_bh(int rw, struct buffer_hea
+ 	bio->bi_private = bh;
+ 	bio->bi_flags |= bio_flags;
+ 
++	/* Take care of bh's that straddle the end of the device */
++	guard_bh_eod(rw, bio, bh);
++
+ 	bio_get(bio);
+ 	submit_bio(rw, bio);
+ 
