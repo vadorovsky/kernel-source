@@ -1,0 +1,151 @@
+From: Ian Kent <raven@themaw.net>
+Date:   Fri Dec 14 10:23:23 2012 +0800
+Subject: autofs4 - dont clear DCACHE_NEED_AUTOMOUNT on rootless mount
+Git-commit: f55fb0c24386cee8b78f60d60186716bd0909493
+Patch-mainline: v3.8
+References: bnc#851314
+
+The DCACHE_NEED_AUTOMOUNT flag is cleared on mount and set on expire
+for autofs rootless multi-mount dentrys to prevent unnecessary calls
+to ->d_automount().
+
+Since DCACHE_MANAGE_TRANSIT is always set on autofs dentrys ->d_managed()
+is always called so the check can be done in ->d_manage() without the
+need to change the flag. This still avoids unnecessary calls to
+->d_automount(), adds negligible overhead and eliminates a seriously
+ugly check in the expire code.
+
+Signed-off-by: Ian Kent <raven@themaw.net>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Miklos Szeredi <mszeredi@suse.cz>
+---
+ fs/autofs4/expire.c |    9 -------
+ fs/autofs4/root.c   |   61 ++++++++++++++++++++++++++++++----------------------
+ 2 files changed, 36 insertions(+), 34 deletions(-)
+
+--- a/fs/autofs4/expire.c
++++ b/fs/autofs4/expire.c
+@@ -544,15 +544,6 @@ int autofs4_do_expire_multi(struct super
+ 
+ 		spin_lock(&sbi->fs_lock);
+ 		ino->flags &= ~AUTOFS_INF_EXPIRING;
+-		spin_lock(&dentry->d_lock);
+-		if (!ret) {
+-			if ((IS_ROOT(dentry) ||
+-			    (autofs_type_indirect(sbi->type) &&
+-			     IS_ROOT(dentry->d_parent))) &&
+-			    !(dentry->d_flags & DCACHE_NEED_AUTOMOUNT))
+-				__managed_dentry_set_automount(dentry);
+-		}
+-		spin_unlock(&dentry->d_lock);
+ 		complete_all(&ino->expire_complete);
+ 		spin_unlock(&sbi->fs_lock);
+ 		dput(dentry);
+--- a/fs/autofs4/root.c
++++ b/fs/autofs4/root.c
+@@ -352,7 +352,6 @@ static struct vfsmount *autofs4_d_automo
+ 		status = autofs4_mount_wait(dentry);
+ 		if (status)
+ 			return ERR_PTR(status);
+-		spin_lock(&sbi->fs_lock);
+ 		goto done;
+ 	}
+ 
+@@ -361,8 +360,11 @@ static struct vfsmount *autofs4_d_automo
+ 	 * having d_mountpoint() true, so there's no need to call back
+ 	 * to the daemon.
+ 	 */
+-	if (dentry->d_inode && S_ISLNK(dentry->d_inode->i_mode))
++	if (dentry->d_inode && S_ISLNK(dentry->d_inode->i_mode)) {
++		spin_unlock(&sbi->fs_lock);
+ 		goto done;
++	}
++
+ 	if (!d_mountpoint(dentry)) {
+ 		/*
+ 		 * It's possible that user space hasn't removed directories
+@@ -376,8 +378,10 @@ static struct vfsmount *autofs4_d_automo
+ 		 * require user space behave.
+ 		 */
+ 		if (sbi->version > 4) {
+-			if (have_submounts(dentry))
++			if (have_submounts(dentry)) {
++				spin_unlock(&sbi->fs_lock);
+ 				goto done;
++			}
+ 		} else {
+ 			if (!simple_empty(dentry))
+ 				goto done;
+@@ -392,28 +396,8 @@ static struct vfsmount *autofs4_d_automo
+ 			return ERR_PTR(status);
+ 		}
+ 	}
+-done:
+-	if (!(ino->flags & AUTOFS_INF_EXPIRING)) {
+-		/*
+-		 * Any needed mounting has been completed and the path
+-		 * updated so clear DCACHE_NEED_AUTOMOUNT so we don't
+-		 * call ->d_automount() on rootless multi-mounts since
+-		 * it can lead to an incorrect ELOOP error return.
+-		 *
+-		 * Only clear DMANAGED_AUTOMOUNT for rootless multi-mounts and
+-		 * symlinks as in all other cases the dentry will be covered by
+-		 * an actual mount so ->d_automount() won't be called during
+-		 * the follow.
+-		 */
+-		spin_lock(&dentry->d_lock);
+-		if ((!d_mountpoint(dentry) &&
+-		    !list_empty(&dentry->d_subdirs)) ||
+-		    (dentry->d_inode && S_ISLNK(dentry->d_inode->i_mode)))
+-			__managed_dentry_clear_automount(dentry);
+-		spin_unlock(&dentry->d_lock);
+-	}
+ 	spin_unlock(&sbi->fs_lock);
+-
++done:
+ 	/* Mount succeeded, check if we ended up with a new dentry */
+ 	dentry = autofs4_mountpoint_changed(path);
+ 	if (!dentry)
+@@ -425,6 +409,8 @@ static struct vfsmount *autofs4_d_automo
+ int autofs4_d_manage(struct dentry *dentry, bool rcu_walk)
+ {
+ 	struct autofs_sb_info *sbi = autofs4_sbi(dentry->d_sb);
++	struct autofs_info *ino = autofs4_dentry_ino(dentry);
++	int status;
+ 
+ 	DPRINTK("dentry=%p %.*s",
+ 		dentry, dentry->d_name.len, dentry->d_name.name);
+@@ -449,7 +435,32 @@ int autofs4_d_manage(struct dentry *dent
+ 	 * This dentry may be under construction so wait on mount
+ 	 * completion.
+ 	 */
+-	return autofs4_mount_wait(dentry);
++	status = autofs4_mount_wait(dentry);
++	if (status)
++		return status;
++
++	spin_lock(&sbi->fs_lock);
++	/*
++	 * If the dentry has been selected for expire while we slept
++	 * on the lock then it might go away. We'll deal with that in
++	 * ->d_automount() and wait on a new mount if the expire
++	 * succeeds or return here if it doesn't (since there's no
++	 * mount to follow with a rootless multi-mount).
++	 */
++	if (!(ino->flags & AUTOFS_INF_EXPIRING)) {
++		/*
++		 * Any needed mounting has been completed and the path
++		 * updated so check if this is a rootless multi-mount so
++		 * we can avoid needless calls ->d_automount() and avoid
++		 * an incorrect ELOOP error return.
++		 */
++		if ((!d_mountpoint(dentry) && !simple_empty(dentry)) ||
++		    (dentry->d_inode && S_ISLNK(dentry->d_inode->i_mode)))
++			status = -EISDIR;
++	}
++	spin_unlock(&sbi->fs_lock);
++
++	return status;
+ }
+ 
+ /* Lookups in the root directory */
