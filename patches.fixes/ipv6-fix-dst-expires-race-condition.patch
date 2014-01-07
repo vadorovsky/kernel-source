@@ -1,0 +1,162 @@
+From: Jiri Bohac <jbohac@suse.cz>
+References: bnc#843185
+Patch-mainline: never
+Subject: ipv6: fix race condition regarding dst->expires and dst->from.
+
+Mainline has fixed this in commit
+ecd98837: ipv6: fix race condition regarding dst->expires and dst->from.
+However, adding an extra field to sturct dst_entry was not an option as 
+this would break the KABI.
+
+With no locking, dst->flags can not be used to reliably differentiate between
+the union used as a "from" pointer and an "expires" long.
+
+Since a dst_entry is always aligned, the pointer will never point to an odd 
+address. This patch makes sure the expires field is always "rounded" to an odd 
+number and thus differentiate between the two uses.
+
+from is always set only once, so the only dangerous transition is from "from" to "expires".
+This is now done using cmpxchg so that the "from" dst is only properly released once.
+
+Signed-off-by: Jiri Bohac <jbohac@suse.cz>
+
+diff --git a/include/net/dst.h b/include/net/dst.h
+index 58578b40..33ffc27 100644
+--- a/include/net/dst.h
++++ b/include/net/dst.h
+@@ -39,9 +39,10 @@ struct dst_entry {
+ 	unsigned long		expires;
+ #else
+ 	union {
+-		unsigned long           expires;
+-		/* point to where the dst_entry copied from */
+-		struct dst_entry        *from;
++		unsigned long           expires /* must be 0 or odd number */;
++		/* point to where the dst_entry copied from, treated as
++		   a dst_entry* when the value is an even number */
++		unsigned long		__from;
+ 	};
+ #endif
+ 	struct dst_entry	*path;
+@@ -416,8 +417,7 @@ static inline void dst_set_expires(struct dst_entry *dst, int timeout)
+ {
+ 	unsigned long expires = jiffies + timeout;
+ 
+-	if (expires == 0)
+-		expires = 1;
++	expires |= 1UL;
+ 
+ 	if (dst->expires == 0 || time_before(expires, dst->expires))
+ 		dst->expires = expires;
+diff --git a/include/net/ip6_fib.h b/include/net/ip6_fib.h
+index 93be5c9..99ab869 100644
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@ -127,29 +127,50 @@ static inline struct inet6_dev *ip6_dst_idev(struct dst_entry *dst)
+ 	return ((struct rt6_info *)dst)->rt6i_idev;
+ }
+ 
+-static inline void rt6_clean_expires(struct rt6_info *rt)
++/*
++ * We make sure expires is always an odd number or 0.
++ * No locks are taken to update the from/expires union, so
++ * the update of expires may race with the use of the from pointer.
++ * We only treat even numbers as "from" pointers to work around this
++ * race condition.
++ */
++static inline struct rt6_info *rt6_get_from(const struct rt6_info *rt)
+ {
+-	if (!(rt->rt6i_flags & RTF_EXPIRES) && rt->dst.from)
+-		dst_release(rt->dst.from);
++	unsigned long from = rt->dst.__from;
++	if (!(from & 1UL))
++		return (struct rt6_info *)from;
++	return NULL;
++}
++
++static inline void rt6_release_from(struct rt6_info *rt)
++{
++	struct rt6_info *from = rt6_get_from(rt);
++	if (from) {
++		struct rt6_info *prev;
++		prev = (struct rt6_info *)cmpxchg(&rt->dst.__from, (unsigned long)from, 0UL);
++		if (prev == from)
++			dst_release((struct dst_entry *)from);
++	}
++}
+ 
++static inline void rt6_clean_expires(struct rt6_info *rt)
++{
++	rt6_release_from(rt);
+ 	rt->rt6i_flags &= ~RTF_EXPIRES;
+ 	rt->dst.expires = 0;
+ }
+ 
+ static inline void rt6_set_expires(struct rt6_info *rt, unsigned long expires)
+ {
+-	if (!(rt->rt6i_flags & RTF_EXPIRES) && rt->dst.from)
+-		dst_release(rt->dst.from);
+-
++	rt6_release_from(rt);
+ 	rt->rt6i_flags |= RTF_EXPIRES;
+-	rt->dst.expires = expires;
++	rt->dst.expires = expires | 1UL;
+ }
+ 
+ static inline void rt6_update_expires(struct rt6_info *rt, int timeout)
+ {
++	rt6_release_from(rt);
+ 	if (!(rt->rt6i_flags & RTF_EXPIRES)) {
+-		if (rt->dst.from)
+-			dst_release(rt->dst.from);
+ 		/* dst_set_expires relies on expires == 0 
+                   if it has not been set previously */
+ 		rt->dst.expires = 0;
+@@ -162,15 +183,9 @@ static inline void rt6_update_expires(struct rt6_info *rt, int timeout)
+ static inline void rt6_set_from(struct rt6_info *rt, struct rt6_info *from)
+ {
+ 	struct dst_entry *new = (struct dst_entry *) from;
+-
+-	if (!(rt->rt6i_flags & RTF_EXPIRES) && rt->dst.from) {
+-		if (new == rt->dst.from)
+-			return;
+-		dst_release(rt->dst.from);
+-	}
+-
++	BUG_ON(((unsigned long)from) & 1UL);
+ 	rt->rt6i_flags &= ~RTF_EXPIRES;
+-	rt->dst.from = new;
++	rt->dst.__from = (unsigned long)new;
+ 	dst_hold(new);
+ }
+ 
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 625f21e..90ad7f3 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -259,8 +259,7 @@ static void ip6_dst_destroy(struct dst_entry *dst)
+ 		in6_dev_put(idev);
+ 	}
+ 
+-	if (!(rt->rt6i_flags & RTF_EXPIRES) && dst->from)
+-		dst_release(dst->from);
++	rt6_release_from(rt);
+ 
+ 	if (peer) {
+ 		rt->rt6i_peer = NULL;
+@@ -307,13 +306,12 @@ static void ip6_dst_ifdown(struct dst_entry *dst, struct net_device *dev,
+ 
+ static __inline__ int rt6_check_expired(const struct rt6_info *rt)
+ {
+-	struct rt6_info *ort = NULL;
++	struct rt6_info *ort = rt6_get_from(rt);
+ 
+ 	if (rt->rt6i_flags & RTF_EXPIRES) {
+ 		if (time_after(jiffies, rt->dst.expires))
+ 			return 1;
+-	} else if (rt->dst.from) {
+-		ort = (struct rt6_info *) rt->dst.from;
++	} else if (ort) {
+ 		return (ort->rt6i_flags & RTF_EXPIRES) &&
+ 			time_after(jiffies, ort->dst.expires);
+ 	}
