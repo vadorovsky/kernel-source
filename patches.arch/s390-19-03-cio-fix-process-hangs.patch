@@ -1,0 +1,236 @@
+From: Peter Oberparleiter <oberpar@linux.vnet.ibm.com>
+Subject: cio: Fix process hangs during subchannel scan
+Patch-mainline: v3.14-rc1
+Git-commit: 449666dd1efacaf3f0eb020cc617dd702356575c
+            b207f5a8f9a60fda4e995151af7d8670015e261d
+            175746eb06a8925274558793814d8c802dc48276
+            47d30674d6c79197fa7bfb0d09d5857f61e0277b
+            e6b2551425d961e68e70e806e22ec40787f7ed67
+References: bnc#866081, LTC#104805
+
+Description:  cio: Fix process hangs during subchannel scan
+Symptom:      User space processes appear to hang for a prolonged amount
+              of time while the kernel is performing a subchannel scan.
+Problem:      The Linux kernel scans for new subchannels in a busy loop
+              during which the CPU scheduler cannot schedule other processes
+              on the same CPU for a period of time of up to multiple seconds.
+              In addition the Store Subchannel (STSCH) instruction is
+              potentially performed multiple times per unknown subchannel,
+              resulting in excessive Hypervisor overhead that further slows
+              down other processes.
+Solution:     Enable the CPU scheduler to schedule other processes during the
+              subchannel scan loop. Also optimize the number of STSCH
+              instructions being performed.
+Reproduction: Trigger a subchannel scan, for example by performing one of the
+              following:
+               * CHPID configure off/on:  chchp -c 0 CHPID ; chchp -c 1 CHPID
+               * CHPID vary off/on:       chchp -v 0 CHPID ; chchp -v 1 CHPID
+               * CIO blacklist free:      echo free all > /proc/cio_ignore
+               * cable pull and plug
+              During the scan observe system responsiveness, CPU usage and
+              Hypervisor overhead (for example using the hyptop command). The
+              problem becomes especially apparent on systems with a single CPU
+              and with many HyperPAV DASDs.
+
+Signed-off-by: Peter Oberparleiter <oberpar@linux.vnet.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/cio/blacklist.c |    6 +++---
+ drivers/s390/cio/chsc.c      |   40 ++++------------------------------------
+ drivers/s390/cio/css.c       |   26 +++++++++++++++++++-------
+ drivers/s390/cio/css.h       |    1 +
+ 4 files changed, 27 insertions(+), 46 deletions(-)
+
+--- a/drivers/s390/cio/blacklist.c
++++ b/drivers/s390/cio/blacklist.c
+@@ -238,16 +238,16 @@ static int blacklist_parse_proc_paramete
+ 
+ 	parm = strsep(&buf, " ");
+ 
+-	if (strcmp("free", parm) == 0)
++	if (strcmp("free", parm) == 0) {
+ 		rc = blacklist_parse_parameters(buf, free, 0);
+-	else if (strcmp("add", parm) == 0)
++		css_schedule_eval_all_unreg(0);
++	} else if (strcmp("add", parm) == 0)
+ 		rc = blacklist_parse_parameters(buf, add, 0);
+ 	else if (strcmp("purge", parm) == 0)
+ 		return ccw_purge_blacklisted();
+ 	else
+ 		return -EINVAL;
+ 
+-	css_schedule_reprobe();
+ 
+ 	return rc;
+ }
+--- a/drivers/s390/cio/chsc.c
++++ b/drivers/s390/cio/chsc.c
+@@ -178,26 +178,6 @@ void chsc_chp_offline(struct chp_id chpi
+ 	for_each_subchannel_staged(s390_subchannel_remove_chpid, NULL, &link);
+ }
+ 
+-static int s390_process_res_acc_new_sch(struct subchannel_id schid, void *data)
+-{
+-	struct schib schib;
+-	/*
+-	 * We don't know the device yet, but since a path
+-	 * may be available now to the device we'll have
+-	 * to do recognition again.
+-	 * Since we don't have any idea about which chpid
+-	 * that beast may be on we'll have to do a stsch
+-	 * on all devices, grr...
+-	 */
+-	if (stsch_err(schid, &schib))
+-		/* We're through */
+-		return -ENXIO;
+-
+-	/* Put it on the slow path. */
+-	css_schedule_eval(schid);
+-	return 0;
+-}
+-
+ static int __s390_process_res_acc(struct subchannel *sch, void *data)
+ {
+ 	spin_lock_irq(sch->lock);
+@@ -228,8 +208,8 @@ static void s390_process_res_acc(struct
+ 	 * The more information we have (info), the less scanning
+ 	 * will we have to do.
+ 	 */
+-	for_each_subchannel_staged(__s390_process_res_acc,
+-				   s390_process_res_acc_new_sch, link);
++	for_each_subchannel_staged(__s390_process_res_acc, NULL, link);
++	css_schedule_reprobe();
+ }
+ 
+ static int
+@@ -587,19 +567,6 @@ static int s390_subchannel_vary_chpid_on
+ 	return 0;
+ }
+ 
+-static int
+-__s390_vary_chpid_on(struct subchannel_id schid, void *data)
+-{
+-	struct schib schib;
+-
+-	if (stsch_err(schid, &schib))
+-		/* We're through */
+-		return -ENXIO;
+-	/* Put it on the slow path. */
+-	css_schedule_eval(schid);
+-	return 0;
+-}
+-
+ /**
+  * chsc_chp_vary - propagate channel-path vary operation to subchannels
+  * @chpid: channl-path ID
+@@ -621,7 +588,8 @@ int chsc_chp_vary(struct chp_id chpid, i
+ 		/* Try to update the channel path descritor. */
+ 		chsc_determine_base_channel_path_desc(chpid, &chp->desc);
+ 		for_each_subchannel_staged(s390_subchannel_vary_chpid_on,
+-					   __s390_vary_chpid_on, &link);
++					   NULL, &link);
++		css_schedule_reprobe();
+ 	} else
+ 		for_each_subchannel_staged(s390_subchannel_vary_chpid_off,
+ 					   NULL, &link);
+--- a/drivers/s390/cio/css.c
++++ b/drivers/s390/cio/css.c
+@@ -69,7 +69,8 @@ static int call_fn_known_sch(struct devi
+ 	struct cb_data *cb = data;
+ 	int rc = 0;
+ 
+-	idset_sch_del(cb->set, sch->schid);
++	if (cb->set)
++		idset_sch_del(cb->set, sch->schid);
+ 	if (cb->fn_known_sch)
+ 		rc = cb->fn_known_sch(sch, cb->data);
+ 	return rc;
+@@ -115,6 +116,13 @@ int for_each_subchannel_staged(int (*fn_
+ 	cb.fn_known_sch = fn_known;
+ 	cb.fn_unknown_sch = fn_unknown;
+ 
++	if (fn_known && !fn_unknown) {
++		/* Skip idset allocation in case of known-only loop. */
++		cb.set = NULL;
++		return bus_for_each_dev(&css_bus_type, NULL, &cb,
++					call_fn_known_sch);
++	}
++
+ 	cb.set = idset_sch_new();
+ 	if (!cb.set)
+ 		/* fall back to brute force scanning in case of oom */
+@@ -540,6 +548,9 @@ static int slow_eval_unknown_fn(struct s
+ 		default:
+ 			rc = 0;
+ 		}
++		/* Allow scheduling here since the containing loop might
++		 * take a while.  */
++		cond_resched();
+ 	}
+ 	return rc;
+ }
+@@ -559,7 +570,7 @@ static void css_slow_path_func(struct wo
+ 	spin_unlock_irqrestore(&slow_subchannel_lock, flags);
+ }
+ 
+-static DECLARE_WORK(slow_path_work, css_slow_path_func);
++static DECLARE_DELAYED_WORK(slow_path_work, css_slow_path_func);
+ struct workqueue_struct *cio_work_q;
+ 
+ void css_schedule_eval(struct subchannel_id schid)
+@@ -569,7 +580,7 @@ void css_schedule_eval(struct subchannel
+ 	spin_lock_irqsave(&slow_subchannel_lock, flags);
+ 	idset_sch_add(slow_subchannel_set, schid);
+ 	atomic_set(&css_eval_scheduled, 1);
+-	queue_work(cio_work_q, &slow_path_work);
++	queue_delayed_work(cio_work_q, &slow_path_work, 0);
+ 	spin_unlock_irqrestore(&slow_subchannel_lock, flags);
+ }
+ 
+@@ -580,7 +591,7 @@ void css_schedule_eval_all(void)
+ 	spin_lock_irqsave(&slow_subchannel_lock, flags);
+ 	idset_fill(slow_subchannel_set);
+ 	atomic_set(&css_eval_scheduled, 1);
+-	queue_work(cio_work_q, &slow_path_work);
++	queue_delayed_work(cio_work_q, &slow_path_work, 0);
+ 	spin_unlock_irqrestore(&slow_subchannel_lock, flags);
+ }
+ 
+@@ -593,7 +604,7 @@ static int __unset_registered(struct dev
+ 	return 0;
+ }
+ 
+-static void css_schedule_eval_all_unreg(void)
++void css_schedule_eval_all_unreg(unsigned long delay)
+ {
+ 	unsigned long flags;
+ 	struct idset *unreg_set;
+@@ -611,7 +622,7 @@ static void css_schedule_eval_all_unreg(
+ 	spin_lock_irqsave(&slow_subchannel_lock, flags);
+ 	idset_add_set(slow_subchannel_set, unreg_set);
+ 	atomic_set(&css_eval_scheduled, 1);
+-	queue_work(cio_work_q, &slow_path_work);
++	queue_delayed_work(cio_work_q, &slow_path_work, delay);
+ 	spin_unlock_irqrestore(&slow_subchannel_lock, flags);
+ 	idset_free(unreg_set);
+ }
+@@ -624,7 +635,8 @@ void css_wait_for_slow_path(void)
+ /* Schedule reprobing of all unregistered subchannels. */
+ void css_schedule_reprobe(void)
+ {
+-	css_schedule_eval_all_unreg();
++	/* Schedule with a delay to allow merging of subsequent calls. */
++	css_schedule_eval_all_unreg(1 * HZ);
+ }
+ EXPORT_SYMBOL_GPL(css_schedule_reprobe);
+ 
+--- a/drivers/s390/cio/css.h
++++ b/drivers/s390/cio/css.h
+@@ -136,6 +136,7 @@ extern struct channel_subsystem *channel
+ /* Helper functions to build lists for the slow path. */
+ void css_schedule_eval(struct subchannel_id schid);
+ void css_schedule_eval_all(void);
++void css_schedule_eval_all_unreg(unsigned long delay);
+ int css_complete_work(void);
+ 
+ int sch_is_pseudo_sch(struct subchannel *);
