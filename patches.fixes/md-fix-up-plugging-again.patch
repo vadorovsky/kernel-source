@@ -1,0 +1,167 @@
+Git-commit: b357f04a67c2aeee828b240863cd3f21d6cb3179
+From: NeilBrown <neilb@suse.de>
+Date: Tue, 3 Jul 2012 17:45:31 +1000
+Subject: [PATCH] md: fix up plugging (again).
+Patch-mainline: v3.5
+References: bnc#866800
+
+The value returned by "mddev_check_plug" is only valid until the
+next 'schedule' as that will unplug things.  This could happen at any
+call to mempool_alloc.
+So just calling mddev_check_plug at the start doesn't really make
+sense.
+
+So call it just before, or just after, queuing things for the thread.
+As the action that happens at unplug is to wake the thread, this makes
+lots of sense.
+If we cannot add a plug (which requires a small GFP_ATOMIC alloc) we
+wake thread immediately.
+
+RAID5 is a bit different.  Requests are queued for the thread and the
+thread is woken by release_stripe.  So we don't need to wake the
+thread on failure.
+However the thread doesn't perform certain actions when there is any
+active plug, so it is important to install a plug before waking the
+thread.  So for RAID5 we install the plug *before* queuing the request
+and waking the thread.
+
+Without this patch it is possible for raid1 or raid10 to queue a
+request without then waking the thread, resulting in the array locking
+up.
+
+Also change raid10 to only flush_pending_write when there are not
+active plugs, just like raid1.
+
+This patch is suitable for 3.0 or later.  I plan to submit it to
+-stable, but I'll like to let it spend a few weeks in mainline
+first to be sure it is completely safe.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+Acked-by: NeilBrown <neilb@suse.de>
+
+---
+ drivers/md/raid1.c  |    7 ++-----
+ drivers/md/raid10.c |   10 ++++------
+ drivers/md/raid5.c  |    6 +-----
+ 3 files changed, 7 insertions(+), 16 deletions(-)
+
+--- linux-3.0-SLE11-SP3.orig/drivers/md/raid1.c
++++ linux-3.0-SLE11-SP3/drivers/md/raid1.c
+@@ -775,7 +775,6 @@ static int make_request(mddev_t *mddev,
+ 	const unsigned long do_discard = (bio->bi_rw
+ 					  & (REQ_DISCARD | REQ_SECURE));
+ 	mdk_rdev_t *blocked_rdev;
+-	int plugged;
+ 
+ 	/*
+ 	 * Register the new request and wait if the reconstruction
+@@ -875,7 +874,6 @@ static int make_request(mddev_t *mddev,
+ 	 * inc refcount on their rdev.  Record them by setting
+ 	 * bios[x] to bio
+ 	 */
+-	plugged = mddev_check_plugged(mddev);
+ 
+ 	disks = conf->raid_disks;
+  retry_write:
+@@ -979,15 +977,14 @@ static int make_request(mddev_t *mddev,
+ 		bio_list_add(&conf->pending_bio_list, mbio);
+ 		conf->pending_count++;
+ 		spin_unlock_irqrestore(&conf->device_lock, flags);
++		if (!mddev_check_plugged(mddev))
++			md_wakeup_thread(mddev->thread);
+ 	}
+ 	r1_bio_write_done(r1_bio);
+ 
+ 	/* In case raid1d snuck in to freeze_array */
+ 	wake_up(&conf->wait_barrier);
+ 
+-	if (do_sync || !bitmap || !plugged)
+-		md_wakeup_thread(mddev->thread);
+-
+ 	return 0;
+ }
+ 
+--- linux-3.0-SLE11-SP3.orig/drivers/md/raid10.c
++++ linux-3.0-SLE11-SP3/drivers/md/raid10.c
+@@ -928,7 +928,6 @@ static int make_request(mddev_t *mddev,
+ 					  & (REQ_DISCARD | REQ_SECURE));
+ 	unsigned long flags;
+ 	mdk_rdev_t *blocked_rdev;
+-	int plugged = 1;
+ 	int sectors;
+ 
+ 	if (unlikely(bio->bi_rw & REQ_FLUSH)) {
+@@ -1149,7 +1148,6 @@ static int make_request(mddev_t *mddev,
+ 			mbio->bi_rw |= REQ_FAILFAST_DEV;
+ 		mbio->bi_private = r10_bio;
+ 
+-		plugged = mddev_check_plugged(mddev);
+ 		atomic_inc(&r10_bio->remaining);
+ 		spin_lock_irqsave(&conf->device_lock, flags);
+ 		trace_block_bio_remap(bdev_get_queue(mbio->bi_bdev),
+@@ -1159,6 +1157,8 @@ static int make_request(mddev_t *mddev,
+ 		bio_list_add(&conf->pending_bio_list, mbio);
+ 		conf->pending_count++;
+ 		spin_unlock_irqrestore(&conf->device_lock, flags);
++		if (!mddev_check_plugged(mddev))
++			md_wakeup_thread(mddev->thread);
+ 	}
+ 
+ 	if (atomic_dec_and_test(&r10_bio->remaining)) {
+@@ -1173,9 +1173,6 @@ static int make_request(mddev_t *mddev,
+ 
+ 	/* In case raid10d snuck in to freeze_array */
+ 	wake_up(&conf->wait_barrier);
+-
+-	if (do_sync || !mddev->bitmap || !plugged)
+-		md_wakeup_thread(mddev->thread);
+ 	return 0;
+ }
+ 
+@@ -2008,7 +2005,8 @@ static void raid10d(mddev_t *mddev)
+ 	for (;;) {
+ 		char b[BDEVNAME_SIZE];
+ 
+-		flush_pending_writes(conf);
++		if (atomic_read(&mddev->plug_cnt) == 0)
++			flush_pending_writes(conf);
+ 
+ 		spin_lock_irqsave(&conf->device_lock, flags);
+ 		if (list_empty(head)) {
+--- linux-3.0-SLE11-SP3.orig/drivers/md/raid5.c
++++ linux-3.0-SLE11-SP3/drivers/md/raid5.c
+@@ -3953,7 +3953,6 @@ static int make_request(mddev_t *mddev,
+ 	struct stripe_head *sh;
+ 	const int rw = bio_data_dir(bi);
+ 	int remaining;
+-	int plugged;
+ 
+ 	if (unlikely(bi->bi_rw & REQ_FLUSH)) {
+ 		md_flush_request(mddev, bi);
+@@ -3972,7 +3971,6 @@ static int make_request(mddev_t *mddev,
+ 	bi->bi_next = NULL;
+ 	bi->bi_phys_segments = 1;	/* over-loaded to count active stripes */
+ 
+-	plugged = mddev_check_plugged(mddev);
+ 	for (;logical_sector < last_sector; logical_sector += STRIPE_SECTORS) {
+ 		DEFINE_WAIT(w);
+ 		int disks, data_disks;
+@@ -4078,6 +4076,7 @@ static int make_request(mddev_t *mddev,
+ 			if ((bi->bi_rw & REQ_SYNC) &&
+ 			    !test_and_set_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+ 				atomic_inc(&conf->preread_active_stripes);
++			mddev_check_plugged(mddev);
+ 			release_stripe(sh);
+ 		} else {
+ 			/* cannot get stripe for read-ahead, just give-up */
+@@ -4085,10 +4084,7 @@ static int make_request(mddev_t *mddev,
+ 			finish_wait(&conf->wait_for_overlap, &w);
+ 			break;
+ 		}
+-			
+ 	}
+-	if (!plugged)
+-		md_wakeup_thread(mddev->thread);
+ 
+ 	spin_lock_irq(&conf->device_lock);
+ 	remaining = raid5_dec_bi_phys_segments(bi);
