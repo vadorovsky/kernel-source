@@ -1,0 +1,153 @@
+From c6627c60c07c43b51ef88e352627fa786d1e1592 Mon Sep 17 00:00:00 2001
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 7 Jun 2011 14:09:20 +0100
+Subject: VFS: Remove dentry->d_lock locking from
+ shrink_dcache_for_umount_subtree()
+Git-commit: c6627c60c07c43b51ef88e352627fa786d1e1592
+Patch-mainline: v3.1-rc1
+References: FATE#317271
+
+Locks of the dcache_lock were replaced by locks of dentry->d_lock in commits
+such as:
+
+	2304450783dfde7b0b94ae234edd0dbffa865073
+	2fd6b7f50797f2e993eea59e0a0b8c6399c811dc
+
+as part of the RCU-based pathwalk changes, despite the fact that the caller
+(shrink_dcache_for_umount()) notes in the banner comment the reasons that
+d_lock is not necessary in these functions:
+
+/*
+ * destroy the dentries attached to a superblock on unmounting
+ * - we don't need to use dentry->d_lock because:
+ *   - the superblock is detached from all mountings and open files, so the
+ *     dentry trees will not be rearranged by the VFS
+ *   - s_umount is write-locked, so the memory pressure shrinker will ignore
+ *     any dentries belonging to this superblock that it comes across
+ *   - the filesystem itself is no longer permitted to rearrange the dentries
+ *     in this superblock
+ */
+
+So remove these locks.  If the locks are actually necessary, then this banner
+comment should be altered instead.
+
+The hash table chains are protected by 1-bit locks in the hash table heads, so
+those shouldn't be a problem.
+
+Note that to make this work, __d_drop() has to be split so that the RCUwalk
+barrier can be avoided.  This causes problems otherwise as it has an assertion
+that dentry->d_lock is locked - but there is no need for that as no one else
+can be trying to access this dentry, except to step over it (and that should
+be handled by d_free(), I think).
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Cc: Nick Piggin <npiggin@kernel.dk>
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+ fs/dcache.c | 48 ++++++++++++++++++++++++------------------------
+ 1 file changed, 24 insertions(+), 24 deletions(-)
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index 7559057..9df8b86 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -301,6 +301,27 @@ static struct dentry *d_kill(struct dentry *dentry, struct dentry *parent)
+ 	return parent;
+ }
+ 
++/*
++ * Unhash a dentry without inserting an RCU walk barrier or checking that
++ * dentry->d_lock is locked.  The caller must take care of that, if
++ * appropriate.
++ */
++static void __d_shrink(struct dentry *dentry)
++{
++	if (!d_unhashed(dentry)) {
++		struct hlist_bl_head *b;
++		if (unlikely(dentry->d_flags & DCACHE_DISCONNECTED))
++			b = &dentry->d_sb->s_anon;
++		else
++			b = d_hash(dentry->d_parent, dentry->d_name.hash);
++
++		hlist_bl_lock(b);
++		__hlist_bl_del(&dentry->d_hash);
++		dentry->d_hash.pprev = NULL;
++		hlist_bl_unlock(b);
++	}
++}
++
+ /**
+  * d_drop - drop a dentry
+  * @dentry: dentry to drop
+@@ -319,17 +340,7 @@ static struct dentry *d_kill(struct dentry *dentry, struct dentry *parent)
+ void __d_drop(struct dentry *dentry)
+ {
+ 	if (!d_unhashed(dentry)) {
+-		struct hlist_bl_head *b;
+-		if (unlikely(dentry->d_flags & DCACHE_DISCONNECTED))
+-			b = &dentry->d_sb->s_anon;
+-		else
+-			b = d_hash(dentry->d_parent, dentry->d_name.hash);
+-
+-		hlist_bl_lock(b);
+-		__hlist_bl_del(&dentry->d_hash);
+-		dentry->d_hash.pprev = NULL;
+-		hlist_bl_unlock(b);
+-
++		__d_shrink(dentry);
+ 		dentry_rcuwalk_barrier(dentry);
+ 	}
+ }
+@@ -832,10 +843,8 @@ static void shrink_dcache_for_umount_subtree(struct dentry *dentry)
+ 	BUG_ON(!IS_ROOT(dentry));
+ 
+ 	/* detach this root from the system */
+-	spin_lock(&dentry->d_lock);
+ 	dentry_lru_del(dentry);
+-	__d_drop(dentry);
+-	spin_unlock(&dentry->d_lock);
++	__d_shrink(dentry);
+ 
+ 	for (;;) {
+ 		/* descend to the first leaf in the current subtree */
+@@ -844,16 +853,11 @@ static void shrink_dcache_for_umount_subtree(struct dentry *dentry)
+ 
+ 			/* this is a branch with children - detach all of them
+ 			 * from the system in one go */
+-			spin_lock(&dentry->d_lock);
+ 			list_for_each_entry(loop, &dentry->d_subdirs,
+ 					    d_u.d_child) {
+-				spin_lock_nested(&loop->d_lock,
+-						DENTRY_D_LOCK_NESTED);
+ 				dentry_lru_del(loop);
+-				__d_drop(loop);
+-				spin_unlock(&loop->d_lock);
++				__d_shrink(loop);
+ 			}
+-			spin_unlock(&dentry->d_lock);
+ 
+ 			/* move to the first child */
+ 			dentry = list_entry(dentry->d_subdirs.next,
+@@ -885,10 +889,8 @@ static void shrink_dcache_for_umount_subtree(struct dentry *dentry)
+ 				list_del(&dentry->d_u.d_child);
+ 			} else {
+ 				parent = dentry->d_parent;
+-				spin_lock(&parent->d_lock);
+ 				parent->d_count--;
+ 				list_del(&dentry->d_u.d_child);
+-				spin_unlock(&parent->d_lock);
+ 			}
+ 
+ 			detached++;
+@@ -935,9 +937,7 @@ void shrink_dcache_for_umount(struct super_block *sb)
+ 
+ 	dentry = sb->s_root;
+ 	sb->s_root = NULL;
+-	spin_lock(&dentry->d_lock);
+ 	dentry->d_count--;
+-	spin_unlock(&dentry->d_lock);
+ 	shrink_dcache_for_umount_subtree(dentry);
+ 
+ 	while (!hlist_bl_empty(&sb->s_anon)) {
+
