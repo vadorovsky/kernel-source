@@ -1,0 +1,222 @@
+From bc08b449ee14ace4d869adaa1bb35a44ce68d775 Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Mon, 2 Sep 2013 12:12:15 -0700
+Subject: lockref: implement lockless reference count updates using cmpxchg()
+Git-commit: bc08b449ee14ace4d869adaa1bb35a44ce68d775
+Patch-mainline: v3.12-rc1
+References: FATE#317271
+
+Instead of taking the spinlock, the lockless versions atomically check
+that the lock is not taken, and do the reference count update using a
+cmpxchg() loop.  This is semantically identical to doing the reference
+count update protected by the lock, but avoids the "wait for lock"
+contention that you get when accesses to the reference count are
+contended.
+
+Note that a "lockref" is absolutely _not_ equivalent to an atomic_t.
+Even when the lockref reference counts are updated atomically with
+cmpxchg, the fact that they also verify the state of the spinlock means
+that the lockless updates can never happen while somebody else holds the
+spinlock.
+
+So while "lockref_put_or_lock()" looks a lot like just another name for
+"atomic_dec_and_lock()", and both optimize to lockless updates, they are
+fundamentally different: the decrement done by atomic_dec_and_lock() is
+truly independent of any lock (as long as it doesn't decrement to zero),
+so a locked region can still see the count change.
+
+The lockref structure, in contrast, really is a *locked* reference
+count.  If you hold the spinlock, the reference count will be stable and
+you can modify the reference count without using atomics, because even
+the lockless updates will see and respect the state of the lock.
+
+In order to enable the cmpxchg lockless code, the architecture needs to
+do three things:
+
+ (1) Make sure that the "arch_spinlock_t" and an "unsigned int" can fit
+     in an aligned u64, and have a "cmpxchg()" implementation that works
+     on such a u64 data type.
+
+ (2) define a helper function to test for a spinlock being unlocked
+     ("arch_spin_value_unlocked()")
+
+ (3) select the "ARCH_USE_CMPXCHG_LOCKREF" config variable in its
+     Kconfig file.
+
+This enables it for x86-64 (but not 32-bit, we'd need to make sure
+cmpxchg() turns into the proper cmpxchg8b in order to enable it for
+32-bit mode).
+
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+ arch/x86/Kconfig                |    1 
+ arch/x86/include/asm/spinlock.h |    6 ++++
+ include/linux/lockref.h         |   11 ++++++-
+ lib/Kconfig                     |   10 ++++++
+ lib/lockref.c                   |   60 +++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 85 insertions(+), 3 deletions(-)
+
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -12,6 +12,7 @@ config X86_32
+ 
+ config X86_64
+ 	def_bool 64BIT
++	select ARCH_USE_CMPXCHG_LOCKREF
+ 
+ ### Arch settings
+ config X86
+--- a/arch/x86/include/asm/spinlock.h
++++ b/arch/x86/include/asm/spinlock.h
+@@ -158,6 +158,12 @@ static __always_inline void __ticket_spi
+ }
+ #endif
+ 
++static __always_inline int arch_spin_value_unlocked(arch_spinlock_t lock)
++{
++	return !(((lock.slock >> TICKET_SHIFT) ^ lock.slock) &
++		 ((1 << TICKET_SHIFT) - 1));
++}
++
+ static inline int __ticket_spin_is_locked(arch_spinlock_t *lock)
+ {
+ 	int tmp = ACCESS_ONCE(lock->slock);
+--- a/include/linux/lockref.h
++++ b/include/linux/lockref.h
+@@ -17,8 +17,15 @@
+ #include <linux/spinlock.h>
+ 
+ struct lockref {
+-	spinlock_t lock;
+-	unsigned int count;
++	union {
++#ifdef CONFIG_CMPXCHG_LOCKREF
++		aligned_u64 lock_count;
++#endif
++		struct {
++			spinlock_t lock;
++			unsigned int count;
++		};
++	};
+ };
+ 
+ extern void lockref_get(struct lockref *);
+--- a/lib/Kconfig
++++ b/lib/Kconfig
+@@ -19,6 +19,16 @@ config RATIONAL
+ config GENERIC_FIND_FIRST_BIT
+ 	bool
+ 
++config ARCH_USE_CMPXCHG_LOCKREF
++	bool
++
++config CMPXCHG_LOCKREF
++	def_bool y if ARCH_USE_CMPXCHG_LOCKREF
++	depends on SMP
++	depends on !GENERIC_LOCKBREAK
++	depends on !DEBUG_SPINLOCK
++	depends on !DEBUG_LOCK_ALLOC
++
+ config CRC_CCITT
+ 	tristate "CRC-CCITT functions"
+ 	help
+--- a/lib/lockref.c
++++ b/lib/lockref.c
+@@ -1,6 +1,33 @@
+ #include <linux/module.h>
+ #include <linux/lockref.h>
+ 
++#ifdef CONFIG_CMPXCHG_LOCKREF
++
++/*
++ * Note that the "cmpxchg()" reloads the "old" value for the
++ * failure case.
++ */
++#define CMPXCHG_LOOP(CODE, SUCCESS) do {					\
++	struct lockref old;							\
++	BUILD_BUG_ON(sizeof(old) != 8);						\
++	old.lock_count = ACCESS_ONCE(lockref->lock_count);			\
++	while (likely(arch_spin_value_unlocked(old.lock.rlock.raw_lock))) {  	\
++		struct lockref new = old, prev = old;				\
++		CODE								\
++		old.lock_count = cmpxchg(&lockref->lock_count,			\
++					 old.lock_count, new.lock_count);	\
++		if (likely(old.lock_count == prev.lock_count)) {		\
++			SUCCESS;						\
++		}								\
++	}									\
++} while (0)
++
++#else
++
++#define CMPXCHG_LOOP(CODE, SUCCESS) do { } while (0)
++
++#endif
++
+ /**
+  * lockref_get - Increments reference count unconditionally
+  * @lockcnt: pointer to lockref structure
+@@ -10,6 +37,12 @@
+  */
+ void lockref_get(struct lockref *lockref)
+ {
++	CMPXCHG_LOOP(
++		new.count++;
++	,
++		return;
++	);
++
+ 	spin_lock(&lockref->lock);
+ 	lockref->count++;
+ 	spin_unlock(&lockref->lock);
+@@ -23,9 +56,18 @@ EXPORT_SYMBOL(lockref_get);
+  */
+ int lockref_get_not_zero(struct lockref *lockref)
+ {
+-	int retval = 0;
++	int retval;
++
++	CMPXCHG_LOOP(
++		new.count++;
++		if (!old.count)
++			return 0;
++	,
++		return 1;
++	);
+ 
+ 	spin_lock(&lockref->lock);
++	retval = 0;
+ 	if (lockref->count) {
+ 		lockref->count++;
+ 		retval = 1;
+@@ -43,6 +85,14 @@ EXPORT_SYMBOL(lockref_get_not_zero);
+  */
+ int lockref_get_or_lock(struct lockref *lockref)
+ {
++	CMPXCHG_LOOP(
++		new.count++;
++		if (!old.count)
++			break;
++	,
++		return 1;
++	);
++
+ 	spin_lock(&lockref->lock);
+ 	if (!lockref->count)
+ 		return 0;
+@@ -59,6 +109,14 @@ EXPORT_SYMBOL(lockref_get_or_lock);
+  */
+ int lockref_put_or_lock(struct lockref *lockref)
+ {
++	CMPXCHG_LOOP(
++		new.count--;
++		if (old.count <= 1)
++			break;
++	,
++		return 1;
++	);
++
+ 	spin_lock(&lockref->lock);
+ 	if (lockref->count <= 1)
+ 		return 0;
