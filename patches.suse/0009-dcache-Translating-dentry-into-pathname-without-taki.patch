@@ -1,0 +1,431 @@
+From ff92cb17a30701cf3cac0e33733e32c7f5babeee Mon Sep 17 00:00:00 2001
+From: Waiman Long <Waiman.Long@hp.com>
+Date: Wed, 14 May 2014 14:11:51 -0400
+Subject: [PATCH 09/17] dcache: Translating dentry into pathname without taking rename_lock
+Git-commit: 232d2d60aa5469bb097f55728f65146bd49c1d25
+Patch-mainline: v3.12-rc1
+References: FATE#317271
+
+When running the AIM7's short workload, Linus' lockref patch eliminated
+most of the spinlock contention. However, there were still some left:
+
+     8.46%     reaim  [kernel.kallsyms]     [k] _raw_spin_lock
+                 |--42.21%-- d_path
+                 |          proc_pid_readlink
+                 |          SyS_readlinkat
+                 |          SyS_readlink
+                 |          system_call
+                 |          __GI___readlink
+                 |
+                 |--40.97%-- sys_getcwd
+                 |          system_call
+                 |          __getcwd
+
+The big one here is the rename_lock (seqlock) contention in d_path()
+and the getcwd system call. This patch will eliminate the need to take
+the rename_lock while translating dentries into the full pathnames.
+
+The need to take the rename_lock is to make sure that no rename
+operation can be ongoing while the translation is in progress. However,
+only one thread can take the rename_lock thus blocking all the other
+threads that need it even though the translation process won't make
+any change to the dentries.
+
+This patch will replace the writer's write_seqlock/write_sequnlock
+sequence of the rename_lock of the callers of the prepend_path() and
+__dentry_path() functions with the reader's read_seqbegin/read_seqretry
+sequence within these 2 functions. As a result, the code will have to
+retry if one or more rename operations had been performed. In addition,
+RCU read lock will be taken during the translation process to make sure
+that no dentries will go away. To prevent live-lock from happening,
+the code will switch back to take the rename_lock if read_seqretry()
+fails for three times.
+
+To further reduce spinlock contention, this patch does not take the
+dentry's d_lock when copying the filename from the dentries. Instead,
+it treats the name pointer and length as unreliable and just copy
+the string byte-by-byte over until it hits a null byte or the end of
+string as specified by the length. This should avoid stepping into
+invalid memory address. The error cases are left to be handled by
+the sequence number check.
+
+The following code re-factoring are also made:
+1. Move prepend('/') into prepend_name() to remove one conditional
+   check.
+2. Move the global root check in prepend_path() back to the top of
+   the while loop.
+
+With this patch, the _raw_spin_lock will now account for only 1.2%
+of the total CPU cycles for the short workload. This patch also has
+the effect of reducing the effect of running perf on its profile
+since the perf command itself can be a heavy user of the d_path()
+function depending on the complexity of the workload.
+
+When taking the perf profile of the high-systime workload, the amount
+of spinlock contention contributed by running perf without this patch
+was about 16%. With this patch, the spinlock contention caused by
+the running of perf will go away and we will have a more accurate
+perf profile.
+
+This patch is based on the following 3.12 kernel patch:
+
+  232d2d60aa5469bb097f55728f65146bd49c1d25
+  dcache: Translating dentry into pathname without taking rename_lock
+
+Signed-off-by: Waiman Long <Waiman.Long@hp.com>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+ fs/dcache.c |  194 +++++++++++++++++++++++++++++++++++++++-------------------
+ 1 files changed, 130 insertions(+), 64 deletions(-)
+
+diff --git a/fs/dcache.c b/fs/dcache.c
+index ac7a640..055da5f 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -87,6 +87,44 @@ EXPORT_SYMBOL(rename_lock);
+ 
+ static struct kmem_cache *dentry_cache __read_mostly;
+ 
++/**
++ * read_seqbegin_or_lock - begin a sequence number check or locking block
++ * @lock: sequence lock
++ * @seq : sequence number to be checked
++ *
++ * First try it once optimistically without taking the lock (the reader turn).
++ * If that fails, take the lock (the writer turn). The sequence number is also
++ * used as a marker for deciding whether to be a reader (even) or writer (odd).
++ * N.B. seq must be initialized to an even number to begin with.
++ */
++static inline void read_seqbegin_or_lock(seqlock_t *lock, int *seq)
++{
++	if (!(*seq & 1)) {	/* Even */
++		*seq = read_seqbegin(lock);
++		rcu_read_lock();
++	} else			/* Odd */
++		write_seqlock(lock);
++}
++
++/**
++ * read_seqretry_or_unlock - end a seqretry or lock block & return retry status
++ * @lock : sequence lock
++ * @seq	 : sequence number
++ * Return: 1 to retry operation again, 0 to continue
++ */
++static inline int read_seqretry_or_unlock(seqlock_t *lock, int *seq)
++{
++	if (!(*seq & 1)) {	/* Even */
++		rcu_read_unlock();
++		if (read_seqretry(lock, *seq)) {
++			(*seq)++;	/* Take writer lock */
++			return 1;
++		}
++	} else			/* Odd */
++		write_sequnlock(lock);
++	return 0;
++}
++
+ /*
+  * This is the single most critical data structure when it comes
+  * to the dcache: the hashtable for lookups. Somebody should try
+@@ -2560,9 +2598,39 @@ static int prepend(char **buffer, int *buflen, const char *str, int namelen)
+ 	return 0;
+ }
+ 
++/**
++ * prepend_name - prepend a pathname in front of current buffer pointer
++ * @buffer: buffer pointer
++ * @buflen: allocated length of the buffer
++ * @name:   name string and length qstr structure
++ *
++ * With RCU path tracing, it may race with d_move(). Use ACCESS_ONCE() to
++ * make sure that either the old or the new name pointer and length are
++ * fetched. However, there may be mismatch between length and pointer.
++ * The length cannot be trusted, we need to copy it byte-by-byte until
++ * the length is reached or a null byte is found. It also prepends "/" at
++ * the beginning of the name. The sequence number check at the caller will
++ * retry it again when a d_move() does happen. So any garbage in the buffer
++ * due to mismatched pointer and length will be discarded.
++ */
+ static int prepend_name(char **buffer, int *buflen, struct qstr *name)
+ {
+-	return prepend(buffer, buflen, name->name, name->len);
++	const char *dname = ACCESS_ONCE(name->name);
++	u32 dlen = ACCESS_ONCE(name->len);
++	char *p;
++
++	if (*buflen < dlen + 1)
++		return -ENAMETOOLONG;
++	*buflen -= dlen + 1;
++	p = *buffer -= dlen + 1;
++	*p++ = '/';
++	while (dlen--) {
++		char c = *dname++;
++		if (!c)
++			break;
++		*p++ = c;
++	}
++	return 0;
+ }
+ 
+ /**
+@@ -2572,7 +2640,15 @@ static int prepend_name(char **buffer, int *buflen, struct qstr *name)
+  * @buffer: pointer to the end of the buffer
+  * @buflen: pointer to buffer length
+  *
+- * Caller holds the rename_lock.
++ * The function will first try to write out the pathname without taking any
++ * lock other than the RCU read lock to make sure that dentries won't go away.
++ * It only checks the sequence number of the global rename_lock as any change
++ * in the dentry's d_seq will be preceded by changes in the rename_lock
++ * sequence number. If the sequence number had been changed, it will restart
++ * the whole pathname back-tracing sequence again by taking the rename_lock.
++ * In this case, there is no need to take the RCU read lock as the recursive
++ * parent pointer references will keep the dentry chain alive as long as no
++ * rename operation is performed.
+  */
+ static int prepend_path(const struct path *path,
+ 			const struct path *root,
+@@ -2580,58 +2656,62 @@ static int prepend_path(const struct path *path,
+ {
+ 	struct dentry *dentry = path->dentry;
+ 	struct vfsmount *vfsmnt = path->mnt;
+-	bool slash = false;
+ 	int error = 0;
++	unsigned seq = 0;
++	char *bptr;
++	int blen;
+ 
+ 	br_read_lock(vfsmount_lock);
++restart:
++	bptr = *buffer;
++	blen = *buflen;
++	read_seqbegin_or_lock(&rename_lock, &seq);
+ 	while (dentry != root->dentry || vfsmnt != root->mnt) {
+ 		struct dentry * parent;
+ 
+ 		if (dentry == vfsmnt->mnt_root || IS_ROOT(dentry)) {
+ 			/* Global root? */
+-			if (vfsmnt->mnt_parent == vfsmnt) {
+-				goto global_root;
++			if (vfsmnt->mnt_parent != vfsmnt) {
++				dentry = vfsmnt->mnt_mountpoint;
++				vfsmnt = vfsmnt->mnt_parent;
++				continue;
+ 			}
+-			dentry = vfsmnt->mnt_mountpoint;
+-			vfsmnt = vfsmnt->mnt_parent;
+-			continue;
++			/*
++			 * Filesystems needing to implement special "root names"
++			 * should do so with ->d_dname()
++			 */
++			if (IS_ROOT(dentry) &&
++			    (dentry->d_name.len != 1 ||
++			     dentry->d_name.name[0] != '/')) {
++				WARN(1, "Root dentry has weird name <%.*s>\n",
++				     (int) dentry->d_name.len,
++				     dentry->d_name.name);
++			}
++			if (!error)
++				error = vfsmnt->mnt_ns ? 1 : 2;
++			break;
+ 		}
+ 		parent = dentry->d_parent;
+ 		prefetch(parent);
+-		spin_lock(&dentry->d_lock);
+-		error = prepend_name(buffer, buflen, &dentry->d_name);
+-		spin_unlock(&dentry->d_lock);
+-		if (!error)
+-			error = prepend(buffer, buflen, "/", 1);
++		error = prepend_name(&bptr, &blen, &dentry->d_name);
+ 		if (error)
+ 			break;
+ 
+-		slash = true;
+ 		dentry = parent;
+ 	}
++	if (read_seqretry_or_unlock(&rename_lock, &seq))
++		goto restart;
+ 
+-	if (!error && !slash)
+-		error = prepend(buffer, buflen, "/", 1);
+-
+-out:
++	if (error >= 0 && bptr == *buffer) {
++		if (--blen < 0)
++			error = -ENAMETOOLONG;
++		else
++			*--bptr = '/';
++	}
++	*buffer = bptr;
++	*buflen = blen;
+ 	br_read_unlock(vfsmount_lock);
+ 	return error;
+-
+-global_root:
+-	/*
+-	 * Filesystems needing to implement special "root names"
+-	 * should do so with ->d_dname()
+-	 */
+-	if (IS_ROOT(dentry) &&
+-	    (dentry->d_name.len != 1 || dentry->d_name.name[0] != '/')) {
+-		WARN(1, "Root dentry has weird name <%.*s>\n",
+-		     (int) dentry->d_name.len, dentry->d_name.name);
+-	}
+-	if (!slash)
+-		error = prepend(buffer, buflen, "/", 1);
+-	if (!error)
+-		error = vfsmnt->mnt_ns ? 1 : 2;
+-	goto out;
+ }
+ 
+ /**
+@@ -2658,9 +2738,7 @@ char *__d_path(const struct path *path,
+ 	int error;
+ 
+ 	prepend(&res, &buflen, "\0", 1);
+-	write_seqlock(&rename_lock);
+ 	error = prepend_path(path, root, &res, &buflen);
+-	write_sequnlock(&rename_lock);
+ 
+ 	if (error < 0)
+ 		return ERR_PTR(error);
+@@ -2677,9 +2755,7 @@ char *d_absolute_path(const struct path *path,
+ 	int error;
+ 
+ 	prepend(&res, &buflen, "\0", 1);
+-	write_seqlock(&rename_lock);
+ 	error = prepend_path(path, &root, &res, &buflen);
+-	write_sequnlock(&rename_lock);
+ 
+ 	if (error > 1)
+ 		error = -EINVAL;
+@@ -2743,11 +2819,9 @@ char *d_path(const struct path *path, char *buf, int buflen)
+ 		return path->dentry->d_op->d_dname(path->dentry, buf, buflen);
+ 
+ 	get_fs_root(current->fs, &root);
+-	write_seqlock(&rename_lock);
+ 	error = path_with_deleted(path, &root, &res, &buflen);
+ 	if (error < 0)
+ 		res = ERR_PTR(error);
+-	write_sequnlock(&rename_lock);
+ 	path_put(&root);
+ 	return res;
+ }
+@@ -2772,11 +2846,9 @@ char *d_path_with_unreachable(const struct path *path, char *buf, int buflen)
+ 		return path->dentry->d_op->d_dname(path->dentry, buf, buflen);
+ 
+ 	get_fs_root(current->fs, &root);
+-	write_seqlock(&rename_lock);
+ 	error = path_with_deleted(path, &root, &res, &buflen);
+ 	if (error > 0)
+ 		error = prepend_unreachable(&res, &buflen);
+-	write_sequnlock(&rename_lock);
+ 	path_put(&root);
+ 	if (error)
+ 		res =  ERR_PTR(error);
+@@ -2810,30 +2882,36 @@ char *dynamic_dname(struct dentry *dentry, char *buffer, int buflen,
+  */
+ static char *__dentry_path(struct dentry *dentry, char *buf, int buflen)
+ {
+-	char *end = buf + buflen;
+-	char *retval;
++	char *end, *retval;
++	int len, seq = 0;
++	int error = 0;
+ 
+-	prepend(&end, &buflen, "\0", 1);
++restart:
++	end = buf + buflen;
++	len = buflen;
++	prepend(&end, &len, "\0", 1);
+ 	if (buflen < 1)
+ 		goto Elong;
+ 	/* Get '/' right */
+ 	retval = end-1;
+ 	*retval = '/';
+-
++	read_seqbegin_or_lock(&rename_lock, &seq);
+ 	while (!IS_ROOT(dentry)) {
+ 		struct dentry *parent = dentry->d_parent;
+ 		int error;
+ 
+ 		prefetch(parent);
+-		spin_lock(&dentry->d_lock);
+-		error = prepend_name(&end, &buflen, &dentry->d_name);
+-		spin_unlock(&dentry->d_lock);
+-		if (error != 0 || prepend(&end, &buflen, "/", 1) != 0)
+-			goto Elong;
++		error = prepend_name(&end, &len, &dentry->d_name);
++		if (error)
++			break;
+ 
+ 		retval = end;
+ 		dentry = parent;
+ 	}
++	if (read_seqretry_or_unlock(&rename_lock, &seq))
++		goto restart;
++	if (error)
++		goto Elong;
+ 	return retval;
+ Elong:
+ 	return ERR_PTR(-ENAMETOOLONG);
+@@ -2841,13 +2919,7 @@ Elong:
+ 
+ char *dentry_path_raw(struct dentry *dentry, char *buf, int buflen)
+ {
+-	char *retval;
+-
+-	write_seqlock(&rename_lock);
+-	retval = __dentry_path(dentry, buf, buflen);
+-	write_sequnlock(&rename_lock);
+-
+-	return retval;
++	return __dentry_path(dentry, buf, buflen);
+ }
+ EXPORT_SYMBOL(dentry_path_raw);
+ 
+@@ -2856,7 +2928,6 @@ char *dentry_path(struct dentry *dentry, char *buf, int buflen)
+ 	char *p = NULL;
+ 	char *retval;
+ 
+-	write_seqlock(&rename_lock);
+ 	if (d_unlinked(dentry)) {
+ 		p = buf + buflen;
+ 		if (prepend(&p, &buflen, "//deleted", 10) != 0)
+@@ -2864,7 +2935,6 @@ char *dentry_path(struct dentry *dentry, char *buf, int buflen)
+ 		buflen++;
+ 	}
+ 	retval = __dentry_path(dentry, buf, buflen);
+-	write_sequnlock(&rename_lock);
+ 	if (!IS_ERR(retval) && p)
+ 		*p = '/';	/* restore '/' overriden with '\0' */
+ 	return retval;
+@@ -2902,7 +2972,6 @@ SYSCALL_DEFINE2(getcwd, char __user *, buf, unsigned long, size)
+ 	get_fs_root_and_pwd(current->fs, &root, &pwd);
+ 
+ 	error = -ENOENT;
+-	write_seqlock(&rename_lock);
+ 	if (!d_unlinked(pwd.dentry)) {
+ 		unsigned long len;
+ 		char *cwd = page + PAGE_SIZE;
+@@ -2910,7 +2979,6 @@ SYSCALL_DEFINE2(getcwd, char __user *, buf, unsigned long, size)
+ 
+ 		prepend(&cwd, &buflen, "\0", 1);
+ 		error = prepend_path(&pwd, &root, &cwd, &buflen);
+-		write_sequnlock(&rename_lock);
+ 
+ 		if (error < 0)
+ 			goto out;
+@@ -2929,8 +2997,6 @@ SYSCALL_DEFINE2(getcwd, char __user *, buf, unsigned long, size)
+ 			if (copy_to_user(buf, cwd, len))
+ 				error = -EFAULT;
+ 		}
+-	} else {
+-		write_sequnlock(&rename_lock);
+ 	}
+ 
+ out:
+-- 
+1.7.1
+
