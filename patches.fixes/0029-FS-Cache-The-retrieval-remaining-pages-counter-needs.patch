@@ -1,0 +1,150 @@
+From: David Howells <dhowells@redhat.com>
+Date: Tue, 21 May 2013 13:44:15 +0100
+Subject: [PATCH] FS-Cache: The retrieval remaining-pages counter needs to be
+ atomic_t
+Git-commit: 1bb4b7f98f361132ea322834515334d95b93c184
+Patch-mainline: v3.11
+References: bnc#880344
+
+struct fscache_retrieval contains a count of the number of pages that still
+need some processing (n_pages).  This is decremented as the pages are
+processed.
+
+However, this needs to be atomic as fscache_retrieval_complete() (I think) just
+occasionally may be called from cachefiles_read_backing_file() and
+cachefiles_read_copier() simultaneously.
+
+This happens when an fscache_read_or_alloc_pages() request containing a lot of
+pages (say a couple of hundred) is being processed.  The read on each backing
+page is dispatched individually because we need to insert a monitor into the
+waitqueue to catch when the read completes.  However, under low-memory
+conditions, we might be forced to wait in the allocator - and this gives the
+I/O on the backing page a chance to complete first.
+
+When the I/O completes, fscache_enqueue_retrieval() chucks the retrieval onto
+the workqueue without waiting for the operation to finish the initial I/O
+dispatch (we want to release any pages we can as soon as we can), thus both can
+end up running simultaneously and potentially attempting to partially complete
+the retrieval simultaneously (ENOMEM may occur, backing pages may already be in
+the page cache).
+
+This was demonstrated by parallelling the non-atomic counter with an atomic
+counter and printing both of them when the assertion fails.  At this point, the
+atomic counter has reached zero, but the non-atomic counter has not.
+
+To fix this, make the counter an atomic_t.
+
+This results in the following bug appearing
+
+	FS-Cache: Assertion failed
+	3 == 5 is false
+	------------[ cut here ]------------
+	kernel BUG at fs/fscache/operation.c:421!
+
+or
+
+	FS-Cache: Assertion failed
+	3 == 5 is false
+	------------[ cut here ]------------
+	kernel BUG at fs/fscache/operation.c:414!
+
+With a backtrace like the following:
+
+RIP: 0010:[<ffffffffa0211b1d>] fscache_put_operation+0x1ad/0x240 [fscache]
+Call Trace:
+ [<ffffffffa0213185>] fscache_retrieval_work+0x55/0x270 [fscache]
+ [<ffffffffa0213130>] ? fscache_retrieval_work+0x0/0x270 [fscache]
+ [<ffffffff81090b10>] worker_thread+0x170/0x2a0
+ [<ffffffff81096d10>] ? autoremove_wake_function+0x0/0x40
+ [<ffffffff810909a0>] ? worker_thread+0x0/0x2a0
+ [<ffffffff81096966>] kthread+0x96/0xa0
+ [<ffffffff8100c0ca>] child_rip+0xa/0x20
+ [<ffffffff810968d0>] ? kthread+0x0/0xa0
+ [<ffffffff8100c0c0>] ? child_rip+0x0/0x20
+
+Signed-off-by: David Howells <dhowells@redhat.com>
+Reviewed-and-tested-by: Milosz Tanski <milosz@adfin.com>
+Acked-by: Jeff Layton <jlayton@redhat.com>
+Acked-by: NeilBrown <neilb@suse.de>
+
+---
+ fs/fscache/page.c             |   10 +++++-----
+ include/linux/fscache-cache.h |    7 +++----
+ 2 files changed, 8 insertions(+), 9 deletions(-)
+
+--- linux-3.0-SLE11-SP3.orig/fs/fscache/page.c
++++ linux-3.0-SLE11-SP3/fs/fscache/page.c
+@@ -235,7 +235,7 @@ static void fscache_release_retrieval_op
+ 
+ 	_enter("{OP%x}", op->op.debug_id);
+ 
+-	ASSERTCMP(op->n_pages, ==, 0);
++	ASSERTCMP(atomic_read(&op->n_pages), ==, 0);
+ 
+ 	fscache_hist(fscache_retrieval_histogram, op->start_time);
+ 	if (op->context)
+@@ -316,7 +316,7 @@ static void fscache_do_cancel_retrieval(
+ 	struct fscache_retrieval *op =
+ 		container_of(_op, struct fscache_retrieval, op);
+ 
+-	op->n_pages = 0;
++	atomic_set(&op->n_pages, 0);
+ }
+ 
+ /*
+@@ -406,7 +406,7 @@ int __fscache_read_or_alloc_page(struct
+ 		_leave(" = -ENOMEM");
+ 		return -ENOMEM;
+ 	}
+-	op->n_pages = 1;
++	atomic_set(&op->n_pages, 1);
+ 
+ 	spin_lock(&cookie->lock);
+ 
+@@ -533,7 +533,7 @@ int __fscache_read_or_alloc_pages(struct
+ 	op = fscache_alloc_retrieval(cookie, mapping, end_io_func, context);
+ 	if (!op)
+ 		return -ENOMEM;
+-	op->n_pages = *nr_pages;
++	atomic_set(&op->n_pages, *nr_pages);
+ 
+ 	spin_lock(&cookie->lock);
+ 
+@@ -643,7 +643,7 @@ int __fscache_alloc_page(struct fscache_
+ 	op = fscache_alloc_retrieval(cookie, page->mapping, NULL, NULL);
+ 	if (!op)
+ 		return -ENOMEM;
+-	op->n_pages = 1;
++	atomic_set(&op->n_pages, 1);
+ 
+ 	spin_lock(&cookie->lock);
+ 
+--- linux-3.0-SLE11-SP3.orig/include/linux/fscache-cache.h
++++ linux-3.0-SLE11-SP3/include/linux/fscache-cache.h
+@@ -151,7 +151,7 @@ struct fscache_retrieval {
+ 	void			*context;	/* netfs read context (pinned) */
+ 	struct list_head	to_do;		/* list of things to be done by the backend */
+ 	unsigned long		start_time;	/* time at which retrieval started */
+-	unsigned		n_pages;	/* number of pages to be retrieved */
++	atomic_t		n_pages;	/* number of pages to be retrieved */
+ };
+ 
+ typedef int (*fscache_page_retrieval_func_t)(struct fscache_retrieval *op,
+@@ -195,15 +195,14 @@ static inline void fscache_enqueue_retri
+ static inline void fscache_retrieval_complete(struct fscache_retrieval *op,
+ 					      int n_pages)
+ {
+-	op->n_pages -= n_pages;
+-	if (op->n_pages <= 0)
++	atomic_sub(n_pages, &op->n_pages);
++	if (atomic_read(&op->n_pages) <= 0)
+ 		fscache_op_complete(&op->op, true);
+ }
+ 
+ /**
+  * fscache_put_retrieval - Drop a reference to a retrieval operation
+  * @op: The retrieval operation affected
+- * @n_pages: The number of pages to account for
+  *
+  * Drop a reference to a retrieval operation.
+  */
