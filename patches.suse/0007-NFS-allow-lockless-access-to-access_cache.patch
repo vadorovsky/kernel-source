@@ -1,0 +1,121 @@
+From: NeilBrown <neilb@suse.de>
+Date: Wed, 5 Mar 2014 11:32:58 +1100
+Patch-mainline: submitted 2014-07-24
+References: bnc#866130
+Subject: [PATCH 8/8] NFS: allow lockless access to access_cache
+
+The access cache is used during RCU-walk path lookups, so it is best
+to avoid locking if possible as taking a lock kills concurrency.
+
+The rbtree is not rcu-safe and cannot easily be made so.
+Instead we simply check the last (i.e. most recent) entry on the LRU
+list.  If this doesn't match, then we return -ECHILD and retry in
+lock/refcount mode.
+
+This requires freeing the nfs_access_entry struct with rcu, and
+requires using rcu access primatives when adding entries to the lru, and
+when examining the last entry.
+
+Calling put_rpccred before kfree_rcu looks a bit odd, but as
+put_rpccred already provides rcu protection, we know that the cred will
+not actually be freed until the next grace period, so any concurrent
+access will be safe.
+
+This patch provides about 5% performance improvement on a stat-heavy
+synthetic work load with 4 threads on a 2-core CPU.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+---
+ fs/nfs/dir.c           |   43 +++++++++++++++++++++++++++++++++++++++++--
+ include/linux/nfs_fs.h |    7 +++++++
+ 2 files changed, 48 insertions(+), 2 deletions(-)
+
+--- linux-3.0-SLE11-SP3.orig/fs/nfs/dir.c
++++ linux-3.0-SLE11-SP3/fs/nfs/dir.c
+@@ -2136,7 +2136,7 @@ static atomic_long_t nfs_access_nr_entri
+ static void nfs_access_free_entry(struct nfs_access_entry *entry)
+ {
+ 	put_rpccred(entry->cred);
+-	kfree(entry);
++	kfree_rcu(entry, rcu_head);
+ 	smp_mb__before_atomic_dec();
+ 	atomic_long_dec(&nfs_access_nr_entries);
+ 	smp_mb__after_atomic_dec();
+@@ -2282,6 +2282,38 @@ out_zap:
+ 	return -ENOENT;
+ }
+ 
++static int nfs_access_get_cached_rcu(struct inode *inode, struct rpc_cred *cred, struct nfs_access_entry *res)
++{
++	/* Only check the most recently returned cache entry,
++	 * but do it without locking.
++	 */
++	struct nfs_inode *nfsi = NFS_I(inode);
++	struct nfs_access_entry *cache;
++	int err = -ECHILD;
++	struct list_head *lh;
++
++	rcu_read_lock();
++	if (nfsi->cache_validity & NFS_INO_INVALID_ACCESS)
++		goto out;
++	lh = rcu_dereference(nfsi->access_cache_entry_lru.prev);
++	cache = list_entry(lh, struct nfs_access_entry, lru);
++	if (lh == &nfsi->access_cache_entry_lru ||
++	    cred != cache->cred)
++		cache = NULL;
++	if (cache == NULL)
++		goto out;
++	if (!nfs_have_delegated_attributes(inode) &&
++	    !time_in_range_open(jiffies, cache->jiffies, cache->jiffies + nfsi->attrtimeo))
++		goto out;
++	res->jiffies = cache->jiffies;
++	res->cred = cache->cred;
++	res->mask = cache->mask;
++	err = 0;
++out:
++	rcu_read_unlock();
++	return err;
++}
++
+ static void nfs_access_add_rbtree(struct inode *inode, struct nfs_access_entry *set)
+ {
+ 	struct nfs_inode *nfsi = NFS_I(inode);
+@@ -2325,6 +2357,11 @@ void nfs_access_add_cache(struct inode *
+ 	cache->cred = get_rpccred(set->cred);
+ 	cache->mask = set->mask;
+ 
++	/* The above fields assignments must be visible
++	 * before this item appears on the lru.  We cannot easily
++	 * Use rcu_assign_pointer, so just force the memory barrier.
++	 */
++	smp_wmb();
+ 	nfs_access_add_rbtree(inode, cache);
+ 
+ 	/* Update accounting */
+@@ -2359,7 +2396,9 @@ static int nfs_do_access(struct inode *i
+ 	struct nfs_access_entry cache;
+ 	int status;
+ 
+-	status = nfs_access_get_cached(inode, cred, &cache);
++	status = nfs_access_get_cached_rcu(inode, cred, &cache);
++	if (status != 0)
++		status = nfs_access_get_cached(inode, cred, &cache);
+ 	if (status == 0)
+ 		goto out;
+ 
+--- linux-3.0-SLE11-SP3.orig/include/linux/nfs_fs.h
++++ linux-3.0-SLE11-SP3/include/linux/nfs_fs.h
+@@ -72,6 +72,13 @@ struct nfs_access_entry {
+ 	unsigned long		jiffies;
+ 	struct rpc_cred *	cred;
+ 	int			mask;
++#ifndef __GENKSYMS__
++	/* these structures are only allocated in fs/nfs/dir.c
++	 * So there is no need to export the full definition.
++	 * Some modules use the structure but only the early fields
++	 */
++	struct rcu_head		rcu_head;
++#endif
+ };
+ 
+ struct nfs_lock_context {

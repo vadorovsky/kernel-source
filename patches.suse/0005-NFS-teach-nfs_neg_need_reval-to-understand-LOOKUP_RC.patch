@@ -1,0 +1,175 @@
+From: NeilBrown <neilb@suse.de>
+Date: Tue, 4 Mar 2014 16:08:54 +1100
+Patch-mainline: submitted 2014-07-24
+References: bnc#866130
+Subject: [PATCH 6/8] NFS: teach nfs_neg_need_reval to understand LOOKUP_RCU
+
+This requires nfs_check_verifier to take an rcu_walk flag, and requires
+an rcu version of nfs_revalidate_inode which returns -ECHILD rather
+than making an RPC call.
+
+With this, nfs_lookup_revalidate can call nfs_neg_need_reval in
+RCU-walk mode.
+
+We can also move the LOOKUP_RCU check past the nfs_check_verifier()
+call in nfs_lookup_revalidate.
+
+Signed-off-by: NeilBrown <neilb@suse.de>
+---
+ fs/nfs/dir.c           |   61 ++++++++++++++++++++++++++++++++++---------------
+ fs/nfs/inode.c         |    8 ++++++
+ include/linux/nfs_fs.h |    1 
+ 3 files changed, 52 insertions(+), 18 deletions(-)
+
+--- linux-3.0-SLE11-SP3.orig/fs/nfs/dir.c
++++ linux-3.0-SLE11-SP3/fs/nfs/dir.c
+@@ -1015,9 +1015,13 @@ void nfs_force_lookup_revalidate(struct
+  * A check for whether or not the parent directory has changed.
+  * In the case it has, we assume that the dentries are untrustworthy
+  * and may need to be looked up again.
++ * If rcu_walk prevents us from performing a full check, return 0.
+  */
+-static int nfs_check_verifier(struct inode *dir, struct dentry *dentry)
++static int nfs_check_verifier(struct inode *dir, struct dentry *dentry,
++			      int rcu_walk)
+ {
++	int ret;
++
+ 	if (IS_ROOT(dentry))
+ 		return 1;
+ 	if (NFS_SERVER(dir)->flags & NFS_MOUNT_LOOKUP_CACHE_NONE)
+@@ -1025,7 +1029,11 @@ static int nfs_check_verifier(struct ino
+ 	if (!nfs_verify_change_attribute(dir, dentry->d_time))
+ 		return 0;
+ 	/* Revalidate nfsi->cache_change_attribute before we declare a match */
+-	if (nfs_revalidate_inode(NFS_SERVER(dir), dir) < 0)
++	if (rcu_walk)
++		ret = nfs_revalidate_inode_rcu(NFS_SERVER(dir), dir);
++	else
++		ret = nfs_revalidate_inode(NFS_SERVER(dir), dir);
++	if (ret < 0)
+ 		return 0;
+ 	if (!nfs_verify_change_attribute(dir, dentry->d_time))
+ 		return 0;
+@@ -1096,6 +1104,9 @@ out_force:
+  *
+  * If parent mtime has changed, we revalidate, else we wait for a
+  * period corresponding to the parent's attribute cache timeout value.
++ *
++ * If LOOKUP_RCU prevents us from performing a full check, return 1
++ * suggesting a reval is needed.
+  */
+ static inline
+ int nfs_neg_need_reval(struct inode *dir, struct dentry *dentry,
+@@ -1106,7 +1117,7 @@ int nfs_neg_need_reval(struct inode *dir
+ 		return 0;
+ 	if (NFS_SERVER(dir)->flags & NFS_MOUNT_LOOKUP_CACHE_NONEG)
+ 		return 1;
+-	return !nfs_check_verifier(dir, dentry);
++	return !nfs_check_verifier(dir, dentry, nd && (nd->flags & LOOKUP_RCU));
+ }
+ 
+ /*
+@@ -1146,11 +1157,11 @@ static int nfs_lookup_revalidate(struct
+ 	inode = dentry->d_inode;
+ 
+ 	if (!inode) {
+-		if (nd && (nd->flags & LOOKUP_RCU))
+-			return -ECHILD;
+-
+-		if (nfs_neg_need_reval(dir, dentry, nd))
++		if (nfs_neg_need_reval(dir, dentry, nd)) {
++			if (nd && (nd->flags & LOOKUP_RCU))
++				return -ECHILD;
+ 			goto out_bad;
++		}
+ 		goto out_valid_noent;
+ 	}
+ 
+@@ -1166,11 +1177,13 @@ static int nfs_lookup_revalidate(struct
+ 	if (nfs_have_delegation(inode, FMODE_READ))
+ 		goto out_set_verifier;
+ 
+-	if (nd && (nd->flags & LOOKUP_RCU))
+-		return -ECHILD;
+-
+ 	/* Force a full look up iff the parent directory has changed */
+-	if (!nfs_is_exclusive_create(dir, nd) && nfs_check_verifier(dir, dentry)) {
++	if (!nfs_is_exclusive_create(dir, nd) &&
++	    nfs_check_verifier(dir, dentry, nd && (nd->flags & LOOKUP_RCU))) {
++
++		if (nd && (nd->flags & LOOKUP_RCU))
++			return -ECHILD;
++
+ 		if (nfs_server_capable(dir, NFS_CAP_READDIRPLUS)
+ 		    && ((NFS_I(inode)->cache_validity & NFS_INO_INVALID_ATTR)
+ 			|| nfs_attribute_cache_expired(inode))
+@@ -1185,6 +1198,9 @@ static int nfs_lookup_revalidate(struct
+ 		goto out_valid;
+ 	}
+ 
++	if (nd && (nd->flags & LOOKUP_RCU))
++		return -ECHILD;
++
+ 	if (NFS_STALE(inode))
+ 		goto out_bad;
+ 
+@@ -1585,15 +1601,24 @@ static int nfs_open_revalidate(struct de
+ 	 * optimize away revalidation of negative dentries.
+ 	 */
+ 	if (inode == NULL) {
+-		if (nd && (nd->flags & LOOKUP_RCU))
+-			return -ECHILD;
+-
+-		parent = dget_parent(dentry);
+-		dir = parent->d_inode;
+-
++		if (nd && (nd->flags & LOOKUP_RCU)) {
++			parent = rcu_dereference(dentry);
++			dir = ACCESS_ONCE(parent->d_inode);
++			if (!dir)
++				return -ECHILD;
++		} else {
++			parent = dget_parent(dentry);
++			dir = parent->d_inode;
++		}
+ 		if (!nfs_neg_need_reval(dir, dentry, nd))
+ 			ret = 1;
+-		goto out;
++		else if (nd && (nd->flags & LOOKUP_RCU))
++			ret = -ECHILD;
++		if (!(nd && (nd->flags & LOOKUP_RCU)))
++			dput(parent);
++		else if (parent != rcu_dereference(dentry))
++			ret = -ECHILD;
++		return ret;
+ 	}
+ 
+ 	/* NFS only supports OPEN on regular files */
+--- linux-3.0-SLE11-SP3.orig/fs/nfs/inode.c
++++ linux-3.0-SLE11-SP3/fs/nfs/inode.c
+@@ -843,6 +843,14 @@ int nfs_revalidate_inode(struct nfs_serv
+ 	return __nfs_revalidate_inode(server, inode);
+ }
+ 
++int nfs_revalidate_inode_rcu(struct nfs_server *server, struct inode *inode)
++{
++	if (!(NFS_I(inode)->cache_validity & NFS_INO_INVALID_ATTR)
++			&& !nfs_attribute_cache_expired(inode))
++		return NFS_STALE(inode) ? -ESTALE : 0;
++	return -ECHILD;
++}
++
+ static int nfs_invalidate_mapping(struct inode *inode, struct address_space *mapping)
+ {
+ 	struct nfs_inode *nfsi = NFS_I(inode);
+--- linux-3.0-SLE11-SP3.orig/include/linux/nfs_fs.h
++++ linux-3.0-SLE11-SP3/include/linux/nfs_fs.h
+@@ -360,6 +360,7 @@ extern int nfs_release(struct inode *, s
+ extern int nfs_attribute_timeout(struct inode *inode);
+ extern int nfs_attribute_cache_expired(struct inode *inode);
+ extern int nfs_revalidate_inode(struct nfs_server *server, struct inode *inode);
++extern int nfs_revalidate_inode_rcu(struct nfs_server *server, struct inode *inode);
+ extern int __nfs_revalidate_inode(struct nfs_server *, struct inode *);
+ extern int nfs_revalidate_mapping(struct inode *inode, struct address_space *mapping);
+ extern int nfs_setattr(struct dentry *, struct iattr *);
