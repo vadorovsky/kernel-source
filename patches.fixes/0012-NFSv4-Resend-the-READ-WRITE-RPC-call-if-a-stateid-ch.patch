@@ -1,0 +1,243 @@
+From: Trond Myklebust <Trond.Myklebust@netapp.com>
+Date: Sat, 16 Mar 2013 20:54:34 -0400
+Subject: [PATCH] NFSv4: Resend the READ/WRITE RPC call if a stateid change
+ causes an error
+Git-commit: 5521abfdcf4d67c3441d4414f29e1acd7cc43380
+Patch-mainline: v3.10
+References: bnc#888968
+
+Adds logic to ensure that if the server returns a BAD_STATEID,
+or other state related error, then we check if the stateid has
+already changed. If it has, then rather than start state recovery,
+we should just resend the failed RPC call with the new stateid.
+
+Allow nfs4_select_rw_stateid to notify that the stateid is unstable by
+having it return -EWOULDBLOCK if an RPC is underway that might change the
+stateid.
+
+Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+Acked-by: NeilBrown <neilb@suse.de>
+
+---
+ fs/nfs/nfs4_fs.h   |    4 +-
+ fs/nfs/nfs4proc.c  |   71 ++++++++++++++++++++++++++++++++++++++++++++++++-----
+ fs/nfs/nfs4state.c |   29 ++++++++++++++++-----
+ 3 files changed, 89 insertions(+), 15 deletions(-)
+
+--- linux-3.0-SLE11-SP3.orig/fs/nfs/nfs4_fs.h
++++ linux-3.0-SLE11-SP3/fs/nfs/nfs4_fs.h
+@@ -257,7 +257,7 @@ extern int nfs4_proc_fs_locations(struct
+ 		struct nfs4_fs_locations *fs_locations, struct page *page);
+ extern void nfs4_release_lockowner(const struct nfs4_lock_state *);
+ extern const struct xattr_handler *nfs4_xattr_handlers[];
+-extern void nfs4_set_rw_stateid(nfs4_stateid *stateid,
++extern int nfs4_set_rw_stateid(nfs4_stateid *stateid,
+ 		const struct nfs_open_context *ctx,
+ 		const struct nfs_lock_context *l_ctx,
+ 		fmode_t fmode);
+@@ -370,7 +370,7 @@ extern void nfs41_handle_sequence_flag_e
+ extern void nfs41_handle_recall_slot(struct nfs_client *clp);
+ extern void nfs4_put_lock_state(struct nfs4_lock_state *lsp);
+ extern int nfs4_set_lock_state(struct nfs4_state *state, struct file_lock *fl);
+-extern void nfs4_select_rw_stateid(nfs4_stateid *, struct nfs4_state *,
++extern int nfs4_select_rw_stateid(nfs4_stateid *, struct nfs4_state *,
+ 		fmode_t, const struct nfs_lockowner *);
+ extern int nfs4_lock_lost(const struct nfs_open_context *ctx,
+ 			  const struct nfs_lock_context *l_ctx);
+--- linux-3.0-SLE11-SP3.orig/fs/nfs/nfs4proc.c
++++ linux-3.0-SLE11-SP3/fs/nfs/nfs4proc.c
+@@ -1951,8 +1951,9 @@ static int _nfs4_do_setattr(struct inode
+ 			.l_owner = current->files,
+ 			.l_pid = current->tgid,
+ 		};
+-		nfs4_select_rw_stateid(&arg.stateid, state, FMODE_WRITE,
+-				&lockowner);
++		if (nfs4_select_rw_stateid(&arg.stateid, state, FMODE_WRITE,
++					   &lockowner) == -EIO)
++			return -EBADF;
+ 	} else if (nfs4_copy_delegation_stateid(&arg.stateid, inode,
+ 				FMODE_WRITE)) {
+ 		/* Use that stateid */
+@@ -3288,7 +3289,7 @@ static int nfs4_proc_pathconf(struct nfs
+ 	return err;
+ }
+ 
+-void nfs4_set_rw_stateid(nfs4_stateid *stateid,
++int nfs4_set_rw_stateid(nfs4_stateid *stateid,
+ 		const struct nfs_open_context *ctx,
+ 		const struct nfs_lock_context *l_ctx,
+ 		fmode_t fmode)
+@@ -3297,14 +3298,41 @@ void nfs4_set_rw_stateid(nfs4_stateid *s
+ 
+ 	if (ctx->state == NULL) {
+ 		nfs4_stateid_copy(stateid, &zero_stateid);
+-		return;
++		return 0;
+ 	}
+ 	if (l_ctx != NULL)
+ 		lockowner = &l_ctx->lockowner;
+-	nfs4_select_rw_stateid(stateid, ctx->state, fmode, lockowner);
++	return nfs4_select_rw_stateid(stateid, ctx->state, fmode, lockowner);
+ }
+ EXPORT_SYMBOL_GPL(nfs4_set_rw_stateid);
+ 
++static bool nfs4_stateid_is_current(nfs4_stateid *stateid,
++		const struct nfs_open_context *ctx,
++		const struct nfs_lock_context *l_ctx,
++		fmode_t fmode)
++{
++	nfs4_stateid current_stateid;
++
++	if (nfs4_set_rw_stateid(&current_stateid, ctx, l_ctx, fmode))
++		return false;
++	return nfs4_stateid_match(stateid, &current_stateid);
++}
++
++static bool nfs4_error_stateid_expired(int err)
++{
++	switch (err) {
++	case -NFS4ERR_DELEG_REVOKED:
++	case -NFS4ERR_ADMIN_REVOKED:
++	case -NFS4ERR_BAD_STATEID:
++	case -NFS4ERR_STALE_STATEID:
++	case -NFS4ERR_OLD_STATEID:
++	case -NFS4ERR_OPENMODE:
++	case -NFS4ERR_EXPIRED:
++		return true;
++	}
++	return false;
++}
++
+ void __nfs4_read_done_cb(struct nfs_read_data *data)
+ {
+ 	nfs_invalidate_atime(data->inode);
+@@ -3325,6 +3353,20 @@ static int nfs4_read_done_cb(struct rpc_
+ 	return 0;
+ }
+ 
++static bool nfs4_read_stateid_changed(struct rpc_task *task,
++		struct nfs_readargs *args)
++{
++
++	if (!nfs4_error_stateid_expired(task->tk_status) ||
++		nfs4_stateid_is_current(&args->stateid,
++				args->context,
++				args->lock_context,
++				FMODE_READ))
++		return false;
++	rpc_restart_call_prepare(task);
++	return true;
++}
++
+ static int nfs4_read_done(struct rpc_task *task, struct nfs_read_data *data)
+ {
+ 
+@@ -3332,7 +3374,8 @@ static int nfs4_read_done(struct rpc_tas
+ 
+ 	if (!nfs4_sequence_done(task, &data->res.seq_res))
+ 		return -EAGAIN;
+-
++	if (nfs4_read_stateid_changed(task, &data->args))
++		return -EAGAIN;
+ 	return data->read_done_cb ? data->read_done_cb(task, data) :
+ 				    nfs4_read_done_cb(task, data);
+ }
+@@ -3375,10 +3418,26 @@ static int nfs4_write_done_cb(struct rpc
+ 	return 0;
+ }
+ 
++static bool nfs4_write_stateid_changed(struct rpc_task *task,
++		struct nfs_writeargs *args)
++{
++
++	if (!nfs4_error_stateid_expired(task->tk_status) ||
++		nfs4_stateid_is_current(&args->stateid,
++				args->context,
++				args->lock_context,
++				FMODE_WRITE))
++		return false;
++	rpc_restart_call_prepare(task);
++	return true;
++}
++
+ static int nfs4_write_done(struct rpc_task *task, struct nfs_write_data *data)
+ {
+ 	if (!nfs4_sequence_done(task, &data->res.seq_res))
+ 		return -EAGAIN;
++	if (nfs4_write_stateid_changed(task, &data->args))
++		return -EAGAIN;
+ 	return data->write_done_cb ? data->write_done_cb(task, data) :
+ 		nfs4_write_done_cb(task, data);
+ }
+--- linux-3.0-SLE11-SP3.orig/fs/nfs/nfs4state.c
++++ linux-3.0-SLE11-SP3/fs/nfs/nfs4state.c
+@@ -871,7 +871,8 @@ int nfs4_set_lock_state(struct nfs4_stat
+ 	return 0;
+ }
+ 
+-static int nfs4_copy_lock_stateid(nfs4_stateid *dst, struct nfs4_state *state,
++static int nfs4_copy_lock_stateid(nfs4_stateid *dst,
++		struct nfs4_state *state,
+ 		const struct nfs_lockowner *lockowner)
+ {
+ 	struct nfs4_lock_state *lsp;
+@@ -896,6 +897,10 @@ static int nfs4_copy_lock_stateid(nfs4_s
+ 	    (lsp->ls_flags & (NFS_LOCK_INITIALIZED | NFS_LOCK_LOST)) != 0) {
+ 		nfs4_stateid_copy(dst, &lsp->ls_stateid);
+ 		ret = 0;
++		smp_rmb();
++		if (lsp->ls_seqid.sequence &&
++		    !list_empty(&lsp->ls_seqid.sequence->list))
++			ret = -EWOULDBLOCK;
+ 	}
+ 	spin_unlock(&state->state_lock);
+ 	nfs4_put_lock_state(lsp);
+@@ -903,32 +908,42 @@ out:
+ 	return ret;
+ }
+ 
+-static void nfs4_copy_open_stateid(nfs4_stateid *dst, struct nfs4_state *state)
++static int nfs4_copy_open_stateid(nfs4_stateid *dst, struct nfs4_state *state)
+ {
++	int ret;
+ 	int seq;
+ 
+ 	do {
+ 		seq = read_seqbegin(&state->seqlock);
+ 		nfs4_stateid_copy(dst, &state->stateid);
++		ret = 0;
++		smp_rmb();
++		if (state->owner->so_seqid.sequence &&
++		    !list_empty(&state->owner->so_seqid.sequence->list))
++			ret = -EWOULDBLOCK;
+ 	} while (read_seqretry(&state->seqlock, seq));
++	return ret;
+ }
+ 
+ /*
+  * Byte-range lock aware utility to initialize the stateid of read/write
+  * requests.
+  */
+-void nfs4_select_rw_stateid(nfs4_stateid *dst, struct nfs4_state *state,
++int nfs4_select_rw_stateid(nfs4_stateid *dst, struct nfs4_state *state,
+ 		fmode_t fmode, const struct nfs_lockowner *lockowner)
+ {
+ 	int ret = nfs4_copy_lock_stateid(dst, state, lockowner);
+ 	if (ret == -EIO)
+ 		/* A lost lock - don't even consider delegations */
+ 		goto out;
+-	if (nfs4_copy_delegation_stateid(dst, state->inode, fmode))
+-		return;
+-out:
++	if (nfs4_copy_delegation_stateid(dst, state->inode, fmode)) {
++		ret = 0;
++		goto out;
++	}
+ 	if (ret)
+-		nfs4_copy_open_stateid(dst, state);
++		ret = nfs4_copy_open_stateid(dst, state);
++out:
++	return ret;
+ }
+ 
+ /* Check the lock access would try to use a lost lock stateid */
