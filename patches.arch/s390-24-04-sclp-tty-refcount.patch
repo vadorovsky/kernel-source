@@ -1,0 +1,228 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: kernel: sclp console tty reference counting
+Patch-mainline: not yet
+Git-commit: -
+References: bnc#891087, LTC#115466
+
+Description:  kernel: sclp console tty reference counting
+Symptom:      The kernel crashes on shutdown in the tty layer.
+Problem:      The pointer to the tty data structure that is associated
+              with the sclp line mode or vt220 console is not properly
+              reference counted. An sclp request completing after
+              the tty has been closed can cause an oops because of a
+              use after free on the tty data structure.
+Solution:     Improve reference counting on the tty data structure
+              that is associated with the sclp console.
+Reproduction: Shutdown a Linux system while i/o is in progress on one
+              of the line mode or vt220 sclp console.
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/char/sclp_tty.c   |   51 ++++++++++++++++++++++++++++++-----------
+ drivers/s390/char/sclp_vt220.c |   37 ++++++++++++++++++++++++-----
+ 2 files changed, 68 insertions(+), 20 deletions(-)
+
+--- a/drivers/s390/char/sclp_tty.c
++++ b/drivers/s390/char/sclp_tty.c
+@@ -64,9 +64,17 @@ static int sclp_tty_columns = 80;
+ static int
+ sclp_tty_open(struct tty_struct *tty, struct file *filp)
+ {
+-	sclp_tty = tty;
+-	tty->driver_data = NULL;
+-	tty->low_latency = 0;
++	unsigned long flags;
++
++	if (tty->count == 1) {
++		spin_lock_irqsave(&sclp_tty_lock, flags);
++		if (sclp_tty)
++			tty_kref_put(sclp_tty);
++		sclp_tty = tty_kref_get(tty);
++		spin_unlock_irqrestore(&sclp_tty_lock, flags);
++		tty->driver_data = NULL;
++		tty->low_latency = 0;
++	}
+ 	return 0;
+ }
+ 
+@@ -74,9 +82,15 @@ sclp_tty_open(struct tty_struct *tty, st
+ static void
+ sclp_tty_close(struct tty_struct *tty, struct file *filp)
+ {
++	unsigned long flags;
++
+ 	if (tty->count > 1)
+ 		return;
++	spin_lock_irqsave(&sclp_tty_lock, flags);
++	if (sclp_tty)
++		tty_kref_put(sclp_tty);
+ 	sclp_tty = NULL;
++	spin_unlock_irqrestore(&sclp_tty_lock, flags);
+ }
+ 
+ /*
+@@ -108,6 +122,7 @@ sclp_tty_write_room (struct tty_struct *
+ static void
+ sclp_ttybuf_callback(struct sclp_buffer *buffer, int rc)
+ {
++	struct tty_struct *tty;
+ 	unsigned long flags;
+ 	void *page;
+ 
+@@ -126,8 +141,12 @@ sclp_ttybuf_callback(struct sclp_buffer
+ 		spin_unlock_irqrestore(&sclp_tty_lock, flags);
+ 	} while (buffer && sclp_emit_buffer(buffer, sclp_ttybuf_callback));
+ 	/* check if the tty needs a wake up call */
+-	if (sclp_tty != NULL) {
+-		tty_wakeup(sclp_tty);
++	spin_lock_irqsave(&sclp_tty_lock, flags);
++	tty = sclp_tty ? tty_kref_get(sclp_tty) : NULL;
++	spin_unlock_irqrestore(&sclp_tty_lock, flags);
++	if (tty)  {
++		tty_wakeup(tty);
++		tty_kref_put(tty);
+ 	}
+ }
+ 
+@@ -326,21 +345,26 @@ sclp_tty_flush_buffer(struct tty_struct
+ static void
+ sclp_tty_input(unsigned char* buf, unsigned int count)
+ {
++	struct tty_struct *tty;
++	unsigned long flags;
+ 	unsigned int cchar;
+ 
+ 	/*
+ 	 * If this tty driver is currently closed
+ 	 * then throw the received input away.
+ 	 */
+-	if (sclp_tty == NULL)
++	spin_lock_irqsave(&sclp_tty_lock, flags);
++	tty = sclp_tty ? tty_kref_get(sclp_tty) : NULL;
++	spin_unlock_irqrestore(&sclp_tty_lock, flags);
++	if (tty == NULL)
+ 		return;
+-	cchar = ctrlchar_handle(buf, count, sclp_tty);
++	cchar = ctrlchar_handle(buf, count, tty);
+ 	switch (cchar & CTRLCHAR_MASK) {
+ 	case CTRLCHAR_SYSRQ:
+ 		break;
+ 	case CTRLCHAR_CTRL:
+-		tty_insert_flip_char(sclp_tty, cchar, TTY_NORMAL);
+-		tty_flip_buffer_push(sclp_tty);
++		tty_insert_flip_char(tty, cchar, TTY_NORMAL);
++		tty_flip_buffer_push(tty);
+ 		break;
+ 	case CTRLCHAR_NONE:
+ 		/* send (normal) input to line discipline */
+@@ -348,13 +372,14 @@ sclp_tty_input(unsigned char* buf, unsig
+ 		    (strncmp((const char *) buf + count - 2, "^n", 2) &&
+ 		     strncmp((const char *) buf + count - 2, "\252n", 2))) {
+ 			/* add the auto \n */
+-			tty_insert_flip_string(sclp_tty, buf, count);
+-			tty_insert_flip_char(sclp_tty, '\n', TTY_NORMAL);
++			tty_insert_flip_string(tty, buf, count);
++			tty_insert_flip_char(tty, '\n', TTY_NORMAL);
+ 		} else
+-			tty_insert_flip_string(sclp_tty, buf, count - 2);
+-		tty_flip_buffer_push(sclp_tty);
++			tty_insert_flip_string(tty, buf, count - 2);
++		tty_flip_buffer_push(tty);
+ 		break;
+ 	}
++	tty_kref_put(tty);
+ }
+ 
+ /*
+--- a/drivers/s390/char/sclp_vt220.c
++++ b/drivers/s390/char/sclp_vt220.c
+@@ -116,6 +116,7 @@ static struct sclp_register sclp_vt220_r
+ static void
+ sclp_vt220_process_queue(struct sclp_vt220_request *request)
+ {
++	struct tty_struct *tty;
+ 	unsigned long flags;
+ 	void *page;
+ 
+@@ -141,8 +142,12 @@ sclp_vt220_process_queue(struct sclp_vt2
+ 	if (request == NULL && sclp_vt220_flush_later)
+ 		sclp_vt220_emit_current();
+ 	/* Check if the tty needs a wake up call */
+-	if (sclp_vt220_tty != NULL) {
+-		tty_wakeup(sclp_vt220_tty);
++	spin_lock_irqsave(&sclp_vt220_lock, flags);
++	tty = sclp_vt220_tty ? tty_kref_get(sclp_vt220_tty) : NULL;
++	spin_unlock_irqrestore(&sclp_vt220_lock, flags);
++	if (tty != NULL) {
++		tty_wakeup(tty);
++		tty_kref_put(tty);
+ 	}
+ }
+ 
+@@ -489,11 +494,16 @@ sclp_vt220_write(struct tty_struct *tty,
+ static void
+ sclp_vt220_receiver_fn(struct evbuf_header *evbuf)
+ {
++	struct tty_struct *tty;
+ 	char *buffer;
++	unsigned long flags;
+ 	unsigned int count;
+ 
+ 	/* Ignore input if device is not open */
+-	if (sclp_vt220_tty == NULL)
++	spin_lock_irqsave(&sclp_vt220_lock, flags);
++	tty = sclp_vt220_tty ? tty_kref_get(sclp_vt220_tty) : NULL;
++	spin_unlock_irqrestore(&sclp_vt220_lock, flags);
++	if (tty == NULL)
+ 		return;
+ 
+ 	buffer = (char *) ((addr_t) evbuf + sizeof(struct evbuf_header));
+@@ -507,10 +517,11 @@ sclp_vt220_receiver_fn(struct evbuf_head
+ 		/* Send input to line discipline */
+ 		buffer++;
+ 		count--;
+-		tty_insert_flip_string(sclp_vt220_tty, buffer, count);
+-		tty_flip_buffer_push(sclp_vt220_tty);
++		tty_insert_flip_string(tty, buffer, count);
++		tty_flip_buffer_push(tty);
+ 		break;
+ 	}
++	tty_kref_put(tty);
+ }
+ 
+ /*
+@@ -519,8 +530,14 @@ sclp_vt220_receiver_fn(struct evbuf_head
+ static int
+ sclp_vt220_open(struct tty_struct *tty, struct file *filp)
+ {
++	unsigned long flags;
++
+ 	if (tty->count == 1) {
+-		sclp_vt220_tty = tty;
++		spin_lock_irqsave(&sclp_vt220_lock, flags);
++		if (sclp_vt220_tty)
++			tty_kref_put(sclp_vt220_tty);
++		sclp_vt220_tty = tty_kref_get(tty);
++		spin_unlock_irqrestore(&sclp_vt220_lock, flags);
+ 		tty->driver_data = kmalloc(SCLP_VT220_BUF_SIZE, GFP_KERNEL);
+ 		if (tty->driver_data == NULL)
+ 			return -ENOMEM;
+@@ -539,10 +556,16 @@ sclp_vt220_open(struct tty_struct *tty,
+ static void
+ sclp_vt220_close(struct tty_struct *tty, struct file *filp)
+ {
++	unsigned long flags;
++
+ 	if (tty->count == 1) {
+-		sclp_vt220_tty = NULL;
+ 		kfree(tty->driver_data);
+ 		tty->driver_data = NULL;
++		spin_lock_irqsave(&sclp_vt220_lock, flags);
++		if (sclp_vt220_tty)
++			tty_kref_put(sclp_vt220_tty);
++		sclp_vt220_tty = NULL;
++		spin_unlock_irqrestore(&sclp_vt220_lock, flags);
+ 	}
+ }
+ 
