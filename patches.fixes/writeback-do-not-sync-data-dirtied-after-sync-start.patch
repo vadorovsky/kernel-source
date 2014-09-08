@@ -1,8 +1,7 @@
 From: Jan Kara <jack@suse.cz>
 Subject: writeback: Do not sync data dirtied after sync start
 References: bnc#833820
-Patch-mainline: 3.13-rc1
-Git-commit: c4a391b53a72d2df4ee97f96f78c1d5971b47489
+Patch-mainline: No
 
 When there are processes heavily creating small files while sync(2) is running,
 it can easily happen that quite some new files are created between WB_SYNC_NONE
@@ -12,13 +11,18 @@ rather long sync(2) times.
 
 Fix the problem by disregarding inodes dirtied after WB_SYNC_NONE pass has
 started in the WB_SYNC_ALL pass. To allow for this, __sync_filesystem() passes
-the time stamp when sync started to both syncing works.
+the time stamp when sync started to both syncing works. Things are complicated
+a bit more by redirty_tail() updating inode->i_dirtied_when. Thus we have
+to keep track when inode was redirtied and allow at least as new inodes
+as the latest redirtied ones so that we don't miss any inodes from the syncing
+pass.
 
 Signed-off-by: Jan Kara <jack@suse.cz>
 
-diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2/fs/fs-writeback.c linux-3.0-SLE11-SP2-1-sync_faster/fs/fs-writeback.c
---- linux-3.0-SLE11-SP2/fs/fs-writeback.c	2013-09-12 18:53:23.689055055 +0200
-+++ linux-3.0-SLE11-SP2-1-sync_faster/fs/fs-writeback.c	2013-09-20 14:23:31.622847986 +0200
+Index: linux-3.0-SLE11-SP3/fs/fs-writeback.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/fs/fs-writeback.c
++++ linux-3.0-SLE11-SP3/fs/fs-writeback.c
 @@ -35,6 +35,7 @@
  struct wb_writeback_work {
  	long nr_pages;
@@ -27,7 +31,19 @@ diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2/fs/fs-writeba
  	enum writeback_sync_modes sync_mode;
  	unsigned int tagged_writepages:1;
  	unsigned int for_kupdate:1;
-@@ -670,6 +671,7 @@ static long wb_writeback(struct bdi_writ
+@@ -204,8 +205,10 @@ static void redirty_tail(struct inode *i
+ 		struct inode *tail;
+ 
+ 		tail = wb_inode(wb->b_dirty.next);
+-		if (time_before(inode->dirtied_when, tail->dirtied_when))
++		if (time_before(inode->dirtied_when, tail->dirtied_when)) {
++			wb->last_move_tail = jiffies;
+ 			inode->dirtied_when = jiffies;
++		}
+ 	}
+ 	list_move(&inode->i_wb_list, &wb->b_dirty);
+ }
+@@ -690,6 +693,7 @@ static long wb_writeback(struct bdi_writ
  		.sync_mode		= work->sync_mode,
  		.tagged_writepages	= work->tagged_writepages,
  		.older_than_this	= NULL,
@@ -35,17 +51,32 @@ diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2/fs/fs-writeba
  		.for_kupdate		= work->for_kupdate,
  		.for_background		= work->for_background,
  		.range_cyclic		= work->range_cyclic,
-@@ -705,7 +707,8 @@ static long wb_writeback(struct bdi_writ
+@@ -725,7 +729,23 @@ static long wb_writeback(struct bdi_writ
  	if (wbc.sync_mode == WB_SYNC_ALL || wbc.tagged_writepages)
  		write_chunk = LONG_MAX;
  
 -	wbc.wb_start = jiffies; /* livelock avoidance */
 +	if (!wbc.wb_start)
 +		wbc.wb_start = jiffies; /* livelock avoidance */
++	else if (wbc.sync_mode == WB_SYNC_ALL) {
++		/*
++		 * last_move_tail is overflowing? Move it to current
++		 * time.
++		 */
++		if (time_is_after_jiffies(wb->last_move_tail))
++			wb->last_move_tail = jiffies;
++		/*
++		 * If we did redirty_tail() after desired inode start
++		 * time, we have move the start time as well so that
++		 * WB_SYNC_ALL pass doesn't miss any inodes.
++		 */
++		if (time_before(wbc.wb_start, wb->last_move_tail))
++			wbc.wb_start = wb->last_move_tail;
++	}
  	for (;;) {
  		/*
  		 * Stop writeback when nr_pages has been consumed
-@@ -1304,18 +1307,12 @@ int writeback_inodes_sb_nr_if_idle(struc
+@@ -1324,18 +1344,12 @@ int writeback_inodes_sb_nr_if_idle(struc
  }
  EXPORT_SYMBOL(writeback_inodes_sb_nr_if_idle);
  
@@ -66,7 +97,7 @@ diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2/fs/fs-writeba
  		.sync_mode	= WB_SYNC_ALL,
  		.nr_pages	= LONG_MAX,
  		.range_cyclic	= 0,
-@@ -1329,8 +1326,21 @@ void sync_inodes_sb(struct super_block *
+@@ -1349,8 +1363,21 @@ void sync_inodes_sb(struct super_block *
  
  	wait_sb_inodes(sb);
  }
@@ -88,9 +119,10 @@ diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2/fs/fs-writeba
  /**
   * write_inode_now	-	write an inode to disk
   * @inode: inode to write to disk
-diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2/fs/sync.c linux-3.0-SLE11-SP2-1-sync_faster/fs/sync.c
---- linux-3.0-SLE11-SP2/fs/sync.c	2013-09-12 18:53:22.600053575 +0200
-+++ linux-3.0-SLE11-SP2-1-sync_faster/fs/sync.c	2013-09-20 14:30:47.271541418 +0200
+Index: linux-3.0-SLE11-SP3/fs/sync.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/fs/sync.c
++++ linux-3.0-SLE11-SP3/fs/sync.c
 @@ -28,7 +28,8 @@
   * wait == 1 case since in that case write_inode() functions do
   * sync_dirty_buffer() and thus effectively write one block at a time.
@@ -185,9 +217,28 @@ diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2/fs/sync.c lin
  	printk("Emergency Sync complete\n");
  	kfree(work);
  }
-diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2/include/linux/writeback.h linux-3.0-SLE11-SP2-1-sync_faster/include/linux/writeback.h
---- linux-3.0-SLE11-SP2/include/linux/writeback.h	2013-09-12 18:53:23.083054232 +0200
-+++ linux-3.0-SLE11-SP2-1-sync_faster/include/linux/writeback.h	2013-09-20 14:31:55.941651394 +0200
+Index: linux-3.0-SLE11-SP3/include/linux/backing-dev.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/include/linux/backing-dev.h
++++ linux-3.0-SLE11-SP3/include/linux/backing-dev.h
+@@ -48,8 +48,11 @@ enum bdi_stat_item {
+ 
+ struct bdi_writeback {
+ 	struct backing_dev_info *bdi;	/* our parent bdi */
+-	unsigned int nr;
+-
++#ifndef __GENKSYMS__
++	unsigned long last_move_tail;
++#else
++ 	unsigned int nr;
++#endif
+ 	unsigned long last_old_flush;	/* last old data flush */
+ 	unsigned long last_active;	/* last time bdi thread was active */
+ 
+Index: linux-3.0-SLE11-SP3/include/linux/writeback.h
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/include/linux/writeback.h
++++ linux-3.0-SLE11-SP3/include/linux/writeback.h
 @@ -62,6 +62,7 @@ int writeback_inodes_sb_if_idle(struct s
  int writeback_inodes_sb_nr_if_idle(struct super_block *, unsigned long nr);
  int try_to_writeback_inodes_sb_nr(struct super_block *, unsigned long nr);
@@ -196,3 +247,15 @@ diff -rupX /crypted/home/jack/.kerndiffexclude linux-3.0-SLE11-SP2/include/linux
  void writeback_inodes_wb(struct bdi_writeback *wb,
  		struct writeback_control *wbc);
  long wb_do_writeback(struct bdi_writeback *wb, int force_wait);
+Index: linux-3.0-SLE11-SP3/mm/backing-dev.c
+===================================================================
+--- linux-3.0-SLE11-SP3.orig/mm/backing-dev.c
++++ linux-3.0-SLE11-SP3/mm/backing-dev.c
+@@ -661,6 +661,7 @@ static void bdi_wb_init(struct bdi_write
+ 
+ 	wb->bdi = bdi;
+ 	wb->last_old_flush = jiffies;
++	wb->last_move_tail = jiffies;
+ 	INIT_LIST_HEAD(&wb->b_dirty);
+ 	INIT_LIST_HEAD(&wb->b_io);
+ 	INIT_LIST_HEAD(&wb->b_more_io);
