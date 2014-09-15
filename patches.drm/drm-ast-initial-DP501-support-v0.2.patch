@@ -1,0 +1,654 @@
+From: Dave Airlie <airlied@redhat.com>
+Date: Fri Mar 28 11:05:12 2014 +1000
+Subject: drm/ast: initial DP501 support (v0.2)
+Patch-mainline: Upstream/v3.16-rc1
+Git-commit: 83c6620bae3f14adb2430fdcc367980fe3b7bee2
+References: bnc#871134
+Signed-off-by: Egbert Eich <eich@suse.com>
+
+This is the initial attempt at porting the DP501 code from the userspace
+driver,
+
+the firmware file is in
+http://people.freedesktop.org/~airlied/ast_dp501_fw.bin
+
+this should really be exposed as another encoder/connector that is cloneable
+
+v0.2:
+init 3rd tx properly,
+add scratch reduction of VRAM size
+backup firmware properly.
+
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+---
+ drivers/gpu/drm/ast/Makefile    |    4 
+ drivers/gpu/drm/ast/ast_dp501.c |  411 ++++++++++++++++++++++++++++++++++++++++
+ drivers/gpu/drm/ast/ast_drv.h   |   22 ++
+ drivers/gpu/drm/ast/ast_main.c  |   53 ++++-
+ drivers/gpu/drm/ast/ast_mode.c  |   22 +-
+ drivers/gpu/drm/ast/ast_post.c  |    6 
+ 6 files changed, 507 insertions(+), 11 deletions(-)
+
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/ast/Makefile
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/ast/Makefile
+@@ -4,6 +4,6 @@
+ 
+ ccflags-y := -Iinclude/drm
+ 
+-ast-y := ast_drv.o ast_main.o ast_mode.o ast_fb.o ast_ttm.o ast_post.o
++ast-y := ast_drv.o ast_main.o ast_mode.o ast_fb.o ast_ttm.o ast_post.o ast_dp501.o
+ 
+-obj-$(CONFIG_DRM_AST) := ast.o
+\ No newline at end of file
++obj-$(CONFIG_DRM_AST) := ast.o
+--- /dev/null
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/ast/ast_dp501.c
+@@ -0,0 +1,411 @@
++
++#include <linux/firmware.h>
++#include <drm/drmP.h>
++#include "ast_drv.h"
++MODULE_FIRMWARE("ast_dp501_fw.bin");
++
++int ast_load_dp501_microcode(struct drm_device *dev)
++{
++	struct ast_private *ast = dev->dev_private;
++	static char *fw_name = "ast_dp501_fw.bin";
++	int err;
++	err = request_firmware(&ast->dp501_fw, fw_name, dev->dev);
++	if (err)
++		return err;
++
++	return 0;
++}
++
++static void send_ack(struct ast_private *ast)
++{
++	u8 sendack;
++	sendack = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0x9b, 0xff);
++	sendack |= 0x80;
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0x9b, 0x00, sendack);
++}
++
++static void send_nack(struct ast_private *ast)
++{
++	u8 sendack;
++	sendack = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0x9b, 0xff);
++	sendack &= ~0x80;
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0x9b, 0x00, sendack);
++}
++
++static bool wait_ack(struct ast_private *ast)
++{
++	u8 waitack;
++	u32 retry = 0;
++	do {
++		waitack = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xd2, 0xff);
++		waitack &= 0x80;
++		udelay(100);
++	} while ((!waitack) && (retry++ < 1000));
++
++	if (retry < 1000)
++		return true;
++	else
++		return false;
++}
++
++static bool wait_nack(struct ast_private *ast)
++{
++	u8 waitack;
++	u32 retry = 0;
++	do {
++		waitack = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xd2, 0xff);
++		waitack &= 0x80;
++		udelay(100);
++	} while ((waitack) && (retry++ < 1000));
++
++	if (retry < 1000)
++		return true;
++	else
++		return false;
++}
++
++static void set_cmd_trigger(struct ast_private *ast)
++{
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0x9b, ~0x40, 0x40);
++}
++
++static void clear_cmd_trigger(struct ast_private *ast)
++{
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0x9b, ~0x40, 0x00);
++}
++
++#if 0
++static bool wait_fw_ready(struct ast_private *ast)
++{
++	u8 waitready;
++	u32 retry = 0;
++	do {
++		waitready = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xd2, 0xff);
++		waitready &= 0x40;
++		udelay(100);
++	} while ((!waitready) && (retry++ < 1000));
++
++	if (retry < 1000)
++		return true;
++	else
++		return false;
++}
++#endif
++
++static bool ast_write_cmd(struct drm_device *dev, u8 data)
++{
++	struct ast_private *ast = dev->dev_private;
++	int retry = 0;
++	if (wait_nack(ast)) {
++		send_nack(ast);
++		ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0x9a, 0x00, data);
++		send_ack(ast);
++		set_cmd_trigger(ast);
++		do {
++			if (wait_ack(ast)) {
++				clear_cmd_trigger(ast);
++				send_nack(ast);
++				return true;
++			}
++		} while (retry++ < 100);
++	}
++	clear_cmd_trigger(ast);
++	send_nack(ast);
++	return false;
++}
++
++static bool ast_write_data(struct drm_device *dev, u8 data)
++{
++	struct ast_private *ast = dev->dev_private;
++
++	if (wait_nack(ast)) {
++		send_nack(ast);
++		ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0x9a, 0x00, data);
++		send_ack(ast);
++		if (wait_ack(ast)) {
++			send_nack(ast);
++			return true;
++		}
++	}
++	send_nack(ast);
++	return false;
++}
++
++#if 0
++static bool ast_read_data(struct drm_device *dev, u8 *data)
++{
++	struct ast_private *ast = dev->dev_private;
++	u8 tmp;
++
++	*data = 0;
++
++	if (wait_ack(ast) == false)
++		return false;
++	tmp = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xd3, 0xff);
++	*data = tmp;
++	if (wait_nack(ast) == false) {
++		send_nack(ast);
++		return false;
++	}
++	send_nack(ast);
++	return true;
++}
++
++static void clear_cmd(struct ast_private *ast)
++{
++	send_nack(ast);
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0x9a, 0x00, 0x00);
++}
++#endif
++
++void ast_set_dp501_video_output(struct drm_device *dev, u8 mode)
++{
++	ast_write_cmd(dev, 0x40);
++	ast_write_data(dev, mode);
++
++	msleep(10);
++}
++
++static u32 get_fw_base(struct ast_private *ast)
++{
++	return ast_mindwm(ast, 0x1e6e2104) & 0x7fffffff;
++}
++
++bool ast_backup_fw(struct drm_device *dev, u8 *addr, u32 size)
++{
++	struct ast_private *ast = dev->dev_private;
++	u32 i, data;
++	u32 boot_address;
++
++	data = ast_mindwm(ast, 0x1e6e2100) & 0x01;
++	if (data) {
++		boot_address = get_fw_base(ast);
++		for (i = 0; i < size; i += 4) {
++			*(u32 *)(addr + i) = ast_mindwm(ast, boot_address + i);
++		}
++		return true;
++	}
++	return false;
++}
++
++bool ast_launch_m68k(struct drm_device *dev)
++{
++	struct ast_private *ast = dev->dev_private;
++	u32 i, data, len = 0;
++	u32 boot_address;
++	u8 *fw_addr = NULL;
++	u8 jreg;
++
++	data = ast_mindwm(ast, 0x1e6e2100) & 0x01;
++	if (!data) {
++
++		if (ast->dp501_fw_addr) {
++			fw_addr = ast->dp501_fw_addr;
++			len = 32*1024;
++		} else if (ast->dp501_fw) {
++			fw_addr = (u8 *)ast->dp501_fw->data;
++			len = ast->dp501_fw->size;
++		}
++		/* Get BootAddress */
++		ast_moutdwm(ast, 0x1e6e2000, 0x1688a8a8);
++		data = ast_mindwm(ast, 0x1e6e0004);
++		switch (data & 0x03) {
++		case 0:
++			boot_address = 0x44000000;
++			break;
++		default:
++		case 1:
++			boot_address = 0x48000000;
++			break;
++		case 2:
++			boot_address = 0x50000000;
++			break;
++		case 3:
++			boot_address = 0x60000000;
++			break;
++		}
++		boot_address -= 0x200000; /* -2MB */
++
++		/* copy image to buffer */
++		for (i = 0; i < len; i += 4) {
++			data = *(u32 *)(fw_addr + i);
++			ast_moutdwm(ast, boot_address + i, data);
++		}
++
++		/* Init SCU */
++		ast_moutdwm(ast, 0x1e6e2000, 0x1688a8a8);
++
++		/* Launch FW */
++		ast_moutdwm(ast, 0x1e6e2104, 0x80000000 + boot_address);
++		ast_moutdwm(ast, 0x1e6e2100, 1);
++
++		/* Update Scratch */
++		data = ast_mindwm(ast, 0x1e6e2040) & 0xfffff1ff;		/* D[11:9] = 100b: UEFI handling */
++		data |= 0x800;
++		ast_moutdwm(ast, 0x1e6e2040, data);
++
++		jreg = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0x99, 0xfc); /* D[1:0]: Reserved Video Buffer */
++		jreg |= 0x02;
++		ast_set_index_reg(ast, AST_IO_CRTC_PORT, 0x99, jreg);
++	}
++	return true;
++}
++
++u8 ast_get_dp501_max_clk(struct drm_device *dev)
++{
++	struct ast_private *ast = dev->dev_private;
++	u32 boot_address, offset, data;
++	u8 linkcap[4], linkrate, linklanes, maxclk = 0xff;
++
++	boot_address = get_fw_base(ast);
++
++	/* validate FW version */
++	offset = 0xf000;
++	data = ast_mindwm(ast, boot_address + offset);
++	if ((data & 0xf0) != 0x10) /* version: 1x */
++		return maxclk;
++
++	/* Read Link Capability */
++	offset  = 0xf014;
++	*(u32 *)linkcap = ast_mindwm(ast, boot_address + offset);
++	if (linkcap[2] == 0) {
++		linkrate = linkcap[0];
++		linklanes = linkcap[1];
++		data = (linkrate == 0x0a) ? (90 * linklanes) : (54 * linklanes);
++		if (data > 0xff)
++			data = 0xff;
++		maxclk = (u8)data;
++	}
++	return maxclk;
++}
++
++bool ast_dp501_read_edid(struct drm_device *dev, u8 *ediddata)
++{
++	struct ast_private *ast = dev->dev_private;
++	u32 i, boot_address, offset, data;
++
++	boot_address = get_fw_base(ast);
++
++	/* validate FW version */
++	offset = 0xf000;
++	data = ast_mindwm(ast, boot_address + offset);
++	if ((data & 0xf0) != 0x10)
++		return false;
++
++	/* validate PnP Monitor */
++	offset = 0xf010;
++	data = ast_mindwm(ast, boot_address + offset);
++	if (!(data & 0x01))
++		return false;
++
++	/* Read EDID */
++	offset = 0xf020;
++	for (i = 0; i < 128; i+=4) {
++		data = ast_mindwm(ast, boot_address + offset + i);
++		*(u32 *)(ediddata + i) = data;
++	}
++
++	return true;
++}
++
++static bool ast_init_dvo(struct drm_device *dev)
++{
++	struct ast_private *ast = dev->dev_private;
++	u8 jreg;
++	u32 data;
++	ast_write32(ast, 0xf004, 0x1e6e0000);
++	ast_write32(ast, 0xf000, 0x1);
++	ast_write32(ast, 0x12000, 0x1688a8a8);
++
++	jreg = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xd0, 0xff);
++	if (!(jreg & 0x80)) {
++		/* Init SCU DVO Settings */
++		data = ast_read32(ast, 0x12008);
++		/* delay phase */
++		data &= 0xfffff8ff;
++		data |= 0x00000500;
++		ast_write32(ast, 0x12008, data);
++
++		if (ast->chip == AST2300) {
++			data = ast_read32(ast, 0x12084);
++			/* multi-pins for DVO single-edge */
++			data |= 0xfffe0000;
++			ast_write32(ast, 0x12084, data);
++
++			data = ast_read32(ast, 0x12088);
++			/* multi-pins for DVO single-edge */
++			data |= 0x000fffff;
++			ast_write32(ast, 0x12088, data);
++
++			data = ast_read32(ast, 0x12090);
++			/* multi-pins for DVO single-edge */
++			data &= 0xffffffcf;
++			data |= 0x00000020;
++			ast_write32(ast, 0x12090, data);
++		} else { /* AST2400 */
++			data = ast_read32(ast, 0x12088);
++			/* multi-pins for DVO single-edge */
++			data |= 0x30000000;
++			ast_write32(ast, 0x12088, data);
++
++			data = ast_read32(ast, 0x1208c);
++			/* multi-pins for DVO single-edge */
++			data |= 0x000000cf;
++			ast_write32(ast, 0x1208c, data);
++
++			data = ast_read32(ast, 0x120a4);
++			/* multi-pins for DVO single-edge */
++			data |= 0xffff0000;
++			ast_write32(ast, 0x120a4, data);
++
++			data = ast_read32(ast, 0x120a8);
++			/* multi-pins for DVO single-edge */
++			data |= 0x0000000f;
++			ast_write32(ast, 0x120a8, data);
++
++			data = ast_read32(ast, 0x12094);
++			/* multi-pins for DVO single-edge */
++			data |= 0x00000002;
++			ast_write32(ast, 0x12094, data);
++		}
++	}
++
++	/* Force to DVO */
++	data = ast_read32(ast, 0x1202c);
++	data &= 0xfffbffff;
++	ast_write32(ast, 0x1202c, data);
++
++	/* Init VGA DVO Settings */
++	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xa3, 0xcf, 0x80);
++	return true;
++}
++
++void ast_init_3rdtx(struct drm_device *dev)
++{
++	struct ast_private *ast = dev->dev_private;
++	u8 jreg;
++	u32 data;
++	if (ast->chip == AST2300 || ast->chip == AST2400) {
++		jreg = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xd1, 0xff);
++		switch (jreg & 0x0e) {
++		case 0x04:
++			ast_init_dvo(dev);
++			break;
++		case 0x08:
++			ast_launch_m68k(dev);
++			break;
++		case 0x0c:
++			ast_init_dvo(dev);
++			break;
++		default:
++			if (ast->tx_chip_type == AST_TX_SIL164)
++				ast_init_dvo(dev);
++			else {
++				ast_write32(ast, 0x12000, 0x1688a8a8);
++				data = ast_read32(ast, 0x1202c);
++				data &= 0xfffcffff;
++				ast_write32(ast, 0, data);
++			}
++		}
++	}
++}
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/ast/ast_drv.h
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/ast/ast_drv.h
+@@ -65,6 +65,13 @@ enum ast_chip {
+ 	AST1180,
+ };
+ 
++enum ast_tx_chip {
++	AST_TX_NONE,
++	AST_TX_SIL164,
++	AST_TX_ITE66121,
++	AST_TX_DP501,
++};
++
+ #define AST_DRAM_512Mx16 0
+ #define AST_DRAM_1Gx16   1
+ #define AST_DRAM_512Mx32 2
+@@ -102,6 +109,11 @@ struct ast_private {
+ 	struct ttm_bo_kmap_obj cache_kmap;
+ 	int next_cursor;
+ 	bool support_wide_screen;
++
++	enum ast_tx_chip tx_chip_type;
++	u8 dp501_maxclk;
++	u8 *dp501_fw_addr;
++	const struct firmware *dp501_fw;	/* dp501 fw */
+ };
+ 
+ int ast_driver_load(struct drm_device *dev, unsigned long flags);
+@@ -373,4 +385,14 @@ int ast_mmap(struct file *filp, struct v
+ 
+ /* ast post */
+ void ast_post_gpu(struct drm_device *dev);
++u32 ast_mindwm(struct ast_private *ast, u32 r);
++void ast_moutdwm(struct ast_private *ast, u32 r, u32 v);
++/* ast dp501 */
++int ast_load_dp501_microcode(struct drm_device *dev);
++void ast_set_dp501_video_output(struct drm_device *dev, u8 mode);
++bool ast_launch_m68k(struct drm_device *dev);
++bool ast_backup_fw(struct drm_device *dev, u8 *addr, u32 size);
++bool ast_dp501_read_edid(struct drm_device *dev, u8 *ediddata);
++u8 ast_get_dp501_max_clk(struct drm_device *dev);
++void ast_init_3rdtx(struct drm_device *dev);
+ #endif
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/ast/ast_main.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/ast/ast_main.c
+@@ -138,6 +138,31 @@ static int ast_detect_chip(struct drm_de
+ 		break;
+ 	}
+ 
++	ast->tx_chip_type = AST_TX_NONE;
++	jreg = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xa3, 0xff);
++	if (jreg & 0x80)
++		ast->tx_chip_type = AST_TX_SIL164;
++	if ((ast->chip == AST2300) || (ast->chip == AST2400)) {
++		jreg = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xd1, 0xff);
++		switch (jreg) {
++		case 0x04:
++			ast->tx_chip_type = AST_TX_SIL164;
++			break;
++		case 0x08:
++			ast->dp501_fw_addr = kzalloc(32*1024, GFP_KERNEL);
++			if (ast->dp501_fw_addr) {
++				/* backup firmware */
++				if (ast_backup_fw(dev, ast->dp501_fw_addr, 32*1024)) {
++					kfree(ast->dp501_fw_addr);
++					ast->dp501_fw_addr = NULL;
++				}
++			}
++			/* fallthrough */
++		case 0x0c:
++			ast->tx_chip_type = AST_TX_DP501;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -339,16 +364,32 @@ static u32 ast_get_vram_info(struct drm_
+ 	struct ast_private *ast = dev->dev_private;
+ 	u8 jreg;
+ 
++	u32 vram_size;
+ 	ast_open_key(ast);
+ 
++	vram_size = AST_VIDMEM_DEFAULT_SIZE;
+ 	jreg = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xaa, 0xff);
+ 	switch (jreg & 3) {
+-	case 0: return AST_VIDMEM_SIZE_8M;
+-	case 1: return AST_VIDMEM_SIZE_16M;
+-	case 2: return AST_VIDMEM_SIZE_32M;
+-	case 3: return AST_VIDMEM_SIZE_64M;
++	case 0: vram_size = AST_VIDMEM_SIZE_8M; break;
++	case 1: vram_size = AST_VIDMEM_SIZE_16M; break;
++	case 2: vram_size = AST_VIDMEM_SIZE_32M; break;
++	case 3: vram_size = AST_VIDMEM_SIZE_64M; break;
+ 	}
+-	return AST_VIDMEM_DEFAULT_SIZE;
++
++	jreg = ast_get_index_reg_mask(ast, AST_IO_CRTC_PORT, 0x99, 0xff);
++	switch (jreg & 0x03) {
++	case 1:
++		vram_size -= 0x100000;
++		break;
++	case 2:
++		vram_size -= 0x200000;
++		break;
++	case 3:
++		vram_size -= 0x400000;
++		break;
++	}
++
++	return vram_size;
+ }
+ 
+ int ast_driver_load(struct drm_device *dev, unsigned long flags)
+@@ -425,7 +466,9 @@ out_free:
+ int ast_driver_unload(struct drm_device *dev)
+ {
+ 	struct ast_private *ast = dev->dev_private;
++	u32 jreg;
+ 
++	kfree(ast->dp501_fw_addr);
+ 	ast_mode_fini(dev);
+ 	ast_fbdev_fini(dev);
+ 	drm_mode_config_cleanup(dev);
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/ast/ast_mode.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/ast/ast_mode.c
+@@ -485,9 +485,13 @@ static void ast_crtc_dpms(struct drm_crt
+ 	case DRM_MODE_DPMS_STANDBY:
+ 	case DRM_MODE_DPMS_SUSPEND:
+ 		ast_set_index_reg_mask(ast, AST_IO_SEQ_PORT, 0x1, 0xdf, 0);
++		if (ast->tx_chip_type == AST_TX_DP501)
++			ast_set_dp501_video_output(crtc->dev, 1);
+ 		ast_crtc_load_lut(crtc);
+ 		break;
+ 	case DRM_MODE_DPMS_OFF:
++		if (ast->tx_chip_type == AST_TX_DP501)
++			ast_set_dp501_video_output(crtc->dev, 0);
+ 		ast_set_index_reg_mask(ast, AST_IO_SEQ_PORT, 0x1, 0xdf, 0x20);
+ 		break;
+ 	}
+@@ -780,10 +784,24 @@ int ast_encoder_init(struct drm_device *
+ static int ast_get_modes(struct drm_connector *connector)
+ {
+ 	struct ast_connector *ast_connector = to_ast_connector(connector);
++	struct ast_private *ast = connector->dev->dev_private;
+ 	struct edid *edid;
+ 	int ret;
+-
+-	edid = drm_get_edid(connector, &ast_connector->i2c->adapter);
++	bool flags = false;
++	if (ast->tx_chip_type == AST_TX_DP501) {
++		ast->dp501_maxclk = 0xff;
++		edid = kmalloc(128, GFP_KERNEL);
++		if (!edid)
++			return -ENOMEM;
++
++		flags = ast_dp501_read_edid(connector->dev, (u8 *)edid);
++		if (flags)
++			ast->dp501_maxclk = ast_get_dp501_max_clk(connector->dev);
++		else
++			kfree(edid);
++	}
++	if (!flags)
++		edid = drm_get_edid(connector, &ast_connector->i2c->adapter);
+ 	if (edid) {
+ 		drm_mode_connector_update_edid_property(&ast_connector->base, edid);
+ 		ret = drm_add_edid_modes(connector, edid);
+--- linux-3.0-SLE11-SP3.orig/drivers/gpu/drm/ast/ast_post.c
++++ linux-3.0-SLE11-SP3/drivers/gpu/drm/ast/ast_post.c
+@@ -107,7 +107,7 @@ ast_set_def_ext_reg(struct drm_device *d
+ 	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xb6, 0xff, reg);
+ }
+ 
+-static u32 ast_mindwm(struct ast_private *ast, u32 r)
++u32 ast_mindwm(struct ast_private *ast, u32 r)
+ {
+ 	uint32_t data;
+ 
+@@ -120,7 +120,7 @@ static u32 ast_mindwm(struct ast_private
+ 	return ast_read32(ast, 0x10000 + (r & 0x0000ffff));
+ }
+ 
+-static void ast_moutdwm(struct ast_private *ast, u32 r, u32 v)
++void ast_moutdwm(struct ast_private *ast, u32 r, u32 v)
+ {
+ 	uint32_t data;
+ 	ast_write32(ast, 0xf004, r & 0xffff0000);
+@@ -378,6 +378,8 @@ void ast_post_gpu(struct drm_device *dev
+ 		ast_init_dram_2300(dev);
+ 	else
+ 		ast_init_dram_reg(dev);
++
++	ast_init_3rdtx(dev);
+ }
+ 
+ /* AST 2300 DRAM settings */
