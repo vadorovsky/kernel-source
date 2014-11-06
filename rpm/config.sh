@@ -3,5 +3,8 @@ SRCVERSION=3.0
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
 # buildservice projects to build the kernel against
+#
+# There is no SP4 project in OBS yet
+#
 OBS_PROJECT=SUSE:SLE-11:SP3
-IBS_PROJECT=SUSE:SLE-11-SP3:GA
+IBS_PROJECT=SUSE:SLE-11-SP4:GA
