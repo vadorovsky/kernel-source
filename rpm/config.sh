@@ -3,5 +3,5 @@ SRCVERSION=3.0
 # variant of the kernel-source package, either empty or "-rt"
 VARIANT=
 # buildservice projects to build the kernel against
-OBS_PROJECT=SUSE:SLE-11:SP3
-IBS_PROJECT=SUSE:SLE-11-SP3:GA
+OBS_PROJECT=SUSE:SLE-11:SP3:Update
+IBS_PROJECT=SUSE:SLE-11-SP3:Update
