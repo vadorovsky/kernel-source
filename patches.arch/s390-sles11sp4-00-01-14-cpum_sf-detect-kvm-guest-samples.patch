@@ -1,0 +1,144 @@
+From: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+Subject: s390/cpum_sf: Detect KVM guest samples
+Patch-mainline: v3.14-rc1
+Git-commit: 443e802bab16916f9a51a34f2213f4dee6e8762c
+References: bnc#900899, FATE#317698, LTC#110510
+
+Summary:     s390/perf: add support for the CPU-measurement sampling facility
+Description: Use the CPU-measurement sampling facility to obtain performance
+             data for Linux in LPAR mode.  You can use the perf tool on Linux
+             to access the hardware sample data of the CPU-measurement
+             sampling facility.
+
+Upstream-Description:
+
+             s390/cpum_sf: Detect KVM guest samples
+
+             The host-program-parameter (hpp) value of basic sample-data-entries designates
+             a SIE control block that is set by the LPP instruction in sie64a().
+             Non-zero values indicate guest samples, a value of zero indicates a host sample.
+
+             For perf samples, host and guest samples are distinguished using particular
+             PERF_MISC_* flags.  The perf layer calls perf_misc_flags() to set the flags
+             based on the pt_regs content.  For each sample-data-entry, the cpum_sf PMU
+             creates a pt_regs structure with the sample-data information.  An additional
+             flag structure is added to easily distinguish between host and guest samples.
+
+             Signed-off-by: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+             Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+
+Signed-off-by: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ arch/s390/include/asm/perf_event.h |    6 ++++++
+ arch/s390/kernel/perf_cpum_sf.c    |   24 ++++++++++++++++++++++++
+ arch/s390/kernel/perf_event.c      |   25 ++++++++++++++++++++++++-
+ 3 files changed, 54 insertions(+), 1 deletion(-)
+
+--- a/arch/s390/include/asm/perf_event.h
++++ b/arch/s390/include/asm/perf_event.h
+@@ -25,6 +25,12 @@ extern unsigned long perf_instruction_po
+ extern unsigned long perf_misc_flags(struct pt_regs *regs);
+ #define perf_misc_flags(regs) perf_misc_flags(regs)
+ 
++/* Perf pt_regs extension for sample-data-entry indicators */
++struct perf_sf_sde_regs {
++	unsigned char in_guest:1;	  /* guest sample */
++	unsigned long reserved:63;	  /* reserved */
++};
++
+ /* Perf PMU definitions for the counter facility */
+ #define PERF_CPUM_CF_MAX_CTR		256
+ 
+--- a/arch/s390/kernel/perf_cpum_sf.c
++++ b/arch/s390/kernel/perf_cpum_sf.c
+@@ -839,6 +839,7 @@ static int perf_push_sample(struct perf_
+ {
+ 	int overflow;
+ 	struct pt_regs regs;
++	struct perf_sf_sde_regs *sde_regs;
+ 	struct perf_sample_data data;
+ 
+ 	/* Skip samples that are invalid or for which the instruction address
+@@ -849,7 +850,20 @@ static int perf_push_sample(struct perf_
+ 
+ 	perf_sample_data_init(&data, 0, event->hw.last_period);
+ 
++	/* Setup pt_regs to look like an CPU-measurement external interrupt
++	 * using the Program Request Alert code.  The regs.int_parm_long
++	 * field which is unused contains additional sample-data-entry related
++	 * indicators.
++	 *
++	 * Note on the backport: Instead of int_code/int_parm, other fields
++	 * in the pt_regs structure are used to store the perf_sf_sde_regs
++	 * data.
++	 */
+ 	memset(&regs, 0, sizeof(regs));
++	regs.svcnr = (unsigned short) -1;
++	regs.ilc = 0x1407;
++	sde_regs = (struct perf_sf_sde_regs *) &regs.args[0];
++
+ 	regs.psw.addr = sample->ia;
+ 	if (sample->T)
+ 		regs.psw.mask |= PSW_MASK_DAT;
+@@ -872,6 +886,16 @@ static int perf_push_sample(struct perf_
+ 		break;
+ 	}
+ 
++	/* The host-program-parameter (hpp) contains the sie control
++	 * block that is set by sie64a() in entry64.S.	Check if hpp
++	 * refers to a valid control block and set sde_regs flags
++	 * accordingly.  This would allow to use hpp values for other
++	 * purposes too.
++	 * For now, simply use a non-zero value as guest indicator.
++	 */
++	if (sample->hpp)
++		sde_regs->in_guest = 1;
++
+ 	overflow = 0;
+ 	if (perf_event_overflow(event, &data, &regs)) {
+ 		overflow = 1;
+--- a/arch/s390/kernel/perf_event.c
++++ b/arch/s390/kernel/perf_event.c
+@@ -1,7 +1,7 @@
+ /*
+  * Performance event support for s390x
+  *
+- *  Copyright IBM Corp. 2012
++ *  Copyright IBM Corp. 2012, 2013
+  *  Author(s): Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+  *
+  * This program is free software; you can redistribute it and/or modify
+@@ -87,8 +87,31 @@ static unsigned long perf_misc_guest_fla
+ 					: PERF_RECORD_MISC_GUEST_KERNEL;
+ }
+ 
++static unsigned long perf_misc_flags_sf(struct pt_regs *regs)
++{
++	struct perf_sf_sde_regs *sde_regs;
++	unsigned long flags;
++
++	sde_regs = (struct perf_sf_sde_regs *) &regs->args[0];
++	if (sde_regs->in_guest)
++		flags = user_mode(regs) ? PERF_RECORD_MISC_GUEST_USER
++					: PERF_RECORD_MISC_GUEST_KERNEL;
++	else
++		flags = user_mode(regs) ? PERF_RECORD_MISC_USER
++					: PERF_RECORD_MISC_KERNEL;
++	return flags;
++}
++
+ unsigned long perf_misc_flags(struct pt_regs *regs)
+ {
++	/* Check if the cpum_sf PMU has created the pt_regs structure.
++	 * In this case, perf misc flags can be easily extracted.  Otherwise,
++	 * do regular checks on the pt_regs content.
++	 */
++	if (regs->svcnr == (unsigned short)-1 && regs->ilc == 0x1407)
++		if (!regs->gprs[15])
++			return perf_misc_flags_sf(regs);
++
+ 	if (is_in_guest(regs))
+ 		return perf_misc_guest_flags(regs);
+ 
