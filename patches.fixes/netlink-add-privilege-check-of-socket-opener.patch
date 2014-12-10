@@ -1,0 +1,164 @@
+From: Jiri Bohac <jbohac@suse.cz>
+Subject: netlink: add privilege check of socket opener
+References: bsc#875051, CVE-2014-0181
+Patch-mainline: v3.15
+Git-commit: 2d7a85f4b06e9c27ff629f07a524c48074f07f81
+
+Netlink only checks the privileges of the process writing to the socket, not
+the privileges of the process opening the socket. This can be misused by
+- an unprivileged process opening a netlink socket
+- passing the socket file descriptor as standard output/error to a suid binary
+  tricked to output a netlink message
+
+This patch is an aggregate of a few upstream patches, mainly:
+
+90f62cf30a78721641e08737bda787552428061e - net: Use netlink_ns_capable to
+verify the permisions of netlink messages
+
+2d7a85f4b06e9c27ff629f07a524c48074f07f81 - netlink: Only check file credentials
+for implicit destinations
+
+aa4cf9452f469f16cea8c96283b641b4576d4a7b -  net: Add variants of capable for
+use on netlink messages
+
+These patches don't appply to v3.0, where all the checks are performed by
+cap_netlink_recv(). This patch only cherry-picks te needed parts.
+
+
+diff --git a/include/linux/netlink.h b/include/linux/netlink.h
+index fdd0188..0edb672 100644
+--- a/include/linux/netlink.h
++++ b/include/linux/netlink.h
+@@ -157,18 +157,31 @@ static inline struct nlmsghdr *nlmsg_hdr(const struct sk_buff *skb)
+ 	return (struct nlmsghdr *)skb->data;
+ }
+ 
++enum netlink_skb_flags {
++	NETLINK_SKB_DST		= 0x8,  /* Dst set in sendto or sendmsg */
++};
++
+ struct netlink_skb_parms {
+ 	struct ucred		creds;		/* Skb credentials	*/
+ 	__u32			pid;
+ 	__u32			dst_group;
+ };
+ 
++/* extension of netlink_skb_parms avoiding KABI breakage */
++struct netlink_skb_parms_long {
++	struct netlink_skb_parms	parms;
++	__u32				flags;
++	struct sock			*sk;
++};
++
+ #define NETLINK_CB(skb)		(*(struct netlink_skb_parms*)&((skb)->cb))
++#define NETLINK_CB_LONG(skb)	(*(struct netlink_skb_parms_long*)&((skb)->cb))
+ #define NETLINK_CREDS(skb)	(&NETLINK_CB((skb)).creds)
+ 
+ 
+ extern void netlink_table_grab(void);
+ extern void netlink_table_ungrab(void);
++extern int netlink_opener_capable(struct sk_buff *skb, int cap);
+ 
+ extern struct sock *netlink_kernel_create(struct net *net,
+ 					  int unit,unsigned int groups,
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index 3529fbe..ff60bcb 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -899,7 +899,7 @@ static inline void netlink_rcv_wake(struct sock *sk)
+ 		wake_up_interruptible(&nlk->wait);
+ }
+ 
+-static inline int netlink_unicast_kernel(struct sock *sk, struct sk_buff *skb)
++static inline int netlink_unicast_kernel(struct sock *sk, struct sk_buff *skb, struct sock* ssk)
+ {
+ 	int ret;
+ 	struct netlink_sock *nlk = nlk_sk(sk);
+@@ -907,6 +907,7 @@ static inline int netlink_unicast_kernel(struct sock *sk, struct sk_buff *skb)
+ 	ret = -ECONNREFUSED;
+ 	if (nlk->netlink_rcv != NULL) {
+ 		ret = skb->len;
++		NETLINK_CB_LONG(skb).sk = ssk;
+ 		skb_set_owner_r(skb, sk);
+ 		nlk->netlink_rcv(skb);
+ 	}
+@@ -932,7 +933,7 @@ retry:
+ 		return PTR_ERR(sk);
+ 	}
+ 	if (netlink_is_kernel(sk))
+-		return netlink_unicast_kernel(sk, skb);
++		return netlink_unicast_kernel(sk, skb, ssk);
+ 
+ 	if (sk_filter(sk, skb)) {
+ 		err = skb->len;
+@@ -951,6 +952,19 @@ retry:
+ }
+ EXPORT_SYMBOL(netlink_unicast);
+ 
++int netlink_opener_capable(struct sk_buff *skb, int cap)
++{
++	struct netlink_skb_parms_long *nspl = &NETLINK_CB_LONG(skb);
++
++	if (((nspl->flags & NETLINK_SKB_DST) == 0) &&
++	    nspl->sk &&
++	    nspl->sk->sk_socket &&
++	    nspl->sk->sk_socket->file &&
++	    security_capable(&init_user_ns, nspl->sk->sk_socket->file->f_cred, cap) != 0)
++			return -EPERM;
++	return 0;
++}
++
+ int netlink_has_listeners(struct sock *sk, unsigned int group)
+ {
+ 	int res = 0;
+@@ -1337,6 +1351,8 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
+ 	struct sk_buff *skb;
+ 	int err;
+ 	struct scm_cookie scm;
++	u32 netlink_skb_flags = 0;
++
+ 
+ 	if (msg->msg_flags&MSG_OOB)
+ 		return -EOPNOTSUPP;
+@@ -1359,6 +1375,7 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
+ 		if ((dst_group || dst_pid) &&
+ 		    !netlink_capable(sock, NL_NONROOT_SEND))
+ 			goto out;
++		netlink_skb_flags |= NETLINK_SKB_DST;
+ 	} else {
+ 		dst_pid = nlk->dst_pid;
+ 		dst_group = nlk->dst_group;
+@@ -1381,6 +1398,8 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
+ 	NETLINK_CB(skb).pid	= nlk->pid;
+ 	NETLINK_CB(skb).dst_group = dst_group;
+ 	memcpy(NETLINK_CREDS(skb), &siocb->scm->creds, sizeof(struct ucred));
++	NETLINK_CB_LONG(skb).flags = netlink_skb_flags;
++
+ 
+ 	err = -EFAULT;
+ 	if (memcpy_fromiovec(skb_put(skb, len), msg->msg_iov, len)) {
+@@ -2135,6 +2154,7 @@ static int __init netlink_proto_init(void)
+ 		goto out;
+ 
+ 	BUILD_BUG_ON(sizeof(struct netlink_skb_parms) > sizeof(dummy_skb->cb));
++	BUILD_BUG_ON(sizeof(struct netlink_skb_parms_long) > sizeof(dummy_skb->cb));
+ 
+ 	nl_table = kcalloc(MAX_LINKS, sizeof(*nl_table), GFP_KERNEL);
+ 	if (!nl_table)
+diff --git a/security/commoncap.c b/security/commoncap.c
+index 5de54b8..3f6f1cdc 100644
+--- a/security/commoncap.c
++++ b/security/commoncap.c
+@@ -59,6 +59,12 @@ int cap_netlink_send(struct sock *sk, struct sk_buff *skb)
+ 
+ int cap_netlink_recv(struct sk_buff *skb, int cap)
+ {
++	int ocap;
++
++	ocap = netlink_opener_capable(skb, cap);
++	if (ocap)
++		return ocap;
++
+ 	if (!cap_raised(current_cap(), cap))
+ 		return -EPERM;
+ 	return 0;
