@@ -1,0 +1,206 @@
+From: Erik Hugne <erik.hugne@ericsson.com>
+Subject: [PATCH 1/3] tipc: fix OOS packet delivery
+References: bsc#907063
+Patch-mainline: not yet
+Acked-by: Jiri Bohac <jbohac@suse.cz>
+
+A new skb receive queue is added to the node struct. Whenever
+we receive multicast packets on the TIPC link/bclink, the packets
+are enqueued on this _before_ the node lock is released. This
+applies for both normal and bundled traffic. We then invoke the
+tipc_port_process_rcvd() function which will grab the node receive
+queue lock and deliver messages one-by-one to the port layer until
+it is empty. This will eliminate the packet delivery race condition
+between the link and port layer.
+
+Signed-off-by: Erik Hugne <erik.hugne@ericsson.com>
+---
+ net/tipc/bcast.c | 14 +++++++++-----
+ net/tipc/link.c  | 10 ++++++----
+ net/tipc/link.h  |  2 +-
+ net/tipc/node.c  |  1 +
+ net/tipc/node.h  |  1 +
+ net/tipc/port.c  | 32 ++++++++++++++++++++++++++++++++
+ net/tipc/port.h  |  2 ++
+ 7 files changed, 52 insertions(+), 10 deletions(-)
+
+diff --git a/net/tipc/bcast.c b/net/tipc/bcast.c
+index 74b20ce..34ffbc2 100644
+--- a/net/tipc/bcast.c
++++ b/net/tipc/bcast.c
+@@ -466,19 +466,23 @@ receive:
+ 			spin_lock_bh(&bc_lock);
+ 			bclink_accept_pkt(node, seqno);
+ 			spin_unlock_bh(&bc_lock);
++			if (likely(msg_mcast(msg))) {
++				skb_queue_tail(&node->rq, buf);
++				tipc_node_unlock(node);
++				tipc_port_process_rcvd(&node->rq);
++			} else {
+ 			tipc_node_unlock(node);
+-			if (likely(msg_mcast(msg)))
+-				tipc_port_recv_mcast(buf, NULL);
+-			else
+-				kfree_skb(buf);
++			kfree_skb(buf);
++			}
+ 		} else if (msg_user(msg) == MSG_BUNDLER) {
+ 			spin_lock_bh(&bc_lock);
+ 			bclink_accept_pkt(node, seqno);
+ 			bcl->stats.recv_bundles++;
+ 			bcl->stats.recv_bundled += msg_msgcnt(msg);
+ 			spin_unlock_bh(&bc_lock);
++			tipc_link_recv_bundle(buf, &node->rq);
+ 			tipc_node_unlock(node);
+-			tipc_link_recv_bundle(buf);
++			tipc_port_process_rcvd(&node->rq);
+ 		} else if (msg_user(msg) == MSG_FRAGMENTER) {
+ 			int ret;
+ 			ret = tipc_link_recv_fragment(&node->bclink.reasm_head,
+diff --git a/net/tipc/link.c b/net/tipc/link.c
+index b1590a5..8a39b91 100644
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@ -1701,8 +1701,9 @@ protocol_check:
+ 									  head);
+ deliver:
+ 				if (likely(msg_isdata(msg))) {
++					skb_queue_tail(&n_ptr->rq, buf);
+ 					tipc_node_unlock(n_ptr);
+-					tipc_port_recv_msg(buf);
++					tipc_port_process_rcvd(&n_ptr->rq);
+ 					continue;
+ 				}
+ 				switch (msg_user(msg)) {
+@@ -1711,8 +1712,9 @@ deliver:
+ 					l_ptr->stats.recv_bundles++;
+ 					l_ptr->stats.recv_bundled +=
+ 						msg_msgcnt(msg);
++					tipc_link_recv_bundle(buf, &n_ptr->rq);
+ 					tipc_node_unlock(n_ptr);
+-					tipc_link_recv_bundle(buf);
++					tipc_port_process_rcvd(&n_ptr->rq);
+ 					continue;
+ 				case NAME_DISTRIBUTOR:
+ 					n_ptr->bclink.recv_permitted = true;
+@@ -2348,7 +2350,7 @@ exit:
+ /*
+  *  Bundler functionality:
+  */
+-void tipc_link_recv_bundle(struct sk_buff *buf)
++void tipc_link_recv_bundle(struct sk_buff *buf, struct sk_buff_head *head)
+ {
+ 	u32 msgcount = msg_msgcnt(buf_msg(buf));
+ 	u32 pos = INT_H_SIZE;
+@@ -2361,7 +2363,7 @@ void tipc_link_recv_bundle(struct sk_buff *buf)
+ 			break;
+ 		}
+ 		pos += align(msg_size(buf_msg(obuf)));
+-		tipc_net_route_msg(obuf);
++		skb_queue_tail(head, obuf);
+ 	}
+ 	kfree_skb(buf);
+ }
+diff --git a/net/tipc/link.h b/net/tipc/link.h
+index 130bd83..22a5754 100644
+--- a/net/tipc/link.h
++++ b/net/tipc/link.h
+@@ -238,7 +238,7 @@ int tipc_link_send_sections_fast(struct tipc_port *sender,
+ 				 const u32 num_sect,
+ 				 unsigned int total_len,
+ 				 u32 destnode);
+-void tipc_link_recv_bundle(struct sk_buff *buf);
++void tipc_link_recv_bundle(struct sk_buff *buf, struct sk_buff_head *head);
+ int  tipc_link_recv_fragment(struct sk_buff **reasm_head,
+ 			     struct sk_buff **reasm_tail,
+ 			     struct sk_buff **fbuf);
+diff --git a/net/tipc/node.c b/net/tipc/node.c
+index d914d43..e98efec 100644
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@ -114,6 +114,7 @@ struct tipc_node *tipc_node_create(u32 addr)
+ 	INIT_HLIST_NODE(&n_ptr->hash);
+ 	INIT_LIST_HEAD(&n_ptr->list);
+ 	INIT_LIST_HEAD(&n_ptr->nsub);
++	skb_queue_head_init(&n_ptr->rq);
+ 
+ 	hlist_add_head(&n_ptr->hash, &node_htable[tipc_hashfn(addr)]);
+ 
+diff --git a/net/tipc/node.h b/net/tipc/node.h
+index e5e96c0..e3fd578 100644
+--- a/net/tipc/node.h
++++ b/net/tipc/node.h
+@@ -91,6 +91,7 @@ struct tipc_node {
+ 	int block_setup;
+ 	int permit_changeover;
+ 	u32 signature;
++	struct sk_buff_head rq;
+ 	struct {
+ 		u32 acked;
+ 		u32 last_in;
+diff --git a/net/tipc/port.c b/net/tipc/port.c
+index 3d74567..38d7e49 100644
+--- a/net/tipc/port.c
++++ b/net/tipc/port.c
+@@ -38,6 +38,7 @@
+ #include "config.h"
+ #include "port.h"
+ #include "name_table.h"
++#include "name_distr.h"
+ 
+ /* Connection management: */
+ #define PROBING_INTERVAL 3600000	/* [ms] => 1 h */
+@@ -153,6 +154,37 @@ int tipc_multicast(u32 ref, struct tipc_name_seq const *seq,
+ 	return res;
+ }
+ 
++void tipc_port_process_rcvd(struct sk_buff_head *head)
++{
++	struct sk_buff *skb;
++	struct tipc_msg *msg;
++
++	spin_lock_bh(&head->lock);
++
++	while((skb = __skb_dequeue(head))) {
++		msg = buf_msg(skb);
++		if (msg_isdata(msg)) {
++			if (msg_mcast(msg))
++				tipc_port_recv_mcast(skb, NULL);
++			else
++				tipc_port_recv_msg(skb);
++			continue;
++		}
++		switch (msg_user(msg)) {
++		case NAME_DISTRIBUTOR:
++			tipc_named_recv(skb);
++		break;
++		case CONN_MANAGER:
++			tipc_port_recv_proto_msg(skb);
++		break;
++		default:
++			kfree_skb(skb);
++		break;
++		}
++	}
++	spin_unlock_bh(&head->lock);
++}
++
+ /**
+  * tipc_port_recv_mcast - deliver multicast message to all destination ports
+  *
+diff --git a/net/tipc/port.h b/net/tipc/port.h
+index b9102ea..f78e1fd 100644
+--- a/net/tipc/port.h
++++ b/net/tipc/port.h
+@@ -208,6 +208,8 @@ int tipc_port_peer_msg(struct tipc_port *p_ptr, struct tipc_msg *msg);
+ /*
+  * TIPC messaging routines
+  */
++
++void tipc_port_process_rcvd(struct sk_buff_head *head);
+ int tipc_port_recv_msg(struct sk_buff *buf);
+ int tipc_send(u32 portref, unsigned int num_sect, struct iovec const *msg_sect,
+ 	      unsigned int total_len);
+-- 
+2.1.3
+
