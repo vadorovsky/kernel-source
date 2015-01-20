@@ -1,0 +1,223 @@
+From: "H. Peter Anvin" <hpa@linux.intel.com>
+Date: Tue, 29 Apr 2014 16:46:09 -0700
+Subject: x86-64, espfix: Don't leak bits 31:16 of %esp returning to 16-bit
+	stack
+Patch-mainline: v3.16-rc1
+References: bsc#907818,CVE-2014-9090
+
+The IRET instruction, when returning to a 16-bit segment, only
+restores the bottom 16 bits of the user space stack pointer.  This
+causes some 16-bit software to break, but it also leaks kernel state
+to user space.  We have a software workaround for that ("espfix") for
+the 32-bit kernel, but it relies on a nonzero stack segment base which
+is not available in 64-bit mode.
+
+In checkin:
+
+    b3b42ac2cbae x86-64, modify_ldt: Ban 16-bit segments on 64-bit kernels
+
+we "solved" this by forbidding 16-bit segments on 64-bit kernels, with
+the logic that 16-bit support is crippled on 64-bit kernels anyway (no
+V86 support), but it turns out that people are doing stuff like
+running old Win16 binaries under Wine and expect it to work.
+
+This works around this by creating percpu "ministacks", each of which
+is mapped 2^16 times 64K apart.  When we detect that the return SS is
+on the LDT, we copy the IRET frame to the ministack and use the
+relevant alias to return to userspace.  The ministacks are mapped
+readonly, so if IRET faults we promote #GP to #DF which is an IST
+vector and thus has its own stack; we then do the fixup in the #DF
+handler.
+
+(Making #GP an IST exception would make the msr_safe functions unsafe
+in NMI/MC context, and quite possibly have other effects.)
+
+Special thanks to:
+
+- Andy Lutomirski, for the suggestion of using very small stack slots
+  and copy (as opposed to map) the IRET frame there, and for the
+  suggestion to mark them readonly and let the fault promote to #DF.
+- Konrad Wilk for paravirt fixup and testing.
+- Borislav Petkov for testing help and useful comments.
+
+Reported-by: Brian Gerst <brgerst@gmail.com>
+Signed-off-by: H. Peter Anvin <hpa@linux.intel.com>
+Link: http://lkml.kernel.org/r/1398816946-3351-1-git-send-email-hpa@linux.intel.com
+Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Andrew Lutomriski <amluto@gmail.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Dirk Hohndel <dirk@hohndel.org>
+Cc: Arjan van de Ven <arjan.van.de.ven@intel.com>
+Cc: comex <comexk@gmail.com>
+Cc: Alexander van Heukelum <heukelum@fastmail.fm>
+Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Cc: <stable@vger.kernel.org> # consider after upstream merge
+
+Acked-by: Borislav Petkov <bp@suse.de>
+Automatically created from "patches.fixes/x86-64-espfix-don-t-leak-bits-31-16-of-esp-returning-to-16-bit-stack.patch" by xen-port-patches.py
+
+--- sle11sp3.orig/arch/x86/include/mach-xen/asm/pgtable_64_types.h	2011-02-01 14:50:44.000000000 +0100
++++ sle11sp3/arch/x86/include/mach-xen/asm/pgtable_64_types.h	2014-06-27 10:54:54.000000000 +0200
+@@ -60,5 +60,7 @@ typedef union { pteval_t pte; unsigned i
+ #define MODULES_VADDR    _AC(0xffffffffa0000000, UL)
+ #define MODULES_END      _AC(0xffffffffff000000, UL)
+ #define MODULES_LEN   (MODULES_END - MODULES_VADDR)
++#define ESPFIX_PGD_ENTRY _AC(-2, UL)
++#define ESPFIX_BASE_ADDR (ESPFIX_PGD_ENTRY << PGDIR_SHIFT)
+ 
+ #endif /* _ASM_X86_PGTABLE_64_DEFS_H */
+--- sle11sp3.orig/arch/x86/kernel/entry_64-xen.S	2013-05-24 08:25:30.000000000 +0200
++++ sle11sp3/arch/x86/kernel/entry_64-xen.S	2015-01-09 14:36:11.000000000 +0100
+@@ -56,6 +56,7 @@
+ #include <asm/processor-flags.h>
+ #include <asm/ftrace.h>
+ #include <asm/percpu.h>
++#include <asm/pgtable_types.h>
+ #include <xen/interface/xen.h>
+ #include <xen/interface/features.h>
+ 
+@@ -822,10 +823,36 @@ ENTRY(retint_kernel)
+ 	call preempt_schedule_irq
+ 	jmp retint_kernel       /* check again */
+ #endif
+-
+ 	CFI_ENDPROC
+ END(retint_check)
+ 
++	/*
++	 * If IRET takes a fault on the espfix stack, then we
++	 * end up promoting it to a doublefault.  In that case,
++	 * modify the stack to make it look like we just entered
++	 * the #GP handler from user space, similar to bad_iret.
++	 */
++	ALIGN
++__do_double_fault:
++	XCPT_FRAME 1 RDI+8
++	movq RSP(%rdi),%rax		/* Trap on the espfix stack? */
++	sarq $PGDIR_SHIFT,%rax
++	cmpl $ESPFIX_PGD_ENTRY,%eax
++	jne do_double_fault		/* No, just deliver the fault */
++	cmpl $__KERNEL_CS,CS(%rdi)
++	jne do_double_fault
++	movq RIP(%rdi),%rax
++	cmpq $native_irq_return_iret,%rax
++	jne do_double_fault		/* This shouldn't happen... */
++	movq PER_CPU_VAR(kernel_stack),%rax
++	subq $(6*8-KERNEL_STACK_OFFSET),%rax	/* Reset to original stack */
++	movq %rax,RSP(%rdi)
++	movq $0,(%rax)			/* Missing (lost) #GP error code */
++	movq $general_protection,RIP(%rdi)
++	retq
++	CFI_ENDPROC
++END(__do_double_fault)
++
+ #ifndef CONFIG_XEN
+ /*
+  * APIC interrupts.
+@@ -1299,7 +1326,7 @@ error_sti:
+ error_kernelspace:
+ 	CFI_REL_OFFSET rcx, RCX+8
+ 	incl %ebx
+-	leaq irq_return(%rip),%rcx
++	leaq irq_return_iret(%rip),%rcx
+ 	cmpq %rcx,RIP+8(%rsp)
+ 	je error_swapgs
+ 	movl %ecx,%eax	/* zero extend */
+--- sle11sp3.orig/arch/x86/mm/dump_pagetables-xen.c	2011-02-01 15:04:27.000000000 +0100
++++ sle11sp3/arch/x86/mm/dump_pagetables-xen.c	2014-06-27 10:54:54.000000000 +0200
+@@ -33,11 +33,13 @@ struct pg_state {
+ 	unsigned long start_address;
+ 	unsigned long current_address;
+ 	const struct addr_marker *marker;
++	unsigned long lines;
+ };
+ 
+ struct addr_marker {
+ 	unsigned long start_address;
+ 	const char *name;
++	unsigned long max_lines;
+ };
+ 
+ /* indices for address_markers; keep sync'd w/ address_markers below */
+@@ -48,6 +50,7 @@ enum address_markers_idx {
+ 	LOW_KERNEL_NR,
+ 	VMALLOC_START_NR,
+ 	VMEMMAP_START_NR,
++	ESPFIX_START_NR,
+ 	HIGH_KERNEL_NR,
+ 	MODULES_VADDR_NR,
+ 	MODULES_END_NR,
+@@ -71,6 +74,7 @@ static struct addr_marker address_marker
+ 	{ PAGE_OFFSET,                "Low Kernel Mapping" },
+ 	{ VMALLOC_START,              "vmalloc() Area" },
+ 	{ VMEMMAP_START,              "Vmemmap" },
++	{ ESPFIX_BASE_ADDR,           "ESPfix Area", 16 },
+ 	{ __START_KERNEL_map,         "High Kernel Mapping" },
+ 	{ MODULES_VADDR,              "Modules" },
+ 	{ MODULES_END,                "End Modules" },
+@@ -176,7 +180,7 @@ static void note_page(struct seq_file *m
+ 		      pgprot_t new_prot, int level)
+ {
+ 	pgprotval_t prot, cur;
+-	static const char units[] = "KMGTPE";
++	static const char units[] = "BKMGTPE";
+ 
+ 	/*
+ 	 * If we have a "break" in the series, we need to flush the state that
+@@ -191,6 +195,7 @@ static void note_page(struct seq_file *m
+ 		st->current_prot = new_prot;
+ 		st->level = level;
+ 		st->marker = address_markers;
++		st->lines = 0;
+ 		seq_printf(m, "---[ %s ]---\n", st->marker->name);
+ 	} else if (prot != cur || level != st->level ||
+ 		   st->current_address >= st->marker[1].start_address) {
+@@ -201,17 +206,21 @@ static void note_page(struct seq_file *m
+ 		/*
+ 		 * Now print the actual finished series
+ 		 */
+-		seq_printf(m, "0x%0*lx-0x%0*lx   ",
+-			   width, st->start_address,
+-			   width, st->current_address);
+-
+-		delta = (st->current_address - st->start_address) >> 10;
+-		while (!(delta & 1023) && unit[1]) {
+-			delta >>= 10;
+-			unit++;
++		if (!st->marker->max_lines ||
++		    st->lines < st->marker->max_lines) {
++			seq_printf(m, "0x%0*lx-0x%0*lx   ",
++				   width, st->start_address,
++				   width, st->current_address);
++
++			delta = st->current_address - st->start_address;
++			while (!(delta & 1023) && unit[1]) {
++				delta >>= 10;
++				unit++;
++			}
++			seq_printf(m, "%9lu%c ", delta, *unit);
++			printk_prot(m, st->current_prot, st->level);
+ 		}
+-		seq_printf(m, "%9lu%c ", delta, *unit);
+-		printk_prot(m, st->current_prot, st->level);
++		st->lines++;
+ 
+ 		/*
+ 		 * We print markers for special areas of address space,
+@@ -219,7 +228,15 @@ static void note_page(struct seq_file *m
+ 		 * This helps in the interpretation.
+ 		 */
+ 		if (st->current_address >= st->marker[1].start_address) {
++			if (st->marker->max_lines &&
++			    st->lines > st->marker->max_lines) {
++				unsigned long nskip =
++					st->lines - st->marker->max_lines;
++				seq_printf(m, "... %lu entr%s skipped ... \n",
++					   nskip, nskip == 1 ? "y" : "ies");
++			}
+ 			st->marker++;
++			st->lines = 0;
+ 			seq_printf(m, "---[ %s ]---\n", st->marker->name);
+ 		}
+ 
