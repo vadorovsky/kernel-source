@@ -1,0 +1,141 @@
+From 9db7d04450d0648b89d1ff2f190312f08210f883 Mon Sep 17 00:00:00 2001
+From: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+Date: Wed, 22 Oct 2014 05:33:13 -0500
+Subject: powerpc: Handle facility unavailable exceptions at 0xf60
+Patch-mainline: Never, this is a half-stub special implementation for SLE11SP4.
+References: bsc#912129, FATE#317619
+
+If the user program invokes POWER8 based TM instruction, BHRB
+instruction etc, the kernel does not handle them as there is
+no entry for the corresponding interrupt vector location 0xf60.
+So the kernel will crash on an illegal instruction after landing
+at the 0xf60 location.
+
+	This patch selectively backports some of the mainline
+patches such as 74e400cee, d0c0c9a13 and 021424a1f to handle the
+facility unavailable exceptions at 0xf60, delivers an SIGILL to
+the user space program which caused it and also prevents a kernel
+crash.
+
+Signed-off-by: Anshuman Khandual <khandual@linux.vnet.ibm.com>
+Acked-by: Torsten Duwe <duwe@suse.de>
+---
+ arch/powerpc/include/asm/reg.h       | 11 ++++++++++
+ arch/powerpc/kernel/exceptions-64s.S | 13 ++++++++++++
+ arch/powerpc/kernel/traps.c          | 40 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 64 insertions(+)
+
+diff --git a/arch/powerpc/include/asm/reg.h b/arch/powerpc/include/asm/reg.h
+index 96743cf..c0eda55 100644
+--- a/arch/powerpc/include/asm/reg.h
++++ b/arch/powerpc/include/asm/reg.h
+@@ -280,6 +280,17 @@
+ #define SPRN_DBAT7U	0x23E	/* Data BAT 7 Upper Register */
+ #define	SPRN_PPR	0x380	/* SMT Thread status Register */
+ 
++/* HFSCR and FSCR bit numbers are the same */
++#define FSCR_TAR_LG	8	/* Enable Target Address Register */
++#define FSCR_EBB_LG	7	/* Enable Event Based Branching */
++#define FSCR_TM_LG	5	/* Enable Transactional Memory */
++#define FSCR_BHRB_LG	4	/* Enable Branch History Rolling Buffer*/
++#define FSCR_PM_LG	3	/* Enable prob/priv access to PMU SPRs */
++#define FSCR_DSCR_LG	2	/* Enable Data Stream Control Register */
++#define FSCR_VECVSX_LG	1	/* Enable VMX/VSX registers */
++#define FSCR_FP_LG	0	/* Enable Floating Point registers */
++#define SPRN_FSCR	0x099	/* Facility Status & Control Register */
++
+ #define SPRN_DEC	0x016		/* Decrement Register */
+ #define SPRN_DER	0x095		/* Debug Enable Regsiter */
+ #define DER_RSTE	0x40000000	/* Reset Interrupt */
+diff --git a/arch/powerpc/kernel/exceptions-64s.S b/arch/powerpc/kernel/exceptions-64s.S
+index 282570e..fd07789 100644
+--- a/arch/powerpc/kernel/exceptions-64s.S
++++ b/arch/powerpc/kernel/exceptions-64s.S
+@@ -263,6 +263,9 @@ vsx_unavailable_pSeries_1:
+ 	. = 0xf40
+ 	b	vsx_unavailable_pSeries
+ 
++	. = 0xf60
++	b	facility_unavailable_pSeries
++
+ #ifdef CONFIG_CBE_RAS
+ 	STD_EXCEPTION_HV(0x1200, 0x1202, cbe_system_error)
+ #endif /* CONFIG_CBE_RAS */
+@@ -289,6 +292,7 @@ vsx_unavailable_pSeries_1:
+ 	STD_EXCEPTION_PSERIES(., 0xf00, performance_monitor)
+ 	STD_EXCEPTION_PSERIES(., 0xf20, altivec_unavailable)
+ 	STD_EXCEPTION_PSERIES(., 0xf40, vsx_unavailable)
++	STD_EXCEPTION_PSERIES(., 0xf60, facility_unavailable)
+ 
+ /*
+  * An interrupt came in while soft-disabled; clear EE in SRR1,
+@@ -783,6 +787,15 @@ END_FTR_SECTION_IFSET(CPU_FTR_VSX)
+ 	b	.ret_from_except
+ 
+ 	.align	7
++	.globl facility_unavailable_common
++facility_unavailable_common:
++	EXCEPTION_PROLOG_COMMON(0xf60, PACA_EXGEN)
++	bl	.save_nvgprs
++	addi	r3,r1,STACK_FRAME_OVERHEAD
++	bl	.facility_unavailable_exception
++	b	.ret_from_except
++
++	.align	7
+ 	.globl	__end_handlers
+ __end_handlers:
+ 
+diff --git a/arch/powerpc/kernel/traps.c b/arch/powerpc/kernel/traps.c
+index f4808fe..636b83f 100644
+--- a/arch/powerpc/kernel/traps.c
++++ b/arch/powerpc/kernel/traps.c
+@@ -1119,6 +1119,46 @@ void vsx_unavailable_exception(struct pt_regs *regs)
+ 	die("Unrecoverable VSX Unavailable Exception", regs, SIGABRT);
+ }
+ 
++#ifdef CONFIG_PPC64
++void facility_unavailable_exception(struct pt_regs *regs)
++{
++	static char *facility_strings[] = {
++		[FSCR_FP_LG] = "FPU",
++		[FSCR_VECVSX_LG] = "VMX/VSX",
++		[FSCR_DSCR_LG] = "DSCR",
++		[FSCR_PM_LG] = "PMU SPRs",
++		[FSCR_BHRB_LG] = "BHRB",
++		[FSCR_TM_LG] = "TM",
++		[FSCR_EBB_LG] = "EBB",
++		[FSCR_TAR_LG] = "TAR",
++	};
++	char *facility = "unknown";
++	u64 value;
++	u8 status;
++
++	value = mfspr(SPRN_FSCR);
++	status = value >> 56;
++	if ((status < ARRAY_SIZE(facility_strings)) &&
++				facility_strings[status])
++		facility = facility_strings[status];
++	/*
++	 * An user program has executed an instruction which is not
++	 * supported in the problem state. Kernel does not support
++	 * these features, hence will deliver SIGILL signal to the
++	 * user program.
++	 */
++	if (user_mode(regs)) {
++		 _exception(SIGILL, regs, ILL_ILLOPC, regs->nip);
++		return;
++	}
++
++	pr_err_ratelimited("Facility '%s' Unavailable Exception at %lx "
++				"(msr %lx)\n", facility, regs->nip, regs->msr);
++
++	/* Kernel must not have caused this */
++	die("Unrecoverable Facility Unavailable Exception", regs, SIGABRT);
++}
++#endif
+ void performance_monitor_exception(struct pt_regs *regs)
+ {
+ 	__get_cpu_var(irq_stat).pmu_irqs++;
+-- 
+1.9.3
+
