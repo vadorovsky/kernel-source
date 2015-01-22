@@ -1,0 +1,342 @@
+From: Rajesh Borundia <rajesh.borundia@qlogic.com>
+Date: Fri, 29 Mar 2013 05:46:38 +0000
+Subject: [PATCH 006/270] qlcnic: Support atomic commands
+Patch-mainline: v3.10-rc1
+Git-commit: e8b508ef71fb70ec761086532716b19d3c4773e5
+References: bsc#909350 FATE#317546
+
+o VFs might get scheduled out after sending a command to a PF
+  and scheduled in after receiving a response. Implement a
+  worker thread to handle atomic commands.
+
+Signed-off-by: Manish Chopra <manish.chopra@qlogic.com>
+Signed-off-by: Rajesh Borundia <rajesh.borundia@qlogic.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Shahed Shaikh <shahed.shaikh@qlogic.com>
+Acked-by: Gary Ching-Pang Lin <glin@suse.com>
+---
+ drivers/net/ethernet/qlogic/qlcnic/qlcnic.h              |    4 
+ drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c           |   47 ++++-
+ drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c         |    2 
+ drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov.h        |    9 +
+ drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c |  130 ++++++++++++++-
+ 5 files changed, 183 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic.h
+@@ -1013,6 +1013,7 @@ struct qlcnic_adapter {
+ 
+ 	struct qlcnic_filter_hash fhash;
+ 	struct qlcnic_filter_hash rx_fhash;
++	struct list_head vf_mc_list;
+ 
+ 	spinlock_t tx_clean_lock;
+ 	spinlock_t mac_learn_lock;
+@@ -1443,6 +1444,7 @@ void qlcnic_post_rx_buffers(struct qlcni
+ 		struct qlcnic_host_rds_ring *rds_ring, u8 ring_id);
+ int qlcnic_process_rcv_ring(struct qlcnic_host_sds_ring *sds_ring, int max);
+ void qlcnic_set_multi(struct net_device *netdev);
++void __qlcnic_set_multi(struct net_device *netdev);
+ int qlcnic_nic_add_mac(struct qlcnic_adapter *, const u8 *);
+ int qlcnic_nic_del_mac(struct qlcnic_adapter *, const u8 *);
+ void qlcnic_free_mac_list(struct qlcnic_adapter *adapter);
+@@ -1526,6 +1528,8 @@ void qlcnic_add_lb_filter(struct qlcnic_
+ int qlcnic_83xx_configure_opmode(struct qlcnic_adapter *adapter);
+ int qlcnic_read_mac_addr(struct qlcnic_adapter *);
+ int qlcnic_setup_netdev(struct qlcnic_adapter *, struct net_device *, int);
++void qlcnic_sriov_vf_schedule_multi(struct net_device *);
++void qlcnic_vf_add_mc_list(struct net_device *);
+ 
+ /*
+  * QLOGIC Board information
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_hw.c
+@@ -496,7 +496,7 @@ int qlcnic_nic_add_mac(struct qlcnic_ada
+ 	return 0;
+ }
+ 
+-void qlcnic_set_multi(struct net_device *netdev)
++void __qlcnic_set_multi(struct net_device *netdev)
+ {
+ 	struct qlcnic_adapter *adapter = netdev_priv(netdev);
+ 	struct netdev_hw_addr *ha;
+@@ -508,7 +508,8 @@ void qlcnic_set_multi(struct net_device
+ 	if (!test_bit(__QLCNIC_FW_ATTACHED, &adapter->state))
+ 		return;
+ 
+-	qlcnic_nic_add_mac(adapter, adapter->mac_addr);
++	if (!qlcnic_sriov_vf_check(adapter))
++		qlcnic_nic_add_mac(adapter, adapter->mac_addr);
+ 	qlcnic_nic_add_mac(adapter, bcast_addr);
+ 
+ 	if (netdev->flags & IFF_PROMISC) {
+@@ -523,23 +524,53 @@ void qlcnic_set_multi(struct net_device
+ 		goto send_fw_cmd;
+ 	}
+ 
+-	if (!netdev_mc_empty(netdev)) {
++	if (!netdev_mc_empty(netdev) && !qlcnic_sriov_vf_check(adapter)) {
+ 		netdev_for_each_mc_addr(ha, netdev) {
+ 			qlcnic_nic_add_mac(adapter, ha->addr);
+ 		}
+ 	}
+ 
++	if (qlcnic_sriov_vf_check(adapter))
++		qlcnic_vf_add_mc_list(netdev);
++
+ send_fw_cmd:
+-	if (mode == VPORT_MISS_MODE_ACCEPT_ALL && !adapter->fdb_mac_learn) {
+-		qlcnic_alloc_lb_filters_mem(adapter);
+-		adapter->drv_mac_learn = true;
+-	} else {
+-		adapter->drv_mac_learn = false;
++	if (!qlcnic_sriov_vf_check(adapter)) {
++		if (mode == VPORT_MISS_MODE_ACCEPT_ALL &&
++		    !adapter->fdb_mac_learn) {
++			qlcnic_alloc_lb_filters_mem(adapter);
++			adapter->drv_mac_learn = true;
++		} else {
++			adapter->drv_mac_learn = false;
++		}
+ 	}
+ 
+ 	qlcnic_nic_set_promisc(adapter, mode);
+ }
+ 
++void qlcnic_set_multi(struct net_device *netdev)
++{
++	struct qlcnic_adapter *adapter = netdev_priv(netdev);
++	struct netdev_hw_addr *ha;
++	struct qlcnic_mac_list_s *cur;
++
++	if (!test_bit(__QLCNIC_FW_ATTACHED, &adapter->state))
++		return;
++	if (qlcnic_sriov_vf_check(adapter)) {
++		if (!netdev_mc_empty(netdev)) {
++			netdev_for_each_mc_addr(ha, netdev) {
++				cur = kzalloc(sizeof(struct qlcnic_mac_list_s),
++					      GFP_ATOMIC);
++				memcpy(cur->mac_addr,
++				       ha->addr, ETH_ALEN);
++				list_add_tail(&cur->list, &adapter->vf_mc_list);
++			}
++		}
++		qlcnic_sriov_vf_schedule_multi(adapter->netdev);
++		return;
++	}
++	__qlcnic_set_multi(netdev);
++}
++
+ int qlcnic_82xx_nic_set_promisc(struct qlcnic_adapter *adapter, u32 mode)
+ {
+ 	struct qlcnic_nic_req req;
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_main.c
+@@ -1433,6 +1433,8 @@ void __qlcnic_down(struct qlcnic_adapter
+ 	if (!test_and_clear_bit(__QLCNIC_DEV_UP, &adapter->state))
+ 		return;
+ 
++	if (qlcnic_sriov_vf_check(adapter))
++		qlcnic_sriov_cleanup_async_list(&adapter->ahw->sriov->bc);
+ 	smp_mb();
+ 	spin_lock(&adapter->tx_clean_lock);
+ 	netif_carrier_off(netdev);
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov.h
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov.h
+@@ -133,9 +133,17 @@ struct qlcnic_vf_info {
+ 	struct qlcnic_vport		*vp;
+ };
+ 
++struct qlcnic_async_work_list {
++	struct list_head	list;
++	struct work_struct	work;
++	void			*ptr;
++};
++
+ struct qlcnic_back_channel {
+ 	u16			trans_counter;
+ 	struct workqueue_struct *bc_trans_wq;
++	struct workqueue_struct *bc_async_wq;
++	struct list_head	async_list;
+ };
+ 
+ struct qlcnic_sriov {
+@@ -156,6 +164,7 @@ int qlcnic_sriov_func_to_index(struct ql
+ int qlcnic_sriov_channel_cfg_cmd(struct qlcnic_adapter *, u8);
+ void qlcnic_sriov_handle_bc_event(struct qlcnic_adapter *, u32);
+ int qlcnic_sriov_cfg_bc_intr(struct qlcnic_adapter *, u8);
++void qlcnic_sriov_cleanup_async_list(struct qlcnic_back_channel *);
+ 
+ static inline bool qlcnic_sriov_enable_check(struct qlcnic_adapter *adapter)
+ {
+--- a/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
++++ b/drivers/net/ethernet/qlogic/qlcnic/qlcnic_sriov_common.c
+@@ -141,6 +141,16 @@ int qlcnic_sriov_init(struct qlcnic_adap
+ 
+ 	bc->bc_trans_wq = wq;
+ 
++	wq = create_singlethread_workqueue("async");
++	if (wq == NULL) {
++		err = -ENOMEM;
++		dev_err(&adapter->pdev->dev, "Cannot create async workqueue\n");
++		goto qlcnic_destroy_trans_wq;
++	}
++
++	bc->bc_async_wq =  wq;
++	INIT_LIST_HEAD(&bc->async_list);
++
+ 	for (i = 0; i < num_vfs; i++) {
+ 		vf = &sriov->vf_info[i];
+ 		vf->adapter = adapter;
+@@ -156,7 +166,7 @@ int qlcnic_sriov_init(struct qlcnic_adap
+ 			vp = kzalloc(sizeof(struct qlcnic_vport), GFP_KERNEL);
+ 			if (!vp) {
+ 				err = -ENOMEM;
+-				goto qlcnic_destroy_trans_wq;
++				goto qlcnic_destroy_async_wq;
+ 			}
+ 			sriov->vf_info[i].vp = vp;
+ 			random_ether_addr(vp->mac);
+@@ -168,6 +178,9 @@ int qlcnic_sriov_init(struct qlcnic_adap
+ 
+ 	return 0;
+ 
++qlcnic_destroy_async_wq:
++	destroy_workqueue(bc->bc_async_wq);
++
+ qlcnic_destroy_trans_wq:
+ 	destroy_workqueue(bc->bc_trans_wq);
+ 
+@@ -188,6 +201,8 @@ void __qlcnic_sriov_cleanup(struct qlcni
+ 	if (!qlcnic_sriov_enable_check(adapter))
+ 		return;
+ 
++	qlcnic_sriov_cleanup_async_list(bc);
++	destroy_workqueue(bc->bc_async_wq);
+ 	destroy_workqueue(bc->bc_trans_wq);
+ 
+ 	for (i = 0; i < sriov->num_vfs; i++)
+@@ -351,6 +366,7 @@ static int qlcnic_sriov_setup_vf(struct
+ {
+ 	int err;
+ 
++	INIT_LIST_HEAD(&adapter->vf_mc_list);
+ 	if (!qlcnic_use_msi_x && !!qlcnic_use_msi)
+ 		dev_warn(&adapter->pdev->dev,
+ 			 "83xx adapter do not support MSI interrupts\n");
+@@ -1167,3 +1183,115 @@ out:
+ 	qlcnic_free_mbx_args(&cmd);
+ 	return ret;
+ }
++
++void qlcnic_vf_add_mc_list(struct net_device *netdev)
++{
++	struct qlcnic_adapter *adapter = netdev_priv(netdev);
++	struct qlcnic_mac_list_s *cur;
++	struct list_head *head, tmp_list;
++
++	INIT_LIST_HEAD(&tmp_list);
++	head = &adapter->vf_mc_list;
++	netif_addr_lock_bh(netdev);
++
++	while (!list_empty(head)) {
++		cur = list_entry(head->next, struct qlcnic_mac_list_s, list);
++		list_move(&cur->list, &tmp_list);
++	}
++
++	netif_addr_unlock_bh(netdev);
++
++	while (!list_empty(&tmp_list)) {
++		cur = list_entry((&tmp_list)->next,
++				 struct qlcnic_mac_list_s, list);
++		qlcnic_nic_add_mac(adapter, cur->mac_addr);
++		list_del(&cur->list);
++		kfree(cur);
++	}
++}
++
++void qlcnic_sriov_cleanup_async_list(struct qlcnic_back_channel *bc)
++{
++	struct list_head *head = &bc->async_list;
++	struct qlcnic_async_work_list *entry;
++
++	while (!list_empty(head)) {
++		entry = list_entry(head->next, struct qlcnic_async_work_list,
++				   list);
++		cancel_work_sync(&entry->work);
++		list_del(&entry->list);
++		kfree(entry);
++	}
++}
++
++static void qlcnic_sriov_vf_set_multi(struct net_device *netdev)
++{
++	struct qlcnic_adapter *adapter = netdev_priv(netdev);
++
++	if (!test_bit(__QLCNIC_FW_ATTACHED, &adapter->state))
++		return;
++
++	__qlcnic_set_multi(netdev);
++}
++
++static void qlcnic_sriov_handle_async_multi(struct work_struct *work)
++{
++	struct qlcnic_async_work_list *entry;
++	struct net_device *netdev;
++
++	entry = container_of(work, struct qlcnic_async_work_list, work);
++	netdev = (struct net_device *)entry->ptr;
++
++	qlcnic_sriov_vf_set_multi(netdev);
++	return;
++}
++
++static struct qlcnic_async_work_list *
++qlcnic_sriov_get_free_node_async_work(struct qlcnic_back_channel *bc)
++{
++	struct list_head *node;
++	struct qlcnic_async_work_list *entry = NULL;
++	u8 empty = 0;
++
++	list_for_each(node, &bc->async_list) {
++		entry = list_entry(node, struct qlcnic_async_work_list, list);
++		if (!work_pending(&entry->work)) {
++			empty = 1;
++			break;
++		}
++	}
++
++	if (!empty) {
++		entry = kzalloc(sizeof(struct qlcnic_async_work_list),
++				GFP_ATOMIC);
++		if (entry == NULL)
++			return NULL;
++		list_add_tail(&entry->list, &bc->async_list);
++	}
++
++	return entry;
++}
++
++static void qlcnic_sriov_schedule_bc_async_work(struct qlcnic_back_channel *bc,
++						work_func_t func, void *data)
++{
++	struct qlcnic_async_work_list *entry = NULL;
++
++	entry = qlcnic_sriov_get_free_node_async_work(bc);
++	if (!entry)
++		return;
++
++	entry->ptr = data;
++	INIT_WORK(&entry->work, func);
++	queue_work(bc->bc_async_wq, &entry->work);
++}
++
++void qlcnic_sriov_vf_schedule_multi(struct net_device *netdev)
++{
++
++	struct qlcnic_adapter *adapter = netdev_priv(netdev);
++	struct qlcnic_back_channel *bc = &adapter->ahw->sriov->bc;
++
++	qlcnic_sriov_schedule_bc_async_work(bc, qlcnic_sriov_handle_async_multi,
++					    netdev);
++}
