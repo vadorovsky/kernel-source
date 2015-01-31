@@ -1,0 +1,146 @@
+From: Jan Kiszka <jan.kiszka@siemens.com>
+Date: Sun, 28 Apr 2013 10:50:52 +0200
+Subject: KVM: x86: Rework request for immediate exit
+References: FATE#317460
+Patch-mainline: v3.10
+Git-commit: 730dca42c1d363c939da18c1499c7327c66e2b37
+
+The VMX implementation of enable_irq_window raised
+KVM_REQ_IMMEDIATE_EXIT after we checked it in vcpu_enter_guest. This
+caused infinite loops on vmentry. Fix it by letting enable_irq_window
+signal the need for an immediate exit via its return value and drop
+KVM_REQ_IMMEDIATE_EXIT.
+
+This issue only affects nested VMX scenarios.
+
+Signed-off-by: Jan Kiszka <jan.kiszka@siemens.com>
+Signed-off-by: Gleb Natapov <gleb@redhat.com>
+Acked-by: Bruce Rogers <brogers@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  2 +-
+ arch/x86/kvm/svm.c              |  3 ++-
+ arch/x86/kvm/vmx.c              | 21 ++++++++++++++-------
+ arch/x86/kvm/x86.c              |  7 +++----
+ include/linux/kvm_host.h        |  1 -
+ 5 files changed, 20 insertions(+), 14 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index e30d350..1a3ed40 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -620,7 +620,7 @@ struct kvm_x86_ops {
+ 	bool (*get_nmi_mask)(struct kvm_vcpu *vcpu);
+ 	void (*set_nmi_mask)(struct kvm_vcpu *vcpu, bool masked);
+ 	void (*enable_nmi_window)(struct kvm_vcpu *vcpu);
+-	void (*enable_irq_window)(struct kvm_vcpu *vcpu);
++	int (*enable_irq_window)(struct kvm_vcpu *vcpu);
+ 	void (*update_cr8_intercept)(struct kvm_vcpu *vcpu, int tpr, int irr);
+ 	int (*vm_has_apicv)(struct kvm *kvm);
+ 	void (*hwapic_irr_update)(struct kvm_vcpu *vcpu, int max_irr);
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index ac8a9e2..36cf1b7 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -3619,7 +3619,7 @@ static int svm_interrupt_allowed(struct kvm_vcpu *vcpu)
+ 	return ret;
+ }
+ 
+-static void enable_irq_window(struct kvm_vcpu *vcpu)
++static int enable_irq_window(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 
+@@ -3633,6 +3633,7 @@ static void enable_irq_window(struct kvm_vcpu *vcpu)
+ 		svm_set_vintr(svm);
+ 		svm_inject_irq(svm, 0x0);
+ 	}
++	return 0;
+ }
+ 
+ static void enable_nmi_window(struct kvm_vcpu *vcpu)
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 358ec7c..1f1a593 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -4255,22 +4255,29 @@ static bool nested_exit_on_intr(struct kvm_vcpu *vcpu)
+ 		PIN_BASED_EXT_INTR_MASK;
+ }
+ 
+-static void enable_irq_window(struct kvm_vcpu *vcpu)
++static bool nested_exit_on_nmi(struct kvm_vcpu *vcpu)
++{
++	return get_vmcs12(vcpu)->pin_based_vm_exec_control &
++		PIN_BASED_NMI_EXITING;
++}
++
++static int enable_irq_window(struct kvm_vcpu *vcpu)
+ {
+ 	u32 cpu_based_vm_exec_control;
+-	if (is_guest_mode(vcpu) && nested_exit_on_intr(vcpu)) {
++
++	if (is_guest_mode(vcpu) && nested_exit_on_intr(vcpu))
+ 		/*
+ 		 * We get here if vmx_interrupt_allowed() said we can't
+-		 * inject to L1 now because L2 must run. Ask L2 to exit
+-		 * right after entry, so we can inject to L1 more promptly.
++		 * inject to L1 now because L2 must run. The caller will have
++		 * to make L2 exit right after entry, so we can inject to L1
++		 * more promptly.
+ 		 */
+-		kvm_make_request(KVM_REQ_IMMEDIATE_EXIT, vcpu);
+-		return;
+-	}
++		return -EBUSY;
+ 
+ 	cpu_based_vm_exec_control = vmcs_read32(CPU_BASED_VM_EXEC_CONTROL);
+ 	cpu_based_vm_exec_control |= CPU_BASED_VIRTUAL_INTR_PENDING;
+ 	vmcs_write32(CPU_BASED_VM_EXEC_CONTROL, cpu_based_vm_exec_control);
++	return 0;
+ }
+ 
+ static void enable_nmi_window(struct kvm_vcpu *vcpu)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 9f6a980..879d7ef 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -5545,7 +5545,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 	bool nmi_pending;
+ 	bool req_int_win = !irqchip_in_kernel(vcpu->kvm) &&
+ 		vcpu->run->request_interrupt_window;
+-	bool req_immediate_exit = 0;
++	bool req_immediate_exit = false;
+ 
+ 	if (vcpu->requests) {
+ 		if (kvm_check_request(KVM_REQ_MMU_RELOAD, vcpu))
+@@ -5583,8 +5583,6 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		}
+ 		if (kvm_check_request(KVM_REQ_SCAN_IOAPIC, vcpu))
+ 			vcpu_scan_ioapic(vcpu);
+-		req_immediate_exit =
+-			kvm_check_request(KVM_REQ_IMMEDIATE_EXIT, vcpu);
+ 	}
+ 
+ 	/*
+@@ -5602,7 +5600,8 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 		if (nmi_pending)
+ 			kvm_x86_ops->enable_nmi_window(vcpu);
+ 		else if (kvm_cpu_has_injectable_intr(vcpu) || req_int_win)
+-			kvm_x86_ops->enable_irq_window(vcpu);
++			req_immediate_exit =
++				kvm_x86_ops->enable_irq_window(vcpu) != 0;
+ 
+ 		if (kvm_lapic_enabled(vcpu)) {
+ 			/*
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 787567e..0fb8b2d 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -47,7 +47,6 @@
+ #define KVM_REQ_DEACTIVATE_FPU    10
+ #define KVM_REQ_EVENT             11
+ #define KVM_REQ_APF_HALT          12
+-#define KVM_REQ_IMMEDIATE_EXIT    15
+ #define KVM_REQ_SCAN_IOAPIC       22
+ 
+ #define KVM_USERSPACE_IRQ_SOURCE_ID	0
+
