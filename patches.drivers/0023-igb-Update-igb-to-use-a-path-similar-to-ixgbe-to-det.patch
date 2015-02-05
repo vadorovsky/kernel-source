@@ -1,0 +1,141 @@
+From 21ba6fe19370f8008d1edd9aedd6dadd7e3fa8f8 Mon Sep 17 00:00:00 2001
+From: Alexander Duyck <alexander.h.duyck@intel.com>
+Date: Sat, 9 Feb 2013 04:27:48 +0000
+Subject: [PATCH v5 023/164] igb: Update igb to use a path similar to ixgbe to determine
+ when to stop Tx
+
+Git-commit: 21ba6fe19370f8008d1edd9aedd6dadd7e3fa8f8
+Patch-mainline: v3.9-rc1
+Reference: fate#317388, bsc#909491
+Target: sle11-sp4
+
+After reviewing the igb and ixgbe code I realized there are a few issues in
+how the code is structured.  Specifically we are not checking the size of the
+buffers being used in transmits and we are not using the same value to
+determine when to stop or start a Tx queue.  As such the code is prone to be
+buggy.
+
+This patch makes it so that we have one value DESC_NEEDED that we will use for
+starting and stopping the queue.  In addition we will check the size of
+buffers being used when setting up a transmit so as to avoid a possible buffer
+overrun if we were to receive a frame with a block of data larger than 32K in
+skb->data.
+
+Joey Lee:
+depend on
+69b08f6 net: use bigger pages in __netdev_alloc_frag (v3.7-rc1)
+e5e6730 skbuff: Move definition of NETDEV_FRAG_PAGE_MAX_SIZE (v3.9-rc1)
+Add #define NETDEV_FRAG_PAGE_MAX_SIZE PAGE_ZIE
+because before 69b08f6 the max size of one fragment (skb->frags[]) is one page.
+
+Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Acked-by: Lee, Chun-Yi <jlee@suse.com>
+
+---
+ drivers/net/ethernet/intel/igb/igb.h      |   13 ++++++++++--
+ drivers/net/ethernet/intel/igb/igb_main.c |   31 +++++++++++++++++-------------
+ 2 files changed, 29 insertions(+), 15 deletions(-)
+
+Index: linux-3.0-SLE11-SP4/drivers/net/ethernet/intel/igb/igb.h
+===================================================================
+--- linux-3.0-SLE11-SP4.orig/drivers/net/ethernet/intel/igb/igb.h
++++ linux-3.0-SLE11-SP4/drivers/net/ethernet/intel/igb/igb.h
+@@ -139,8 +139,6 @@ struct vf_data_storage {
+ #define IGB_RX_HDR_LEN		IGB_RXBUFFER_256
+ #define IGB_RX_BUFSZ		IGB_RXBUFFER_2048
+ 
+-/* How many Tx Descriptors do we need to call netif_wake_queue ? */
+-#define IGB_TX_QUEUE_WAKE	16
+ /* How many Rx Buffers do we bundle into one write to the hardware ? */
+ #define IGB_RX_BUFFER_WRITE	16	/* Must be power of 2 */
+ 
+@@ -169,6 +167,17 @@ enum igb_tx_flags {
+ #define IGB_TX_FLAGS_VLAN_MASK		0xffff0000
+ #define IGB_TX_FLAGS_VLAN_SHIFT	16
+ 
++/*
++ * The largest size we can write to the descriptor is 65535.  In order to
++ * maintain a power of two alignment we have to limit ourselves to 32K.
++ */
++#define IGB_MAX_TXD_PWR	15
++#define IGB_MAX_DATA_PER_TXD	(1 << IGB_MAX_TXD_PWR)
++
++/* Tx Descriptors needed, worst case */
++#define TXD_USE_COUNT(S) DIV_ROUND_UP((S), IGB_MAX_DATA_PER_TXD)
++#define DESC_NEEDED (MAX_SKB_FRAGS + 4)
++
+ /* wrapper around a pointer to a socket buffer,
+  * so a DMA handle can be stored along with the buffer */
+ struct igb_tx_buffer {
+Index: linux-3.0-SLE11-SP4/drivers/net/ethernet/intel/igb/igb_main.c
+===================================================================
+--- linux-3.0-SLE11-SP4.orig/drivers/net/ethernet/intel/igb/igb_main.c
++++ linux-3.0-SLE11-SP4/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -4352,13 +4352,6 @@ static void igb_tx_olinfo_status(struct
+ 	tx_desc->read.olinfo_status = cpu_to_le32(olinfo_status);
+ }
+ 
+-/*
+- * The largest size we can write to the descriptor is 65535.  In order to
+- * maintain a power of two alignment we have to limit ourselves to 32K.
+- */
+-#define IGB_MAX_TXD_PWR	15
+-#define IGB_MAX_DATA_PER_TXD	(1<<IGB_MAX_TXD_PWR)
+-
+ static void igb_tx_map(struct igb_ring *tx_ring,
+ 		       struct igb_tx_buffer *first,
+ 		       const u8 hdr_len)
+@@ -4527,15 +4520,26 @@ netdev_tx_t igb_xmit_frame_ring(struct s
+ 	struct igb_tx_buffer *first;
+ 	int tso;
+ 	u32 tx_flags = 0;
++	u16 count = TXD_USE_COUNT(skb_headlen(skb));
+ 	__be16 protocol = vlan_get_protocol(skb);
+ 	u8 hdr_len = 0;
+ 
+-	/* need: 1 descriptor per page,
++	/* need: 1 descriptor per page * PAGE_SIZE/IGB_MAX_DATA_PER_TXD,
++	 *       + 1 desc for skb_headlen/IGB_MAX_DATA_PER_TXD,
+ 	 *       + 2 desc gap to keep tail from touching head,
+-	 *       + 1 desc for skb->data,
+ 	 *       + 1 desc for context descriptor,
+-	 * otherwise try next time */
+-	if (igb_maybe_stop_tx(tx_ring, skb_shinfo(skb)->nr_frags + 4)) {
++	 * otherwise try next time
++	 */
++#define NETDEV_FRAG_PAGE_MAX_SIZE PAGE_SIZE
++	if (NETDEV_FRAG_PAGE_MAX_SIZE > IGB_MAX_DATA_PER_TXD) {
++		unsigned short f;
++		for (f = 0; f < skb_shinfo(skb)->nr_frags; f++)
++			count += TXD_USE_COUNT(skb_shinfo(skb)->frags[f].size);
++	} else {
++		count += skb_shinfo(skb)->nr_frags;
++	}
++
++	if (igb_maybe_stop_tx(tx_ring, count + 3)) {
+ 		/* this is a hard error */
+ 		return NETDEV_TX_BUSY;
+ 	}
+@@ -4577,7 +4581,7 @@ netdev_tx_t igb_xmit_frame_ring(struct s
+ 	igb_tx_map(tx_ring, first, hdr_len);
+ 
+ 	/* Make sure there is space in the ring for the next send. */
+-	igb_maybe_stop_tx(tx_ring, MAX_SKB_FRAGS + 4);
++	igb_maybe_stop_tx(tx_ring, DESC_NEEDED);
+ 
+ 	return NETDEV_TX_OK;
+ 
+@@ -5980,9 +5984,10 @@ static bool igb_clean_tx_irq(struct igb_
+ 		}
+ 	}
+ 
++#define TX_WAKE_THRESHOLD (DESC_NEEDED * 2)
+ 	if (unlikely(total_packets &&
+ 		     netif_carrier_ok(tx_ring->netdev) &&
+-		     igb_desc_unused(tx_ring) >= IGB_TX_QUEUE_WAKE)) {
++		     igb_desc_unused(tx_ring) >= TX_WAKE_THRESHOLD)) {
+ 		/* Make sure that anybody stopping the queue after this
+ 		 * sees the new next_to_clean.
+ 		 */
