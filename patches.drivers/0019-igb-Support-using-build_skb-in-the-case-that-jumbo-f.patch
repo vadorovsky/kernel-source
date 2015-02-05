@@ -1,0 +1,157 @@
+From 74e238eada573540f82530f8ae4f3343c023d774 Mon Sep 17 00:00:00 2001
+From: Alexander Duyck <alexander.h.duyck@intel.com>
+Date: Sat, 2 Feb 2013 05:07:11 +0000
+Subject: [PATCH v5 019/164] igb: Support using build_skb in the case that jumbo frames
+ are disabled
+
+Git-commit: 74e238eada573540f82530f8ae4f3343c023d774
+Git-commit: e4f7dbb17e797d922d72567f37de3735722034ba
+Git-commit: f9d40f6a9921cc7d9385f64362314054e22152bd
+Patch-mainline: v3.9-rc1
+Reference: fate#317388, bsc#909491
+Target: sle11-sp4
+
+This change makes it so that we can enable the use of build_skb for cases
+where jumbo frames are disabled.  The advantage to this is that we do not
+have to perform a memcpy to populate the header and as a result we see a
+significant performance improvement.
+
+Joey Lee:
+Condensing the three patches is that even after the revert there are some
+leftover changes, notably a truesize fix for arches with large pages.
+ 
+Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Tested-by: Aaron Brown <aaron.f.brown@intel.com>
+Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Acked-by: Lee, Chun-Yi <jlee@suse.com>
+
+---
+ drivers/net/ethernet/intel/igb/igb_main.c |   86 ++++++++++++++++--------------
+ 1 file changed, 48 insertions(+), 38 deletions(-)
+
+Index: linux-3.0-SLE11-SP4/drivers/net/ethernet/intel/igb/igb_main.c
+===================================================================
+--- linux-3.0-SLE11-SP4.orig/drivers/net/ethernet/intel/igb/igb_main.c
++++ linux-3.0-SLE11-SP4/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -6031,6 +6031,41 @@ static void igb_reuse_rx_page(struct igb
+ 					 DMA_FROM_DEVICE);
+ }
+ 
++static bool igb_can_reuse_rx_page(struct igb_rx_buffer *rx_buffer,
++				  struct page *page,
++				  unsigned int truesize)
++{
++	/* avoid re-using remote pages */
++	if (unlikely(page_to_nid(page) != numa_node_id()))
++		return false;
++
++#if (PAGE_SIZE < 8192)
++	/* if we are only owner of page we can reuse it */
++	if (unlikely(page_count(page) != 1))
++		return false;
++
++	/* flip page offset to other buffer */
++	rx_buffer->page_offset ^= IGB_RX_BUFSZ;
++
++	/* since we are the only owner of the page and we need to
++	 * increment it, just set the value to 2 in order to avoid
++	 * an unnecessary locked operation
++	 */
++	atomic_set(&page->_count, 2);
++#else
++	/* move offset up to the next cache line */
++	rx_buffer->page_offset += truesize;
++
++	if (rx_buffer->page_offset > (PAGE_SIZE - IGB_RX_BUFSZ))
++		return false;
++
++	/* bump ref count on page before it is given to the stack */
++	get_page(page);
++#endif
++
++	return true;
++}
++
+ /**
+  * igb_add_rx_frag - Add contents of Rx buffer to sk_buff
+  * @rx_ring: rx descriptor ring to transact packets on
+@@ -6053,6 +6088,11 @@ static bool igb_add_rx_frag(struct igb_r
+ {
+ 	struct page *page = rx_buffer->page;
+ 	unsigned int size = le16_to_cpu(rx_desc->wb.upper.length);
++#if (PAGE_SIZE < 8192)
++	unsigned int truesize = IGB_RX_BUFSZ;
++#else
++	unsigned int truesize = ALIGN(size, L1_CACHE_BYTES);
++#endif
+ 
+ 	if ((size <= IGB_RX_HDR_LEN) && !skb_is_nonlinear(skb)) {
+ 		unsigned char *va = page_address(page) + rx_buffer->page_offset;
+@@ -6075,38 +6115,9 @@ static bool igb_add_rx_frag(struct igb_r
+ 	}
+ 
+ 	skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
+-			rx_buffer->page_offset, size, IGB_RX_BUFSZ);
++			rx_buffer->page_offset, size, truesize);
+ 
+-	/* avoid re-using remote pages */
+-	if (unlikely(page_to_nid(page) != numa_node_id()))
+-		return false;
+-
+-#if (PAGE_SIZE < 8192)
+-	/* if we are only owner of page we can reuse it */
+-	if (unlikely(page_count(page) != 1))
+-		return false;
+-
+-	/* flip page offset to other buffer */
+-	rx_buffer->page_offset ^= IGB_RX_BUFSZ;
+-
+-	/*
+-	 * since we are the only owner of the page and we need to
+-	 * increment it, just set the value to 2 in order to avoid
+-	 * an unnecessary locked operation
+-	 */
+-	atomic_set(&page->_count, 2);
+-#else
+-	/* move offset up to the next cache line */
+-	rx_buffer->page_offset += SKB_DATA_ALIGN(size);
+-
+-	if (rx_buffer->page_offset > (PAGE_SIZE - IGB_RX_BUFSZ))
+-		return false;
+-
+-	/* bump ref count on page before it is given to the stack */
+-	get_page(page);
+-#endif
+-
+-	return true;
++	return igb_can_reuse_rx_page(rx_buffer, page, truesize);
+ }
+ 
+ static struct sk_buff *igb_fetch_rx_buffer(struct igb_ring *rx_ring,
+@@ -6118,13 +6129,6 @@ static struct sk_buff *igb_fetch_rx_buff
+ 
+ 	rx_buffer = &rx_ring->rx_buffer_info[rx_ring->next_to_clean];
+ 
+-	/*
+-	 * This memory barrier is needed to keep us from reading
+-	 * any other fields out of the rx_desc until we know the
+-	 * RXD_STAT_DD bit is set
+-	 */
+-	rmb();
+-
+ 	page = rx_buffer->page;
+ 	prefetchw(page);
+ 
+@@ -6519,6 +6523,12 @@ static bool igb_clean_rx_irq(struct igb_
+ 		if (!igb_test_staterr(rx_desc, E1000_RXD_STAT_DD))
+ 			break;
+ 
++		/* This memory barrier is needed to keep us from reading
++		 * any other fields out of the rx_desc until we know the
++		 * RXD_STAT_DD bit is set
++		 */
++		rmb();
++
+ 		/* retrieve a buffer from the ring */
+ 		skb = igb_fetch_rx_buffer(rx_ring, rx_desc, skb);
+ 
