@@ -1,0 +1,163 @@
+From: Pavel Emelyanov <xemul@openvz.org>
+Date: Thu, 10 Oct 2013 17:12:05 +0400
+Subject: fuse: Fix O_DIRECT operations vs cached writeback misorder
+Git-commit: ea8cd33390fafc1eca06a26e6a9c7bf1d386526f
+Patch-mainline: v3.15-rc1
+References: FATE#317677
+
+The problem is:
+
+1. write cached data to a file
+2. read directly from the same file (via another fd)
+
+The 2nd operation may read stale data, i.e. the one that was in a file
+before the 1st op. Problem is in how fuse manages writeback.
+
+When direct op occurs the core kernel code calls filemap_write_and_wait
+to flush all the cached ops in flight. But fuse acks the writeback right
+after the ->writepages callback exits w/o waiting for the real write to
+happen. Thus the subsequent direct op proceeds while the real writeback
+is still in flight. This is a problem for backends that reorder operation.
+
+Fix this by making the fuse direct IO callback explicitly wait on the
+in-flight writeback to finish.
+
+Signed-off-by: Maxim Patlasov <MPatlasov@parallels.com>
+Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+---
+ fs/fuse/cuse.c   |    5 +++--
+ fs/fuse/file.c   |   32 ++++++++++++++++++++++++++------
+ fs/fuse/fuse_i.h |   13 ++++++++++++-
+ 3 files changed, 41 insertions(+), 9 deletions(-)
+
+--- a/fs/fuse/cuse.c
++++ b/fs/fuse/cuse.c
+@@ -94,7 +94,7 @@ static ssize_t cuse_read(struct file *fi
+ 	struct iovec iov = { .iov_base = buf, .iov_len = count };
+ 	struct fuse_io_priv io = { .async = 0, .file = file };
+ 
+-	return fuse_direct_io(&io, &iov, 1, count, &pos, 0);
++	return fuse_direct_io(&io, &iov, 1, count, &pos, FUSE_DIO_CUSE);
+ }
+ 
+ static ssize_t cuse_write(struct file *file, const char __user *buf,
+@@ -108,7 +108,8 @@ static ssize_t cuse_write(struct file *f
+ 	 * No locking or generic_write_checks(), the server is
+ 	 * responsible for locking and sanity checks.
+ 	 */
+-	return fuse_direct_io(&io, &iov, 1, count, &pos, 1);
++	return fuse_direct_io(&io, &iov, 1, count, &pos,
++			      FUSE_DIO_WRITE | FUSE_DIO_CUSE);
+ }
+ 
+ static int cuse_open(struct inode *inode, struct file *file)
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -332,12 +332,13 @@ u64 fuse_lock_owner_id(struct fuse_conn
+ }
+ 
+ /*
+- * Check if page is under writeback
++ * Check if any page in a range is under writeback
+  *
+  * This is currently done by walking the list of writepage requests
+  * for the inode, which can be pretty inefficient.
+  */
+-static bool fuse_page_is_writeback(struct inode *inode, pgoff_t index)
++static bool fuse_range_is_writeback(struct inode *inode, pgoff_t idx_from,
++				   pgoff_t idx_to)
+ {
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
+ 	struct fuse_inode *fi = get_fuse_inode(inode);
+@@ -350,8 +351,8 @@ static bool fuse_page_is_writeback(struc
+ 
+ 		BUG_ON(req->inode != inode);
+ 		curr_index = req->misc.write.in.offset >> PAGE_CACHE_SHIFT;
+-		if (curr_index <= index &&
+-		    index < curr_index + req->num_pages) {
++		if (idx_from < curr_index + req->num_pages &&
++		    curr_index <= idx_to) {
+ 			found = true;
+ 			break;
+ 		}
+@@ -361,6 +362,11 @@ static bool fuse_page_is_writeback(struc
+ 	return found;
+ }
+ 
++static inline bool fuse_page_is_writeback(struct inode *inode, pgoff_t index)
++{
++	return fuse_range_is_writeback(inode, index, index);
++}
++
+ /*
+  * Wait for page writeback to be completed.
+  *
+@@ -1336,13 +1342,18 @@ static inline int fuse_iter_npages(const
+ 
+ ssize_t fuse_direct_io(struct fuse_io_priv *io, const struct iovec *iov,
+ 		       unsigned long nr_segs, size_t count, loff_t *ppos,
+-		       int write)
++		       int flags)
+ {
++	int write = flags & FUSE_DIO_WRITE;
++	int cuse = flags & FUSE_DIO_CUSE;
+ 	struct file *file = io->file;
++	struct inode *inode = file->f_mapping->host;
+ 	struct fuse_file *ff = file->private_data;
+ 	struct fuse_conn *fc = ff->fc;
+ 	size_t nmax = write ? fc->max_write : fc->max_read;
+ 	loff_t pos = *ppos;
++	pgoff_t idx_from = pos >> PAGE_CACHE_SHIFT;
++	pgoff_t idx_to = (pos + count - 1) >> PAGE_CACHE_SHIFT;
+ 	ssize_t res = 0;
+ 	struct fuse_req *req;
+ 	struct iov_iter ii;
+@@ -1353,6 +1364,14 @@ ssize_t fuse_direct_io(struct fuse_io_pr
+ 	if (IS_ERR(req))
+ 		return PTR_ERR(req);
+ 
++	if (!cuse && fuse_range_is_writeback(inode, idx_from, idx_to)) {
++		if (!write)
++			mutex_lock(&inode->i_mutex);
++		fuse_sync_writes(inode);
++		if (!write)
++			mutex_unlock(&inode->i_mutex);
++	}
++
+ 	while (count) {
+ 		size_t nres;
+ 		fl_owner_t owner = current->files;
+@@ -1437,7 +1456,8 @@ static ssize_t __fuse_direct_write(struc
+ 
+ 	res = generic_write_checks(file, ppos, &count, 0);
+ 	if (!res)
+-		res = fuse_direct_io(io, iov, nr_segs, count, ppos, 1);
++		res = fuse_direct_io(io, iov, nr_segs, count, ppos,
++				     FUSE_DIO_WRITE);
+ 
+ 	fuse_invalidate_attr(inode);
+ 
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -835,9 +835,20 @@ int fuse_reverse_inval_entry(struct supe
+ 
+ int fuse_do_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
+ 		 bool isdir);
++
++/**
++ * fuse_direct_io() flags
++ */
++
++/** If set, it is WRITE; otherwise - READ */
++#define FUSE_DIO_WRITE (1 << 0)
++
++/** CUSE pass fuse_direct_io() a file which f_mapping->host is not from FUSE */
++#define FUSE_DIO_CUSE  (1 << 1)
++
+ ssize_t fuse_direct_io(struct fuse_io_priv *io, const struct iovec *iov,
+ 		       unsigned long nr_segs, size_t count, loff_t *ppos,
+-		       int write);
++		       int flags);
+ long fuse_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg,
+ 		   unsigned int flags);
+ unsigned fuse_file_poll(struct file *file, poll_table *wait);
