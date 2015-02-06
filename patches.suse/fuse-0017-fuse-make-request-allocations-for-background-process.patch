@@ -1,0 +1,187 @@
+From: Maxim Patlasov <mpatlasov@parallels.com>
+Date: Thu, 21 Mar 2013 18:02:04 +0400
+Subject: fuse: make request allocations for background processing explicit
+Git-commit: 8b41e6715ed555e2d8e8dac52ec1f05a9f04dcb4
+Patch-mainline: v3.10-rc1
+References: FATE#317677
+
+There are two types of processing requests in FUSE: synchronous (via
+fuse_request_send()) and asynchronous (via adding to fc->bg_queue).
+
+Fortunately, the type of processing is always known in advance, at the time
+of request allocation. This preparatory patch utilizes this fact making
+fuse_get_req() aware about the type. Next patches will use it.
+
+Signed-off-by: Maxim Patlasov <mpatlasov@parallels.com>
+Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+---
+ fs/fuse/cuse.c   |    2 +-
+ fs/fuse/dev.c    |   20 ++++++++++++++++++--
+ fs/fuse/file.c   |   16 ++++++++++++++--
+ fs/fuse/fuse_i.h |    2 ++
+ fs/fuse/inode.c  |    2 ++
+ 5 files changed, 37 insertions(+), 5 deletions(-)
+
+--- a/fs/fuse/cuse.c
++++ b/fs/fuse/cuse.c
+@@ -413,7 +413,7 @@ static int cuse_send_init(struct cuse_co
+ 
+ 	BUILD_BUG_ON(CUSE_INIT_INFO_MAX > PAGE_SIZE);
+ 
+-	req = fuse_get_req(fc, 1);
++	req = fuse_get_req_for_background(fc, 1);
+ 	if (IS_ERR(req)) {
+ 		rc = PTR_ERR(req);
+ 		goto err;
+--- a/fs/fuse/dev.c
++++ b/fs/fuse/dev.c
+@@ -130,7 +130,8 @@ static void fuse_req_init_context(struct
+ 	req->in.h.pid = current->pid;
+ }
+ 
+-struct fuse_req *fuse_get_req(struct fuse_conn *fc, unsigned npages)
++static struct fuse_req *__fuse_get_req(struct fuse_conn *fc, unsigned npages,
++				       bool for_background)
+ {
+ 	struct fuse_req *req;
+ 	sigset_t oldset;
+@@ -156,14 +157,27 @@ struct fuse_req *fuse_get_req(struct fus
+ 
+ 	fuse_req_init_context(req);
+ 	req->waiting = 1;
++	req->background = for_background;
+ 	return req;
+ 
+  out:
+ 	atomic_dec(&fc->num_waiting);
+ 	return ERR_PTR(err);
+ }
++
++struct fuse_req *fuse_get_req(struct fuse_conn *fc, unsigned npages)
++{
++	return __fuse_get_req(fc, npages, false);
++}
+ EXPORT_SYMBOL_GPL(fuse_get_req);
+ 
++struct fuse_req *fuse_get_req_for_background(struct fuse_conn *fc,
++					     unsigned npages)
++{
++	return __fuse_get_req(fc, npages, true);
++}
++EXPORT_SYMBOL_GPL(fuse_get_req_for_background);
++
+ /*
+  * Return request in fuse_file->reserved_req.  However that may
+  * currently be in use.  If that is the case, wait for it to become
+@@ -233,6 +247,7 @@ struct fuse_req *fuse_get_req_nofail_nop
+ 
+ 	fuse_req_init_context(req);
+ 	req->waiting = 1;
++	req->background = 0;
+ 	return req;
+ }
+ 
+@@ -444,6 +459,7 @@ __acquires(fc->lock)
+ void fuse_request_send(struct fuse_conn *fc, struct fuse_req *req)
+ {
+ 	req->isreply = 1;
++	BUG_ON(req->background);
+ 	spin_lock(&fc->lock);
+ 	if (!fc->connected)
+ 		req->out.h.error = -ENOTCONN;
+@@ -465,7 +481,7 @@ EXPORT_SYMBOL_GPL(fuse_request_send);
+ static void fuse_request_send_nowait_locked(struct fuse_conn *fc,
+ 					    struct fuse_req *req)
+ {
+-	req->background = 1;
++	BUG_ON(!req->background);
+ 	fc->num_background++;
+ 	if (fc->num_background == fc->max_background)
+ 		fc->blocked = 1;
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -125,11 +125,13 @@ static void fuse_file_put(struct fuse_fi
+ 		struct fuse_req *req = ff->reserved_req;
+ 
+ 		if (sync) {
++			req->background = 0;
+ 			fuse_request_send(ff->fc, req);
+ 			path_put(&req->misc.release.path);
+ 			fuse_put_request(ff->fc, req);
+ 		} else {
+ 			req->end = fuse_release_end;
++			req->background = 1;
+ 			fuse_request_send_background(ff->fc, req);
+ 		}
+ 		kfree(ff);
+@@ -275,6 +277,7 @@ void fuse_sync_release(struct fuse_file
+ 	WARN_ON(atomic_read(&ff->count) > 1);
+ 	fuse_prepare_release(ff, flags, FUSE_RELEASE);
+ 	ff->reserved_req->force = 1;
++	ff->reserved_req->background = 0;
+ 	fuse_request_send(ff->fc, ff->reserved_req);
+ 	fuse_put_request(ff->fc, ff->reserved_req);
+ 	kfree(ff);
+@@ -654,7 +657,12 @@ static int fuse_readpages_fill(void *_da
+ 		int nr_alloc = min_t(unsigned, data->nr_pages,
+ 				     FUSE_MAX_PAGES_PER_REQ);
+ 		fuse_send_readpages(req, data->file);
+-		data->req = req = fuse_get_req(fc, nr_alloc);
++		if (fc->async_read)
++			req = fuse_get_req_for_background(fc, nr_alloc);
++		else
++			req = fuse_get_req(fc, nr_alloc);
++
++		data->req = req;
+ 		if (IS_ERR(req)) {
+ 			unlock_page(page);
+ 			return PTR_ERR(req);
+@@ -689,7 +697,10 @@ static int fuse_readpages(struct file *f
+ 
+ 	data.file = file;
+ 	data.inode = inode;
+-	data.req = fuse_get_req(fc, nr_alloc);
++	if (fc->async_read)
++		data.req = fuse_get_req_for_background(fc, nr_alloc);
++	else
++		data.req = fuse_get_req(fc, nr_alloc);
+ 	data.nr_pages = nr_pages;
+ 	err = PTR_ERR(data.req);
+ 	if (IS_ERR(data.req))
+@@ -1363,6 +1374,7 @@ static int fuse_writepage_locked(struct
+ 	if (!req)
+ 		goto err;
+ 
++	req->background = 1; /* writeback always goes to bg_queue */
+ 	tmp_page = alloc_page(GFP_NOFS | __GFP_HIGHMEM);
+ 	if (!tmp_page)
+ 		goto err_free;
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -678,6 +678,8 @@ void fuse_request_free(struct fuse_req *
+  * caller should specify # elements in req->pages[] explicitly
+  */
+ struct fuse_req *fuse_get_req(struct fuse_conn *fc, unsigned npages);
++struct fuse_req *fuse_get_req_for_background(struct fuse_conn *fc,
++					     unsigned npages);
+ 
+ /**
+  * Get a request, may fail with -ENOMEM,
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -325,6 +325,7 @@ static void fuse_send_destroy(struct fus
+ 		fc->destroy_req = NULL;
+ 		req->in.h.opcode = FUSE_DESTROY;
+ 		req->force = 1;
++		req->background = 0;
+ 		fuse_request_send(fc, req);
+ 		fuse_put_request(fc, req);
+ 	}
+@@ -1009,6 +1010,7 @@ static int fuse_fill_super(struct super_
+ 	init_req = fuse_request_alloc(0);
+ 	if (!init_req)
+ 		goto err_put_root;
++	init_req->background = 1;
+ 
+ 	if (is_bdev) {
+ 		fc->destroy_req = fuse_request_alloc(0);
