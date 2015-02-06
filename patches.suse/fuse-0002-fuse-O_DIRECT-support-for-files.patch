@@ -1,0 +1,249 @@
+From: Anand Avati <avati@redhat.com>
+Date: Fri, 17 Feb 2012 12:46:25 -0500
+Subject: fuse: O_DIRECT support for files
+Git-commit: 4273b793ec68753cc3fcf5be7cbfd88c2be2058d
+Patch-mainline: v3.4-rc4
+References: FATE#317677
+
+Implement ->direct_IO() method in aops. The ->direct_IO() method combines
+the existing fuse_direct_read/fuse_direct_write methods to implement
+O_DIRECT functionality.
+
+Reaching ->direct_IO() in the read path via generic_file_aio_read ensures
+proper synchronization with page cache with its existing framework.
+
+Reaching ->direct_IO() in the write path via fuse_file_aio_write is made
+to come via generic_file_direct_write() which makes it play nice with
+the page cache w.r.t other mmap pages etc.
+
+On files marked 'direct_io' by the filesystem server, IO always follows
+the fuse_direct_read/write path. There is no effect of fcntl(O_DIRECT)
+and it always succeeds.
+
+On files not marked with 'direct_io' by the filesystem server, the IO
+path depends on O_DIRECT flag by the application. This can be passed
+at the time of open() as well as via fcntl().
+
+Note that asynchronous O_DIRECT iocb jobs are completed synchronously
+always (this has been the case with FUSE even before this patch)
+
+Signed-off-by: Anand Avati <avati@redhat.com>
+Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+---
+ fs/fuse/dir.c  |    3 -
+ fs/fuse/file.c |  129 +++++++++++++++++++++++++++++++++++++++++++++++++--------
+ 2 files changed, 112 insertions(+), 20 deletions(-)
+
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -387,9 +387,6 @@ static int fuse_create_open(struct inode
+ 	if (fc->no_create)
+ 		return -ENOSYS;
+ 
+-	if (flags & O_DIRECT)
+-		return -EINVAL;
+-
+ 	forget = fuse_alloc_forget();
+ 	if (!forget)
+ 		return -ENOMEM;
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -193,10 +193,6 @@ int fuse_open_common(struct inode *inode
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
+ 	int err;
+ 
+-	/* VFS checks this, but only _after_ ->open() */
+-	if (file->f_flags & O_DIRECT)
+-		return -EINVAL;
+-
+ 	err = generic_file_open(inode, file);
+ 	if (err)
+ 		return err;
+@@ -923,17 +919,23 @@ static ssize_t fuse_file_aio_write(struc
+ 	struct file *file = iocb->ki_filp;
+ 	struct address_space *mapping = file->f_mapping;
+ 	size_t count = 0;
++	size_t ocount = 0;
+ 	ssize_t written = 0;
++	ssize_t written_buffered = 0;
+ 	struct inode *inode = mapping->host;
+ 	ssize_t err;
+ 	struct iov_iter i;
++	loff_t endbyte = 0;
+ 
+ 	WARN_ON(iocb->ki_pos != pos);
+ 
+-	err = generic_segment_checks(iov, &nr_segs, &count, VERIFY_READ);
++	ocount = 0;
++	err = generic_segment_checks(iov, &nr_segs, &ocount, VERIFY_READ);
+ 	if (err)
+ 		return err;
+ 
++	count = ocount;
++
+ 	mutex_lock(&inode->i_mutex);
+ 	vfs_check_frozen(inode->i_sb, SB_FREEZE_WRITE);
+ 
+@@ -955,11 +957,41 @@ static ssize_t fuse_file_aio_write(struc
+ 	if (err)
+ 		goto out;
+ 
+-	iov_iter_init(&i, iov, nr_segs, count, 0);
+-	written = fuse_perform_write(file, mapping, &i, pos);
+-	if (written >= 0)
+-		iocb->ki_pos = pos + written;
++	if (file->f_flags & O_DIRECT) {
++		written = generic_file_direct_write(iocb, iov, &nr_segs,
++						    pos, &iocb->ki_pos,
++						    count, ocount);
++		if (written < 0 || written == count)
++			goto out;
++
++		pos += written;
++		count -= written;
++
++		iov_iter_init(&i, iov, nr_segs, count, written);
++		written_buffered = fuse_perform_write(file, mapping, &i, pos);
++		if (written_buffered < 0) {
++			err = written_buffered;
++			goto out;
++		}
++		endbyte = pos + written_buffered - 1;
++
++		err = filemap_write_and_wait_range(file->f_mapping, pos,
++						   endbyte);
++		if (err)
++			goto out;
++
++		invalidate_mapping_pages(file->f_mapping,
++					 pos >> PAGE_CACHE_SHIFT,
++					 endbyte >> PAGE_CACHE_SHIFT);
+ 
++		written += written_buffered;
++		iocb->ki_pos = pos + written_buffered;
++	} else {
++		iov_iter_init(&i, iov, nr_segs, count, 0);
++		written = fuse_perform_write(file, mapping, &i, pos);
++		if (written >= 0)
++			iocb->ki_pos = pos + written;
++	}
+ out:
+ 	current->backing_dev_info = NULL;
+ 	mutex_unlock(&inode->i_mutex);
+@@ -1094,30 +1126,41 @@ static ssize_t fuse_direct_read(struct f
+ 	return res;
+ }
+ 
+-static ssize_t fuse_direct_write(struct file *file, const char __user *buf,
+-				 size_t count, loff_t *ppos)
++static ssize_t __fuse_direct_write(struct file *file, const char __user *buf,
++				   size_t count, loff_t *ppos)
+ {
+ 	struct inode *inode = file->f_path.dentry->d_inode;
+ 	ssize_t res;
+ 
+-	if (is_bad_inode(inode))
+-		return -EIO;
+-
+-	/* Don't allow parallel writes to the same file */
+-	mutex_lock(&inode->i_mutex);
+ 	res = generic_write_checks(file, ppos, &count, 0);
+ 	if (!res) {
+ 		res = fuse_direct_io(file, buf, count, ppos, 1);
+ 		if (res > 0)
+ 			fuse_write_update_size(inode, *ppos);
+ 	}
+-	mutex_unlock(&inode->i_mutex);
+ 
+ 	fuse_invalidate_attr(inode);
+ 
+ 	return res;
+ }
+ 
++static ssize_t fuse_direct_write(struct file *file, const char __user *buf,
++				 size_t count, loff_t *ppos)
++{
++	struct inode *inode = file->f_path.dentry->d_inode;
++	ssize_t res;
++
++	if (is_bad_inode(inode))
++		return -EIO;
++
++	/* Don't allow parallel writes to the same file */
++	mutex_lock(&inode->i_mutex);
++	res = __fuse_direct_write(file, buf, count, ppos);
++	mutex_unlock(&inode->i_mutex);
++
++	return res;
++}
++
+ static void fuse_writepage_free(struct fuse_conn *fc, struct fuse_req *req)
+ {
+ 	__free_page(req->pages[0]);
+@@ -2096,6 +2139,57 @@ int fuse_notify_poll_wakeup(struct fuse_
+ 	return 0;
+ }
+ 
++static ssize_t fuse_loop_dio(struct file *filp, const struct iovec *iov,
++			     unsigned long nr_segs, loff_t *ppos, int rw)
++{
++	const struct iovec *vector = iov;
++	ssize_t ret = 0;
++
++	while (nr_segs > 0) {
++		void __user *base;
++		size_t len;
++		ssize_t nr;
++
++		base = vector->iov_base;
++		len = vector->iov_len;
++		vector++;
++		nr_segs--;
++
++		if (rw == WRITE)
++			nr = __fuse_direct_write(filp, base, len, ppos);
++		else
++			nr = fuse_direct_read(filp, base, len, ppos);
++
++		if (nr < 0) {
++			if (!ret)
++				ret = nr;
++			break;
++		}
++		ret += nr;
++		if (nr != len)
++			break;
++	}
++
++	return ret;
++}
++
++
++static ssize_t
++fuse_direct_IO(int rw, struct kiocb *iocb, const struct iovec *iov,
++			loff_t offset, unsigned long nr_segs)
++{
++	ssize_t ret = 0;
++	struct file *file = NULL;
++	loff_t pos = 0;
++
++	file = iocb->ki_filp;
++	pos = offset;
++
++	ret = fuse_loop_dio(file, iov, nr_segs, &pos, rw);
++
++	return ret;
++}
++
+ static const struct file_operations fuse_file_operations = {
+ 	.llseek		= fuse_file_llseek,
+ 	.read		= do_sync_read,
+@@ -2139,6 +2233,7 @@ static const struct address_space_operat
+ 	.readpages	= fuse_readpages,
+ 	.set_page_dirty	= __set_page_dirty_nobuffers,
+ 	.bmap		= fuse_bmap,
++	.direct_IO	= fuse_direct_IO,
+ };
+ 
+ void fuse_init_file_inode(struct inode *inode)
