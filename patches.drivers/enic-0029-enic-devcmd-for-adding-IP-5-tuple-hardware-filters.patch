@@ -1,0 +1,210 @@
+From: Govindarajulu Varadarajan <_govind@gmx.com>
+Date: Mon, 23 Jun 2014 16:08:00 +0530
+Subject: [PATCH 29/56] enic: devcmd for adding IP 5 tuple hardware filters
+Patch-mainline: v3.17-rc1
+Git-commit: 631185273b6e1f8e0b5a00c1aca08650b2d18a57
+References: bsc#911105 FATE#317501
+
+This patch adds interface to add and delete IP 5 tuple filter. This interface
+is used by Accelerated RFS code to steer a flow to corresponding receive
+queue.
+
+As of now adaptor supports only ipv4 + tcp/udp packet steering.
+
+Signed-off-by: Govindarajulu Varadarajan <_govind@gmx.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Govindarajulu Varadarajulu <gvaradar@cisco.com>
+Acked-by: Gary Ching-Pang Lin <glin@suse.com>
+---
+ drivers/net/ethernet/cisco/enic/Makefile      |    2 
+ drivers/net/ethernet/cisco/enic/enic_clsf.c   |   66 ++++++++++++++++++++++++++
+ drivers/net/ethernet/cisco/enic/enic_clsf.h   |   10 +++
+ drivers/net/ethernet/cisco/enic/vnic_dev.c    |   61 ++++++++++++++++++++++++
+ drivers/net/ethernet/cisco/enic/vnic_dev.h    |    2 
+ drivers/net/ethernet/cisco/enic/vnic_devcmd.h |    5 +
+ 6 files changed, 145 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/ethernet/cisco/enic/enic_clsf.c
+ create mode 100644 drivers/net/ethernet/cisco/enic/enic_clsf.h
+
+--- a/drivers/net/ethernet/cisco/enic/Makefile
++++ b/drivers/net/ethernet/cisco/enic/Makefile
+@@ -2,5 +2,5 @@ obj-$(CONFIG_ENIC) := enic.o
+ 
+ enic-y := enic_main.o vnic_cq.o vnic_intr.o vnic_wq.o \
+ 	enic_res.o enic_dev.o enic_pp.o vnic_dev.o vnic_rq.o vnic_vic.o \
+-	enic_ethtool.o enic_api.o
++	enic_ethtool.o enic_api.o enic_clsf.o
+ 
+--- /dev/null
++++ b/drivers/net/ethernet/cisco/enic/enic_clsf.c
+@@ -0,0 +1,66 @@
++#include <linux/if.h>
++#include <linux/if_ether.h>
++#include <linux/if_link.h>
++#include <linux/netdevice.h>
++#include <linux/in.h>
++#include <linux/types.h>
++#include <linux/skbuff.h>
++#include <net/flow_keys.h>
++#include "enic_res.h"
++#include "enic_clsf.h"
++
++/* enic_addfltr_5t - Add ipv4 5tuple filter
++ *	@enic: enic struct of vnic
++ *	@keys: flow_keys of ipv4 5tuple
++ *	@rq: rq number to steer to
++ *
++ * This function returns filter_id(hardware_id) of the filter
++ * added. In case of error it returns an negative number.
++ */
++int enic_addfltr_5t(struct enic *enic, struct flow_keys *keys, u16 rq)
++{
++	int res;
++	struct filter data;
++
++	switch (keys->ip_proto) {
++	case IPPROTO_TCP:
++		data.u.ipv4.protocol = PROTO_TCP;
++		break;
++	case IPPROTO_UDP:
++		data.u.ipv4.protocol = PROTO_UDP;
++		break;
++	default:
++		return -EPROTONOSUPPORT;
++	};
++	data.type = FILTER_IPV4_5TUPLE;
++	data.u.ipv4.src_addr = ntohl(keys->src);
++	data.u.ipv4.dst_addr = ntohl(keys->dst);
++	data.u.ipv4.src_port = ntohs(keys->port16[0]);
++	data.u.ipv4.dst_port = ntohs(keys->port16[1]);
++	data.u.ipv4.flags = FILTER_FIELDS_IPV4_5TUPLE;
++
++	spin_lock_bh(&enic->devcmd_lock);
++	res = vnic_dev_classifier(enic->vdev, CLSF_ADD, &rq, &data);
++	spin_unlock_bh(&enic->devcmd_lock);
++	res = (res == 0) ? rq : res;
++
++	return res;
++}
++
++/* enic_delfltr - Delete clsf filter
++ *	@enic: enic struct of vnic
++ *	@filter_id: filter_is(hardware_id) of filter to be deleted
++ *
++ * This function returns zero in case of success, negative number incase of
++ * error.
++ */
++int enic_delfltr(struct enic *enic, u16 filter_id)
++{
++	int ret;
++
++	spin_lock_bh(&enic->devcmd_lock);
++	ret = vnic_dev_classifier(enic->vdev, CLSF_DEL, &filter_id, NULL);
++	spin_unlock_bh(&enic->devcmd_lock);
++
++	return ret;
++}
+--- /dev/null
++++ b/drivers/net/ethernet/cisco/enic/enic_clsf.h
+@@ -0,0 +1,10 @@
++#ifndef _ENIC_CLSF_H_
++#define _ENIC_CLSF_H_
++
++#include "vnic_dev.h"
++#include "enic.h"
++
++int enic_addfltr_5t(struct enic *enic, struct flow_keys *keys, u16 rq);
++int enic_delfltr(struct enic *enic, u16 filter_id);
++
++#endif /* _ENIC_CLSF_H_ */
+--- a/drivers/net/ethernet/cisco/enic/vnic_dev.c
++++ b/drivers/net/ethernet/cisco/enic/vnic_dev.c
+@@ -1048,3 +1048,64 @@ int vnic_dev_set_mac_addr(struct vnic_de
+ 
+ 	return vnic_dev_cmd(vdev, CMD_SET_MAC_ADDR, &a0, &a1, wait);
+ }
++
++/* vnic_dev_classifier: Add/Delete classifier entries
++ * @vdev: vdev of the device
++ * @cmd: CLSF_ADD for Add filter
++ *	 CLSF_DEL for Delete filter
++ * @entry: In case of ADD filter, the caller passes the RQ number in this
++ *	   variable.
++ *
++ *	   This function stores the filter_id returned by the firmware in the
++ *	   same variable before return;
++ *
++ *	   In case of DEL filter, the caller passes the RQ number. Return
++ *	   value is irrelevant.
++ * @data: filter data
++ */
++int vnic_dev_classifier(struct vnic_dev *vdev, u8 cmd, u16 *entry,
++			struct filter *data)
++{
++	u64 a0, a1;
++	int wait = 1000;
++	dma_addr_t tlv_pa;
++	int ret = -EINVAL;
++	struct filter_tlv *tlv, *tlv_va;
++	struct filter_action *action;
++	u64 tlv_size;
++
++	if (cmd == CLSF_ADD) {
++		tlv_size = sizeof(struct filter) +
++			   sizeof(struct filter_action) +
++			   2 * sizeof(struct filter_tlv);
++		tlv_va = pci_alloc_consistent(vdev->pdev, tlv_size, &tlv_pa);
++		if (!tlv_va)
++			return -ENOMEM;
++		tlv = tlv_va;
++		a0 = tlv_pa;
++		a1 = tlv_size;
++		memset(tlv, 0, tlv_size);
++		tlv->type = CLSF_TLV_FILTER;
++		tlv->length = sizeof(struct filter);
++		*(struct filter *)&tlv->val = *data;
++
++		tlv = (struct filter_tlv *)((char *)tlv +
++					    sizeof(struct filter_tlv) +
++					    sizeof(struct filter));
++
++		tlv->type = CLSF_TLV_ACTION;
++		tlv->length = sizeof(struct filter_action);
++		action = (struct filter_action *)&tlv->val;
++		action->type = FILTER_ACTION_RQ_STEERING;
++		action->u.rq_idx = *entry;
++
++		ret = vnic_dev_cmd(vdev, CMD_ADD_FILTER, &a0, &a1, wait);
++		*entry = (u16)a0;
++		pci_free_consistent(vdev->pdev, tlv_size, tlv_va, tlv_pa);
++	} else if (cmd == CLSF_DEL) {
++		a0 = *entry;
++		ret = vnic_dev_cmd(vdev, CMD_DEL_FILTER, &a0, &a1, wait);
++	}
++
++	return ret;
++}
+--- a/drivers/net/ethernet/cisco/enic/vnic_dev.h
++++ b/drivers/net/ethernet/cisco/enic/vnic_dev.h
+@@ -133,5 +133,7 @@ int vnic_dev_enable2(struct vnic_dev *vd
+ int vnic_dev_enable2_done(struct vnic_dev *vdev, int *status);
+ int vnic_dev_deinit_done(struct vnic_dev *vdev, int *status);
+ int vnic_dev_set_mac_addr(struct vnic_dev *vdev, u8 *mac_addr);
++int vnic_dev_classifier(struct vnic_dev *vdev, u8 cmd, u16 *entry,
++			struct filter *data);
+ 
+ #endif /* _VNIC_DEV_H_ */
+--- a/drivers/net/ethernet/cisco/enic/vnic_devcmd.h
++++ b/drivers/net/ethernet/cisco/enic/vnic_devcmd.h
+@@ -603,6 +603,11 @@ struct filter_tlv {
+ 	u_int32_t val[0];
+ };
+ 
++enum {
++	CLSF_ADD = 0,
++	CLSF_DEL = 1,
++};
++
+ /*
+  * Writing cmd register causes STAT_BUSY to get set in status register.
+  * When cmd completes, STAT_BUSY will be cleared.
