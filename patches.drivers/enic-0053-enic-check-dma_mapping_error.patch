@@ -1,0 +1,289 @@
+From: Govindarajulu Varadarajan <_govind@gmx.com>
+Date: Wed, 24 Dec 2014 15:59:37 +0530
+Subject: [PATCH 53/56] enic: check dma_mapping_error
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git
+Git-commit: 065df159ec588630a360a689e4e3043c6622a6e9
+References: bsc#911105 FATE#317501
+
+This patch checks for pci_dma_mapping_error() after dma mapping the data.
+If the dma mapping fails we remove the previously queued frags and return
+NETDEV_TX_OK.
+
+Reported-by: Jan Stancek <jstancek@redhat.com>
+Signed-off-by: Govindarajulu Varadarajan <_govind@gmx.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Govindarajulu Varadarajulu <gvaradar@cisco.com>
+Acked-by: Gary Ching-Pang Lin <glin@suse.com>
+---
+ drivers/net/ethernet/cisco/enic/enic.h      |   12 ++
+ drivers/net/ethernet/cisco/enic/enic_main.c |  152 +++++++++++++++++-----------
+ 2 files changed, 106 insertions(+), 58 deletions(-)
+
+--- a/drivers/net/ethernet/cisco/enic/enic.h
++++ b/drivers/net/ethernet/cisco/enic/enic.h
+@@ -242,6 +242,18 @@ static inline unsigned int enic_msix_not
+ 	return enic->rq_count + enic->wq_count + 1;
+ }
+ 
++static inline int enic_dma_map_check(struct enic *enic, dma_addr_t dma_addr)
++{
++	if (unlikely(pci_dma_mapping_error(enic->pdev, dma_addr))) {
++		net_warn_ratelimited("%s: PCI dma mapping failed!\n",
++				     enic->netdev->name);
++
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
+ void enic_reset_addr_lists(struct enic *enic);
+ int enic_sriov_enabled(struct enic *enic);
+ int enic_is_valid_vf(struct enic *enic, int vf);
+--- a/drivers/net/ethernet/cisco/enic/enic_main.c
++++ b/drivers/net/ethernet/cisco/enic/enic_main.c
+@@ -346,80 +346,94 @@ static irqreturn_t enic_isr_msix_notify(
+ 	return IRQ_HANDLED;
+ }
+ 
+-static inline void enic_queue_wq_skb_cont(struct enic *enic,
+-	struct vnic_wq *wq, struct sk_buff *skb,
+-	unsigned int len_left, int loopback)
++static int enic_queue_wq_skb_cont(struct enic *enic, struct vnic_wq *wq,
++				  struct sk_buff *skb, unsigned int len_left,
++				  int loopback)
+ {
+ 	const skb_frag_t *frag;
++	dma_addr_t dma_addr;
+ 
+ 	/* Queue additional data fragments */
+ 	for (frag = skb_shinfo(skb)->frags; len_left; frag++) {
+ 		len_left -= skb_frag_size(frag);
+-		enic_queue_wq_desc_cont(wq, skb,
+-			skb_frag_dma_map(&enic->pdev->dev,
+-					 frag, 0, skb_frag_size(frag),
+-					 DMA_TO_DEVICE),
+-			skb_frag_size(frag),
+-			(len_left == 0),	/* EOP? */
+-			loopback);
++		dma_addr = skb_frag_dma_map(&enic->pdev->dev, frag, 0,
++					    skb_frag_size(frag),
++					    DMA_TO_DEVICE);
++		if (unlikely(enic_dma_map_check(enic, dma_addr)))
++			return -ENOMEM;
++		enic_queue_wq_desc_cont(wq, skb, dma_addr, skb_frag_size(frag),
++					(len_left == 0),	/* EOP? */
++					loopback);
+ 	}
++
++	return 0;
+ }
+ 
+-static inline void enic_queue_wq_skb_vlan(struct enic *enic,
+-	struct vnic_wq *wq, struct sk_buff *skb,
+-	int vlan_tag_insert, unsigned int vlan_tag, int loopback)
++static int enic_queue_wq_skb_vlan(struct enic *enic, struct vnic_wq *wq,
++				  struct sk_buff *skb, int vlan_tag_insert,
++				  unsigned int vlan_tag, int loopback)
+ {
+ 	unsigned int head_len = skb_headlen(skb);
+ 	unsigned int len_left = skb->len - head_len;
+ 	int eop = (len_left == 0);
++	dma_addr_t dma_addr;
++	int err = 0;
++
++	dma_addr = pci_map_single(enic->pdev, skb->data, head_len,
++				  PCI_DMA_TODEVICE);
++	if (unlikely(enic_dma_map_check(enic, dma_addr)))
++		return -ENOMEM;
+ 
+ 	/* Queue the main skb fragment. The fragments are no larger
+ 	 * than max MTU(9000)+ETH_HDR_LEN(14) bytes, which is less
+ 	 * than WQ_ENET_MAX_DESC_LEN length. So only one descriptor
+ 	 * per fragment is queued.
+ 	 */
+-	enic_queue_wq_desc(wq, skb,
+-		pci_map_single(enic->pdev, skb->data,
+-			head_len, PCI_DMA_TODEVICE),
+-		head_len,
+-		vlan_tag_insert, vlan_tag,
+-		eop, loopback);
++	enic_queue_wq_desc(wq, skb, dma_addr, head_len,	vlan_tag_insert,
++			   vlan_tag, eop, loopback);
+ 
+ 	if (!eop)
+-		enic_queue_wq_skb_cont(enic, wq, skb, len_left, loopback);
++		err = enic_queue_wq_skb_cont(enic, wq, skb, len_left, loopback);
++
++	return err;
+ }
+ 
+-static inline void enic_queue_wq_skb_csum_l4(struct enic *enic,
+-	struct vnic_wq *wq, struct sk_buff *skb,
+-	int vlan_tag_insert, unsigned int vlan_tag, int loopback)
++static int enic_queue_wq_skb_csum_l4(struct enic *enic, struct vnic_wq *wq,
++				     struct sk_buff *skb, int vlan_tag_insert,
++				     unsigned int vlan_tag, int loopback)
+ {
+ 	unsigned int head_len = skb_headlen(skb);
+ 	unsigned int len_left = skb->len - head_len;
+ 	unsigned int hdr_len = skb_checksum_start_offset(skb);
+ 	unsigned int csum_offset = hdr_len + skb->csum_offset;
+ 	int eop = (len_left == 0);
++	dma_addr_t dma_addr;
++	int err = 0;
++
++	dma_addr = pci_map_single(enic->pdev, skb->data, head_len,
++				  PCI_DMA_TODEVICE);
++	if (unlikely(enic_dma_map_check(enic, dma_addr)))
++		return -ENOMEM;
+ 
+ 	/* Queue the main skb fragment. The fragments are no larger
+ 	 * than max MTU(9000)+ETH_HDR_LEN(14) bytes, which is less
+ 	 * than WQ_ENET_MAX_DESC_LEN length. So only one descriptor
+ 	 * per fragment is queued.
+ 	 */
+-	enic_queue_wq_desc_csum_l4(wq, skb,
+-		pci_map_single(enic->pdev, skb->data,
+-			head_len, PCI_DMA_TODEVICE),
+-		head_len,
+-		csum_offset,
+-		hdr_len,
+-		vlan_tag_insert, vlan_tag,
+-		eop, loopback);
++	enic_queue_wq_desc_csum_l4(wq, skb, dma_addr, head_len,	csum_offset,
++				   hdr_len, vlan_tag_insert, vlan_tag, eop,
++				   loopback);
+ 
+ 	if (!eop)
+-		enic_queue_wq_skb_cont(enic, wq, skb, len_left, loopback);
++		err = enic_queue_wq_skb_cont(enic, wq, skb, len_left, loopback);
++
++	return err;
+ }
+ 
+-static inline void enic_queue_wq_skb_tso(struct enic *enic,
+-	struct vnic_wq *wq, struct sk_buff *skb, unsigned int mss,
+-	int vlan_tag_insert, unsigned int vlan_tag, int loopback)
++static int enic_queue_wq_skb_tso(struct enic *enic, struct vnic_wq *wq,
++				 struct sk_buff *skb, unsigned int mss,
++				 int vlan_tag_insert, unsigned int vlan_tag,
++				 int loopback)
+ {
+ 	unsigned int frag_len_left = skb_headlen(skb);
+ 	unsigned int len_left = skb->len - frag_len_left;
+@@ -449,20 +463,19 @@ static inline void enic_queue_wq_skb_tso
+ 	 */
+ 	while (frag_len_left) {
+ 		len = min(frag_len_left, (unsigned int)WQ_ENET_MAX_DESC_LEN);
+-		dma_addr = pci_map_single(enic->pdev, skb->data + offset,
+-				len, PCI_DMA_TODEVICE);
+-		enic_queue_wq_desc_tso(wq, skb,
+-			dma_addr,
+-			len,
+-			mss, hdr_len,
+-			vlan_tag_insert, vlan_tag,
+-			eop && (len == frag_len_left), loopback);
++		dma_addr = pci_map_single(enic->pdev, skb->data + offset, len,
++					  PCI_DMA_TODEVICE);
++		if (unlikely(enic_dma_map_check(enic, dma_addr)))
++			return -ENOMEM;
++		enic_queue_wq_desc_tso(wq, skb, dma_addr, len, mss, hdr_len,
++				       vlan_tag_insert, vlan_tag,
++				       eop && (len == frag_len_left), loopback);
+ 		frag_len_left -= len;
+ 		offset += len;
+ 	}
+ 
+ 	if (eop)
+-		return;
++		return 0;
+ 
+ 	/* Queue WQ_ENET_MAX_DESC_LEN length descriptors
+ 	 * for additional data fragments
+@@ -478,16 +491,18 @@ static inline void enic_queue_wq_skb_tso
+ 			dma_addr = skb_frag_dma_map(&enic->pdev->dev, frag,
+ 						    offset, len,
+ 						    DMA_TO_DEVICE);
+-			enic_queue_wq_desc_cont(wq, skb,
+-				dma_addr,
+-				len,
+-				(len_left == 0) &&
+-				(len == frag_len_left),		/* EOP? */
+-				loopback);
++			if (unlikely(enic_dma_map_check(enic, dma_addr)))
++				return -ENOMEM;
++			enic_queue_wq_desc_cont(wq, skb, dma_addr, len,
++						(len_left == 0) &&
++						 (len == frag_len_left),/*EOP*/
++						loopback);
+ 			frag_len_left -= len;
+ 			offset += len;
+ 		}
+ 	}
++
++	return 0;
+ }
+ 
+ static inline void enic_queue_wq_skb(struct enic *enic,
+@@ -497,6 +512,7 @@ static inline void enic_queue_wq_skb(str
+ 	unsigned int vlan_tag = 0;
+ 	int vlan_tag_insert = 0;
+ 	int loopback = 0;
++	int err;
+ 
+ 	if (vlan_tx_tag_present(skb)) {
+ 		/* VLAN tag from trunking driver */
+@@ -508,14 +524,30 @@ static inline void enic_queue_wq_skb(str
+ 	}
+ 
+ 	if (mss)
+-		enic_queue_wq_skb_tso(enic, wq, skb, mss,
+-			vlan_tag_insert, vlan_tag, loopback);
++		err = enic_queue_wq_skb_tso(enic, wq, skb, mss,
++					    vlan_tag_insert, vlan_tag,
++					    loopback);
+ 	else if	(skb->ip_summed == CHECKSUM_PARTIAL)
+-		enic_queue_wq_skb_csum_l4(enic, wq, skb,
+-			vlan_tag_insert, vlan_tag, loopback);
++		err = enic_queue_wq_skb_csum_l4(enic, wq, skb, vlan_tag_insert,
++						vlan_tag, loopback);
+ 	else
+-		enic_queue_wq_skb_vlan(enic, wq, skb,
+-			vlan_tag_insert, vlan_tag, loopback);
++		err = enic_queue_wq_skb_vlan(enic, wq, skb, vlan_tag_insert,
++					     vlan_tag, loopback);
++	if (unlikely(err)) {
++		struct vnic_wq_buf *buf;
++
++		buf = wq->to_use->prev;
++		/* while not EOP of previous pkt && queue not empty.
++		 * For all non EOP bufs, os_buf is NULL.
++		 */
++		while (!buf->os_buf && (buf->next != wq->to_clean)) {
++			enic_free_wq_buf(wq, buf);
++			wq->ring.desc_avail++;
++			buf = buf->prev;
++		}
++		wq->to_use = buf->next;
++		dev_kfree_skb(skb);
++	}
+ }
+ 
+ /* netif_tx_lock held, process context with BHs disabled, or BH */
+@@ -941,8 +973,12 @@ static int enic_rq_alloc_buf(struct vnic
+ 	if (!skb)
+ 		return -ENOMEM;
+ 
+-	dma_addr = pci_map_single(enic->pdev, skb->data,
+-		len, PCI_DMA_FROMDEVICE);
++	dma_addr = pci_map_single(enic->pdev, skb->data, len,
++				  PCI_DMA_FROMDEVICE);
++	if (unlikely(enic_dma_map_check(enic, dma_addr))) {
++		dev_kfree_skb(skb);
++		return -ENOMEM;
++	}
+ 
+ 	enic_queue_rq_desc(rq, skb, os_buf_index,
+ 		dma_addr, len);
