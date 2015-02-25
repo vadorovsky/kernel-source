@@ -1,0 +1,152 @@
+From: Konstantin Khlebnikov <koct9i@gmail.com>
+Subject: mm: prevent endless growth of anon_vma hierarchy
+Patch-mainline: 3.19-rc4
+References: bnc#904242
+Git-commit: 7a3ef208e662f4b63d43a23f61a64a129c525bbc
+
+Constantly forking task causes unlimited grow of anon_vma chain.
+Each next child allocate new level of anon_vmas and links vmas to all
+previous levels because it inherits pages from them. None of anon_vmas
+cannot be freed because there might be pages which points to them.
+
+This patch adds heuristic which decides to reuse existing anon_vma instead
+of forking new one. It counts vmas and direct descendants for each anon_vma.
+Anon_vma with degree lower than two will be reused at next fork.
+As a result each anon_vma has either alive vma or at least two descendants,
+endless chains are no longer possible and count of anon_vmas is no more than
+two times more than count of vmas.
+
+Signed-off-by: Konstantin Khlebnikov <koct9i@gmail.com>
+Link: http://lkml.kernel.org/r/20120816024610.GA5350@evergreen.ssec.wisc.edu
+Acked-by: Michal Hocko <mhocko@suse.cz>
+
+---
+ include/linux/rmap.h |   16 ++++++++++++++++
+ mm/rmap.c            |   29 ++++++++++++++++++++++++++++-
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+
+--- a/include/linux/rmap.h
++++ b/include/linux/rmap.h
+@@ -45,6 +45,22 @@ struct anon_vma {
+ 	 * mm_take_all_locks() (mm_all_locks_mutex).
+ 	 */
+ 	struct list_head head;	/* Chain of private "related" vmas */
++
++	/*
++	 * Count of child anon_vmas and VMAs which points to this anon_vma.
++	 *
++	 * This counter is used for making decision about reusing old anon_vma
++	 * instead of forking new one. It allows to detect anon_vmas which have
++	 * just one direct descendant and no vmas. Reusing such anon_vma not
++	 * leads to significant preformance regression but prevents degradation
++	 * of anon_vma hierarchy to endless linear chain.
++	 *
++	 * Root anon_vma is never reused because it is its own parent and it has
++	 * at leat one vma or child, thus at fork it's degree is at least 2.
++	 */
++	unsigned degree;
++
++	struct anon_vma *parent;	/* Parent of this anon_vma */
+ };
+ 
+ /*
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -73,6 +73,8 @@ static inline struct anon_vma *anon_vma_
+ 	anon_vma = kmem_cache_alloc(anon_vma_cachep, GFP_KERNEL);
+ 	if (anon_vma) {
+ 		atomic_set(&anon_vma->refcount, 1);
++		anon_vma->degree = 1;	/* Reference for first vma */
++		anon_vma->parent = anon_vma;
+ 		/*
+ 		 * Initialise the anon_vma root to point to itself. If called
+ 		 * from fork, the root will be reset to the parents anon_vma.
+@@ -181,6 +183,7 @@ int anon_vma_prepare(struct vm_area_stru
+ 			avc->vma = vma;
+ 			list_add(&avc->same_vma, &vma->anon_vma_chain);
+ 			list_add_tail(&avc->same_anon_vma, &anon_vma->head);
++			anon_vma->degree++;
+ 			allocated = NULL;
+ 			avc = NULL;
+ 		}
+@@ -264,7 +267,17 @@ int anon_vma_clone(struct vm_area_struct
+ 		anon_vma = pavc->anon_vma;
+ 		root = lock_anon_vma_root(root, anon_vma);
+ 		anon_vma_chain_link(dst, avc, anon_vma);
++
++		/*
++		 * Reuse existing anon_vma if its degree lower than two,
++		 * that means it has no vma and just one anon_vma child.
++		 */
++		if (!dst->anon_vma && anon_vma != src->anon_vma &&
++				anon_vma->degree < 2)
++			dst->anon_vma = anon_vma;
+ 	}
++	if (dst->anon_vma)
++		dst->anon_vma->degree++;
+ 	unlock_anon_vma_root(root);
+ 	return 0;
+ 
+@@ -287,6 +300,9 @@ int anon_vma_fork(struct vm_area_struct
+ 	if (!pvma->anon_vma)
+ 		return 0;
+ 
++	/* Drop inherited anon_vma, we'll reuse old one or allocate new. */
++	vma->anon_vma = NULL;
++
+ 	/*
+ 	 * First, attach the new VMA to the parent VMA's anon_vmas,
+ 	 * so rmap can find non-COWed pages in child processes.
+@@ -294,6 +310,10 @@ int anon_vma_fork(struct vm_area_struct
+ 	if (anon_vma_clone(vma, pvma))
+ 		return -ENOMEM;
+ 
++	/* An old anon_vma has been reused. */
++	if (vma->anon_vma)
++		return 0;
++
+ 	/* Then add our own anon_vma. */
+ 	anon_vma = anon_vma_alloc();
+ 	if (!anon_vma)
+@@ -307,6 +327,7 @@ int anon_vma_fork(struct vm_area_struct
+ 	 * lock any of the anon_vmas in this anon_vma tree.
+ 	 */
+ 	anon_vma->root = pvma->anon_vma->root;
++	anon_vma->parent = pvma->anon_vma;
+ 	/*
+ 	 * With refcounts, an anon_vma can stay around longer than the
+ 	 * process it belongs to. The root anon_vma needs to be pinned until
+@@ -317,6 +338,7 @@ int anon_vma_fork(struct vm_area_struct
+ 	vma->anon_vma = anon_vma;
+ 	anon_vma_lock(anon_vma);
+ 	anon_vma_chain_link(vma, avc, anon_vma);
++	anon_vma->parent->degree++;
+ 	anon_vma_unlock(anon_vma);
+ 
+ 	return 0;
+@@ -347,12 +369,16 @@ void unlink_anon_vmas(struct vm_area_str
+ 		 * Leave empty anon_vmas on the list - we'll need
+ 		 * to free them outside the lock.
+ 		 */
+-		if (list_empty(&anon_vma->head))
++		if (list_empty(&anon_vma->head)) {
++			anon_vma->parent->degree--;
+ 			continue;
++		}
+ 
+ 		list_del(&avc->same_vma);
+ 		anon_vma_chain_free(avc);
+ 	}
++	if (vma->anon_vma)
++		vma->anon_vma->degree--;
+ 	unlock_anon_vma_root(root);
+ 
+ 	/*
+@@ -363,6 +389,7 @@ void unlink_anon_vmas(struct vm_area_str
+ 	list_for_each_entry_safe(avc, next, &vma->anon_vma_chain, same_vma) {
+ 		struct anon_vma *anon_vma = avc->anon_vma;
+ 
++		BUG_ON(anon_vma->degree);
+ 		put_anon_vma(anon_vma);
+ 
+ 		list_del(&avc->same_vma);
