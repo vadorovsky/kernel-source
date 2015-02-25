@@ -1,0 +1,306 @@
+From: Joseph Gasparakis <joseph.gasparakis@intel.com>
+Date: Fri, 7 Dec 2012 14:14:14 +0000
+Subject: [PATCH v3] net: Add support for hardware-offloaded
+ encapsulation
+Patch-mainline: v3.8-rc1
+Git-commit: 6a674e9c75b17e7a88ff15b3c2e269eed54f7cfb
+References: bsc#909484 FATE#317397
+
+This patch adds support in the kernel for offloading in the NIC Tx and Rx
+checksumming for encapsulated packets (such as VXLAN and IP GRE).
+
+For Tx encapsulation offload, the driver will need to set the right bits
+in netdev->hw_enc_features. The protocol driver will have to set the
+skb->encapsulation bit and populate the inner headers, so the NIC driver will
+use those inner headers to calculate the csum in hardware.
+
+For Rx encapsulation offload, the driver will need to set again the
+skb->encapsulation flag and the skb->ip_csum to CHECKSUM_UNNECESSARY.
+In that case the protocol driver should push the decapsulated packet up
+to the stack, again with CHECKSUM_UNNECESSARY. In ether case, the protocol
+driver should set the skb->encapsulation flag back to zero. Finally the
+protocol driver should have NETIF_F_RXCSUM flag set in its features.
+
+Signed-off-by: Joseph Gasparakis <joseph.gasparakis@intel.com>
+Signed-off-by: Peter P Waskiewicz Jr <peter.p.waskiewicz.jr@intel.com>
+Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: David Chang <dchang@suse.com>
+---
+ include/linux/ip.h        |    5 ++
+ include/linux/ipv6.h      |    5 ++
+ include/linux/netdevice.h |    6 ++
+ include/linux/skbuff.h    |   95 ++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/tcp.h       |   10 ++++
+ include/linux/udp.h       |    5 ++
+ net/core/skbuff.c         |    9 ++++
+ 7 files changed, 135 insertions(+)
+
+--- a/include/linux/ip.h
++++ b/include/linux/ip.h
+@@ -112,6 +112,11 @@ static inline struct iphdr *ip_hdr(const
+ 	return (struct iphdr *)skb_network_header(skb);
+ }
+ 
++static inline struct iphdr *inner_ip_hdr(const struct sk_buff *skb)
++{
++	return (struct iphdr *)skb_inner_network_header(skb);
++}
++
+ static inline struct iphdr *ipip_hdr(const struct sk_buff *skb)
+ {
+ 	return (struct iphdr *)skb_transport_header(skb);
+--- a/include/linux/ipv6.h
++++ b/include/linux/ipv6.h
+@@ -228,6 +228,11 @@ static inline struct ipv6hdr *ipv6_hdr(c
+ 	return (struct ipv6hdr *)skb_network_header(skb);
+ }
+ 
++static inline struct ipv6hdr *inner_ipv6_hdr(const struct sk_buff *skb)
++{
++	return (struct ipv6hdr *)skb_inner_network_header(skb);
++}
++
+ static inline struct ipv6hdr *ipipv6_hdr(const struct sk_buff *skb)
+ {
+ 	return (struct ipv6hdr *)skb_transport_header(skb);
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1087,6 +1087,12 @@ struct net_device {
+ 	/* mask of features inheritable by VLAN devices */
+ 	u32			vlan_features;
+ 
++	/* mask of features inherited by encapsulating devices
++	 * This field indicates what encapsulation offloads
++	 * the hardware is capable of doing, and drivers will
++	 * need to set them appropriately.
++	 */
++	u32			hw_enc_features;
+ 	/* Net device feature bits; if you change something,
+ 	 * also update netdev_features_strings[] in ethtool.c */
+ 
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -348,6 +348,8 @@ typedef unsigned char *sk_buff_data_t;
+  *	@mark: Generic packet mark
+  *	@dropcount: total number of sk_receive_queue overflows
+  *	@vlan_tci: vlan tag control information
++ *	@inner_transport_header: Inner transport layer header (encapsulation)
++ *	@inner_network_header: Network layer header (encapsulation)
+  *	@transport_header: Transport layer header
+  *	@network_header: Network layer header
+  *	@mac_header: Link layer header
+@@ -436,6 +438,14 @@ struct sk_buff {
+ 	__u8			pfmemalloc:1;
+ 	__u8			ooo_okay:1;
+ 	__u8			no_fcs:1;
++	/* Encapsulation protocol and NIC drivers should use
++	 * this flag to indicate to each other if the skb contains
++	 * encapsulated packet or not and maybe use the inner packet
++	 * headers if needed
++	 */
++	__u8			encapsulation:1;
++	/* 7/9 bit hole (depending on ndisc_nodetype presence) */
++
+ 	kmemcheck_bitfield_end(flags2);
+ 
+ 	/* 0/13 bit hole */
+@@ -453,6 +463,8 @@ struct sk_buff {
+ 
+ 	__u16			vlan_tci;
+ 
++	sk_buff_data_t		inner_transport_header;
++	sk_buff_data_t		inner_network_header;
+ 	sk_buff_data_t		transport_header;
+ 	sk_buff_data_t		network_header;
+ 	sk_buff_data_t		mac_header;
+@@ -1348,12 +1360,53 @@ static inline void skb_reserve(struct sk
+ 	skb->tail += len;
+ }
+ 
++static inline void skb_reset_inner_headers(struct sk_buff *skb)
++{
++	skb->inner_network_header = skb->network_header;
++	skb->inner_transport_header = skb->transport_header;
++}
++
+ static inline void skb_reset_mac_len(struct sk_buff *skb)
+ {
+ 	skb->mac_len = skb->network_header - skb->mac_header;
+ }
+ 
+ #ifdef NET_SKBUFF_DATA_USES_OFFSET
++static inline unsigned char *skb_inner_transport_header(const struct sk_buff
++							*skb)
++{
++	return skb->head + skb->inner_transport_header;
++}
++
++static inline void skb_reset_inner_transport_header(struct sk_buff *skb)
++{
++	skb->inner_transport_header = skb->data - skb->head;
++}
++
++static inline void skb_set_inner_transport_header(struct sk_buff *skb,
++						   const int offset)
++{
++	skb_reset_inner_transport_header(skb);
++	skb->inner_transport_header += offset;
++}
++
++static inline unsigned char *skb_inner_network_header(const struct sk_buff *skb)
++{
++	return skb->head + skb->inner_network_header;
++}
++
++static inline void skb_reset_inner_network_header(struct sk_buff *skb)
++{
++	skb->inner_network_header = skb->data - skb->head;
++}
++
++static inline void skb_set_inner_network_header(struct sk_buff *skb,
++						const int offset)
++{
++	skb_reset_inner_network_header(skb);
++	skb->inner_network_header += offset;
++}
++
+ static inline unsigned char *skb_transport_header(const struct sk_buff *skb)
+ {
+ 	return skb->head + skb->transport_header;
+@@ -1409,6 +1462,38 @@ static inline void skb_set_mac_header(st
+ }
+ 
+ #else /* NET_SKBUFF_DATA_USES_OFFSET */
++static inline unsigned char *skb_inner_transport_header(const struct sk_buff
++							*skb)
++{
++	return skb->inner_transport_header;
++}
++
++static inline void skb_reset_inner_transport_header(struct sk_buff *skb)
++{
++	skb->inner_transport_header = skb->data;
++}
++
++static inline void skb_set_inner_transport_header(struct sk_buff *skb,
++						   const int offset)
++{
++	skb->inner_transport_header = skb->data + offset;
++}
++
++static inline unsigned char *skb_inner_network_header(const struct sk_buff *skb)
++{
++	return skb->inner_network_header;
++}
++
++static inline void skb_reset_inner_network_header(struct sk_buff *skb)
++{
++	skb->inner_network_header = skb->data;
++}
++
++static inline void skb_set_inner_network_header(struct sk_buff *skb,
++						const int offset)
++{
++	skb->inner_network_header = skb->data + offset;
++}
+ 
+ static inline unsigned char *skb_transport_header(const struct sk_buff *skb)
+ {
+@@ -1487,11 +1572,21 @@ static inline u32 skb_network_header_len
+ 	return skb->transport_header - skb->network_header;
+ }
+ 
++static inline u32 skb_inner_network_header_len(const struct sk_buff *skb)
++{
++	return skb->inner_transport_header - skb->inner_network_header;
++}
++
+ static inline int skb_network_offset(const struct sk_buff *skb)
+ {
+ 	return skb_network_header(skb) - skb->data;
+ }
+ 
++static inline int skb_inner_network_offset(const struct sk_buff *skb)
++{
++	return skb_inner_network_header(skb) - skb->data;
++}
++
+ static inline int pskb_network_may_pull(struct sk_buff *skb, unsigned int len)
+ {
+ 	return pskb_may_pull(skb, skb_network_offset(skb) + len);
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -221,6 +221,16 @@ static inline unsigned int tcp_hdrlen(co
+ 	return tcp_hdr(skb)->doff * 4;
+ }
+ 
++static inline struct tcphdr *inner_tcp_hdr(const struct sk_buff *skb)
++{
++	return (struct tcphdr *)skb_inner_transport_header(skb);
++}
++
++static inline unsigned int inner_tcp_hdrlen(const struct sk_buff *skb)
++{
++	return inner_tcp_hdr(skb)->doff * 4;
++}
++
+ static inline unsigned int tcp_optlen(const struct sk_buff *skb)
+ {
+ 	return (tcp_hdr(skb)->doff - 5) * 4;
+--- a/include/linux/udp.h
++++ b/include/linux/udp.h
+@@ -45,6 +45,11 @@ static inline struct udphdr *udp_hdr(con
+ 	return (struct udphdr *)skb_transport_header(skb);
+ }
+ 
++static inline struct udphdr *inner_udp_hdr(const struct sk_buff *skb)
++{
++	return (struct udphdr *)skb_inner_transport_header(skb);
++}
++
+ #define UDP_HTABLE_SIZE_MIN		(CONFIG_BASE_SMALL ? 128 : 256)
+ 
+ static inline int udp_hashfn(struct net *net, unsigned num, unsigned mask)
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -577,9 +577,12 @@ static void __copy_skb_header(struct sk_
+ 	new->transport_header	= old->transport_header;
+ 	new->network_header	= old->network_header;
+ 	new->mac_header		= old->mac_header;
++	new->inner_transport_header = old->inner_transport_header;
++	new->inner_network_header = old->inner_transport_header;
+ 	skb_dst_copy(new, old);
+ 	new->rxhash		= old->rxhash;
+ 	new->no_fcs		= old->no_fcs;
++	new->encapsulation	= old->encapsulation;
+ #ifdef CONFIG_XFRM
+ 	new->sp			= secpath_get(old->sp);
+ #endif
+@@ -786,6 +789,8 @@ static void copy_skb_header(struct sk_bu
+ 	new->network_header   += offset;
+ 	if (skb_mac_header_was_set(new))
+ 		new->mac_header	      += offset;
++	new->inner_transport_header += offset;
++	new->inner_network_header   += offset;
+ #endif
+ 	skb_shinfo(new)->gso_size = skb_shinfo(old)->gso_size;
+ 	skb_shinfo(new)->gso_segs = skb_shinfo(old)->gso_segs;
+@@ -1002,6 +1007,8 @@ adjust_others:
+ 	skb->network_header   += off;
+ 	if (skb_mac_header_was_set(skb))
+ 		skb->mac_header += off;
++	skb->inner_transport_header += off;
++	skb->inner_network_header += off;
+ 	/* Only adjust this if it actually is csum_start rather than csum */
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL)
+ 		skb->csum_start += nhead;
+@@ -1101,6 +1108,8 @@ struct sk_buff *skb_copy_expand(const st
+ 	n->network_header   += off;
+ 	if (skb_mac_header_was_set(skb))
+ 		n->mac_header += off;
++	n->inner_transport_header += off;
++	n->inner_network_header	   += off;
+ #endif
+ 
+ 	return n;
