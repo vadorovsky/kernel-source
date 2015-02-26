@@ -1,0 +1,198 @@
+From: Ben Hutchings <bhutchings@solarflare.com>
+Date: Fri, 18 Oct 2013 19:21:45 +0100
+Subject: [PATCH v2 192/244] sfc: Associate primary and secondary functions of
+ controller
+Patch-mainline: v3.14-rc1
+Git-commit: 0bcf4a645fc027d05d15e79ce48b5893cff28082
+References: bsc#909618 FATE#317521
+
+The primary function of an EF10 controller will share its clock
+device with other functions in the same domain (which we call
+secondary functions).  To this end, we need to associate functions
+on the same controller.
+
+We do not control probe order, so allow primary and secondary
+functions to appear in any order.  Maintain global lists of all
+primary functions and of unassociated secondary functions,
+and a list of secondary functions on each primary function.
+
+Use the VPD serial number to tell whether functions are part of the
+same controller.  VPD will not be readable by virtual functions, so
+this may need to be revisited later.
+
+Signed-off-by: Ben Hutchings <bhutchings@solarflare.com>
+
+Refreshed, since we skipped
+8f8b3d5 sfc: Fix the initial device operstate (v3.7-rc1)
+Acked-by: David Chang <dchang@suse.com>
+---
+ drivers/net/ethernet/sfc/efx.c        |   77 ++++++++++++++++++++++++++++++++++
+ drivers/net/ethernet/sfc/falcon.c     |    2 
+ drivers/net/ethernet/sfc/mcdi.c       |    4 +
+ drivers/net/ethernet/sfc/net_driver.h |   10 ++++
+ 4 files changed, 93 insertions(+)
+
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -1117,6 +1117,77 @@ static void efx_remove_port(struct efx_n
+  *
+  **************************************************************************/
+ 
++static LIST_HEAD(efx_primary_list);
++static LIST_HEAD(efx_unassociated_list);
++
++static bool efx_same_controller(struct efx_nic *left, struct efx_nic *right)
++{
++	return left->type == right->type &&
++		left->vpd_sn && right->vpd_sn &&
++		!strcmp(left->vpd_sn, right->vpd_sn);
++}
++
++static void efx_associate(struct efx_nic *efx)
++{
++	struct efx_nic *other, *next;
++
++	if (efx->primary == efx) {
++		/* Adding primary function; look for secondaries */
++
++		netif_dbg(efx, probe, efx->net_dev, "adding to primary list\n");
++		list_add_tail(&efx->node, &efx_primary_list);
++
++		list_for_each_entry_safe(other, next, &efx_unassociated_list,
++					 node) {
++			if (efx_same_controller(efx, other)) {
++				list_del(&other->node);
++				netif_dbg(other, probe, other->net_dev,
++					  "moving to secondary list of %s %s\n",
++					  pci_name(efx->pci_dev),
++					  efx->net_dev->name);
++				list_add_tail(&other->node,
++					      &efx->secondary_list);
++				other->primary = efx;
++			}
++		}
++	} else {
++		/* Adding secondary function; look for primary */
++
++		list_for_each_entry(other, &efx_primary_list, node) {
++			if (efx_same_controller(efx, other)) {
++				netif_dbg(efx, probe, efx->net_dev,
++					  "adding to secondary list of %s %s\n",
++					  pci_name(other->pci_dev),
++					  other->net_dev->name);
++				list_add_tail(&efx->node,
++					      &other->secondary_list);
++				efx->primary = other;
++				return;
++			}
++		}
++
++		netif_dbg(efx, probe, efx->net_dev,
++			  "adding to unassociated list\n");
++		list_add_tail(&efx->node, &efx_unassociated_list);
++	}
++}
++
++static void efx_dissociate(struct efx_nic *efx)
++{
++	struct efx_nic *other, *next;
++
++	list_del(&efx->node);
++	efx->primary = NULL;
++
++	list_for_each_entry_safe(other, next, &efx->secondary_list, node) {
++		list_del(&other->node);
++		netif_dbg(other, probe, other->net_dev,
++			  "moving to unassociated list\n");
++		list_add_tail(&other->node, &efx_unassociated_list);
++		other->primary = NULL;
++	}
++}
++
+ /* This configures the PCI device to enable I/O and DMA. */
+ static int efx_init_io(struct efx_nic *efx)
+ {
+@@ -2211,6 +2282,8 @@ static int efx_register_netdev(struct ef
+ 	/* Always start with carrier off; PHY events will detect the link */
+ 	netif_carrier_off(net_dev);
+ 
++	efx_associate(efx);
++
+ 	rtnl_unlock();
+ 
+ 	rc = device_create_file(&efx->pci_dev->dev, &dev_attr_phy_type);
+@@ -2224,6 +2297,7 @@ static int efx_register_netdev(struct ef
+ 
+ fail_registered:
+ 	rtnl_lock();
++	efx_dissociate(efx);
+ 	unregister_netdevice(net_dev);
+ fail_locked:
+ 	efx->state = STATE_UNINIT;
+@@ -2563,6 +2637,8 @@ static int efx_init_struct(struct efx_ni
+ 	int i;
+ 
+ 	/* Initialise common structures */
++	INIT_LIST_HEAD(&efx->node);
++	INIT_LIST_HEAD(&efx->secondary_list);
+ 	spin_lock_init(&efx->biu_lock);
+ #ifdef CONFIG_SFC_MTD
+ 	INIT_LIST_HEAD(&efx->mtd_list);
+@@ -2669,6 +2745,7 @@ static void efx_pci_remove(struct pci_de
+ 
+ 	/* Mark the NIC as fini, then stop the interface */
+ 	rtnl_lock();
++	efx_dissociate(efx);
+ 	dev_close(efx->net_dev);
+ 	efx_disable_interrupts(efx);
+ 	rtnl_unlock();
+--- a/drivers/net/ethernet/sfc/falcon.c
++++ b/drivers/net/ethernet/sfc/falcon.c
+@@ -2247,6 +2247,8 @@ static int falcon_probe_nic(struct efx_n
+ 	struct falcon_board *board;
+ 	int rc;
+ 
++	efx->primary = efx; /* only one usable function per controller */
++
+ 	/* Allocate storage for hardware specific data */
+ 	nic_data = kzalloc(sizeof(*nic_data), GFP_KERNEL);
+ 	if (!nic_data)
+--- a/drivers/net/ethernet/sfc/mcdi.c
++++ b/drivers/net/ethernet/sfc/mcdi.c
+@@ -102,6 +102,10 @@ int efx_mcdi_init(struct efx_nic *efx)
+ 		netif_err(efx, probe, efx->net_dev,
+ 			  "Host already registered with MCPU\n");
+ 
++	if (efx->mcdi->fn_flags &
++	    (1 << MC_CMD_DRV_ATTACH_EXT_OUT_FLAG_PRIMARY))
++		efx->primary = efx;
++
+ 	return 0;
+ }
+ 
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -650,6 +650,13 @@ struct vfdi_status;
+  * struct efx_nic - an Efx NIC
+  * @name: Device name (net device name or bus id before net device registered)
+  * @pci_dev: The PCI device
++ * @node: List node for maintaning primary/secondary function lists
++ * @primary: &struct efx_nic instance for the primary function of this
++ *	controller.  May be the same structure, and may be %NULL if no
++ *	primary function is bound.  Serialised by rtnl_lock.
++ * @secondary_list: List of &struct efx_nic instances for the secondary PCI
++ *	functions of the controller, if this is for the primary function.
++ *	Serialised by rtnl_lock.
+  * @type: Controller type attributes
+  * @legacy_irq: IRQ number
+  * @workqueue: Workqueue for port reconfigures and the HW monitor.
+@@ -779,6 +786,9 @@ struct efx_nic {
+ 	/* The following fields should be written very rarely */
+ 
+ 	char name[IFNAMSIZ];
++	struct list_head node;
++	struct efx_nic *primary;
++	struct list_head secondary_list;
+ 	struct pci_dev *pci_dev;
+ 	unsigned int port_num;
+ 	const struct efx_nic_type *type;
