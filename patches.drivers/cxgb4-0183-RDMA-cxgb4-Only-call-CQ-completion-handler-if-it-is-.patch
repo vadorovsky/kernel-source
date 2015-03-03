@@ -1,0 +1,135 @@
+From: Steve Wise <swise@opengridcomputing.com>
+Date: Thu, 31 Jul 2014 14:35:43 -0500
+Subject: [PATCH 183/223] RDMA/cxgb4: Only call CQ completion handler if it is
+ armed
+Patch-mainline: v3.17-rc1
+Git-commit: 678ea9b5baab6800692b249bdba77c3c07261d61
+References: bsc#909577 FATE#317550
+
+The function __flush_qp() always calls the ULP's CQ completion handler
+functions even if the CQ was not armed.  This can crash the system if
+the function pointer is NULL. The iSER ULP behaves this way: no
+completion handler and never arm the CQ for notification.  So now we
+track whether the CQ is armed at flush time and only call the
+completion handlers if their CQs were armed.
+
+Also, if the RCQ and SCQ are the same CQ, the completion handler is
+getting called twice.  It should only be called once after all SQ and
+RQ WRs are flushed from the QP.  So rearrange the logic to fix this.
+
+Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+Signed-off-by: Roland Dreier <roland@purestorage.com>
+Acked-by: David Chang <dchang@suse.com>
+Signed-off-by: John Jolly <jjolly@suse.de>
+---
+ drivers/infiniband/hw/cxgb4/ev.c |    1 +
+ drivers/infiniband/hw/cxgb4/qp.c |   37 +++++++++++++++++++++++++------------
+ drivers/infiniband/hw/cxgb4/t4.h |   11 +++++++++++
+ 3 files changed, 37 insertions(+), 12 deletions(-)
+
+--- a/drivers/infiniband/hw/cxgb4/ev.c
++++ b/drivers/infiniband/hw/cxgb4/ev.c
+@@ -227,6 +227,7 @@ int c4iw_ev_handler(struct c4iw_dev *dev
+ 
+ 	chp = get_chp(dev, qid);
+ 	if (chp) {
++		t4_clear_cq_armed(&chp->cq);
+ 		spin_lock_irqsave(&chp->comp_handler_lock, flag);
+ 		(*chp->ibcq.comp_handler)(&chp->ibcq, chp->ibcq.cq_context);
+ 		spin_unlock_irqrestore(&chp->comp_handler_lock, flag);
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@ -1111,7 +1111,7 @@ static void __flush_qp(struct c4iw_qp *q
+ 		       struct c4iw_cq *schp)
+ {
+ 	int count;
+-	int flushed;
++	int rq_flushed, sq_flushed;
+ 	unsigned long flag;
+ 
+ 	PDBG("%s qhp %p rchp %p schp %p\n", __func__, qhp, rchp, schp);
+@@ -1129,27 +1129,40 @@ static void __flush_qp(struct c4iw_qp *q
+ 
+ 	c4iw_flush_hw_cq(rchp);
+ 	c4iw_count_rcqes(&rchp->cq, &qhp->wq, &count);
+-	flushed = c4iw_flush_rq(&qhp->wq, &rchp->cq, count);
++	rq_flushed = c4iw_flush_rq(&qhp->wq, &rchp->cq, count);
+ 	spin_unlock(&qhp->lock);
+ 	spin_unlock_irqrestore(&rchp->lock, flag);
+-	if (flushed) {
+-		spin_lock_irqsave(&rchp->comp_handler_lock, flag);
+-		(*rchp->ibcq.comp_handler)(&rchp->ibcq, rchp->ibcq.cq_context);
+-		spin_unlock_irqrestore(&rchp->comp_handler_lock, flag);
+-	}
+ 
+ 	/* locking hierarchy: cq lock first, then qp lock. */
+ 	spin_lock_irqsave(&schp->lock, flag);
+ 	spin_lock(&qhp->lock);
+ 	if (schp != rchp)
+ 		c4iw_flush_hw_cq(schp);
+-	flushed = c4iw_flush_sq(qhp);
++	sq_flushed = c4iw_flush_sq(qhp);
+ 	spin_unlock(&qhp->lock);
+ 	spin_unlock_irqrestore(&schp->lock, flag);
+-	if (flushed) {
+-		spin_lock_irqsave(&schp->comp_handler_lock, flag);
+-		(*schp->ibcq.comp_handler)(&schp->ibcq, schp->ibcq.cq_context);
+-		spin_unlock_irqrestore(&schp->comp_handler_lock, flag);
++
++	if (schp == rchp) {
++		if (t4_clear_cq_armed(&rchp->cq) &&
++		    (rq_flushed || sq_flushed)) {
++			spin_lock_irqsave(&rchp->comp_handler_lock, flag);
++			(*rchp->ibcq.comp_handler)(&rchp->ibcq,
++						   rchp->ibcq.cq_context);
++			spin_unlock_irqrestore(&rchp->comp_handler_lock, flag);
++		}
++	} else {
++		if (t4_clear_cq_armed(&rchp->cq) && rq_flushed) {
++			spin_lock_irqsave(&rchp->comp_handler_lock, flag);
++			(*rchp->ibcq.comp_handler)(&rchp->ibcq,
++						   rchp->ibcq.cq_context);
++			spin_unlock_irqrestore(&rchp->comp_handler_lock, flag);
++		}
++		if (t4_clear_cq_armed(&schp->cq) && sq_flushed) {
++			spin_lock_irqsave(&schp->comp_handler_lock, flag);
++			(*schp->ibcq.comp_handler)(&schp->ibcq,
++						   schp->ibcq.cq_context);
++			spin_unlock_irqrestore(&schp->comp_handler_lock, flag);
++		}
+ 	}
+ }
+ 
+--- a/drivers/infiniband/hw/cxgb4/t4.h
++++ b/drivers/infiniband/hw/cxgb4/t4.h
+@@ -524,6 +524,10 @@ static inline int t4_wq_db_enabled(struc
+ 	return !wq->rq.queue[wq->rq.size].status.db_off;
+ }
+ 
++enum t4_cq_flags {
++	CQ_ARMED	= 1,
++};
++
+ struct t4_cq {
+ 	struct t4_cqe *queue;
+ 	dma_addr_t dma_addr;
+@@ -544,12 +548,19 @@ struct t4_cq {
+ 	u16 cidx_inc;
+ 	u8 gen;
+ 	u8 error;
++	unsigned long flags;
+ };
+ 
++static inline int t4_clear_cq_armed(struct t4_cq *cq)
++{
++	return test_and_clear_bit(CQ_ARMED, &cq->flags);
++}
++
+ static inline int t4_arm_cq(struct t4_cq *cq, int se)
+ {
+ 	u32 val;
+ 
++	set_bit(CQ_ARMED, &cq->flags);
+ 	while (cq->cidx_inc > CIDXINC_MASK) {
+ 		val = SEINTARM(0) | CIDXINC(CIDXINC_MASK) | TIMERREG(7) |
+ 		      INGRESSQID(cq->cqid);
