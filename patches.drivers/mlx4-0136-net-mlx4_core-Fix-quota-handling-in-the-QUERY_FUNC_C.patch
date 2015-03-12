@@ -1,0 +1,223 @@
+From: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Date: Sun, 3 Nov 2013 10:03:24 +0200
+Subject: net/mlx4_core: Fix quota handling in the QUERY_FUNC_CAP wrapper
+Patch-mainline: v3.13-rc1
+Git-commit: eb456a68c67224efa71e7ef5975cf36c91794695
+References: bug#919382 FATE#317529
+
+In current kernels, the mlx4 driver running on a VM does not
+differentiate between max resource numbers for the HCA and
+max quotas -- it simply takes the quota values passed to it
+as max-resource values.
+
+However, the driver actually requires the VFs to be aware of
+the actual number of resources that the HCA was initialized with,
+for QPs, CQs, SRQs and MPTs.
+
+For QPs, CQs and SRQs, the reason is that in completion handling
+the driver must know which of the 24 bits are the actual resource
+number, and which are "padding" bits.
+
+For MPTs, also, the driver assumes knowledge of the number of MPTs
+in the system.
+
+The previous commit fixes the quota logic on the VM for the quota values
+passed to it by QUERY_FUNC_CAPS.
+
+For QPs, CQs, SRQs, and MPTs, it takes the max resource numbers
+from QUERY_HCA (and not QUERY_FUNC_CAPS).  The quotas passed
+in QUERY_FUNC_CAPS are used to report max resource number values
+in the response to ib_query_device.
+
+However, the Hypervisor driver must consider that VMs
+may be running previous kernels, and compatibility must be preserved.
+
+To resolve the incompatibility with previous kernels running on VMs,
+we deprecated the quota fields in mlx4_QUERY_FUNC_CAP.  In the
+deprecated fields, we pass the max-resource values from INIT_HCA
+
+The quota fields are moved to a new location, and the current kernel
+driver takes the proper values from that location. There is
+also a new flag in dword 0, bit 28 of the mlx4_QUERY_FUNC_CAP mailbox;
+if this flag is set, the (VM) driver takes the quota values from the
+new location.
+
+VMs running previous kernels will work properly, except that the max resource
+numbers reported in ib_query_device for these resources will be
+too high.  The Hypervisor driver will, however, enforce the quotas
+for these VMs.
+
+Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/mellanox/mlx4/fw.c |   88 +++++++++++++++++++++++---------
+ 1 file changed, 65 insertions(+), 23 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx4/fw.c
++++ b/drivers/net/ethernet/mellanox/mlx4/fw.c
+@@ -186,18 +186,26 @@ int mlx4_QUERY_FUNC_CAP_wrapper(struct m
+ #define QUERY_FUNC_CAP_NUM_PORTS_OFFSET		0x1
+ #define QUERY_FUNC_CAP_PF_BHVR_OFFSET		0x4
+ #define QUERY_FUNC_CAP_FMR_OFFSET		0x8
+-#define QUERY_FUNC_CAP_QP_QUOTA_OFFSET		0x10
+-#define QUERY_FUNC_CAP_CQ_QUOTA_OFFSET		0x14
+-#define QUERY_FUNC_CAP_SRQ_QUOTA_OFFSET		0x18
+-#define QUERY_FUNC_CAP_MPT_QUOTA_OFFSET		0x20
+-#define QUERY_FUNC_CAP_MTT_QUOTA_OFFSET		0x24
+-#define QUERY_FUNC_CAP_MCG_QUOTA_OFFSET		0x28
++#define QUERY_FUNC_CAP_QP_QUOTA_OFFSET_DEP	0x10
++#define QUERY_FUNC_CAP_CQ_QUOTA_OFFSET_DEP	0x14
++#define QUERY_FUNC_CAP_SRQ_QUOTA_OFFSET_DEP	0x18
++#define QUERY_FUNC_CAP_MPT_QUOTA_OFFSET_DEP	0x20
++#define QUERY_FUNC_CAP_MTT_QUOTA_OFFSET_DEP	0x24
++#define QUERY_FUNC_CAP_MCG_QUOTA_OFFSET_DEP	0x28
+ #define QUERY_FUNC_CAP_MAX_EQ_OFFSET		0x2c
+ #define QUERY_FUNC_CAP_RESERVED_EQ_OFFSET	0x30
+ 
++#define QUERY_FUNC_CAP_QP_QUOTA_OFFSET		0x50
++#define QUERY_FUNC_CAP_CQ_QUOTA_OFFSET		0x54
++#define QUERY_FUNC_CAP_SRQ_QUOTA_OFFSET		0x58
++#define QUERY_FUNC_CAP_MPT_QUOTA_OFFSET		0x60
++#define QUERY_FUNC_CAP_MTT_QUOTA_OFFSET		0x64
++#define QUERY_FUNC_CAP_MCG_QUOTA_OFFSET		0x68
++
+ #define QUERY_FUNC_CAP_FMR_FLAG			0x80
+ #define QUERY_FUNC_CAP_FLAG_RDMA		0x40
+ #define QUERY_FUNC_CAP_FLAG_ETH			0x80
++#define QUERY_FUNC_CAP_FLAG_QUOTAS		0x10
+ 
+ /* when opcode modifier = 1 */
+ #define QUERY_FUNC_CAP_PHYS_PORT_OFFSET		0x3
+@@ -238,8 +246,9 @@ int mlx4_QUERY_FUNC_CAP_wrapper(struct m
+ 		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_QP1_PROXY);
+ 
+ 	} else if (vhcr->op_modifier == 0) {
+-		/* enable rdma and ethernet interfaces */
+-		field = (QUERY_FUNC_CAP_FLAG_ETH | QUERY_FUNC_CAP_FLAG_RDMA);
++		/* enable rdma and ethernet interfaces, and new quota locations */
++		field = (QUERY_FUNC_CAP_FLAG_ETH | QUERY_FUNC_CAP_FLAG_RDMA |
++			 QUERY_FUNC_CAP_FLAG_QUOTAS);
+ 		MLX4_PUT(outbox->buf, field, QUERY_FUNC_CAP_FLAGS_OFFSET);
+ 
+ 		field = dev->caps.num_ports;
+@@ -253,12 +262,18 @@ int mlx4_QUERY_FUNC_CAP_wrapper(struct m
+ 
+ 		size = priv->mfunc.master.res_tracker.res_alloc[RES_QP].quota[slave];
+ 		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_QP_QUOTA_OFFSET);
++		size = dev->caps.num_qps;
++		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_QP_QUOTA_OFFSET_DEP);
+ 
+ 		size = priv->mfunc.master.res_tracker.res_alloc[RES_SRQ].quota[slave];
+ 		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_SRQ_QUOTA_OFFSET);
++		size = dev->caps.num_srqs;
++		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_SRQ_QUOTA_OFFSET_DEP);
+ 
+ 		size = priv->mfunc.master.res_tracker.res_alloc[RES_CQ].quota[slave];
+ 		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_CQ_QUOTA_OFFSET);
++		size = dev->caps.num_cqs;
++		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_CQ_QUOTA_OFFSET_DEP);
+ 
+ 		size = dev->caps.num_eqs;
+ 		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_MAX_EQ_OFFSET);
+@@ -268,12 +283,17 @@ int mlx4_QUERY_FUNC_CAP_wrapper(struct m
+ 
+ 		size = priv->mfunc.master.res_tracker.res_alloc[RES_MPT].quota[slave];
+ 		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_MPT_QUOTA_OFFSET);
++		size = dev->caps.num_mpts;
++		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_MPT_QUOTA_OFFSET_DEP);
+ 
+ 		size = priv->mfunc.master.res_tracker.res_alloc[RES_MTT].quota[slave];
+ 		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_MTT_QUOTA_OFFSET);
++		size = dev->caps.num_mtts;
++		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_MTT_QUOTA_OFFSET_DEP);
+ 
+ 		size = dev->caps.num_mgms + dev->caps.num_amgms;
+ 		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_MCG_QUOTA_OFFSET);
++		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_MCG_QUOTA_OFFSET_DEP);
+ 
+ 	} else
+ 		err = -EINVAL;
+@@ -288,7 +308,7 @@ int mlx4_QUERY_FUNC_CAP(struct mlx4_dev
+ 	u32			*outbox;
+ 	u8			field, op_modifier;
+ 	u32			size;
+-	int			err = 0;
++	int			err = 0, quotas = 0;
+ 
+ 	op_modifier = !!gen_or_port; /* 0 = general, 1 = logical port */
+ 
+@@ -312,6 +332,7 @@ int mlx4_QUERY_FUNC_CAP(struct mlx4_dev
+ 			goto out;
+ 		}
+ 		func_cap->flags = field;
++		quotas = !!(func_cap->flags & QUERY_FUNC_CAP_FLAG_QUOTAS);
+ 
+ 		MLX4_GET(field, outbox, QUERY_FUNC_CAP_NUM_PORTS_OFFSET);
+ 		func_cap->num_ports = field;
+@@ -319,29 +340,50 @@ int mlx4_QUERY_FUNC_CAP(struct mlx4_dev
+ 		MLX4_GET(size, outbox, QUERY_FUNC_CAP_PF_BHVR_OFFSET);
+ 		func_cap->pf_context_behaviour = size;
+ 
+-		MLX4_GET(size, outbox, QUERY_FUNC_CAP_QP_QUOTA_OFFSET);
+-		func_cap->qp_quota = size & 0xFFFFFF;
++		if (quotas) {
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_QP_QUOTA_OFFSET);
++			func_cap->qp_quota = size & 0xFFFFFF;
++
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_SRQ_QUOTA_OFFSET);
++			func_cap->srq_quota = size & 0xFFFFFF;
++
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_CQ_QUOTA_OFFSET);
++			func_cap->cq_quota = size & 0xFFFFFF;
++
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_MPT_QUOTA_OFFSET);
++			func_cap->mpt_quota = size & 0xFFFFFF;
++
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_MTT_QUOTA_OFFSET);
++			func_cap->mtt_quota = size & 0xFFFFFF;
++
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_MCG_QUOTA_OFFSET);
++			func_cap->mcg_quota = size & 0xFFFFFF;
+ 
+-		MLX4_GET(size, outbox, QUERY_FUNC_CAP_SRQ_QUOTA_OFFSET);
+-		func_cap->srq_quota = size & 0xFFFFFF;
++		} else {
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_QP_QUOTA_OFFSET_DEP);
++			func_cap->qp_quota = size & 0xFFFFFF;
+ 
+-		MLX4_GET(size, outbox, QUERY_FUNC_CAP_CQ_QUOTA_OFFSET);
+-		func_cap->cq_quota = size & 0xFFFFFF;
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_SRQ_QUOTA_OFFSET_DEP);
++			func_cap->srq_quota = size & 0xFFFFFF;
+ 
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_CQ_QUOTA_OFFSET_DEP);
++			func_cap->cq_quota = size & 0xFFFFFF;
++
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_MPT_QUOTA_OFFSET_DEP);
++			func_cap->mpt_quota = size & 0xFFFFFF;
++
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_MTT_QUOTA_OFFSET_DEP);
++			func_cap->mtt_quota = size & 0xFFFFFF;
++
++			MLX4_GET(size, outbox, QUERY_FUNC_CAP_MCG_QUOTA_OFFSET_DEP);
++			func_cap->mcg_quota = size & 0xFFFFFF;
++		}
+ 		MLX4_GET(size, outbox, QUERY_FUNC_CAP_MAX_EQ_OFFSET);
+ 		func_cap->max_eq = size & 0xFFFFFF;
+ 
+ 		MLX4_GET(size, outbox, QUERY_FUNC_CAP_RESERVED_EQ_OFFSET);
+ 		func_cap->reserved_eq = size & 0xFFFFFF;
+ 
+-		MLX4_GET(size, outbox, QUERY_FUNC_CAP_MPT_QUOTA_OFFSET);
+-		func_cap->mpt_quota = size & 0xFFFFFF;
+-
+-		MLX4_GET(size, outbox, QUERY_FUNC_CAP_MTT_QUOTA_OFFSET);
+-		func_cap->mtt_quota = size & 0xFFFFFF;
+-
+-		MLX4_GET(size, outbox, QUERY_FUNC_CAP_MCG_QUOTA_OFFSET);
+-		func_cap->mcg_quota = size & 0xFFFFFF;
+ 		goto out;
+ 	}
+ 
