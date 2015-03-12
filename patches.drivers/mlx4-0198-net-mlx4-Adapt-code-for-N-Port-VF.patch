@@ -1,0 +1,757 @@
+From: Matan Barak <matanb@mellanox.com>
+Date: Wed, 19 Mar 2014 18:11:52 +0200
+Subject: net/mlx4: Adapt code for N-Port VF
+Patch-mainline: v3.15-rc1
+Git-commit: 449fc48866f7d84b0d9a19201de18a4dd4d3488c (partial)
+References: bug#919382 FATE#317529
+
+Adds support for N-Port VFs, this includes:
+1. Adding support in the wrapped FW command
+	In wrapped commands, we need to verify and convert
+	the slave's port into the real physical port.
+	Furthermore, when sending the response back to the slave,
+	a reverse conversion should be made.
+2. Adjusting sqpn for QP1 para-virtualization
+	The slave assumes that sqpn is used for QP1 communication.
+	If the slave is assigned to a port != (first port), we need
+	to adjust the sqpn that will direct its QP1 packets into the
+	correct endpoint.
+3. Adjusting gid[5] to modify the port for raw ethernet
+	In B0 steering, gid[5] contains the port. It needs
+	to be adjusted into the physical port.
+4. Adjusting number of ports in the query / ports caps in the FW commands
+	When a slave queries the hardware, it needs to view only
+	the physical ports it's assigned to.
+5. Adjusting the sched_qp according to the port number
+	The QP port is encoded in the sched_qp, thus in modify_qp we need
+	to encode the correct port in sched_qp.
+
+Signed-off-by: Matan Barak <matanb@mellanox.com>
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/infiniband/hw/mlx4/mad.c                      |   19 +-
+ drivers/infiniband/hw/mlx4/main.c                     |   15 +-
+ drivers/infiniband/hw/mlx4/sysfs.c                    |    5 
+ drivers/net/ethernet/mellanox/mlx4/cmd.c              |   21 ++
+ drivers/net/ethernet/mellanox/mlx4/eq.c               |   42 ++++-
+ drivers/net/ethernet/mellanox/mlx4/fw.c               |   60 +++++++-
+ drivers/net/ethernet/mellanox/mlx4/main.c             |    2 
+ drivers/net/ethernet/mellanox/mlx4/mcg.c              |    5 
+ drivers/net/ethernet/mellanox/mlx4/port.c             |    9 +
+ drivers/net/ethernet/mellanox/mlx4/resource_tracker.c |  129 ++++++++++++++++--
+ include/linux/mlx4/device.h                           |    1 
+ 11 files changed, 269 insertions(+), 39 deletions(-)
+
+--- a/drivers/infiniband/hw/mlx4/mad.c
++++ b/drivers/infiniband/hw/mlx4/mad.c
+@@ -1117,6 +1117,7 @@ static void mlx4_ib_multiplex_mad(struct
+ 	struct ib_ah_attr ah_attr;
+ 	u8 *slave_id;
+ 	int slave;
++	int port;
+ 
+ 	/* Get slave that sent this packet */
+ 	if (wc->src_qp < dev->dev->phys_caps.base_proxy_sqpn ||
+@@ -1193,12 +1194,10 @@ static void mlx4_ib_multiplex_mad(struct
+ 	memcpy(&ah.av, &tunnel->hdr.av, sizeof (struct mlx4_av));
+ 	ah.ibah.device = ctx->ib_dev;
+ 	mlx4_ib_query_ah(&ah.ibah, &ah_attr);
+-	if ((ah_attr.ah_flags & IB_AH_GRH) &&
+-	    (ah_attr.grh.sgid_index != slave)) {
+-		mlx4_ib_warn(ctx->ib_dev, "slave:%d accessed invalid sgid_index:%d\n",
+-			     slave, ah_attr.grh.sgid_index);
++	port = mlx4_slave_convert_port(dev->dev, slave, ah_attr.port_num);
++	if (port < 0)
+ 		return;
+-	}
++	ah_attr.port_num = port;
+ 
+ 	mlx4_ib_send_to_wire(dev, slave, ctx->port,
+ 			     is_proxy_qp0(dev, wc->src_qp, slave) ?
+@@ -1783,7 +1782,15 @@ static int mlx4_ib_alloc_demux_ctx(struc
+ 	ctx->port = port;
+ 	ctx->ib_dev = &dev->ib_dev;
+ 
+-	for (i = 0; i < dev->dev->caps.sqp_demux; i++) {
++	for (i = 0;
++	     i < min(dev->dev->caps.sqp_demux, (u16)(dev->dev->num_vfs + 1));
++	     i++) {
++		struct mlx4_active_ports actv_ports =
++			mlx4_get_active_ports(dev->dev, i);
++
++		if (!test_bit(port - 1, actv_ports.ports))
++			continue;
++
+ 		ret = alloc_pv_object(dev, i, port, &ctx->tun[i]);
+ 		if (ret) {
+ 			ret = -ENOMEM;
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -1653,17 +1653,24 @@ static void do_slave_init(struct mlx4_ib
+ 	struct mlx4_dev *dev = ibdev->dev;
+ 	int i;
+ 	unsigned long flags;
++	struct mlx4_active_ports actv_ports;
++	unsigned int ports;
++	unsigned int first_port;
+ 
+ 	if (!mlx4_is_master(dev))
+ 		return;
+ 
+-	dm = kcalloc(dev->caps.num_ports, sizeof *dm, GFP_ATOMIC);
++	actv_ports = mlx4_get_active_ports(dev, slave);
++	ports = bitmap_weight(actv_ports.ports, dev->caps.num_ports);
++	first_port = find_first_bit(actv_ports.ports, dev->caps.num_ports);
++
++	dm = kcalloc(ports, sizeof(*dm), GFP_ATOMIC);
+ 	if (!dm) {
+ 		pr_err("failed to allocate memory for tunneling qp update\n");
+ 		goto out;
+ 	}
+ 
+-	for (i = 0; i < dev->caps.num_ports; i++) {
++	for (i = 0; i < ports; i++) {
+ 		dm[i] = kmalloc(sizeof (struct mlx4_ib_demux_work), GFP_ATOMIC);
+ 		if (!dm[i]) {
+ 			pr_err("failed to allocate memory for tunneling qp update work struct\n");
+@@ -1675,9 +1682,9 @@ static void do_slave_init(struct mlx4_ib
+ 		}
+ 	}
+ 	/* initialize or tear down tunnel QPs for the slave */
+-	for (i = 0; i < dev->caps.num_ports; i++) {
++	for (i = 0; i < ports; i++) {
+ 		INIT_WORK(&dm[i]->work, mlx4_ib_tunnels_update_work);
+-		dm[i]->port = i + 1;
++		dm[i]->port = first_port + i + 1;
+ 		dm[i]->slave = slave;
+ 		dm[i]->do_init = do_init;
+ 		dm[i]->dev = ibdev;
+--- a/drivers/infiniband/hw/mlx4/sysfs.c
++++ b/drivers/infiniband/hw/mlx4/sysfs.c
+@@ -627,6 +627,7 @@ static int register_one_pkey_tree(struct
+ 	int port;
+ 	struct kobject *p, *t;
+ 	struct mlx4_port *mport;
++	struct mlx4_active_ports actv_ports;
+ 
+ 	get_name(dev, name, slave, sizeof name);
+ 
+@@ -649,7 +650,11 @@ static int register_one_pkey_tree(struct
+ 		goto err_ports;
+ 	}
+ 
++	actv_ports = mlx4_get_active_ports(dev->dev, slave);
++
+ 	for (port = 1; port <= dev->dev->caps.num_ports; ++port) {
++		if (!test_bit(port - 1, actv_ports.ports))
++			continue;
+ 		err = add_port(dev, port, slave);
+ 		if (err)
+ 			goto err_add;
+--- a/drivers/net/ethernet/mellanox/mlx4/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx4/cmd.c
+@@ -1614,8 +1614,16 @@ static int mlx4_master_activate_admin_st
+ 	int port, err;
+ 	struct mlx4_vport_state *vp_admin;
+ 	struct mlx4_vport_oper_state *vp_oper;
++	struct mlx4_active_ports actv_ports = mlx4_get_active_ports(
++			&priv->dev, slave);
++	int min_port = find_first_bit(actv_ports.ports,
++				      priv->dev.caps.num_ports) + 1;
++	int max_port = min_port - 1 +
++		bitmap_weight(actv_ports.ports, priv->dev.caps.num_ports);
+ 
+-	for (port = 1; port <= MLX4_MAX_PORTS; port++) {
++	for (port = min_port; port <= max_port; port++) {
++		if (!test_bit(port - 1, actv_ports.ports))
++			continue;
+ 		vp_oper = &priv->mfunc.master.vf_oper[slave].vport[port];
+ 		vp_admin = &priv->mfunc.master.vf_admin[slave].vport[port];
+ 		vp_oper->state = *vp_admin;
+@@ -1656,8 +1664,17 @@ static void mlx4_master_deactivate_admin
+ {
+ 	int port;
+ 	struct mlx4_vport_oper_state *vp_oper;
++	struct mlx4_active_ports actv_ports = mlx4_get_active_ports(
++			&priv->dev, slave);
++	int min_port = find_first_bit(actv_ports.ports,
++				      priv->dev.caps.num_ports) + 1;
++	int max_port = min_port - 1 +
++		bitmap_weight(actv_ports.ports, priv->dev.caps.num_ports);
+ 
+-	for (port = 1; port <= MLX4_MAX_PORTS; port++) {
++
++	for (port = min_port; port <= max_port; port++) {
++		if (!test_bit(port - 1, actv_ports.ports))
++			continue;
+ 		vp_oper = &priv->mfunc.master.vf_oper[slave].vport[port];
+ 		if (NO_INDX != vp_oper->vlan_idx) {
+ 			__mlx4_unregister_vlan(&priv->dev,
+--- a/drivers/net/ethernet/mellanox/mlx4/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx4/eq.c
+@@ -269,7 +269,10 @@ enum slave_port_state mlx4_get_slave_por
+ {
+ 	struct mlx4_priv *priv = mlx4_priv(dev);
+ 	struct mlx4_slave_state *s_state = priv->mfunc.master.slave_state;
+-	if (slave >= dev->num_slaves || port > MLX4_MAX_PORTS) {
++	struct mlx4_active_ports actv_ports = mlx4_get_active_ports(dev, slave);
++
++	if (slave >= dev->num_slaves || port > dev->caps.num_ports ||
++	    port <= 0 || !test_bit(port - 1, actv_ports.ports)) {
+ 		pr_err("%s: Error: asking for slave:%d, port:%d\n",
+ 		       __func__, slave, port);
+ 		return SLAVE_PORT_DOWN;
+@@ -283,8 +286,10 @@ static int mlx4_set_slave_port_state(str
+ {
+ 	struct mlx4_priv *priv = mlx4_priv(dev);
+ 	struct mlx4_slave_state *s_state = priv->mfunc.master.slave_state;
++	struct mlx4_active_ports actv_ports = mlx4_get_active_ports(dev, slave);
+ 
+-	if (slave >= dev->num_slaves || port > MLX4_MAX_PORTS || port == 0) {
++	if (slave >= dev->num_slaves || port > dev->caps.num_ports ||
++	    port <= 0 || !test_bit(port - 1, actv_ports.ports)) {
+ 		pr_err("%s: Error: asking for slave:%d, port:%d\n",
+ 		       __func__, slave, port);
+ 		return -1;
+@@ -298,9 +303,13 @@ static void set_all_slave_state(struct m
+ {
+ 	int i;
+ 	enum slave_port_gen_event gen_event;
++	struct mlx4_slaves_pport slaves_pport = mlx4_phys_to_slaves_pport(dev,
++									  port);
+ 
+-	for (i = 0; i < dev->num_slaves; i++)
+-		set_and_calc_slave_port_state(dev, i, port, event, &gen_event);
++	for (i = 0; i < dev->num_vfs + 1; i++)
++		if (test_bit(i, slaves_pport.slaves))
++			set_and_calc_slave_port_state(dev, i, port,
++						      event, &gen_event);
+ }
+ /**************************************************************************
+ 	The function get as input the new event to that port,
+@@ -319,12 +328,14 @@ int set_and_calc_slave_port_state(struct
+ 	struct mlx4_slave_state *ctx = NULL;
+ 	unsigned long flags;
+ 	int ret = -1;
++	struct mlx4_active_ports actv_ports = mlx4_get_active_ports(dev, slave);
+ 	enum slave_port_state cur_state =
+ 		mlx4_get_slave_port_state(dev, slave, port);
+ 
+ 	*gen_event = SLAVE_PORT_GEN_EVENT_NONE;
+ 
+-	if (slave >= dev->num_slaves || port > MLX4_MAX_PORTS || port == 0) {
++	if (slave >= dev->num_slaves || port > dev->caps.num_ports ||
++	    port <= 0 || !test_bit(port - 1, actv_ports.ports)) {
+ 		pr_err("%s: Error: asking for slave:%d, port:%d\n",
+ 		       __func__, slave, port);
+ 		return ret;
+@@ -539,21 +550,29 @@ static int mlx4_eq_int(struct mlx4_dev *
+ 				       be64_to_cpu(eqe->event.cmd.out_param));
+ 			break;
+ 
+-		case MLX4_EVENT_TYPE_PORT_CHANGE:
++		case MLX4_EVENT_TYPE_PORT_CHANGE: {
++			struct mlx4_slaves_pport slaves_port;
+ 			port = be32_to_cpu(eqe->event.port_change.port) >> 28;
++			slaves_port = mlx4_phys_to_slaves_pport(dev, port);
+ 			if (eqe->subtype == MLX4_PORT_CHANGE_SUBTYPE_DOWN) {
+ 				mlx4_dispatch_event(dev, MLX4_DEV_EVENT_PORT_DOWN,
+ 						    port);
+ 				mlx4_priv(dev)->sense.do_sense_port[port] = 1;
+ 				if (!mlx4_is_master(dev))
+ 					break;
+-				for (i = 0; i < dev->num_slaves; i++) {
++				for (i = 0; i < dev->num_vfs + 1; i++) {
++					if (!test_bit(i, slaves_port.slaves))
++						continue;
+ 					if (dev->caps.port_type[port] == MLX4_PORT_TYPE_ETH) {
+ 						if (i == mlx4_master_func_num(dev))
+ 							continue;
+ 						mlx4_dbg(dev, "%s: Sending MLX4_PORT_CHANGE_SUBTYPE_DOWN"
+ 							 " to slave: %d, port:%d\n",
+ 							 __func__, i, port);
++						eqe->event.port_change.port =
++							cpu_to_be32(
++							(be32_to_cpu(eqe->event.port_change.port) & 0xFFFFFFF)
++							| (mlx4_phys_to_slave_port(dev, i, port) << 28));
+ 						mlx4_slave_event(dev, i, eqe);
+ 					} else {  /* IB port */
+ 						set_and_calc_slave_port_state(dev, i, port,
+@@ -575,9 +594,15 @@ static int mlx4_eq_int(struct mlx4_dev *
+ 				if (!mlx4_is_master(dev))
+ 					break;
+ 				if (dev->caps.port_type[port] == MLX4_PORT_TYPE_ETH)
+-					for (i = 0; i < dev->num_slaves; i++) {
++					for (i = 0; i < dev->num_vfs + 1; i++) {
++						if (!test_bit(i, slaves_port.slaves))
++							continue;
+ 						if (i == mlx4_master_func_num(dev))
+ 							continue;
++						eqe->event.port_change.port =
++							cpu_to_be32(
++							(be32_to_cpu(eqe->event.port_change.port) & 0xFFFFFFF)
++							| (mlx4_phys_to_slave_port(dev, i, port) << 28));
+ 						mlx4_slave_event(dev, i, eqe);
+ 					}
+ 				else /* IB port */
+@@ -587,6 +612,7 @@ static int mlx4_eq_int(struct mlx4_dev *
+ 					set_all_slave_state(dev, port, MLX4_DEV_EVENT_PORT_UP);
+ 			}
+ 			break;
++		}
+ 
+ 		case MLX4_EVENT_TYPE_CQ_ERROR:
+ 			mlx4_warn(dev, "CQ %s on CQN %06x\n",
+--- a/drivers/net/ethernet/mellanox/mlx4/fw.c
++++ b/drivers/net/ethernet/mellanox/mlx4/fw.c
+@@ -223,13 +223,25 @@ int mlx4_QUERY_FUNC_CAP_wrapper(struct m
+ #define QUERY_FUNC_CAP_FLAGS0_FORCE_PHY_WQE_GID 0x80
+ 
+ 	if (vhcr->op_modifier == 1) {
++		struct mlx4_active_ports actv_ports =
++			mlx4_get_active_ports(dev, slave);
++		int converted_port = mlx4_slave_convert_port(
++				dev, slave, vhcr->in_modifier);
++
++		if (converted_port < 0)
++			return -EINVAL;
++
++		vhcr->in_modifier = converted_port;
+ 		/* Set nic_info bit to mark new fields support */
+ 		field  = QUERY_FUNC_CAP_FLAGS1_NIC_INFO;
+ 		MLX4_PUT(outbox->buf, field, QUERY_FUNC_CAP_FLAGS1_OFFSET);
+ 
+-		field = vhcr->in_modifier; /* phys-port = logical-port */
++		/* phys-port = logical-port */
++		field = vhcr->in_modifier -
++			find_first_bit(actv_ports.ports, dev->caps.num_ports);
+ 		MLX4_PUT(outbox->buf, field, QUERY_FUNC_CAP_PHYS_PORT_OFFSET);
+ 
++		field = vhcr->in_modifier;
+ 		/* size is now the QP number */
+ 		size = dev->phys_caps.base_tunnel_sqpn + 8 * slave + field - 1;
+ 		MLX4_PUT(outbox->buf, size, QUERY_FUNC_CAP_QP0_TUNNEL);
+@@ -247,12 +259,16 @@ int mlx4_QUERY_FUNC_CAP_wrapper(struct m
+ 			 QUERY_FUNC_CAP_PHYS_PORT_ID);
+ 
+ 	} else if (vhcr->op_modifier == 0) {
++		struct mlx4_active_ports actv_ports =
++			mlx4_get_active_ports(dev, slave);
+ 		/* enable rdma and ethernet interfaces, and new quota locations */
+ 		field = (QUERY_FUNC_CAP_FLAG_ETH | QUERY_FUNC_CAP_FLAG_RDMA |
+ 			 QUERY_FUNC_CAP_FLAG_QUOTAS);
+ 		MLX4_PUT(outbox->buf, field, QUERY_FUNC_CAP_FLAGS_OFFSET);
+ 
+-		field = dev->caps.num_ports;
++		field = min(
++			bitmap_weight(actv_ports.ports, dev->caps.num_ports),
++			dev->caps.num_ports);
+ 		MLX4_PUT(outbox->buf, field, QUERY_FUNC_CAP_NUM_PORTS_OFFSET);
+ 
+ 		size = dev->caps.function_caps; /* set PF behaviours */
+@@ -831,6 +847,10 @@ int mlx4_QUERY_DEV_CAP_wrapper(struct ml
+ 	int	err = 0;
+ 	u8	field;
+ 	u32	bmme_flags;
++	int	real_port;
++	int	slave_port;
++	int	first_port;
++	struct mlx4_active_ports actv_ports;
+ 
+ 	err = mlx4_cmd_box(dev, 0, outbox->dma, 0, 0, MLX4_CMD_QUERY_DEV_CAP,
+ 			   MLX4_CMD_TIME_CLASS_A, MLX4_CMD_NATIVE);
+@@ -843,8 +863,26 @@ int mlx4_QUERY_DEV_CAP_wrapper(struct ml
+ 	MLX4_GET(flags, outbox->buf, QUERY_DEV_CAP_EXT_FLAGS_OFFSET);
+ 	flags |= MLX4_DEV_CAP_FLAG_PORT_MNG_CHG_EV;
+ 	flags &= ~MLX4_DEV_CAP_FLAG_MEM_WINDOW;
++	actv_ports = mlx4_get_active_ports(dev, slave);
++	first_port = find_first_bit(actv_ports.ports, dev->caps.num_ports);
++	for (slave_port = 0, real_port = first_port;
++	     real_port < first_port +
++	     bitmap_weight(actv_ports.ports, dev->caps.num_ports);
++	     ++real_port, ++slave_port) {
++		if (flags & (MLX4_DEV_CAP_FLAG_WOL_PORT1 << real_port))
++			flags |= MLX4_DEV_CAP_FLAG_WOL_PORT1 << slave_port;
++		else
++			flags &= ~(MLX4_DEV_CAP_FLAG_WOL_PORT1 << slave_port);
++	}
++	for (; slave_port < dev->caps.num_ports; ++slave_port)
++		flags &= ~(MLX4_DEV_CAP_FLAG_WOL_PORT1 << slave_port);
+ 	MLX4_PUT(outbox->buf, flags, QUERY_DEV_CAP_EXT_FLAGS_OFFSET);
+ 
++	MLX4_GET(field, outbox->buf, QUERY_DEV_CAP_VL_PORT_OFFSET);
++	field &= ~0x0F;
++	field |= bitmap_weight(actv_ports.ports, dev->caps.num_ports) & 0x0F;
++	MLX4_PUT(outbox->buf, field, QUERY_DEV_CAP_VL_PORT_OFFSET);
++
+ 	/* For guests, disable timestamp */
+ 	MLX4_GET(field, outbox->buf, QUERY_DEV_CAP_CQ_TS_SUPPORT_OFFSET);
+ 	field &= 0x7f;
+@@ -882,11 +920,19 @@ int mlx4_QUERY_PORT_wrapper(struct mlx4_
+ 	u8 port_type;
+ 	u16 short_field;
+ 	int err;
++	int port = mlx4_slave_convert_port(dev, slave,
++					   vhcr->in_modifier & 0xFF);
+ 
+ #define MLX4_VF_PORT_NO_LINK_SENSE_MASK	0xE0
+ #define QUERY_PORT_CUR_MAX_PKEY_OFFSET	0x0c
+ #define QUERY_PORT_CUR_MAX_GID_OFFSET	0x0e
+ 
++	if (port < 0)
++		return -EINVAL;
++
++	vhcr->in_modifier = (vhcr->in_modifier & ~0xFF) |
++			    (port & 0xFF);
++
+ 	err = mlx4_cmd_box(dev, 0, outbox->dma, vhcr->in_modifier, 0,
+ 			   MLX4_CMD_QUERY_PORT, MLX4_CMD_TIME_CLASS_B,
+ 			   MLX4_CMD_NATIVE);
+@@ -1547,9 +1593,12 @@ int mlx4_INIT_PORT_wrapper(struct mlx4_d
+ 			   struct mlx4_cmd_info *cmd)
+ {
+ 	struct mlx4_priv *priv = mlx4_priv(dev);
+-	int port = vhcr->in_modifier;
++	int port = mlx4_slave_convert_port(dev, slave, vhcr->in_modifier);
+ 	int err;
+ 
++	if (port < 0)
++		return -EINVAL;
++
+ 	if (priv->mfunc.master.slave_state[slave].init_port_mask & (1 << port))
+ 		return 0;
+ 
+@@ -1639,9 +1688,12 @@ int mlx4_CLOSE_PORT_wrapper(struct mlx4_
+ 			    struct mlx4_cmd_info *cmd)
+ {
+ 	struct mlx4_priv *priv = mlx4_priv(dev);
+-	int port = vhcr->in_modifier;
++	int port = mlx4_slave_convert_port(dev, slave, vhcr->in_modifier);
+ 	int err;
+ 
++	if (port < 0)
++		return -EINVAL;
++
+ 	if (!(priv->mfunc.master.slave_state[slave].init_port_mask &
+ 	    (1 << port)))
+ 		return 0;
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@ -1546,7 +1546,7 @@ static void choose_steering_mode(struct
+ 	if (mlx4_log_num_mgm_entry_size == -1 &&
+ 	    dev_cap->flags2 & MLX4_DEV_CAP_FLAG2_FS_EN &&
+ 	    (!mlx4_is_mfunc(dev) ||
+-	     (dev_cap->fs_max_num_qp_per_entry >= (num_vfs + 1))) &&
++	     (dev_cap->fs_max_num_qp_per_entry >= (dev->num_vfs + 1))) &&
+ 	    choose_log_fs_mgm_entry_size(dev_cap->fs_max_num_qp_per_entry) >=
+ 		MLX4_MIN_MGM_LOG_ENTRY_SIZE) {
+ 		dev->oper_log_mgm_entry_size =
+--- a/drivers/net/ethernet/mellanox/mlx4/mcg.c
++++ b/drivers/net/ethernet/mellanox/mlx4/mcg.c
+@@ -1359,9 +1359,12 @@ int mlx4_PROMISC_wrapper(struct mlx4_dev
+ 			 struct mlx4_cmd_info *cmd)
+ {
+ 	u32 qpn = (u32) vhcr->in_param & 0xffffffff;
+-	u8 port = vhcr->in_param >> 62;
++	int port = mlx4_slave_convert_port(dev, slave, vhcr->in_param >> 62);
+ 	enum mlx4_steer_type steer = vhcr->in_modifier;
+ 
++	if (port < 0)
++		return -EINVAL;
++
+ 	/* Promiscuous unicast is not allowed in mfunc */
+ 	if (mlx4_is_mfunc(dev) && steer == MLX4_UC_STEER)
+ 		return 0;
+--- a/drivers/net/ethernet/mellanox/mlx4/port.c
++++ b/drivers/net/ethernet/mellanox/mlx4/port.c
+@@ -625,6 +625,15 @@ int mlx4_SET_PORT_wrapper(struct mlx4_de
+ 			  struct mlx4_cmd_mailbox *outbox,
+ 			  struct mlx4_cmd_info *cmd)
+ {
++	int port = mlx4_slave_convert_port(
++			dev, slave, vhcr->in_modifier & 0xFF);
++
++	if (port < 0)
++		return -EINVAL;
++
++	vhcr->in_modifier = (vhcr->in_modifier & ~0xFF) |
++			    (port & 0xFF);
++
+ 	return mlx4_common_set_port(dev, slave, vhcr->in_modifier,
+ 				    vhcr->op_modifier, inbox);
+ }
+--- a/drivers/net/ethernet/mellanox/mlx4/resource_tracker.c
++++ b/drivers/net/ethernet/mellanox/mlx4/resource_tracker.c
+@@ -461,6 +461,8 @@ int mlx4_init_resource_tracker(struct ml
+ 
+ 		spin_lock_init(&res_alloc->alloc_lock);
+ 		for (t = 0; t < dev->num_vfs + 1; t++) {
++			struct mlx4_active_ports actv_ports =
++				mlx4_get_active_ports(dev, t);
+ 			switch (i) {
+ 			case RES_QP:
+ 				initialize_res_quotas(dev, res_alloc, RES_QP,
+@@ -490,10 +492,27 @@ int mlx4_init_resource_tracker(struct ml
+ 				break;
+ 			case RES_MAC:
+ 				if (t == mlx4_master_func_num(dev)) {
+-					res_alloc->quota[t] = MLX4_MAX_MAC_NUM;
++					int max_vfs_pport = 0;
++					/* Calculate the max vfs per port for */
++					/* both ports.			      */
++					for (j = 0; j < dev->caps.num_ports;
++					     j++) {
++						struct mlx4_slaves_pport slaves_pport =
++							mlx4_phys_to_slaves_pport(dev, j + 1);
++						unsigned current_slaves =
++							bitmap_weight(slaves_pport.slaves,
++								      dev->caps.num_ports) - 1;
++						if (max_vfs_pport < current_slaves)
++							max_vfs_pport =
++								current_slaves;
++					}
++					res_alloc->quota[t] =
++						MLX4_MAX_MAC_NUM -
++						2 * max_vfs_pport;
+ 					res_alloc->guaranteed[t] = 2;
+ 					for (j = 0; j < MLX4_MAX_PORTS; j++)
+-						res_alloc->res_port_free[j] = MLX4_MAX_MAC_NUM;
++						res_alloc->res_port_free[j] =
++							MLX4_MAX_MAC_NUM;
+ 				} else {
+ 					res_alloc->quota[t] = MLX4_MAX_MAC_NUM;
+ 					res_alloc->guaranteed[t] = 2;
+@@ -521,9 +540,10 @@ int mlx4_init_resource_tracker(struct ml
+ 				break;
+ 			}
+ 			if (i == RES_MAC || i == RES_VLAN) {
+-				for (j = 0; j < MLX4_MAX_PORTS; j++)
+-					res_alloc->res_port_rsvd[j] +=
+-						res_alloc->guaranteed[t];
++				for (j = 0; j < dev->caps.num_ports; j++)
++					if (test_bit(j, actv_ports.ports))
++						res_alloc->res_port_rsvd[j] +=
++							res_alloc->guaranteed[t];
+ 			} else {
+ 				res_alloc->res_reserved += res_alloc->guaranteed[t];
+ 			}
+@@ -1715,6 +1735,11 @@ static int mac_alloc_res(struct mlx4_dev
+ 		return err;
+ 
+ 	port = !in_port ? get_param_l(out_param) : in_port;
++	port = mlx4_slave_convert_port(
++			dev, slave, port);
++
++	if (port < 0)
++		return -EINVAL;
+ 	mac = in_param;
+ 
+ 	err = __mlx4_register_mac(dev, port, mac);
+@@ -1821,6 +1846,11 @@ static int vlan_alloc_res(struct mlx4_de
+ 	if (!port || op != RES_OP_RESERVE_AND_MAP)
+ 		return -EINVAL;
+ 
++	port = mlx4_slave_convert_port(
++			dev, slave, port);
++
++	if (port < 0)
++		return -EINVAL;
+ 	/* upstream kernels had NOP for reg/unreg vlan. Continue this. */
+ 	if (!in_port && port > 0 && port <= dev->caps.num_ports) {
+ 		slave_state[slave].old_vlan_api = true;
+@@ -2118,6 +2148,11 @@ static int mac_free_res(struct mlx4_dev
+ 	switch (op) {
+ 	case RES_OP_RESERVE_AND_MAP:
+ 		port = !in_port ? get_param_l(out_param) : in_port;
++		port = mlx4_slave_convert_port(
++				dev, slave, port);
++
++		if (port < 0)
++			return -EINVAL;
+ 		mac_del_from_slave(dev, slave, in_param, port);
+ 		__mlx4_unregister_mac(dev, port, in_param);
+ 		break;
+@@ -2137,6 +2172,11 @@ static int vlan_free_res(struct mlx4_dev
+ 	struct mlx4_slave_state *slave_state = priv->mfunc.master.slave_state;
+ 	int err = 0;
+ 
++	port = mlx4_slave_convert_port(
++			dev, slave, port);
++
++	if (port < 0)
++		return -EINVAL;
+ 	switch (op) {
+ 	case RES_OP_RESERVE_AND_MAP:
+ 		if (slave_state[slave].old_vlan_api)
+@@ -3258,6 +3298,38 @@ int mlx4_INIT2INIT_QP_wrapper(struct mlx
+ 	return mlx4_GEN_QP_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
+ }
+ 
++static int adjust_qp_sched_queue(struct mlx4_dev *dev, int slave,
++				  struct mlx4_qp_context *qpc,
++				  struct mlx4_cmd_mailbox *inbox)
++{
++	enum mlx4_qp_optpar optpar = be32_to_cpu(*(__be32 *)inbox->buf);
++	u8 pri_sched_queue;
++	int port = mlx4_slave_convert_port(
++		   dev, slave, (qpc->pri_path.sched_queue >> 6 & 1) + 1) - 1;
++
++	if (port < 0)
++		return -EINVAL;
++
++	pri_sched_queue = (qpc->pri_path.sched_queue & ~(1 << 6)) |
++			  ((port & 1) << 6);
++
++	if (optpar & MLX4_QP_OPTPAR_PRIMARY_ADDR_PATH) {
++		qpc->pri_path.sched_queue = pri_sched_queue;
++	}
++
++	if (optpar & MLX4_QP_OPTPAR_ALT_ADDR_PATH) {
++		port = mlx4_slave_convert_port(
++				dev, slave, (qpc->alt_path.sched_queue >> 6 & 1)
++				+ 1) - 1;
++		if (port < 0)
++			return -EINVAL;
++		qpc->alt_path.sched_queue =
++			(qpc->alt_path.sched_queue & ~(1 << 6)) |
++			(port & 1) << 6;
++	}
++	return 0;
++}
++
+ int mlx4_INIT2RTR_QP_wrapper(struct mlx4_dev *dev, int slave,
+ 			     struct mlx4_vhcr *vhcr,
+ 			     struct mlx4_cmd_mailbox *inbox,
+@@ -3276,6 +3348,9 @@ int mlx4_INIT2RTR_QP_wrapper(struct mlx4
+ 	u8 orig_vlan_index = qpc->pri_path.vlan_index;
+ 	u8 orig_feup = qpc->pri_path.feup;
+ 
++	err = adjust_qp_sched_queue(dev, slave, qpc, inbox);
++	if (err)
++		return err;
+ 	err = verify_qp_parameters(dev, inbox, QP_TRANS_INIT2RTR, slave);
+ 	if (err)
+ 		return err;
+@@ -3324,6 +3399,9 @@ int mlx4_RTR2RTS_QP_wrapper(struct mlx4_
+ 	int err;
+ 	struct mlx4_qp_context *context = inbox->buf + 8;
+ 
++	err = adjust_qp_sched_queue(dev, slave, context, inbox);
++	if (err)
++		return err;
+ 	err = verify_qp_parameters(dev, inbox, QP_TRANS_RTR2RTS, slave);
+ 	if (err)
+ 		return err;
+@@ -3343,6 +3421,9 @@ int mlx4_RTS2RTS_QP_wrapper(struct mlx4_
+ 	int err;
+ 	struct mlx4_qp_context *context = inbox->buf + 8;
+ 
++	err = adjust_qp_sched_queue(dev, slave, context, inbox);
++	if (err)
++		return err;
+ 	err = verify_qp_parameters(dev, inbox, QP_TRANS_RTS2RTS, slave);
+ 	if (err)
+ 		return err;
+@@ -3361,6 +3442,9 @@ int mlx4_SQERR2RTS_QP_wrapper(struct mlx
+ 			      struct mlx4_cmd_info *cmd)
+ {
+ 	struct mlx4_qp_context *context = inbox->buf + 8;
++	int err = adjust_qp_sched_queue(dev, slave, context, inbox);
++	if (err)
++		return err;
+ 	adjust_proxy_tun_qkey(dev, vhcr, context);
+ 	return mlx4_GEN_QP_wrapper(dev, slave, vhcr, inbox, outbox, cmd);
+ }
+@@ -3374,6 +3458,9 @@ int mlx4_SQD2SQD_QP_wrapper(struct mlx4_
+ 	int err;
+ 	struct mlx4_qp_context *context = inbox->buf + 8;
+ 
++	err = adjust_qp_sched_queue(dev, slave, context, inbox);
++	if (err)
++		return err;
+ 	err = verify_qp_parameters(dev, inbox, QP_TRANS_SQD2SQD, slave);
+ 	if (err)
+ 		return err;
+@@ -3393,6 +3480,9 @@ int mlx4_SQD2RTS_QP_wrapper(struct mlx4_
+ 	int err;
+ 	struct mlx4_qp_context *context = inbox->buf + 8;
+ 
++	err = adjust_qp_sched_queue(dev, slave, context, inbox);
++	if (err)
++		return err;
+ 	err = verify_qp_parameters(dev, inbox, QP_TRANS_SQD2RTS, slave);
+ 	if (err)
+ 		return err;
+@@ -3496,16 +3586,26 @@ static int rem_mcg_res(struct mlx4_dev *
+ 	return err;
+ }
+ 
+-static int qp_attach(struct mlx4_dev *dev, struct mlx4_qp *qp, u8 gid[16],
+-		     int block_loopback, enum mlx4_protocol prot,
++static int qp_attach(struct mlx4_dev *dev, int slave, struct mlx4_qp *qp,
++		     u8 gid[16], int block_loopback, enum mlx4_protocol prot,
+ 		     enum mlx4_steer_type type, u64 *reg_id)
+ {
+ 	switch (dev->caps.steering_mode) {
+-	case MLX4_STEERING_MODE_DEVICE_MANAGED:
+-		return mlx4_trans_to_dmfs_attach(dev, qp, gid, gid[5],
++	case MLX4_STEERING_MODE_DEVICE_MANAGED: {
++		int port = mlx4_slave_convert_port(dev, slave, gid[5]);
++		if (port < 0)
++			return port;
++		return mlx4_trans_to_dmfs_attach(dev, qp, gid, port,
+ 						block_loopback, prot,
+ 						reg_id);
++	}
+ 	case MLX4_STEERING_MODE_B0:
++		if (prot == MLX4_PROT_ETH) {
++			int port = mlx4_slave_convert_port(dev, slave, gid[5]);
++			if (port < 0)
++				return port;
++			gid[5] = port;
++		}
+ 		return mlx4_qp_attach_common(dev, qp, gid,
+ 					    block_loopback, prot, type);
+ 	default:
+@@ -3513,9 +3613,9 @@ static int qp_attach(struct mlx4_dev *de
+ 	}
+ }
+ 
+-static int qp_detach(struct mlx4_dev *dev, struct mlx4_qp *qp, u8 gid[16],
+-		     enum mlx4_protocol prot, enum mlx4_steer_type type,
+-		     u64 reg_id)
++static int qp_detach(struct mlx4_dev *dev, struct mlx4_qp *qp,
++		     u8 gid[16], enum mlx4_protocol prot,
++		     enum mlx4_steer_type type, u64 reg_id)
+ {
+ 	switch (dev->caps.steering_mode) {
+ 	case MLX4_STEERING_MODE_DEVICE_MANAGED:
+@@ -3552,7 +3652,7 @@ int mlx4_QP_ATTACH_wrapper(struct mlx4_d
+ 
+ 	qp.qpn = qpn;
+ 	if (attach) {
+-		err = qp_attach(dev, &qp, gid, block_loopback, prot,
++		err = qp_attach(dev, slave, &qp, gid, block_loopback, prot,
+ 				type, &reg_id);
+ 		if (err) {
+ 			pr_err("Fail to attach rule to qp 0x%x\n", qpn);
+@@ -3688,6 +3788,9 @@ int mlx4_QP_FLOW_STEERING_ATTACH_wrapper
+ 		return -EOPNOTSUPP;
+ 
+ 	ctrl = (struct mlx4_net_trans_rule_hw_ctrl *)inbox->buf;
++	ctrl->port = mlx4_slave_convert_port(dev, slave, ctrl->port);
++	if (ctrl->port <= 0)
++		return -EINVAL;
+ 	qpn = be32_to_cpu(ctrl->qpn) & 0xffffff;
+ 	err = get_res(dev, slave, qpn, RES_QP, &rqp);
+ 	if (err) {
+--- a/include/linux/mlx4/device.h
++++ b/include/linux/mlx4/device.h
+@@ -1171,4 +1171,5 @@ struct mlx4_slaves_pport mlx4_phys_to_sl
+ /* Returns the slave's virtual port that represents the physical port. */
+ int mlx4_phys_to_slave_port(struct mlx4_dev *dev, int slave, int port);
+ 
++int mlx4_get_base_gid_ix(struct mlx4_dev *dev, int slave, int port);
+ #endif /* MLX4_DEVICE_H */
