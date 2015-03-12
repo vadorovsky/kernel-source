@@ -1,0 +1,161 @@
+From: Mark Fasheh <mfasheh@suse.de>
+Date: Tue, 6 Aug 2013 11:42:50 -0700
+Patch-mainline: 3.12
+Git-commit: 4b384318a74e38eb248f74f9a92a700d2ce841f1
+References: FATE#308234
+Subject: [PATCH] btrfs: Introduce extent_read_full_page_nolock()
+
+We want this for btrfs_extent_same. Basically readpage and friends do their
+own extent locking but for the purposes of dedupe, we want to have both
+files locked down across a set of readpage operations (so that we can
+compare data). Introduce this variant and a flag which can be set for
+extent_read_full_page() to indicate that we are already locked.
+
+Partial credit for this patch goes to Gabriel de Perthuis <g2p.code@gmail.com>
+as I have included a fix from him to the original patch which avoids a
+deadlock on compressed extents.
+
+[depends on 125bac016d60e78120e92904a5b2fc3a5ebf0475, adjusted manually]
+
+Signed-off-by: Mark Fasheh <mfasheh@suse.de>
+Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+Signed-off-by: Chris Mason <chris.mason@fusionio.com>
+Signed-off-by: David Sterba <dsterba@suse.cz>
+---
+ fs/btrfs/compression.c |    6 +++++-
+ fs/btrfs/extent_io.c   |   37 +++++++++++++++++++++++++++++--------
+ fs/btrfs/extent_io.h   |    3 +++
+ 3 files changed, 37 insertions(+), 9 deletions(-)
+
+--- a/fs/btrfs/compression.c
++++ b/fs/btrfs/compression.c
+@@ -639,7 +639,11 @@ int btrfs_submit_compressed_read(struct
+ 	faili = nr_pages - 1;
+ 	cb->nr_pages = nr_pages;
+ 
+-	add_ra_bio_pages(inode, em_start + em_len, cb);
++	/* In the parent-locked case, we only locked the range we are
++	 * interested in.  In all other cases, we can opportunistically
++	 * cache decompressed data that goes beyond the requested range. */
++	if (!(bio_flags & EXTENT_BIO_PARENT_LOCKED))
++		add_ra_bio_pages(inode, em_start + em_len, cb);
+ 
+ 	/* include any pages we added in add_ra-bio_pages */
+ 	uncompressed_len = bio->bi_vcnt * PAGE_CACHE_SIZE;
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -2674,11 +2674,12 @@ static int __do_readpage(struct extent_i
+ 	struct block_device *bdev;
+ 	int ret;
+ 	int nr = 0;
++	int parent_locked = *bio_flags & EXTENT_BIO_PARENT_LOCKED;
+ 	size_t pg_offset = 0;
+ 	size_t iosize;
+ 	size_t disk_io_size;
+ 	size_t blocksize = inode->i_sb->s_blocksize;
+-	unsigned long this_bio_flag = 0;
++	unsigned long this_bio_flag = *bio_flags & EXTENT_BIO_PARENT_LOCKED;
+ 
+ 	set_page_extent_mapped(page);
+ 
+@@ -2717,15 +2718,18 @@ static int __do_readpage(struct extent_i
+ 			kunmap_atomic(userpage, KM_USER0);
+ 			set_extent_uptodate(tree, cur, cur + iosize - 1,
+ 					    &cached, GFP_NOFS);
+-			unlock_extent_cached(tree, cur, cur + iosize - 1,
+-					     &cached, GFP_NOFS);
++			if (!parent_locked)
++				unlock_extent_cached(tree, cur,
++						     cur + iosize - 1,
++						     &cached, GFP_NOFS);
+ 			break;
+ 		}
+ 		em = get_extent(inode, page, pg_offset, cur,
+ 				end - cur + 1, 0);
+ 		if (IS_ERR_OR_NULL(em)) {
+ 			SetPageError(page);
+-			unlock_extent(tree, cur, end);
++			if (!parent_locked)
++				unlock_extent(tree, cur, end);
+ 			break;
+ 		}
+ 		extent_offset = cur - em->start;
+@@ -2733,7 +2737,7 @@ static int __do_readpage(struct extent_i
+ 		BUG_ON(end < cur);
+ 
+ 		if (test_bit(EXTENT_FLAG_COMPRESSED, &em->flags)) {
+-			this_bio_flag = EXTENT_BIO_COMPRESSED;
++			this_bio_flag |= EXTENT_BIO_COMPRESSED;
+ 			extent_set_compress_type(&this_bio_flag,
+ 						 em->compress_type);
+ 		}
+@@ -2777,7 +2781,8 @@ static int __do_readpage(struct extent_i
+ 		if (test_range_bit(tree, cur, cur_end,
+ 				   EXTENT_UPTODATE, 1, NULL)) {
+ 			check_page_uptodate(tree, page);
+-			unlock_extent(tree, cur, cur + iosize - 1);
++			if (!parent_locked)
++				unlock_extent(tree, cur, cur + iosize - 1);
+ 			cur = cur + iosize;
+ 			pg_offset += iosize;
+ 			continue;
+@@ -2787,7 +2792,8 @@ static int __do_readpage(struct extent_i
+ 		 */
+ 		if (block_start == EXTENT_MAP_INLINE) {
+ 			SetPageError(page);
+-			unlock_extent(tree, cur, cur + iosize - 1);
++			if (!parent_locked)
++				unlock_extent(tree, cur, cur + iosize - 1);
+ 			cur = cur + iosize;
+ 			pg_offset += iosize;
+ 			continue;
+@@ -2805,7 +2811,8 @@ static int __do_readpage(struct extent_i
+ 			*bio_flags = this_bio_flag;
+ 		} else {
+ 			SetPageError(page);
+-			unlock_extent(tree, cur, cur + iosize - 1);
++			if (!parent_locked)
++				unlock_extent(tree, cur, cur + iosize - 1);
+ 		}
+ 		cur = cur + iosize;
+ 		pg_offset += iosize;
+@@ -2925,6 +2932,20 @@ int extent_read_full_page(struct extent_
+ 				      &bio_flags, READ);
+ 	if (bio)
+ 		ret = submit_one_bio(READ, bio, mirror_num, bio_flags);
++	return ret;
++}
++
++int extent_read_full_page_nolock(struct extent_io_tree *tree, struct page *page,
++				 get_extent_t *get_extent, int mirror_num)
++{
++	struct bio *bio = NULL;
++	unsigned long bio_flags = EXTENT_BIO_PARENT_LOCKED;
++	int ret;
++
++	ret = __do_readpage(tree, page, get_extent, &bio, mirror_num,
++				      &bio_flags, READ);
++	if (bio)
++		ret = submit_one_bio(READ, bio, mirror_num, bio_flags);
+ 	return ret;
+ }
+ 
+--- a/fs/btrfs/extent_io.h
++++ b/fs/btrfs/extent_io.h
+@@ -29,6 +29,7 @@
+  */
+ #define EXTENT_BIO_COMPRESSED 1
+ #define EXTENT_BIO_TREE_LOG 2
++#define EXTENT_BIO_PARENT_LOCKED 4
+ #define EXTENT_BIO_FLAG_SHIFT 16
+ 
+ /* these are bit numbers for test/set bit */
+@@ -196,6 +197,8 @@ int unlock_extent_cached(struct extent_i
+ int try_lock_extent(struct extent_io_tree *tree, u64 start, u64 end);
+ int extent_read_full_page(struct extent_io_tree *tree, struct page *page,
+ 			  get_extent_t *get_extent, int mirror_num);
++int extent_read_full_page_nolock(struct extent_io_tree *tree, struct page *page,
++				 get_extent_t *get_extent, int mirror_num);
+ int __init extent_io_init(void);
+ void extent_io_exit(void);
+ 
