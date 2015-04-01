@@ -152,10 +152,8 @@ for f in "$build_dir"/*; do
 	rm -f "$f"
 done
 mkdir -p "$build_dir"
-if test ! -e "$build_dir/linux-$SRCVERSION.tar.bz2"; then
-	echo "linux-$SRCVERSION.tar.bz2"
-	get_tarball "$SRCVERSION" "tar.bz2" "$build_dir"
-fi
+echo "linux-$SRCVERSION.tar.bz2"
+get_tarball "$SRCVERSION" "tar.bz2" "$build_dir"
 
 # list of patches to include.
 install -m 644 series.conf $build_dir/
@@ -535,8 +533,9 @@ stable_tar() {
     shift
 
     if test -z "$mtime" && $using_git; then
+	local dirs=$(printf '%s\n' "$@" | sed 's:/.*::' | sort -u)
         mtime="$(cd "$chdir"
-            echo "$@" | xargs git log -1 --pretty=tformat:%ct -- | sort -n | \
+            echo "${dirs[@]}" | xargs git log -1 --pretty=tformat:%ct -- | sort -n | \
             tail -n 1)"
     fi
     if test -n "$mtime"; then
@@ -559,11 +558,7 @@ all_archives="$(
 for archive in $all_archives; do
     echo "$archive.tar.bz2"
 
-    files="$( echo "$referenced_files" \
-	| sed -ne "\:^${archive//./\\.}/:p" \
-	| while read patch; do
-	    [ -e "$patch" ] && echo "$patch"
-	done)"
+    files="$(echo "$referenced_files" | sed -ne "\:^${archive//./\\.}/:p")"
     if [ -n "$files" ]; then
 	stable_tar $build_dir/$archive.tar.bz2 $files
     fi

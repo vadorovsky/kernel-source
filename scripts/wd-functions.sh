@@ -44,11 +44,11 @@ _find_tarball()
     local version=$1 suffixes=$2 dir subdir major suffix
 
     set -- ${version//[.-]/ }
-    major=$1.$2
-    case "$major" in
-    3.*)
-        major=3.x
-    esac
+    if test $1 -le 2; then
+        major=$1.$2
+    else
+        major=$1.x
+    fi
     if test -z "$suffixes"; then
         if test -n "$(type -p xz)"; then
             suffixes="tar.xz tar.bz2"
@@ -110,8 +110,12 @@ get_tarball()
 
     tarball=$(_find_tarball "$version" "$suffix")
     if test -n "$tarball"; then
-        cp "$tarball" "$dest/linux-$version.$suffix.part" || exit
+        cp -p "$tarball" "$dest/linux-$version.$suffix.part" || exit
         mv "$dest/linux-$version.$suffix.part" "$dest/linux-$version.$suffix"
+        return
+    fi
+    # Reuse the locally generated tarball if already there
+    if test -e "$dest/linux-$version.$suffix"; then
         return
     fi
     echo "Warning: could not find linux-$version.$suffix, trying to create it from git" >&2
