@@ -1,0 +1,143 @@
+From: Michal Hocko <mhocko@suse.cz>
+Subject: pagecache limit: reduce starvation due to reclaim retries
+Patch-mainline: never
+References: bnc#925903
+
+patches.suse/pagecache-limit-reduce-zone-lrulock-bouncing.patch has introduced
+a retry look within __shrink_page_cache if the current reclaimer is not able to
+reclaim anything because all the zones are already reclaimed by somebody else.
+This is OK but we re-initialize the reclaim target after the retry which might
+lead to a higher reclaim target even after the current task has already
+reclaimed a lot of pages:
+cp-9302  [012]   774.703098: mm_shrink_page_cache_start: mask=GFP_KERNEL
+cp-9302  [012]   774.703104: mm_pagecache_reclaim_start: nr_pages=2089 pass=0 prio=12 mask=GFP_KERNEL may_write=0
+cp-9302  [012]   775.220106: mm_pagecache_reclaim_end: nr_scanned=0 nr_reclaimed=0 nr_scanned_zones=0
+cp-9302  [012]   775.220112: mm_pagecache_reclaim_start: nr_pages=6530 pass=0 prio=12 mask=GFP_KERNEL may_write=0
+cp-9302  [012]   781.507896: mm_pagecache_reclaim_end: nr_scanned=5398 nr_reclaimed=5398 nr_scanned_zones=1
+cp-9302  [012]   781.507913: mm_pagecache_reclaim_start: nr_pages=1132 pass=0 prio=11 mask=GFP_KERNEL may_write=0
+cp-9302  [012]   781.508441: mm_pagecache_reclaim_end: nr_scanned=0 nr_reclaimed=0 nr_scanned_zones=0
+cp-9302  [012]   781.508446: mm_pagecache_reclaim_start: nr_pages=41261 pass=0 prio=12 mask=GFP_KERNEL may_write=0
+
+This is clearly wrong and it might lead to a serious starvation when one task
+reclaims a lot of pages while others are piggy backing on the reclaim progress.
+
+This patch only allows to reduce the reclaim target after the retry. Not only
+that. The reclaim target logic is extracted into
+__shrink_page_cache_reclaim_target helper and we are checking the target in
+each reclaim round. The heavy parallel page cache load should benefit from it
+because the reclaim target should be shrinking much faster with multiple
+reclaimers.
+
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+
+---
+ mm/vmscan.c |   72 ++++++++++++++++++++++++++++++++++++------------------------
+ 1 file changed, 44 insertions(+), 28 deletions(-)
+
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -3220,6 +3220,27 @@ out:
+ 	return nr_locked_zones;
+ }
+ 
++static unsigned long __shrink_page_cache_reclaim_target(void)
++{
++	unsigned long nr_pages;
++
++	/* How many pages are we over the limit?
++	 * But don't enforce limit if there's plenty of free mem */
++	nr_pages = pagecache_over_limit();
++	if (nr_pages == 0)
++		return 0;
++
++	/* Don't need to go there in one step; as the freed
++	 * pages are counted FREE_TO_PAGECACHE_RATIO times, this
++	 * is still more than minimally needed. */
++	nr_pages /= 2;
++
++	/* But do a few at least */
++	nr_pages = max_t(unsigned long, nr_pages, 8*SWAP_CLUSTER_MAX);
++
++	return nr_pages;
++}
++
+ /*
+  * Function to shrink the page cache
+  *
+@@ -3249,35 +3270,12 @@ static void __shrink_page_cache(gfp_t ma
+ 		.gfp_mask = mask,
+ 	};
+ 	struct reclaim_state *old_rs = current->reclaim_state;
+-	long nr_pages;
+-
+-retry:
+-	/* How many pages are we over the limit?
+-	 * But don't enforce limit if there's plenty of free mem */
+-	nr_pages = pagecache_over_limit();
+-
+-	/* Don't need to go there in one step; as the freed
+-	 * pages are counted FREE_TO_PAGECACHE_RATIO times, this
+-	 * is still more than minimally needed. */
+-	nr_pages /= 2;
+-
+-	/*
+-	 * Return early if there's no work to do.
+-	 * Wake up reclaimers that couldn't scan any zone due to congestion.
+-	 * There is apparently nothing to do so they do not have to sleep.
+-	 * This makes sure that no sleeping reclaimer will stay behind.
+-	 * Allow breaching the limit if the task is on the way out.
+-	 */
+-	if (nr_pages <= 0 || fatal_signal_pending(current)) {
+-		wake_up_interruptible(&pagecache_reclaim_wq);
+-		goto out;
+-	}
+-
+-	/* But do a few at least */
+-	nr_pages = max_t(unsigned long, nr_pages, 8*SWAP_CLUSTER_MAX);
++	unsigned long nr_pages;
+ 
+ 	current->reclaim_state = &reclaim_state;
+ 
++	nr_pages = __shrink_page_cache_reclaim_target();
++retry:
+ 	/*
+ 	 * Shrink the LRU in 2 passes:
+ 	 * 0 = Reclaim from inactive_list only (fast)
+@@ -3288,7 +3286,24 @@ retry:
+ 		int prio;
+ 
+ 		for (prio = DEF_PRIORITY; prio >= 0; prio--) {
+-			unsigned long nr_to_scan = nr_pages - ret;
++			/*
++			 * Revalidate the reclaim target but make sure we do not
++			 * reclaim on behalf of other consumers so we shouldn't
++			 * do more than initially.
++			 */
++			nr_pages = min_t(unsigned long, nr_pages, __shrink_page_cache_reclaim_target());
++
++			/*
++			 * Return early if there's no work to do.
++			 * Wake up reclaimers that couldn't scan any zone due to congestion.
++			 * There is apparently nothing to do so they do not have to sleep.
++			 * This makes sure that no sleeping reclaimer will stay behind.
++			 * Allow breaching the limit if the task is on the way out.
++			 */
++			if (nr_pages == 0 || fatal_signal_pending(current)) {
++				wake_up_interruptible(&pagecache_reclaim_wq);
++				goto out;
++			}
+ 
+ 			sc.nr_scanned = 0;
+ 
+@@ -3296,9 +3311,10 @@ retry:
+ 			 * No zone reclaimed because of too many reclaimers. Retry whether
+ 			 * there is still something to do
+ 			 */
+-			if (!shrink_all_zones(nr_to_scan, prio, pass, &sc))
++			if (!shrink_all_zones(nr_pages, prio, pass, &sc))
+ 				goto retry;
+ 
++			nr_pages -= sc.nr_reclaimed;
+ 			ret += sc.nr_reclaimed;
+ 			if (ret >= nr_pages)
+ 				goto out;
