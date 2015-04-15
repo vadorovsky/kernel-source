@@ -1,0 +1,227 @@
+From: Steve French <smfrench@gmail.com>
+Date: Thu, 4 Jul 2013 10:35:21 -0500
+Subject: Limit allocation of crypto mechanisms to dialect which requires
+Git-commit: 95dc8dd14e2e84cc3adabc8310768c13758e7d96
+Patch-mainline: v3.11
+References: bnc#925729
+
+Updated patch to try to prevent allocation of cifs, smb2 or smb3 crypto
+secmech structures unless needed.  Currently cifs allocates all crypto
+mechanisms when the first session is established (4 functions and
+4 contexts), rather than only allocating these when needed (smb3 needs
+two, the rest of the dialects only need one).
+
+Acked-by: Jeff Layton <jlayton@redhat.com>
+Reviewed-by: Shirish Pargaonkar <shirishpargaonkar@gmail.com>
+Signed-off-by: Steve French <smfrench@gmail.com>
+Signed-off-by: Robert Milasan <rmilasan@suse.com>
+Acked-by: Miklos Szeredi <mszeredi@suse.cz>
+---
+ fs/cifs/cifsencrypt.c |  136 +++++++++++++++++++++++++++-----------------------
+ fs/cifs/cifsproto.h   |    1 
+ fs/cifs/connect.c     |    6 --
+ 3 files changed, 76 insertions(+), 67 deletions(-)
+
+--- a/fs/cifs/cifsencrypt.c
++++ b/fs/cifs/cifsencrypt.c
+@@ -30,6 +30,36 @@
+ #include <linux/ctype.h>
+ #include <linux/random.h>
+ 
++static int
++cifs_crypto_shash_md5_allocate(struct TCP_Server_Info *server)
++{
++	int rc;
++	unsigned int size;
++
++	if (server->secmech.sdescmd5 != NULL)
++		return 0; /* already allocated */
++
++	server->secmech.md5 = crypto_alloc_shash("md5", 0, 0);
++	if (IS_ERR(server->secmech.md5)) {
++		cERROR(1, "could not allocate crypto md5\n");
++		return PTR_ERR(server->secmech.md5);
++	}
++
++	size = sizeof(struct shash_desc) +
++		crypto_shash_descsize(server->secmech.md5);
++	server->secmech.sdescmd5 = kmalloc(size, GFP_KERNEL);
++	if (!server->secmech.sdescmd5) {
++		rc = -ENOMEM;
++		crypto_free_shash(server->secmech.md5);
++		server->secmech.md5 = NULL;
++		return rc;
++	}
++	server->secmech.sdescmd5->shash.tfm = server->secmech.md5;
++	server->secmech.sdescmd5->shash.flags = 0x0;
++
++	return 0;
++}
++
+ /*
+  * Calculate and return the CIFS signature based on the mac key and SMB PDU.
+  * The 16 byte signature must be allocated by the caller. Note we only use the
+@@ -46,8 +76,11 @@ static int cifs_calculate_signature(cons
+ 		return -EINVAL;
+ 
+ 	if (!server->secmech.sdescmd5) {
+-		cERROR(1, "%s: Can't generate signature\n", __func__);
+-		return -1;
++		rc = cifs_crypto_shash_md5_allocate(server);
++		if (rc) {
++			cERROR(1, "%s: Can't alloc md5 crypto\n", __func__);
++			return -1;
++		}
+ 	}
+ 
+ 	rc = crypto_shash_init(&server->secmech.sdescmd5->shash);
+@@ -561,6 +594,33 @@ CalcNTLMv2_response(const struct cifs_se
+ 	return rc;
+ }
+ 
++static int crypto_hmacmd5_alloc(struct TCP_Server_Info *server)
++{
++	unsigned int size;
++
++	/* check if already allocated */
++	if (server->secmech.sdeschmacmd5)
++		return 0;
++
++	server->secmech.hmacmd5 = crypto_alloc_shash("hmac(md5)", 0, 0);
++	if (IS_ERR(server->secmech.hmacmd5)) {
++		cERROR(1, "not allocate crypto hmacmd5\n");
++		return PTR_ERR(server->secmech.hmacmd5);
++	}
++
++	size = sizeof(struct shash_desc) +
++			crypto_shash_descsize(server->secmech.hmacmd5);
++	server->secmech.sdeschmacmd5 = kmalloc(size, GFP_KERNEL);
++	if (!server->secmech.sdeschmacmd5) {
++		crypto_free_shash(server->secmech.hmacmd5);
++		server->secmech.hmacmd5 = NULL;
++		return -ENOMEM;
++	}
++	server->secmech.sdeschmacmd5->shash.tfm = server->secmech.hmacmd5;
++	server->secmech.sdeschmacmd5->shash.flags = 0x0;
++
++	return 0;
++}
+ 
+ int
+ setup_ntlmv2_rsp(struct cifs_ses *ses, const struct nls_table *nls_cp)
+@@ -611,6 +671,12 @@ setup_ntlmv2_rsp(struct cifs_ses *ses, c
+ 
+ 	memcpy(ses->auth_key.response + baselen, tiblob, tilen);
+ 
++	rc = crypto_hmacmd5_alloc(ses->server);
++	if (rc) {
++		cERROR(1, "could not crypto alloc hmacmd5 rc %d\n", rc);
++		goto setup_ntlmv2_rsp_ret;
++	}
++
+ 	/* calculate ntlmv2_hash */
+ 	rc = calc_ntlmv2_hash(ses, ntlmv2_hash, nls_cp);
+ 	if (rc) {
+@@ -694,69 +760,19 @@ calc_seckey(struct cifs_ses *ses)
+ void
+ cifs_crypto_shash_release(struct TCP_Server_Info *server)
+ {
+-	if (server->secmech.md5)
++	if (server->secmech.md5) {
+ 		crypto_free_shash(server->secmech.md5);
+-
+-	if (server->secmech.hmacmd5)
+-		crypto_free_shash(server->secmech.hmacmd5);
+-
+-	kfree(server->secmech.sdeschmacmd5);
+-
+-	kfree(server->secmech.sdescmd5);
+-}
+-
+-int
+-cifs_crypto_shash_allocate(struct TCP_Server_Info *server)
+-{
+-	int rc;
+-	unsigned int size;
+-
+-	server->secmech.hmacmd5 = crypto_alloc_shash("hmac(md5)", 0, 0);
+-	if (IS_ERR(server->secmech.hmacmd5)) {
+-		cERROR(1, "could not allocate crypto hmacmd5\n");
+-		return PTR_ERR(server->secmech.hmacmd5);
++		server->secmech.md5 = NULL;
+ 	}
+ 
+-	server->secmech.md5 = crypto_alloc_shash("md5", 0, 0);
+-	if (IS_ERR(server->secmech.md5)) {
+-		cERROR(1, "could not allocate crypto md5\n");
+-		rc = PTR_ERR(server->secmech.md5);
+-		goto crypto_allocate_md5_fail;
+-	}
+-
+-	size = sizeof(struct shash_desc) +
+-			crypto_shash_descsize(server->secmech.hmacmd5);
+-	server->secmech.sdeschmacmd5 = kmalloc(size, GFP_KERNEL);
+-	if (!server->secmech.sdeschmacmd5) {
+-		cERROR(1, "cifs_crypto_shash_allocate: can't alloc hmacmd5\n");
+-		rc = -ENOMEM;
+-		goto crypto_allocate_hmacmd5_sdesc_fail;
+-	}
+-	server->secmech.sdeschmacmd5->shash.tfm = server->secmech.hmacmd5;
+-	server->secmech.sdeschmacmd5->shash.flags = 0x0;
+-
+-
+-	size = sizeof(struct shash_desc) +
+-			crypto_shash_descsize(server->secmech.md5);
+-	server->secmech.sdescmd5 = kmalloc(size, GFP_KERNEL);
+-	if (!server->secmech.sdescmd5) {
+-		cERROR(1, "cifs_crypto_shash_allocate: can't alloc md5\n");
+-		rc = -ENOMEM;
+-		goto crypto_allocate_md5_sdesc_fail;
++	if (server->secmech.hmacmd5) {
++		crypto_free_shash(server->secmech.hmacmd5);
++		server->secmech.hmacmd5 = NULL;
+ 	}
+-	server->secmech.sdescmd5->shash.tfm = server->secmech.md5;
+-	server->secmech.sdescmd5->shash.flags = 0x0;
+ 
+-	return 0;
+-
+-crypto_allocate_md5_sdesc_fail:
+ 	kfree(server->secmech.sdeschmacmd5);
++	server->secmech.sdeschmacmd5 = NULL;
+ 
+-crypto_allocate_hmacmd5_sdesc_fail:
+-	crypto_free_shash(server->secmech.md5);
+-
+-crypto_allocate_md5_fail:
+-	crypto_free_shash(server->secmech.hmacmd5);
+-
+-	return rc;
++	kfree(server->secmech.sdescmd5);
++	server->secmech.sdescmd5 = NULL;
+ }
+--- a/fs/cifs/cifsproto.h
++++ b/fs/cifs/cifsproto.h
+@@ -387,7 +387,6 @@ extern int SMBNTencrypt(unsigned char *,
+ 			const struct nls_table *);
+ extern int setup_ntlm_response(struct cifs_ses *, const struct nls_table *);
+ extern int setup_ntlmv2_rsp(struct cifs_ses *, const struct nls_table *);
+-extern int cifs_crypto_shash_allocate(struct TCP_Server_Info *);
+ extern void cifs_crypto_shash_release(struct TCP_Server_Info *);
+ extern int calc_seckey(struct cifs_ses *);
+ 
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -1730,12 +1730,6 @@ cifs_get_tcp_session(struct smb_vol *vol
+ 		goto out_err;
+ 	}
+ 
+-	rc = cifs_crypto_shash_allocate(tcp_ses);
+-	if (rc) {
+-		cERROR(1, "could not setup hash structures rc %d", rc);
+-		goto out_err;
+-	}
+-
+ 	cifs_set_net_ns(tcp_ses, get_net(current->nsproxy->net_ns));
+ 	tcp_ses->hostname = extract_hostname(volume_info->UNC);
+ 	if (IS_ERR(tcp_ses->hostname)) {
