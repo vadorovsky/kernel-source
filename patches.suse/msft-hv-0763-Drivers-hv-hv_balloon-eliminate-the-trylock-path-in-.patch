@@ -1,0 +1,142 @@
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Sat, 28 Feb 2015 11:38:58 -0800
+Patch-mainline: v4.1-rc1
+Subject: Drivers: hv: hv_balloon: eliminate the trylock path in acquire/release_region_mutex
+Git-commit: b05d8d9ef5ef21d1b18440430f950304836e1aaa
+References: fate#317533
+
+When many memory regions are being added and automatically onlined the
+following lockup is sometimes observed:
+
+INFO: task udevd:1872 blocked for more than 120 seconds.
+...
+Call Trace:
+ [<ffffffff816ec0bc>] schedule_timeout+0x22c/0x350
+ [<ffffffff816eb98f>] wait_for_common+0x10f/0x160
+ [<ffffffff81067650>] ? default_wake_function+0x0/0x20
+ [<ffffffff816eb9fd>] wait_for_completion+0x1d/0x20
+ [<ffffffff8144cb9c>] hv_memory_notifier+0xdc/0x120
+ [<ffffffff816f298c>] notifier_call_chain+0x4c/0x70
+...
+
+When several memory blocks are going online simultaneously we got several
+hv_memory_notifier() trying to acquire the ha_region_mutex. When this mutex is
+being held by hot_add_req() all these competing acquire_region_mutex() do
+mutex_trylock, fail, and queue themselves into wait_for_completion(..). However
+when we do complete() from release_region_mutex() only one of them wakes up.
+This could be solved by changing complete() -> complete_all() memory onlining
+can be delayed as well, in that case we can still get several
+hv_memory_notifier() runners at the same time trying to grab the mutex.
+Only one of them will succeed and the others will hang for forever as
+complete() is not being called. We don't see this issue often because we have
+5sec onlining timeout in hv_mem_hot_add() and usually all udev events arrive
+in this time frame.
+
+Get rid of the trylock path, waiting on the mutex is supposed to provide the
+required serialization.
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: <ohering@suse.de>
+---
+ drivers/hv/hv_balloon.c | 35 ++++++-----------------------------
+ 1 file changed, 6 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/hv/hv_balloon.c b/drivers/hv/hv_balloon.c
+index 965c37a..ea3d33c 100644
+--- a/drivers/hv/hv_balloon.c
++++ b/drivers/hv/hv_balloon.c
+@@ -534,7 +534,6 @@ struct hv_dynmem_device {
+ 	struct task_struct *thread;
+ 
+ 	struct mutex ha_region_mutex;
+-	struct completion waiter_event;
+ 
+ 	/*
+ 	 * A list of hot-add regions.
+@@ -554,38 +553,17 @@ static struct hv_dynmem_device dm_device;
+ static void post_status(struct hv_dynmem_device *dm);
+ 
+ #ifdef CONFIG_MEMORY_HOTPLUG
+-static void acquire_region_mutex(bool trylock)
+-{
+-	if (trylock) {
+-		reinit_completion(&dm_device.waiter_event);
+-		while (!mutex_trylock(&dm_device.ha_region_mutex))
+-			wait_for_completion(&dm_device.waiter_event);
+-	} else {
+-		mutex_lock(&dm_device.ha_region_mutex);
+-	}
+-}
+-
+-static void release_region_mutex(bool trylock)
+-{
+-	if (trylock) {
+-		mutex_unlock(&dm_device.ha_region_mutex);
+-	} else {
+-		mutex_unlock(&dm_device.ha_region_mutex);
+-		complete(&dm_device.waiter_event);
+-	}
+-}
+-
+ static int hv_memory_notifier(struct notifier_block *nb, unsigned long val,
+ 			      void *v)
+ {
+ 	switch (val) {
+ 	case MEM_GOING_ONLINE:
+-		acquire_region_mutex(true);
++		mutex_lock(&dm_device.ha_region_mutex);
+ 		break;
+ 
+ 	case MEM_ONLINE:
+ 	case MEM_CANCEL_ONLINE:
+-		release_region_mutex(true);
++		mutex_unlock(&dm_device.ha_region_mutex);
+ 		if (dm_device.ha_waiting) {
+ 			dm_device.ha_waiting = false;
+ 			complete(&dm_device.ol_waitevent);
+@@ -646,7 +624,7 @@ static void hv_mem_hot_add(unsigned long start, unsigned long size,
+ 		init_completion(&dm_device.ol_waitevent);
+ 		dm_device.ha_waiting = true;
+ 
+-		release_region_mutex(false);
++		mutex_unlock(&dm_device.ha_region_mutex);
+ 		nid = memory_add_physaddr_to_nid(PFN_PHYS(start_pfn));
+ 		ret = add_memory(nid, PFN_PHYS((start_pfn)),
+ 				(HA_CHUNK << PAGE_SHIFT));
+@@ -675,7 +653,7 @@ static void hv_mem_hot_add(unsigned long start, unsigned long size,
+ 		 * have not been "onlined" within the allowed time.
+ 		 */
+ 		wait_for_completion_timeout(&dm_device.ol_waitevent, 5*HZ);
+-		acquire_region_mutex(false);
++		mutex_lock(&dm_device.ha_region_mutex);
+ 		post_status(&dm_device);
+ 	}
+ 
+@@ -886,7 +864,7 @@ static void hot_add_req(struct work_struct *dummy)
+ 	resp.hdr.size = sizeof(struct dm_hot_add_response);
+ 
+ #ifdef CONFIG_MEMORY_HOTPLUG
+-	acquire_region_mutex(false);
++	mutex_lock(&dm_device.ha_region_mutex);
+ 	pg_start = dm->ha_wrk.ha_page_range.finfo.start_page;
+ 	pfn_cnt = dm->ha_wrk.ha_page_range.finfo.page_cnt;
+ 
+@@ -918,7 +896,7 @@ static void hot_add_req(struct work_struct *dummy)
+ 	if (do_hot_add)
+ 		resp.page_count = process_hot_add(pg_start, pfn_cnt,
+ 						rg_start, rg_sz);
+-	release_region_mutex(false);
++	mutex_unlock(&dm_device.ha_region_mutex);
+ #endif
+ 	/*
+ 	 * The result field of the response structure has the
+@@ -1440,7 +1418,6 @@ static int balloon_probe(struct hv_device *dev,
+ 	dm_device.next_version = DYNMEM_PROTOCOL_VERSION_WIN7;
+ 	init_completion(&dm_device.host_event);
+ 	init_completion(&dm_device.config_event);
+-	init_completion(&dm_device.waiter_event);
+ 	INIT_LIST_HEAD(&dm_device.ha_region_list);
+ 	mutex_init(&dm_device.ha_region_mutex);
+ 	INIT_WORK(&dm_device.balloon_wrk.wrk, balloon_up);
