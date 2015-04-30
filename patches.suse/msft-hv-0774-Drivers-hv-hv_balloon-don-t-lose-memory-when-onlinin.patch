@@ -1,0 +1,132 @@
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Wed, 18 Mar 2015 12:29:23 -0700
+Patch-mainline: v4.1-rc1
+Subject: Drivers: hv: hv_balloon: don't lose memory when onlining order is not natural
+Git-commit: 5abbbb75d733793b1637441691de95b7665cee85
+References: fate#317533
+
+Memory blocks can be onlined in random order. When this order is not natural
+some memory pages are not onlined because of the redundant check in
+hv_online_page().
+
+Here is a real world scenario:
+1) Host tries to hot-add the following (process_hot_add):
+  pg_start=rg_start=0x48000, pfn_cnt=111616, rg_size=262144
+
+2) This results in adding 4 memory blocks:
+[  109.057866] init_memory_mapping: [mem 0x48000000-0x4fffffff]
+[  114.102698] init_memory_mapping: [mem 0x50000000-0x57ffffff]
+[  119.168039] init_memory_mapping: [mem 0x58000000-0x5fffffff]
+[  124.233053] init_memory_mapping: [mem 0x60000000-0x67ffffff]
+The last one is incomplete but we have special has->covered_end_pfn counter to
+avoid onlining non-backed frames and hv_bring_pgs_online() function to bring
+them online later on.
+
+3) Now we have 4 offline memory blocks: /sys/devices/system/memory/memory9-12
+$ for f in /sys/devices/system/memory/memory*/state; do echo $f `cat $f`; done | grep -v onlin
+/sys/devices/system/memory/memory10/state offline
+/sys/devices/system/memory/memory11/state offline
+/sys/devices/system/memory/memory12/state offline
+/sys/devices/system/memory/memory9/state offline
+
+4) We bring them online in non-natural order:
+$grep MemTotal /proc/meminfo
+MemTotal:         966348 kB
+$echo online > /sys/devices/system/memory/memory12/state && grep MemTotal /proc/meminfo
+MemTotal:        1019596 kB
+$echo online > /sys/devices/system/memory/memory11/state && grep MemTotal /proc/meminfo
+MemTotal:        1150668 kB
+$echo online > /sys/devices/system/memory/memory9/state && grep MemTotal /proc/meminfo
+MemTotal:        1150668 kB
+
+As you can see memory9 block gives us zero additional memory. We can also
+observe a huge discrepancy between host- and guest-reported memory sizes.
+
+The root cause of the issue is the redundant pg >= covered_start_pfn check (and
+covered_start_pfn advancing) in hv_online_page(). When upper memory block in
+being onlined before the lower one (memory12 and memory11 in the above case) we
+advance the covered_start_pfn pointer and all memory9 pages do not pass the
+check. If the assumption that host always gives us requests in sequential order
+and pg_start always equals rg_start when the first request for the new HA
+region is received (that's the case in my testing) is correct than we can get
+rid of covered_start_pfn and pg >= start_pfn check in hv_online_page() is
+sufficient.
+
+The current char-next branch is broken and this patch fixes
+the bug.
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: <ohering@suse.de>
+---
+ drivers/hv/hv_balloon.c | 14 ++++----------
+ 1 file changed, 4 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/hv/hv_balloon.c b/drivers/hv/hv_balloon.c
+index f1f17c5..014256a 100644
+--- a/drivers/hv/hv_balloon.c
++++ b/drivers/hv/hv_balloon.c
+@@ -428,14 +428,13 @@ struct dm_info_msg {
+  * currently hot added. We hot add in multiples of 128M
+  * chunks; it is possible that we may not be able to bring
+  * online all the pages in the region. The range
+- * covered_start_pfn : covered_end_pfn defines the pages that can
++ * covered_end_pfn defines the pages that can
+  * be brough online.
+  */
+ 
+ struct hv_hotadd_state {
+ 	struct list_head list;
+ 	unsigned long start_pfn;
+-	unsigned long covered_start_pfn;
+ 	unsigned long covered_end_pfn;
+ 	unsigned long ha_end_pfn;
+ 	unsigned long end_pfn;
+@@ -679,8 +678,7 @@ static void hv_online_page(struct page *pg)
+ 
+ 	list_for_each(cur, &dm_device.ha_region_list) {
+ 		has = list_entry(cur, struct hv_hotadd_state, list);
+-		cur_start_pgp = (unsigned long)
+-				pfn_to_page(has->covered_start_pfn);
++		cur_start_pgp = (unsigned long)pfn_to_page(has->start_pfn);
+ 		cur_end_pgp = (unsigned long)pfn_to_page(has->covered_end_pfn);
+ 
+ 		if (((unsigned long)pg >= cur_start_pgp) &&
+@@ -692,7 +690,6 @@ static void hv_online_page(struct page *pg)
+ 			__online_page_set_limits(pg);
+ 			__online_page_increment_counters(pg);
+ 			__online_page_free(pg);
+-			has->covered_start_pfn++;
+ 		}
+ 	}
+ }
+@@ -736,10 +733,9 @@ static bool pfn_covered(unsigned long start_pfn, unsigned long pfn_cnt)
+ 		 * is, update it.
+ 		 */
+ 
+-		if (has->covered_end_pfn != start_pfn) {
++		if (has->covered_end_pfn != start_pfn)
+ 			has->covered_end_pfn = start_pfn;
+-			has->covered_start_pfn = start_pfn;
+-		}
++
+ 		return true;
+ 
+ 	}
+@@ -784,7 +780,6 @@ static unsigned long handle_pg_range(unsigned long pg_start,
+ 				pgs_ol = pfn_cnt;
+ 			hv_bring_pgs_online(start_pfn, pgs_ol);
+ 			has->covered_end_pfn +=  pgs_ol;
+-			has->covered_start_pfn +=  pgs_ol;
+ 			pfn_cnt -= pgs_ol;
+ 		}
+ 
+@@ -845,7 +840,6 @@ static unsigned long process_hot_add(unsigned long pg_start,
+ 		list_add_tail(&ha_region->list, &dm_device.ha_region_list);
+ 		ha_region->start_pfn = rg_start;
+ 		ha_region->ha_end_pfn = rg_start;
+-		ha_region->covered_start_pfn = pg_start;
+ 		ha_region->covered_end_pfn = pg_start;
+ 		ha_region->end_pfn = rg_start + rg_size;
+ 	}
