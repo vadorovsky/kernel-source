@@ -1,0 +1,467 @@
+From: Jan Kara <jack@suse.cz>
+Subject: vfs: Fix race between fcntl() and file->f_flags checks
+References: bnc#900881 CVE-2014-8086
+Git-commit: 2ba48ce513c4e545318d22b138861d5876edf906
+Patch-mainline: 4.1-rc1
+
+We check file->f_flags for O_APPEND and O_DIRECT flags in several places. If
+we race with fcntl() changing these flags while IO is running, we get
+inconsistent results leading to kernel crashes or other bad consequences.
+
+Fix the problem by mirroring O_APPEND and O_DIRECT flags inside struct kiocb.
+This patch is inspired by commit 2ba48ce513c4 (mirror O_APPEND and O_DIRECT
+into iocb->ki_flags) upstream but had to be heavily reworked to avoid kABI
+breakage in struct kiocb and replacing several functions in VFS API.
+
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+Signed-off-by: Jan Kara <jack@suse.cz>
+
+---
+ fs/aio.c            |    7 ++++++-
+ fs/btrfs/file.c     |    4 ++--
+ fs/ceph/file.c      |   26 ++++++++++++++------------
+ fs/cifs/file.c      |    7 ++++---
+ fs/ext4/file.c      |    2 +-
+ fs/fuse/file.c      |    2 +-
+ fs/gfs2/file.c      |    2 +-
+ fs/nfs/file.c       |    6 +++---
+ fs/ntfs/file.c      |    2 +-
+ fs/ocfs2/file.c     |   12 ++++++------
+ include/linux/aio.h |   25 ++++++++++++++++++++++++-
+ include/linux/fs.h  |    1 +
+ mm/filemap.c        |   24 +++++++++++++++++++-----
+ 13 files changed, 83 insertions(+), 37 deletions(-)
+
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@ -444,7 +444,7 @@ static struct kiocb *__aio_get_req(struc
+ 	req->ki_flags = 0;
+ 	req->ki_users = 2;
+ 	req->ki_key = 0;
+-	req->ki_ctx = ctx;
++	req->ki_ctx = (unsigned long)ctx;
+ 	req->ki_cancel = NULL;
+ 	req->ki_retry = NULL;
+ 	req->ki_dtor = NULL;
+@@ -1542,6 +1542,11 @@ static int io_submit_one(struct kioctx *
+ 		fput(file);
+ 		return -EAGAIN;
+ 	}
++	/*
++	 * req isn't visible yet so we can modify ki_flags with non-atomic
++	 * ops
++	 */
++	req->ki_flags |= iocb_flags(file);
+ 	req->ki_filp = file;
+ 	if (iocb->aio_flags & IOCB_FLAG_RESFD) {
+ 		/*
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -1419,7 +1419,7 @@ static ssize_t btrfs_file_aio_write(stru
+ 	count = ocount;
+ 
+ 	current->backing_dev_info = inode->i_mapping->backing_dev_info;
+-	err = generic_write_checks(file, &pos, &count, S_ISBLK(inode->i_mode));
++	err = generic_write_checks2(iocb, &pos, &count, S_ISBLK(inode->i_mode));
+ 	if (err) {
+ 		mutex_unlock(&inode->i_mutex);
+ 		goto out;
+@@ -1464,7 +1464,7 @@ static ssize_t btrfs_file_aio_write(stru
+ 		}
+ 	}
+ 
+-	if (unlikely(file->f_flags & O_DIRECT)) {
++	if (unlikely(kiocb_is_direct(iocb))) {
+ 		num_written = __btrfs_direct_write(iocb, iov, nr_segs,
+ 						   pos, ppos, count, ocount);
+ 	} else {
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -379,11 +379,12 @@ static ssize_t ceph_sync_read(struct fil
+ 	struct page **pages;
+ 	u64 off = *poff;
+ 	int num_pages, ret;
++	bool o_direct = ACCESS_ONCE(file->f_flags) & O_DIRECT;
+ 
+ 	dout("sync_read on file %p %llu~%u %s\n", file, off, len,
+-	     (file->f_flags & O_DIRECT) ? "O_DIRECT" : "");
++	     o_direct ? "O_DIRECT" : "");
+ 
+-	if (file->f_flags & O_DIRECT) {
++	if (o_direct) {
+ 		num_pages = calc_pages_for((unsigned long)data, len);
+ 		pages = ceph_get_direct_page_vector(data, num_pages, true);
+ 	} else {
+@@ -404,16 +405,16 @@ static ssize_t ceph_sync_read(struct fil
+ 		goto done;
+ 
+ 	ret = striped_read(inode, off, len, pages, num_pages, checkeof,
+-			   file->f_flags & O_DIRECT,
++			   o_direct,
+ 			   (unsigned long)data & ~PAGE_MASK);
+ 
+-	if (ret >= 0 && (file->f_flags & O_DIRECT) == 0)
++	if (ret >= 0 && !o_direct)
+ 		ret = ceph_copy_page_vector_to_user(pages, data, off, ret);
+ 	if (ret >= 0)
+ 		*poff = off + ret;
+ 
+ done:
+-	if (file->f_flags & O_DIRECT)
++	if (o_direct)
+ 		ceph_put_page_vector(pages, num_pages, true);
+ 	else
+ 		ceph_release_page_vector(pages, num_pages);
+@@ -464,12 +465,13 @@ static ssize_t ceph_sync_write(struct fi
+ 	unsigned long buf_align;
+ 	int ret;
+ 	struct timespec mtime = CURRENT_TIME;
++	bool o_direct = ACCESS_ONCE(file->f_flags) & O_DIRECT;
+ 
+ 	if (ceph_snap(file->f_dentry->d_inode) != CEPH_NOSNAP)
+ 		return -EROFS;
+ 
+ 	dout("sync_write on file %p %lld~%u %s\n", file, *offset,
+-	     (unsigned)left, (file->f_flags & O_DIRECT) ? "O_DIRECT" : "");
++	     (unsigned)left, o_direct ? "O_DIRECT" : "");
+ 
+ 	if (file->f_flags & O_APPEND)
+ 		pos = i_size_read(inode);
+@@ -489,7 +491,7 @@ static ssize_t ceph_sync_write(struct fi
+ 	flags = CEPH_OSD_FLAG_ORDERSNAP |
+ 		CEPH_OSD_FLAG_ONDISK |
+ 		CEPH_OSD_FLAG_WRITE;
+-	if ((file->f_flags & (O_SYNC|O_DIRECT)) == 0)
++	if ((file->f_flags & O_SYNC) == 0 && !o_direct)
+ 		flags |= CEPH_OSD_FLAG_ACK;
+ 	else
+ 		do_sync = 1;
+@@ -502,7 +504,7 @@ more:
+ 	io_align = pos & ~PAGE_MASK;
+ 	buf_align = (unsigned long)data & ~PAGE_MASK;
+ 	len = left;
+-	if (file->f_flags & O_DIRECT) {
++	if (o_direct) {
+ 		/* write from beginning of first page, regardless of
+ 		   io alignment */
+ 		page_align = (pos - io_align + buf_align) & ~PAGE_MASK;
+@@ -521,7 +523,7 @@ more:
+ 	if (!req)
+ 		return -ENOMEM;
+ 
+-	if (file->f_flags & O_DIRECT) {
++	if (o_direct) {
+ 		pages = ceph_get_direct_page_vector(data, num_pages, false);
+ 		if (IS_ERR(pages)) {
+ 			ret = PTR_ERR(pages);
+@@ -579,7 +581,7 @@ more:
+ 		}
+ 	}
+ 
+-	if (file->f_flags & O_DIRECT)
++	if (o_direct)
+ 		ceph_put_page_vector(pages, num_pages, false);
+ 	else if (file->f_flags & O_SYNC)
+ 		ceph_release_page_vector(pages, num_pages);
+@@ -642,7 +644,7 @@ again:
+ 	     ceph_cap_string(got));
+ 
+ 	if ((got & (CEPH_CAP_FILE_CACHE|CEPH_CAP_FILE_LAZYIO)) == 0 ||
+-	    (iocb->ki_filp->f_flags & O_DIRECT) ||
++	    kiocb_is_direct(iocb) ||
+ 	    (inode->i_sb->s_flags & MS_SYNCHRONOUS))
+ 		/* hmm, this isn't really async... */
+ 		ret = ceph_sync_read(filp, base, len, ppos, &checkeof);
+@@ -719,7 +721,7 @@ retry_snap:
+ 	     ceph_cap_string(got));
+ 
+ 	if ((got & (CEPH_CAP_FILE_BUFFER|CEPH_CAP_FILE_LAZYIO)) == 0 ||
+-	    (iocb->ki_filp->f_flags & O_DIRECT) ||
++	    kiocb_is_direct(iocb) ||
+ 	    (inode->i_sb->s_flags & MS_SYNCHRONOUS)) {
+ 		ret = ceph_sync_write(file, iov->iov_base, iov->iov_len,
+ 			&iocb->ki_pos);
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -1537,9 +1537,10 @@ size_t get_numpages(const size_t wsize,
+ }
+ 
+ static ssize_t
+-cifs_iovec_write(struct file *file, const struct iovec *iov,
++cifs_iovec_write(struct kiocb *iocb, const struct iovec *iov,
+ 		 unsigned long nr_segs, loff_t *poffset)
+ {
++	struct file *file = iocb->ki_filp;
+ 	unsigned int written;
+ 	unsigned long num_pages, npages, i;
+ 	size_t copied, len, cur_len;
+@@ -1559,7 +1560,7 @@ cifs_iovec_write(struct file *file, cons
+ 	if (!len)
+ 		return 0;
+ 
+-	rc = generic_write_checks(file, poffset, &len, 0);
++	rc = generic_write_checks2(iocb, poffset, &len, 0);
+ 	if (rc)
+ 		return rc;
+ 
+@@ -1676,7 +1677,7 @@ ssize_t cifs_user_writev(struct kiocb *i
+ 	 * write request.
+ 	 */
+ 
+-	written = cifs_iovec_write(iocb->ki_filp, iov, nr_segs, &pos);
++	written = cifs_iovec_write(iocb, iov, nr_segs, &pos);
+ 	if (written > 0) {
+ 		CIFS_I(inode)->invalid_mapping = true;
+ 		iocb->ki_pos = pos;
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@ -114,7 +114,7 @@ ext4_file_write(struct kiocb *iocb, cons
+ 			nr_segs = iov_shorten((struct iovec *)iov, nr_segs,
+ 					      sbi->s_bitmap_maxbytes - pos);
+ 		}
+-	} else if (unlikely((iocb->ki_filp->f_flags & O_DIRECT) &&
++	} else if (unlikely(kiocb_is_direct(iocb) &&
+ 		   !is_sync_kiocb(iocb))) {
+ 		unaligned_aio = ext4_unaligned_aio(inode, iov, nr_segs, pos);
+ 	}
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -1008,7 +1008,7 @@ static ssize_t fuse_file_aio_write(struc
+ 	/* We can write back this queue in page reclaim */
+ 	current->backing_dev_info = mapping->backing_dev_info;
+ 
+-	err = generic_write_checks(file, &pos, &count, S_ISBLK(inode->i_mode));
++	err = generic_write_checks2(iocb, &pos, &count, S_ISBLK(inode->i_mode));
+ 	if (err)
+ 		goto out;
+ 
+--- a/fs/gfs2/file.c
++++ b/fs/gfs2/file.c
+@@ -605,7 +605,7 @@ static ssize_t gfs2_file_aio_write(struc
+ {
+ 	struct file *file = iocb->ki_filp;
+ 
+-	if (file->f_flags & O_APPEND) {
++	if (kiocb_is_append(iocb)) {
+ 		struct dentry *dentry = file->f_dentry;
+ 		struct gfs2_inode *ip = GFS2_I(dentry->d_inode);
+ 		struct gfs2_holder gh;
+--- a/fs/nfs/file.c
++++ b/fs/nfs/file.c
+@@ -236,7 +236,7 @@ nfs_file_read(struct kiocb *iocb, const
+ 	ssize_t result;
+ 	size_t count = iov_length(iov, nr_segs);
+ 
+-	if (iocb->ki_filp->f_flags & O_DIRECT)
++	if (kiocb_is_direct(iocb))
+ 		return nfs_file_direct_read(iocb, iov, nr_segs, pos);
+ 
+ 	dprintk("NFS: read(%s/%s, %lu@%lu)\n",
+@@ -624,7 +624,7 @@ static ssize_t nfs_file_write(struct kio
+ 	ssize_t result;
+ 	size_t count = iov_length(iov, nr_segs);
+ 
+-	if (iocb->ki_filp->f_flags & O_DIRECT)
++	if (kiocb_is_direct(iocb))
+ 		return nfs_file_direct_write(iocb, iov, nr_segs, pos);
+ 
+ 	dprintk("NFS: write(%s/%s, %lu@%Ld)\n",
+@@ -637,7 +637,7 @@ static ssize_t nfs_file_write(struct kio
+ 	/*
+ 	 * O_APPEND implies that we must revalidate the file length.
+ 	 */
+-	if (iocb->ki_filp->f_flags & O_APPEND) {
++	if (kiocb_is_append(iocb)) {
+ 		result = nfs_revalidate_file_size(inode, iocb->ki_filp);
+ 		if (result)
+ 			goto out;
+--- a/fs/ntfs/file.c
++++ b/fs/ntfs/file.c
+@@ -2089,7 +2089,7 @@ static ssize_t ntfs_file_aio_write_noloc
+ 	/* We can write back this queue in page reclaim. */
+ 	current->backing_dev_info = mapping->backing_dev_info;
+ 	written = 0;
+-	err = generic_write_checks(file, &pos, &count, S_ISBLK(inode->i_mode));
++	err = generic_write_checks2(iocb, &pos, &count, S_ISBLK(inode->i_mode));
+ 	if (err)
+ 		goto out;
+ 	if (!count)
+--- a/fs/ocfs2/file.c
++++ b/fs/ocfs2/file.c
+@@ -2258,8 +2258,8 @@ static ssize_t ocfs2_file_aio_write(stru
+ 
+ 	vfs_check_frozen(inode->i_sb, SB_FREEZE_WRITE);
+ 
+-	appending = file->f_flags & O_APPEND ? 1 : 0;
+-	direct_io = file->f_flags & O_DIRECT ? 1 : 0;
++	appending = kiocb_is_append(iocb) ? 1 : 0;
++	direct_io = kiocb_is_direct(iocb) ? 1 : 0;
+ 
+ 	mutex_lock(&inode->i_mutex);
+ 
+@@ -2361,7 +2361,7 @@ relock:
+ 		goto out_dio;
+ 
+ 	count = ocount;
+-	ret = generic_write_checks(file, ppos, &count,
++	ret = generic_write_checks2(iocb, ppos, &count,
+ 				   S_ISBLK(inode->i_mode));
+ 	if (ret)
+ 		goto out_dio;
+@@ -2382,7 +2382,7 @@ relock:
+ 
+ out_dio:
+ 	/* buffered aio wouldn't have proper lock coverage today */
+-	BUG_ON(ret == -EIOCBQUEUED && !(file->f_flags & O_DIRECT));
++	BUG_ON(ret == -EIOCBQUEUED && !kiocb_is_direct(iocb));
+ 
+ 	if (((file->f_flags & O_DSYNC) && !direct_io) || IS_SYNC(inode) ||
+ 	    ((file->f_flags & O_DIRECT) && !direct_io)) {
+@@ -2580,7 +2580,7 @@ static ssize_t ocfs2_file_aio_read(struc
+ 	 * buffered reads protect themselves in ->readpage().  O_DIRECT reads
+ 	 * need locks to protect pending reads from racing with truncate.
+ 	 */
+-	if (filp->f_flags & O_DIRECT) {
++	if (kiocb_is_direct(iocb)) {
+ 		down_read(&inode->i_alloc_sem);
+ 		have_alloc_sem = 1;
+ 		ocfs2_iocb_set_sem_locked(iocb);
+@@ -2615,7 +2615,7 @@ static ssize_t ocfs2_file_aio_read(struc
+ 	trace_generic_file_aio_read_ret(ret);
+ 
+ 	/* buffered aio wouldn't have proper lock coverage today */
+-	BUG_ON(ret == -EIOCBQUEUED && !(filp->f_flags & O_DIRECT));
++	BUG_ON(ret == -EIOCBQUEUED && !kiocb_is_direct(iocb));
+ 
+ 	/* see ocfs2_file_aio_write */
+ 	if (ret == -EIOCBQUEUED || !ocfs2_iocb_is_rw_locked(iocb)) {
+--- a/include/linux/aio.h
++++ b/include/linux/aio.h
+@@ -6,6 +6,7 @@
+ #include <linux/aio_abi.h>
+ #include <linux/uio.h>
+ #include <linux/rcupdate.h>
++#include <linux/fs.h>
+ 
+ #include <asm/atomic.h>
+ 
+@@ -34,6 +35,8 @@ struct kioctx;
+ /* #define KIF_LOCKED		0 */
+ #define KIF_KICKED		1
+ #define KIF_CANCELLED		2
++#define KIF_APPEND		3
++#define KIF_DIRECT		4
+ 
+ #define kiocbTryLock(iocb)	test_and_set_bit(KIF_LOCKED, &(iocb)->ki_flags)
+ #define kiocbTryKick(iocb)	test_and_set_bit(KIF_KICKED, &(iocb)->ki_flags)
+@@ -125,11 +128,31 @@ struct kiocb {
+ 	struct eventfd_ctx	*ki_eventfd;
+ };
+ 
++static inline int iocb_flags(struct file *file)
++{
++	int res = 0;
++	if (file->f_flags & O_APPEND)
++		res |= (1 << KIF_APPEND);
++	if (file->f_flags & O_DIRECT)
++		res |= (1 << KIF_DIRECT);
++	return res;
++}
++
++static inline bool kiocb_is_direct(struct kiocb *kiocb)
++{
++	return kiocb->ki_flags & (1 << KIF_DIRECT);
++}
++
++static inline bool kiocb_is_append(struct kiocb *kiocb)
++{
++	return kiocb->ki_flags & (1 << KIF_APPEND);
++}
++
+ #define is_sync_kiocb(iocb)	((iocb)->ki_key == KIOCB_SYNC_KEY)
+ #define init_sync_kiocb(x, filp)			\
+ 	do {						\
+ 		struct task_struct *tsk = current;	\
+-		(x)->ki_flags = 0;			\
++		(x)->ki_flags = filp ? iocb_flags(filp) : 0; \
+ 		(x)->ki_users = 1;			\
+ 		(x)->ki_key = KIOCB_SYNC_KEY;		\
+ 		(x)->ki_filp = (filp);			\
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2332,6 +2332,7 @@ extern int generic_file_mmap(struct file
+ extern int generic_file_readonly_mmap(struct file *, struct vm_area_struct *);
+ extern int file_read_actor(read_descriptor_t * desc, struct page *page, unsigned long offset, unsigned long size);
+ int generic_write_checks(struct file *file, loff_t *pos, size_t *count, int isblk);
++int generic_write_checks2(struct kiocb *iocb, loff_t *pos, size_t *count, int isblk);
+ extern ssize_t generic_file_aio_read(struct kiocb *, const struct iovec *, unsigned long, loff_t);
+ extern ssize_t __generic_file_aio_write(struct kiocb *, const struct iovec *, unsigned long,
+ 		loff_t *);
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1573,7 +1573,7 @@ generic_file_aio_read(struct kiocb *iocb
+ 		return retval;
+ 
+ 	/* coalesce the iovecs and go direct-to-BIO for O_DIRECT */
+-	if (filp->f_flags & O_DIRECT) {
++	if (kiocb_is_direct(iocb)) {
+ 		loff_t size;
+ 		struct address_space *mapping;
+ 		struct inode *inode;
+@@ -2325,7 +2325,8 @@ EXPORT_SYMBOL(iov_iter_single_seg_count)
+  * Returns appropriate error code that caller should return or
+  * zero in case that write should be allowed.
+  */
+-inline int generic_write_checks(struct file *file, loff_t *pos, size_t *count, int isblk)
++int __generic_write_checks(struct kiocb *iocb, struct file *file,
++			   loff_t *pos, size_t *count, int isblk)
+ {
+ 	struct inode *inode = file->f_mapping->host;
+ 	unsigned long limit = rlimit(RLIMIT_FSIZE);
+@@ -2335,7 +2336,8 @@ inline int generic_write_checks(struct f
+ 
+ 	if (!isblk) {
+ 		/* FIXME: this is for backwards compatibility with 2.4 */
+-		if (file->f_flags & O_APPEND)
++		if ((iocb && kiocb_is_append(iocb)) ||
++		    (!iocb && (file->f_flags & O_APPEND)))
+                         *pos = i_size_read(inode);
+ 
+ 		if (limit != RLIM_INFINITY) {
+@@ -2398,6 +2400,18 @@ inline int generic_write_checks(struct f
+ 	}
+ 	return 0;
+ }
++
++int generic_write_checks2(struct kiocb *iocb, loff_t *pos, size_t *count,
++			  int isblk)
++{
++	return __generic_write_checks(iocb, iocb->ki_filp, pos, count, isblk);
++}
++EXPORT_SYMBOL(generic_write_checks2);
++
++int generic_write_checks(struct file *file, loff_t *pos, size_t *count, int isblk)
++{
++	return __generic_write_checks(NULL, file, pos, count, isblk);
++}
+ EXPORT_SYMBOL(generic_write_checks);
+ 
+ int pagecache_write_begin(struct file *file, struct address_space *mapping,
+@@ -2681,7 +2695,7 @@ ssize_t __generic_file_aio_write(struct
+ 	current->backing_dev_info = mapping->backing_dev_info;
+ 	written = 0;
+ 
+-	err = generic_write_checks(file, &pos, &count, S_ISBLK(inode->i_mode));
++	err = generic_write_checks2(iocb, &pos, &count, S_ISBLK(inode->i_mode));
+ 	if (err)
+ 		goto out;
+ 
+@@ -2695,7 +2709,7 @@ ssize_t __generic_file_aio_write(struct
+ 	file_update_time(file);
+ 
+ 	/* coalesce the iovecs and go direct-to-BIO for O_DIRECT */
+-	if (unlikely(file->f_flags & O_DIRECT)) {
++	if (unlikely(kiocb_is_direct(iocb))) {
+ 		loff_t endbyte;
+ 		ssize_t written_buffered;
+ 
