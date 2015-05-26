@@ -316,26 +316,32 @@ if test -z "$CONFIG"; then
 			CONFIG=$machine-smp
 		elif test -e "config/$machine/pae"; then
 			CONFIG=$machine-pae
-		else
+		elif test -e "config/$machine/default"; then
 			CONFIG=$machine-default
+		elif test -e "config/$machine/rt"; then
+			CONFIG=$machine-rt
+		else
+			echo "Cannot determine default config for arch $machine"
 		fi
 	fi
 fi
 
-CONFIG_ARCH=${CONFIG%%-*}
-CONFIG_FLAVOR=${CONFIG##*-}
-if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
-		-z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
-	echo "Invalid config spec: --config=ARCH-FLAVOR is expected."
-	usage
+if test -n "$CONFIG"; then
+	CONFIG_ARCH=${CONFIG%%-*}
+	CONFIG_FLAVOR=${CONFIG##*-}
+	if [ "$CONFIG" = "$CONFIG_ARCH" -o "$CONFIG" = "$CONFIG_FLAVOR" -o \
+			-z "$CONFIG_ARCH" -o -z "$CONFIG_FLAVOR" ]; then
+		echo "Invalid config spec: --config=ARCH-FLAVOR is expected."
+		usage
+	fi
 fi
 
 if [ $# -ne 0 ]; then
     usage
 fi
 
-if ! scripts/guards --prefix=config --list < config.conf | \
-     egrep -q '/(xen|ec2)$'; then
+if ! scripts/guards --prefix=config $(scripts/arch-symbols --list) < config.conf | \
+     egrep -q '/(xen|ec2|pv)$'; then
      echo "*** Xen configs are disabled; Skipping Xen patches." >&2
 
      SKIP_XEN=true
