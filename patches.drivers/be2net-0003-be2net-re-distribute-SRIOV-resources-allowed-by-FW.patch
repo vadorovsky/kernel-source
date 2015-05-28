@@ -1,0 +1,383 @@
+From: Vasundhara Volam <vasundhara.volam@emulex.com>
+Date: Wed, 4 Mar 2015 00:44:33 -0500
+Subject: be2net: re-distribute SRIOV resources allowed by FW
+Patch-mainline: v4.1-rc1
+Git-commit: f285873841299e027a6159dc3d3af0d0caf578d9
+References: bug#908322 FATE#317535
+
+When SR-IOV is enabled in the adapter, the FW distributes resources
+evenly across the PF and it's VFs. This is currently done only for some
+resources.
+
+This patch adds support for a new cmd that queries the FW for the list
+of resources for which the distribution is allowed and distributes them
+accordingly.
+
+Signed-off-by: Vasundhara Volam <vasundhara.volam@emulex.com>
+Signed-off-by: Sathya Perla <sathya.perla@emulex.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Benjamin Poirier <bpoirier@suse.de>
+---
+ drivers/net/ethernet/emulex/benet/be.h      |    4 +
+ drivers/net/ethernet/emulex/benet/be_cmds.c |  108 ++++++++++++++++++++--------
+ drivers/net/ethernet/emulex/benet/be_cmds.h |   18 +++-
+ drivers/net/ethernet/emulex/benet/be_main.c |   49 +++++++++++-
+ 4 files changed, 141 insertions(+), 38 deletions(-)
+
+--- a/drivers/net/ethernet/emulex/benet/be.h
++++ b/drivers/net/ethernet/emulex/benet/be.h
+@@ -107,6 +107,7 @@ static inline char *nic_name(struct pci_
+ #define BE3_MAX_EVT_QS		16
+ #define BE3_SRIOV_MAX_EVT_QS	8
+ 
++#define MAX_RSS_IFACES		15
+ #define MAX_RX_QS		32
+ #define MAX_EVT_QS		32
+ #define MAX_TX_QS		32
+@@ -393,8 +394,11 @@ struct be_resources {
+ 	u16 max_tx_qs;
+ 	u16 max_rss_qs;
+ 	u16 max_rx_qs;
++	u16 max_cq_count;
+ 	u16 max_uc_mac;		/* Max UC MACs programmable */
+ 	u16 max_vlans;		/* Number of vlans supported */
++	u16 max_iface_count;
++	u16 max_mcc_count;
+ 	u16 max_evt_qs;
+ 	u32 if_cap_flags;
+ 	u32 vf_if_cap_flags;	/* VF if capability flags */
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.c
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.c
+@@ -3544,6 +3544,9 @@ static void be_copy_nic_desc(struct be_r
+ 	res->max_rss_qs = le16_to_cpu(desc->rssq_count);
+ 	res->max_rx_qs = le16_to_cpu(desc->rq_count);
+ 	res->max_evt_qs = le16_to_cpu(desc->eq_count);
++	res->max_cq_count = le16_to_cpu(desc->cq_count);
++	res->max_iface_count = le16_to_cpu(desc->iface_count);
++	res->max_mcc_count = le16_to_cpu(desc->mcc_count);
+ 	/* Clear flags that driver is not interested in */
+ 	res->if_cap_flags = le32_to_cpu(desc->cap_flags) &
+ 				BE_IF_CAP_FLAGS_WANT;
+@@ -3608,7 +3611,7 @@ err:
+ 
+ /* Will use MBOX only if MCCQ has not been created */
+ int be_cmd_get_profile_config(struct be_adapter *adapter,
+-			      struct be_resources *res, u8 domain)
++			      struct be_resources *res, u8 query, u8 domain)
+ {
+ 	struct be_cmd_resp_get_profile_config *resp;
+ 	struct be_cmd_req_get_profile_config *req;
+@@ -3618,7 +3621,7 @@ int be_cmd_get_profile_config(struct be_
+ 	struct be_nic_res_desc *nic;
+ 	struct be_mcc_wrb wrb = {0};
+ 	struct be_dma_mem cmd;
+-	u32 desc_count;
++	u16 desc_count;
+ 	int status;
+ 
+ 	memset(&cmd, 0, sizeof(struct be_dma_mem));
+@@ -3637,12 +3640,19 @@ int be_cmd_get_profile_config(struct be_
+ 		req->hdr.version = 1;
+ 	req->type = ACTIVE_PROFILE_TYPE;
+ 
++	/* When QUERY_MODIFIABLE_FIELDS_TYPE bit is set, cmd returns the
++	 * descriptors with all bits set to "1" for the fields which can be
++	 * modified using SET_PROFILE_CONFIG cmd.
++	 */
++	if (query == RESOURCE_MODIFIABLE)
++		req->type |= QUERY_MODIFIABLE_FIELDS_TYPE;
++
+ 	status = be_cmd_notify_wait(adapter, &wrb);
+ 	if (status)
+ 		goto err;
+ 
+ 	resp = cmd.va;
+-	desc_count = le32_to_cpu(resp->desc_count);
++	desc_count = le16_to_cpu(resp->desc_count);
+ 
+ 	pcie = be_get_pcie_desc(adapter->pdev->devfn, resp->func_param,
+ 				desc_count);
+@@ -3766,14 +3776,74 @@ int be_cmd_config_qos(struct be_adapter
+ 					 1, version, domain);
+ }
+ 
++static void be_fill_vf_res_template(struct be_adapter *adapter,
++				    struct be_resources pool_res,
++				    u16 num_vfs, u16 num_vf_qs,
++				    struct be_nic_res_desc *nic_vft)
++{
++	u32 vf_if_cap_flags = pool_res.vf_if_cap_flags;
++	struct be_resources res_mod = {0};
++
++	/* Resource with fields set to all '1's by GET_PROFILE_CONFIG cmd,
++	 * which are modifiable using SET_PROFILE_CONFIG cmd.
++	 */
++	be_cmd_get_profile_config(adapter, &res_mod, RESOURCE_MODIFIABLE, 0);
++
++	/* If RSS IFACE capability flags are modifiable for a VF, set the
++	 * capability flag as valid and set RSS and DEFQ_RSS IFACE flags if
++	 * more than 1 RSSQ is available for a VF.
++	 * Otherwise, provision only 1 queue pair for VF.
++	 */
++	if (res_mod.vf_if_cap_flags & BE_IF_FLAGS_RSS) {
++		nic_vft->flags |= BIT(IF_CAPS_FLAGS_VALID_SHIFT);
++		if (num_vf_qs > 1) {
++			vf_if_cap_flags |= BE_IF_FLAGS_RSS;
++			if (pool_res.if_cap_flags & BE_IF_FLAGS_DEFQ_RSS)
++				vf_if_cap_flags |= BE_IF_FLAGS_DEFQ_RSS;
++		} else {
++			vf_if_cap_flags &= ~(BE_IF_FLAGS_RSS |
++					     BE_IF_FLAGS_DEFQ_RSS);
++		}
++
++		nic_vft->cap_flags = cpu_to_le32(vf_if_cap_flags);
++	} else {
++		num_vf_qs = 1;
++	}
++
++	nic_vft->rq_count = cpu_to_le16(num_vf_qs);
++	nic_vft->txq_count = cpu_to_le16(num_vf_qs);
++	nic_vft->rssq_count = cpu_to_le16(num_vf_qs);
++	nic_vft->cq_count = cpu_to_le16(pool_res.max_cq_count /
++					(num_vfs + 1));
++
++	/* Distribute unicast MACs, VLANs, IFACE count and MCCQ count equally
++	 * among the PF and it's VFs, if the fields are changeable
++	 */
++	if (res_mod.max_uc_mac == FIELD_MODIFIABLE)
++		nic_vft->unicast_mac_count = cpu_to_le16(pool_res.max_uc_mac /
++							 (num_vfs + 1));
++
++	if (res_mod.max_vlans == FIELD_MODIFIABLE)
++		nic_vft->vlan_count = cpu_to_le16(pool_res.max_vlans /
++						  (num_vfs + 1));
++
++	if (res_mod.max_iface_count == FIELD_MODIFIABLE)
++		nic_vft->iface_count = cpu_to_le16(pool_res.max_iface_count /
++						   (num_vfs + 1));
++
++	if (res_mod.max_mcc_count == FIELD_MODIFIABLE)
++		nic_vft->mcc_count = cpu_to_le16(pool_res.max_mcc_count /
++						 (num_vfs + 1));
++}
++
+ int be_cmd_set_sriov_config(struct be_adapter *adapter,
+-			    struct be_resources res, u16 num_vfs)
++			    struct be_resources pool_res, u16 num_vfs,
++			    u16 num_vf_qs)
+ {
+ 	struct {
+ 		struct be_pcie_res_desc pcie;
+ 		struct be_nic_res_desc nic_vft;
+ 	} __packed desc;
+-	u16 vf_q_count;
+ 
+ 	if (BEx_chip(adapter) || lancer_chip(adapter))
+ 		return 0;
+@@ -3782,7 +3852,7 @@ int be_cmd_set_sriov_config(struct be_ad
+ 	be_reset_pcie_desc(&desc.pcie);
+ 	desc.pcie.hdr.desc_type = PCIE_RESOURCE_DESC_TYPE_V1;
+ 	desc.pcie.hdr.desc_len = RESOURCE_DESC_SIZE_V1;
+-	desc.pcie.flags = (1 << IMM_SHIFT) | (1 << NOSV_SHIFT);
++	desc.pcie.flags = BIT(IMM_SHIFT) | BIT(NOSV_SHIFT);
+ 	desc.pcie.pf_num = adapter->pdev->devfn;
+ 	desc.pcie.sriov_state = num_vfs ? 1 : 0;
+ 	desc.pcie.num_vfs = cpu_to_le16(num_vfs);
+@@ -3791,32 +3861,12 @@ int be_cmd_set_sriov_config(struct be_ad
+ 	be_reset_nic_desc(&desc.nic_vft);
+ 	desc.nic_vft.hdr.desc_type = NIC_RESOURCE_DESC_TYPE_V1;
+ 	desc.nic_vft.hdr.desc_len = RESOURCE_DESC_SIZE_V1;
+-	desc.nic_vft.flags = (1 << VFT_SHIFT) | (1 << IMM_SHIFT) |
+-				(1 << NOSV_SHIFT);
++	desc.nic_vft.flags = BIT(VFT_SHIFT) | BIT(IMM_SHIFT) | BIT(NOSV_SHIFT);
+ 	desc.nic_vft.pf_num = adapter->pdev->devfn;
+ 	desc.nic_vft.vf_num = 0;
+ 
+-	if (num_vfs && res.vf_if_cap_flags & BE_IF_FLAGS_RSS) {
+-		/* If number of VFs requested is 8 less than max supported,
+-		 * assign 8 queue pairs to the PF and divide the remaining
+-		 * resources evenly among the VFs
+-		 */
+-		if (num_vfs < (be_max_vfs(adapter) - 8))
+-			vf_q_count = (res.max_rss_qs - 8) / num_vfs;
+-		else
+-			vf_q_count = res.max_rss_qs / num_vfs;
+-
+-		desc.nic_vft.rq_count = cpu_to_le16(vf_q_count);
+-		desc.nic_vft.txq_count = cpu_to_le16(vf_q_count);
+-		desc.nic_vft.rssq_count = cpu_to_le16(vf_q_count - 1);
+-		desc.nic_vft.cq_count = cpu_to_le16(3 * vf_q_count);
+-	} else {
+-		desc.nic_vft.txq_count = cpu_to_le16(1);
+-		desc.nic_vft.rq_count = cpu_to_le16(1);
+-		desc.nic_vft.rssq_count = cpu_to_le16(0);
+-		/* One CQ for each TX, RX and MCCQ */
+-		desc.nic_vft.cq_count = cpu_to_le16(3);
+-	}
++	be_fill_vf_res_template(adapter, pool_res, num_vfs, num_vf_qs,
++				&desc.nic_vft);
+ 
+ 	return be_cmd_set_profile_config(adapter, &desc,
+ 					 2 * RESOURCE_DESC_SIZE_V1, 2, 1, 0);
+--- a/drivers/net/ethernet/emulex/benet/be_cmds.h
++++ b/drivers/net/ethernet/emulex/benet/be_cmds.h
+@@ -1823,6 +1823,7 @@ struct be_cmd_req_set_ext_fat_caps {
+ #define PORT_RESOURCE_DESC_TYPE_V1		0x55
+ #define MAX_RESOURCE_DESC			264
+ 
++#define IF_CAPS_FLAGS_VALID_SHIFT		0	/* IF caps valid */
+ #define VFT_SHIFT				3	/* VF template */
+ #define IMM_SHIFT				6	/* Immediate */
+ #define NOSV_SHIFT				7	/* No save */
+@@ -1933,20 +1934,28 @@ struct be_cmd_resp_get_func_config {
+ 	u8 func_param[MAX_RESOURCE_DESC * RESOURCE_DESC_SIZE_V1];
+ };
+ 
+-#define ACTIVE_PROFILE_TYPE			0x2
++enum {
++	RESOURCE_LIMITS,
++	RESOURCE_MODIFIABLE
++};
++
+ struct be_cmd_req_get_profile_config {
+ 	struct be_cmd_req_hdr hdr;
+ 	u8 rsvd;
++#define ACTIVE_PROFILE_TYPE			0x2
++#define QUERY_MODIFIABLE_FIELDS_TYPE		BIT(3)
+ 	u8 type;
+ 	u16 rsvd1;
+ };
+ 
+ struct be_cmd_resp_get_profile_config {
+ 	struct be_cmd_resp_hdr hdr;
+-	u32 desc_count;
++	__le16 desc_count;
++	u16 rsvd;
+ 	u8 func_param[MAX_RESOURCE_DESC * RESOURCE_DESC_SIZE_V1];
+ };
+ 
++#define FIELD_MODIFIABLE			0xFFFF
+ struct be_cmd_req_set_profile_config {
+ 	struct be_cmd_req_hdr hdr;
+ 	u32 rsvd;
+@@ -2137,7 +2146,7 @@ int be_cmd_query_port_name(struct be_ada
+ int be_cmd_get_func_config(struct be_adapter *adapter,
+ 			   struct be_resources *res);
+ int be_cmd_get_profile_config(struct be_adapter *adapter,
+-			      struct be_resources *res, u8 domain);
++			      struct be_resources *res, u8 query, u8 domain);
+ int be_cmd_get_active_profile(struct be_adapter *adapter, u16 *profile);
+ int be_cmd_get_if_id(struct be_adapter *adapter, struct be_vf_cfg *vf_cfg,
+ 		     int vf_num);
+@@ -2146,4 +2155,5 @@ int be_cmd_intr_set(struct be_adapter *a
+ int be_cmd_set_vxlan_port(struct be_adapter *adapter, __be16 port);
+ int be_cmd_manage_iface(struct be_adapter *adapter, u32 iface, u8 op);
+ int be_cmd_set_sriov_config(struct be_adapter *adapter,
+-			    struct be_resources res, u16 num_vfs);
++			    struct be_resources res, u16 num_vfs,
++			    u16 num_vf_qs);
+--- a/drivers/net/ethernet/emulex/benet/be_main.c
++++ b/drivers/net/ethernet/emulex/benet/be_main.c
+@@ -3012,8 +3012,39 @@ static void be_mac_clear(struct be_adapt
+ 	}
+ }
+ 
++static u16 be_calculate_vf_qs(struct be_adapter *adapter, u16 num_vfs)
++{
++	struct be_resources res = adapter->pool_res;
++	u16 num_vf_qs = 1;
++
++	/* Distribute the queue resources equally among the PF and it's VFs
++	 * Do not distribute queue resources in multi-channel configuration.
++	 */
++	if (num_vfs && !be_is_mc(adapter)) {
++		/* If number of VFs requested is 8 less than max supported,
++		 * assign 8 queue pairs to the PF and divide the remaining
++		 * resources evenly among the VFs
++		 */
++		if (num_vfs < (be_max_vfs(adapter) - 8))
++			num_vf_qs = (res.max_rss_qs - 8) / num_vfs;
++		else
++			num_vf_qs = res.max_rss_qs / num_vfs;
++
++		/* Skyhawk-R chip supports only MAX_RSS_IFACES RSS capable
++		 * interfaces per port. Provide RSS on VFs, only if number
++		 * of VFs requested is less than MAX_RSS_IFACES limit.
++		 */
++		if (num_vfs >= MAX_RSS_IFACES)
++			num_vf_qs = 1;
++	}
++	return num_vf_qs;
++}
++
+ static int be_clear(struct be_adapter *adapter)
+ {
++	struct pci_dev *pdev = adapter->pdev;
++	u16 num_vf_qs;
++
+ 	be_cancel_worker(adapter);
+ 
+ 	if (sriov_enabled(adapter))
+@@ -3022,9 +3053,13 @@ static int be_clear(struct be_adapter *a
+ 	/* Re-configure FW to distribute resources evenly across max-supported
+ 	 * number of VFs, only when VFs are not already enabled.
+ 	 */
+-	if (be_physfn(adapter) && !pci_vfs_assigned(adapter->pdev))
++	if (be_physfn(adapter) && !pci_vfs_assigned(pdev)) {
++		num_vf_qs = be_calculate_vf_qs(adapter,
++					       pci_sriov_get_totalvfs(pdev));
+ 		be_cmd_set_sriov_config(adapter, adapter->pool_res,
+-					pci_sriov_get_totalvfs(adapter->pdev));
++					pci_sriov_get_totalvfs(pdev),
++					num_vf_qs);
++	}
+ 
+ 	/* delete the primary mac along with the uc-mac list */
+ 	be_mac_clear(adapter);
+@@ -3070,6 +3105,7 @@ static int be_vfs_if_create(struct be_ad
+ 	for_all_vfs(adapter, vf_cfg, vf) {
+ 		if (!BE3_chip(adapter)) {
+ 			status = be_cmd_get_profile_config(adapter, &res,
++							   RESOURCE_LIMITS,
+ 							   vf + 1);
+ 			if (!status)
+ 				cap_flags = res.if_cap_flags;
+@@ -3232,7 +3268,8 @@ static void BEx_get_resources(struct be_
+ 		/* On a SuperNIC profile, the driver needs to use the
+ 		 * GET_PROFILE_CONFIG cmd to query the per-function TXQ limits
+ 		 */
+-		be_cmd_get_profile_config(adapter, &super_nic_res, 0);
++		be_cmd_get_profile_config(adapter, &super_nic_res,
++					  RESOURCE_LIMITS, 0);
+ 		/* Some old versions of BE3 FW don't report max_tx_qs value */
+ 		res->max_tx_qs = super_nic_res.max_tx_qs ? : BE3_MAX_TX_QS;
+ 	} else {
+@@ -3277,7 +3314,7 @@ static int be_get_sriov_config(struct be
+ 	int max_vfs, old_vfs;
+ 
+ 	/* Some old versions of BE3 FW don't report max_vfs value */
+-	be_cmd_get_profile_config(adapter, &res, 0);
++	be_cmd_get_profile_config(adapter, &res, RESOURCE_LIMITS, 0);
+ 
+ 	if (BE3_chip(adapter) && !res.max_vfs) {
+ 		max_vfs = pci_sriov_get_totalvfs(adapter->pdev);
+@@ -3366,6 +3403,7 @@ static int be_get_resources(struct be_ad
+ static void be_sriov_config(struct be_adapter *adapter)
+ {
+ 	struct device *dev = &adapter->pdev->dev;
++	u16 num_vf_qs;
+ 	int status;
+ 
+ 	status = be_get_sriov_config(adapter);
+@@ -3384,9 +3422,10 @@ static void be_sriov_config(struct be_ad
+ 	 * Also, this is done by FW in Lancer chip.
+ 	 */
+ 	if (be_max_vfs(adapter) && !pci_num_vf(adapter->pdev)) {
++		num_vf_qs = be_calculate_vf_qs(adapter, adapter->num_vfs);
+ 		status = be_cmd_set_sriov_config(adapter,
+ 						 adapter->pool_res,
+-						 adapter->num_vfs);
++						 adapter->num_vfs, num_vf_qs);
+ 		if (status)
+ 			dev_err(dev, "Failed to optimize SR-IOV resources\n");
+ 	}
