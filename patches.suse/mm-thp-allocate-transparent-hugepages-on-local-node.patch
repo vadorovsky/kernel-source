@@ -1,0 +1,209 @@
+From 8df6b323b47f70bc366ff08c3834e05bbf41b910 Mon Sep 17 00:00:00 2001
+From: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+Date: Wed, 11 Feb 2015 15:27:12 -0800
+Subject: [PATCH] mm/thp: allocate transparent hugepages on local node
+
+References: VM Performance, bnc#931620
+Patch-mainline: v4.0
+Git-commit: 077fcf116c8c2bd7ee9487b645aa3b50368db7e1
+
+This make sure that we try to allocate hugepages from local node if
+allowed by mempolicy.  If we can't, we fallback to small page allocation
+based on mempolicy.  This is based on the observation that allocating
+pages on local node is more beneficial than allocating hugepages on remote
+node.
+
+With this patch applied we may find transparent huge page allocation
+failures if the current node doesn't have enough freee hugepages.  Before
+this patch such failures result in us retrying the allocation on other
+nodes in the numa node mask.
+
+[akpm@linux-foundation.org: fix comment, add CONFIG_TRANSPARENT_HUGEPAGE dependency]
+Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+---
+ include/linux/gfp.h |    4 ++
+ mm/huge_memory.c    |   30 +++++++++------------
+ mm/mempolicy.c      |   72 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 89 insertions(+), 17 deletions(-)
+
+--- a/include/linux/gfp.h
++++ b/include/linux/gfp.h
+@@ -329,11 +329,15 @@ alloc_pages(gfp_t gfp_mask, unsigned int
+ extern struct page *alloc_pages_vma(gfp_t gfp_mask, int order,
+ 			struct vm_area_struct *vma, unsigned long addr,
+ 			int node);
++extern struct page *alloc_hugepage_vma(gfp_t gfp, struct vm_area_struct *vma,
++				       unsigned long addr, int order);
+ #else
+ #define alloc_pages(gfp_mask, order) \
+ 		alloc_pages_node(numa_node_id(), gfp_mask, order)
+ #define alloc_pages_vma(gfp_mask, order, vma, addr, node)	\
+ 	alloc_pages(gfp_mask, order)
++#define alloc_hugepage_vma(gfp_mask, vma, addr, order)	\
++	alloc_pages(gfp_mask, order)
+ #endif
+ #define alloc_page(gfp_mask) alloc_pages(gfp_mask, 0)
+ #define alloc_page_vma(gfp_mask, vma, addr)			\
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -653,15 +653,6 @@ static inline gfp_t alloc_hugepage_gfpma
+ 	return (GFP_TRANSHUGE & ~(defrag ? 0 : __GFP_WAIT)) | extra_gfp;
+ }
+ 
+-static inline struct page *alloc_hugepage_vma(int defrag,
+-					      struct vm_area_struct *vma,
+-					      unsigned long haddr, int nd,
+-					      gfp_t extra_gfp)
+-{
+-	return alloc_pages_vma(alloc_hugepage_gfpmask(defrag, extra_gfp),
+-			       HPAGE_PMD_ORDER, vma, haddr, nd);
+-}
+-
+ #ifndef CONFIG_NUMA
+ static inline struct page *alloc_hugepage(int defrag)
+ {
+@@ -674,6 +665,7 @@ int do_huge_pmd_anonymous_page(struct mm
+ 			       unsigned long address, pmd_t *pmd,
+ 			       unsigned int flags)
+ {
++	gfp_t gfp;
+ 	struct page *page;
+ 	unsigned long haddr = address & HPAGE_PMD_MASK;
+ 	pte_t *pte;
+@@ -683,8 +675,9 @@ int do_huge_pmd_anonymous_page(struct mm
+ 			return VM_FAULT_OOM;
+ 		if (unlikely(khugepaged_enter(vma)))
+ 			return VM_FAULT_OOM;
+-		page = alloc_hugepage_vma(transparent_hugepage_defrag(vma),
+-					  vma, haddr, numa_node_id(), 0);
++		gfp = alloc_hugepage_gfpmask(transparent_hugepage_defrag(vma),
++									0);
++		page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
+ 		if (unlikely(!page)) {
+ 			count_vm_event(THP_FAULT_FALLBACK);
+ 			goto out;
+@@ -911,10 +904,12 @@ int do_huge_pmd_wp_page(struct mm_struct
+ 	spin_unlock(&mm->page_table_lock);
+ 
+ 	if (transparent_hugepage_enabled(vma) &&
+-	    !transparent_hugepage_debug_cow())
+-		new_page = alloc_hugepage_vma(transparent_hugepage_defrag(vma),
+-					      vma, haddr, numa_node_id(), 0);
+-	else
++	    !transparent_hugepage_debug_cow()) {
++		gfp_t gfp;
++
++		gfp = alloc_hugepage_gfpmask(transparent_hugepage_defrag(vma), 0);
++		new_page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
++	} else
+ 		new_page = NULL;
+ 
+ 	if (unlikely(!new_page)) {
+@@ -1830,6 +1825,7 @@ static void collapse_huge_page(struct mm
+ 	spinlock_t *ptl;
+ 	int isolated;
+ 	unsigned long hstart, hend;
++	gfp_t gfp;
+ 
+ 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+ #ifndef CONFIG_NUMA
+@@ -1848,8 +1844,8 @@ static void collapse_huge_page(struct mm
+ 	 * mmap_sem in read mode is good idea also to allow greater
+ 	 * scalability.
+ 	 */
+-	new_page = alloc_hugepage_vma(khugepaged_defrag(), vma, address,
+-				      node, __GFP_OTHER_NODE);
++	gfp = alloc_hugepage_gfpmask(khugepaged_defrag(), __GFP_OTHER_NODE);
++	new_page = alloc_hugepage_vma(gfp, vma, address, HPAGE_PMD_ORDER);
+ 
+ 	/*
+ 	 * After allocating the hugepage, release the mmap_sem read lock in
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -1928,6 +1928,78 @@ retry_cpuset:
+ 	return page;
+ }
+ 
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++/**
++ * alloc_hugepage_vma: Allocate a hugepage for a VMA
++ * @gfp:
++ *   %GFP_USER	  user allocation.
++ *   %GFP_KERNEL  kernel allocations,
++ *   %GFP_HIGHMEM highmem/user allocations,
++ *   %GFP_FS	  allocation should not call back into a file system.
++ *   %GFP_ATOMIC  don't sleep.
++ *
++ * @vma:   Pointer to VMA or NULL if not available.
++ * @addr:  Virtual Address of the allocation. Must be inside the VMA.
++ * @order: Order of the hugepage for gfp allocation.
++ *
++ * This functions allocate a huge page from the kernel page pool and applies
++ * a NUMA policy associated with the VMA or the current process.
++ * For policy other than %MPOL_INTERLEAVE, we make sure we allocate hugepage
++ * only from the current node if the current node is part of the node mask.
++ * If we can't allocate a hugepage we fail the allocation and don' try to fallback
++ * to other nodes in the node mask. If the current node is not part of node mask
++ * or if the NUMA policy is MPOL_INTERLEAVE we use the allocator that can
++ * fallback to nodes in the policy node mask.
++ *
++ * When VMA is not NULL caller must hold down_read on the mmap_sem of the
++ * mm_struct of the VMA to prevent it from going away. Should be used for
++ * all allocations for pages that will be mapped into
++ * user space. Returns NULL when no page can be allocated.
++ *
++ * Should be called with vma->vm_mm->mmap_sem held.
++ *
++ */
++struct page *alloc_hugepage_vma(gfp_t gfp, struct vm_area_struct *vma,
++				unsigned long addr, int order)
++{
++	struct page *page;
++	nodemask_t *nmask;
++	struct mempolicy *pol;
++	int node = numa_node_id();
++	unsigned int cpuset_mems_cookie;
++
++retry_cpuset:
++	pol = get_vma_policy(current, vma, addr);
++	cpuset_mems_cookie = read_mems_allowed_begin();
++	/*
++	 * For interleave policy, we don't worry about
++	 * current node. Otherwise if current node is
++	 * in nodemask, try to allocate hugepage from
++	 * the current node. Don't fall back to other nodes
++	 * for THP.
++	 */
++	if (unlikely(pol->mode == MPOL_INTERLEAVE))
++		goto alloc_with_fallback;
++	nmask = policy_nodemask(gfp, pol);
++	if (!nmask || node_isset(node, *nmask)) {
++		mpol_cond_put(pol);
++		page = alloc_pages_exact_node(node, gfp, order);
++		if (unlikely(!page &&
++			     read_mems_allowed_retry(cpuset_mems_cookie)))
++			goto retry_cpuset;
++		return page;
++	}
++alloc_with_fallback:
++	mpol_cond_put(pol);
++	/*
++	 * if current node is not part of node mask, try
++	 * the allocation from any node, and we can do retry
++	 * in that case.
++	 */
++	return alloc_pages_vma(gfp, order, vma, addr, node);
++}
++#endif
++
+ /**
+  * 	alloc_pages_current - Allocate pages.
+  *
