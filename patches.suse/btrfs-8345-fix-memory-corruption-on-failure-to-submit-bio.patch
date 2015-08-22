@@ -1,0 +1,185 @@
+From: Filipe Manana <fdmanana@suse.com>
+Date: Mon, 29 Jun 2015 14:32:22 +0100
+Patch-mainline: 4.2
+Git-commit: 61de718fceb6bc028dafe4d06a1f87a9e0998303
+References: bnc#942688
+Subject: [PATCH] Btrfs: fix memory corruption on failure to submit bio for
+ direct IO
+
+If we fail to submit a bio for a direct IO request, we were grabbing the
+corresponding ordered extent and decrementing its reference count twice,
+once for our lookup reference and once for the ordered tree reference.
+This was a problem because it caused the ordered extent to be freed
+without removing it from the ordered tree and any lists it might be
+attached to, leaving dangling pointers to the ordered extent around.
+Example trace with CONFIG_DEBUG_PAGEALLOC=y:
+
+[161779.858707] BUG: unable to handle kernel paging request at 0000000087654330
+[161779.859983] IP: [<ffffffff8124ca68>] rb_prev+0x22/0x3b
+[161779.860636] PGD 34d818067 PUD 0
+[161779.860636] Oops: 0000 [#1] PREEMPT SMP DEBUG_PAGEALLOC
+(...)
+[161779.860636] Call Trace:
+[161779.860636]  [<ffffffffa06b36a6>] __tree_search+0xd9/0xf9 [btrfs]
+[161779.860636]  [<ffffffffa06b3708>] tree_search+0x42/0x63 [btrfs]
+[161779.860636]  [<ffffffffa06b4868>] ? btrfs_lookup_ordered_range+0x2d/0xa5 [btrfs]
+[161779.860636]  [<ffffffffa06b4873>] btrfs_lookup_ordered_range+0x38/0xa5 [btrfs]
+[161779.860636]  [<ffffffffa06aab8e>] btrfs_get_blocks_direct+0x11b/0x615 [btrfs]
+[161779.860636]  [<ffffffff8119727f>] do_blockdev_direct_IO+0x5ff/0xb43
+[161779.860636]  [<ffffffffa06aaa73>] ? btrfs_page_exists_in_range+0x1ad/0x1ad [btrfs]
+[161779.860636]  [<ffffffffa06a2c9a>] ? btrfs_get_extent_fiemap+0x1bc/0x1bc [btrfs]
+[161779.860636]  [<ffffffff811977f5>] __blockdev_direct_IO+0x32/0x34
+[161779.860636]  [<ffffffffa06a2c9a>] ? btrfs_get_extent_fiemap+0x1bc/0x1bc [btrfs]
+[161779.860636]  [<ffffffffa06a10ae>] btrfs_direct_IO+0x198/0x21f [btrfs]
+[161779.860636]  [<ffffffffa06a2c9a>] ? btrfs_get_extent_fiemap+0x1bc/0x1bc [btrfs]
+[161779.860636]  [<ffffffff81112ca1>] generic_file_direct_write+0xb3/0x128
+[161779.860636]  [<ffffffffa06affaa>] ? btrfs_file_write_iter+0x15f/0x3e0 [btrfs]
+[161779.860636]  [<ffffffffa06b004c>] btrfs_file_write_iter+0x201/0x3e0 [btrfs]
+(...)
+
+It was also a problem calling bio_endio() against our bio if we failed to
+allocate a struct btrfs_dio_private because the endio callbacks require
+such a structure to exist and be set up correctly.
+
+For read requests we weren't doing any cleanup either (none of the work
+done by btrfs_endio_direct_read()), so a failure submitting a bio for a
+read request would leave a range in the inode's io_tree locked forever,
+blocking any future operations (both reads and writes) against that range.
+
+So fix this by making sure we do the same cleanup that we do for the case
+where the bio submission succeeds.
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+
+Conflicts:
+	fs/btrfs/inode.c
+	fs/btrfs/ordered-data.c
+
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+---
+ fs/btrfs/inode.c        | 63 +++++++++++++++++++++++++++++++++----------------
+ fs/btrfs/ordered-data.c |  4 ++++
+ 2 files changed, 47 insertions(+), 20 deletions(-)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 1d1faf72..145448d 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -7185,14 +7185,18 @@ out_err:
+ static void btrfs_submit_direct(int rw, struct bio *bio, struct inode *inode,
+ 				loff_t file_offset)
+ {
+-	struct btrfs_root *root = BTRFS_I(inode)->root;
+ 	struct btrfs_dio_private *dip;
+ 	struct bio_vec *bvec = bio->bi_io_vec;
+ 	int skip_sum;
+ 	int write = rw & REQ_WRITE;
+ 	int ret = 0;
++	u64 dip_bytes = 0;
+ 
+ 	skip_sum = BTRFS_I(inode)->flags & BTRFS_INODE_NODATASUM;
++	do {
++		dip_bytes += bvec->bv_len;
++		bvec++;
++	} while (bvec <= (bio->bi_io_vec + bio->bi_vcnt - 1));
+ 
+ 	dip = kmalloc(sizeof(*dip), GFP_NOFS);
+ 	if (!dip) {
+@@ -7203,13 +7207,7 @@ static void btrfs_submit_direct(int rw, struct bio *bio, struct inode *inode,
+ 	dip->private = bio->bi_private;
+ 	dip->inode = inode;
+ 	dip->logical_offset = file_offset;
+-
+-	dip->bytes = 0;
+-	do {
+-		dip->bytes += bvec->bv_len;
+-		bvec++;
+-	} while (bvec <= (bio->bi_io_vec + bio->bi_vcnt - 1));
+-
++	dip->bytes = dip_bytes;
+ 	dip->disk_bytenr = (u64)bio->bi_sector << 9;
+ 	bio->bi_private = dip;
+ 	dip->errors = 0;
+@@ -7226,20 +7224,45 @@ static void btrfs_submit_direct(int rw, struct bio *bio, struct inode *inode,
+ 		return;
+ free_ordered:
+ 	/*
+-	 * If this is a write, we need to clean up the reserved space and kill
+-	 * the ordered extent.
++	 * If we arrived here it means either we failed to submit the dip
++	 * or we failed to allocate the dip. If we allocated the dip, we can
++	 * just call bio_endio against our bio so that we get proper resource
++	 * cleanup if we fail to submit the dip, otherwise, we must do the
++	 * same as btrfs_endio_direct_[write|read] because we can't call these
++	 * callbacks - they require an allocated dip.
+ 	 */
+-	if (write) {
+-		struct btrfs_ordered_extent *ordered;
+-		ordered = btrfs_lookup_ordered_extent(inode, file_offset);
+-		if (!test_bit(BTRFS_ORDERED_PREALLOC, &ordered->flags) &&
+-		    !test_bit(BTRFS_ORDERED_NOCOW, &ordered->flags))
+-			btrfs_free_reserved_extent(root, ordered->start,
+-						   ordered->disk_len);
+-		btrfs_put_ordered_extent(ordered);
+-		btrfs_put_ordered_extent(ordered);
++	if (dip) {
++		bio_endio(bio, ret);
++		/*
++		 * The end io callbacks free our dip and all the cleanup and
++		 * final put for dio_bio (through dio_end_io()).
++		 */
++	} else {
++		if (write) {
++			struct btrfs_ordered_extent *ordered;
++
++			ordered = btrfs_lookup_ordered_extent(inode,
++							      file_offset);
++			set_bit(BTRFS_ORDERED_IOERR, &ordered->flags);
++			/*
++			 * Decrements our ref on the ordered extent and removes
++			 * the ordered extent from the inode's ordered tree,
++			 * doing all the proper resource cleanup such as for the
++			 * reserved space and waking up any waiters for this
++			 * ordered extent (through btrfs_remove_ordered_extent).
++			 */
++			btrfs_finish_ordered_io(ordered);
++		} else {
++			unlock_extent(&BTRFS_I(inode)->io_tree, file_offset,
++			      file_offset + dip_bytes - 1);
++		}
++		clear_bit(BIO_UPTODATE, &bio->bi_flags);
++		/*
++		 * Releases and cleans up our bio, no need to bio_put()
++		 * nor bio_endio()/bio_io_error() against bio.
++		 */
++		dio_end_io(bio, ret);
+ 	}
+-	bio_endio(bio, ret);
+ }
+ 
+ static ssize_t check_direct_IO(struct btrfs_root *root, int rw, struct kiocb *iocb,
+diff --git a/fs/btrfs/ordered-data.c b/fs/btrfs/ordered-data.c
+index 4f25e37..2da679c 100644
+--- a/fs/btrfs/ordered-data.c
++++ b/fs/btrfs/ordered-data.c
+@@ -485,6 +485,9 @@ void btrfs_put_ordered_extent(struct btrfs_ordered_extent *entry)
+ 	trace_btrfs_ordered_extent_put(entry->inode, entry);
+ 
+ 	if (atomic_dec_and_test(&entry->refs)) {
++		BUG_ON(!list_empty(&entry->log_list));
++		BUG_ON(!list_empty(&entry->root_extent_list));
++		BUG_ON(!RB_EMPTY_NODE(&entry->rb_node));
+ 		if (entry->inode)
+ 			btrfs_add_delayed_iput(entry->inode);
+ 		while (!list_empty(&entry->list)) {
+@@ -512,6 +515,7 @@ void btrfs_remove_ordered_extent(struct inode *inode,
+ 	spin_lock_irq(&tree->lock);
+ 	node = &entry->rb_node;
+ 	rb_erase(node, &tree->tree);
++	RB_CLEAR_NODE(node);
+ 	tree->last = NULL;
+ 	set_bit(BTRFS_ORDERED_COMPLETE, &entry->flags);
+ 	spin_unlock_irq(&tree->lock);
+-- 
+1.8.4.5
+
