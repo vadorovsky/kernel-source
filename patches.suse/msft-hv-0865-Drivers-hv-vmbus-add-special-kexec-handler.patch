@@ -1,0 +1,146 @@
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Sat, 1 Aug 2015 16:08:07 -0700
+Patch-mainline: v4.2-rc4-50-g2517281
+Subject: Drivers: hv: vmbus: add special kexec handler
+Git-commit: 2517281d63a2b09d94aedfb522943617048f337e
+
+When general-purpose kexec (not kdump) is being performed in Hyper-V guest
+the newly booted kernel fails with an MCE error coming from the host. It
+is the same error which was fixed in the "Drivers: hv: vmbus: Implement
+the protocol for tearing down vmbus state" commit - monitor pages remain
+special and when they're being written to (as the new kernel doesn't know
+these pages are special) bad things happen. We need to perform some
+minimalistic cleanup before booting a new kernel on kexec. To do so we
+need to register a special machine_ops.shutdown handler to be executed
+before the native_machine_shutdown(). Registering a shutdown notification
+handler via the register_reboot_notifier() call is not sufficient as it
+happens to early for our purposes. machine_ops is not being exported to
+modules (and I don't think we want to export it) so let's do this in
+mshyperv.c
+
+The minimalistic cleanup consists of cleaning up clockevents, synic MSRs,
+guest os id MSR, and hypercall MSR.
+
+Kdump doesn't require all this stuff as it lives in a separate memory
+space.
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: <ohering@suse.de>
+---
+ arch/x86/include/asm/mshyperv.h |  2 ++
+ arch/x86/kernel/cpu/mshyperv.c  | 24 ++++++++++++++++++++++++
+ drivers/hv/vmbus_drv.c          | 14 ++++++++++++++
+ 3 files changed, 40 insertions(+)
+
+diff --git a/arch/x86/include/asm/mshyperv.h b/arch/x86/include/asm/mshyperv.h
+index c163215..d3db910 100644
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@ -20,4 +20,6 @@ void hyperv_vector_handler(struct pt_regs *regs);
+ void hyperv_vector_handler(struct pt_regs *regs);
+ void hv_register_vmbus_handler(int irq, irq_handler_t handler);
+ 
++void hv_setup_kexec_handler(void (*handler)(void));
++void hv_remove_kexec_handler(void);
+ #endif
+diff --git a/arch/x86/kernel/cpu/mshyperv.c b/arch/x86/kernel/cpu/mshyperv.c
+index aad4bd8..fa483ed 100644
+--- a/arch/x86/kernel/cpu/mshyperv.c
++++ b/arch/x86/kernel/cpu/mshyperv.c
+@@ -18,6 +18,7 @@
+ #include <linux/hardirq.h>
+ #include <linux/efi.h>
+ #include <linux/interrupt.h>
++#include <linux/kexec.h>
+ #include <asm/processor.h>
+ #include <asm/hypervisor.h>
+ #include <asm/hyperv.h>
+@@ -28,10 +29,13 @@
+ #include <asm/i8259.h>
+ #include <asm/apic.h>
+ #include <asm/timer.h>
++#include <asm/reboot.h>
+ 
+ struct ms_hyperv_info ms_hyperv;
+ EXPORT_SYMBOL_GPL(ms_hyperv);
+ 
++static void (*hv_kexec_handler)(void);
++
+ static bool __init ms_hyperv_platform(void)
+ {
+ 	u32 eax;
+@@ -67,6 +71,25 @@ void hv_remove_vmbus_irq(void)
+ 		!memcmp("Microsoft Hv", hyp_signature, 12);
+ }
+ 
++void hv_setup_kexec_handler(void (*handler)(void))
++{
++	hv_kexec_handler = handler;
++}
++EXPORT_SYMBOL_GPL(hv_setup_kexec_handler);
++
++void hv_remove_kexec_handler(void)
++{
++	hv_kexec_handler = NULL;
++}
++EXPORT_SYMBOL_GPL(hv_remove_kexec_handler);
++
++static void hv_machine_shutdown(void)
++{
++	if (kexec_in_progress && hv_kexec_handler)
++		hv_kexec_handler();
++	native_machine_shutdown();
++}
++
+ static cycle_t read_hv_clock(struct clocksource *arg)
+ {
+ 	cycle_t current_tick;
+@@ -141,6 +164,7 @@ static void __init ms_hyperv_init_platform(void)
+ 	no_timer_check = 1;
+ #endif
+ 
++	machine_ops.shutdown = hv_machine_shutdown;
+ }
+ 
+ const __refconst struct hypervisor_x86 x86_hyper_ms_hyperv = {
+diff --git a/drivers/hv/vmbus_drv.c b/drivers/hv/vmbus_drv.c
+index 00d5158..31748a2 100644
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -1060,6 +1060,17 @@ static struct acpi_driver vmbus_acpi_driver = {
+ 	},
+ };
+ 
++static void hv_kexec_handler(void)
++{
++	int cpu;
++
++	hv_synic_clockevents_cleanup();
++	vmbus_initiate_unload();
++	for_each_online_cpu(cpu)
++		smp_call_function_single(cpu, hv_synic_cleanup, NULL, 1);
++	hv_cleanup();
++};
++
+ static int __init hv_acpi_init(void)
+ {
+ 	int ret, t;
+@@ -1092,6 +1103,8 @@ static int __init hv_acpi_init(void)
+ 	if (ret)
+ 		goto cleanup;
+ 
++	hv_setup_kexec_handler(hv_kexec_handler);
++
+ 	return 0;
+ 
+ cleanup:
+@@ -1104,6 +1117,7 @@ static void __exit vmbus_exit(void)
+ {
+ 	int cpu;
+ 
++	hv_remove_kexec_handler();
+ 	vmbus_connection.conn_state = DISCONNECTED;
+ 	hv_synic_clockevents_cleanup();
+ 	vmbus_disconnect();
