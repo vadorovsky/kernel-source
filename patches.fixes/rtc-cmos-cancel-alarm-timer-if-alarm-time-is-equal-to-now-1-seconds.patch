@@ -1,0 +1,172 @@
+From: Adrian Huang <adrianhuang0701@gmail.com>
+Date: Mon, 6 Jul 2015 12:19:12 +0800
+Subject: rtc: cmos: Cancel alarm timer if alarm time is equal to now+1 seconds
+Git-commit: 88b8d33b1c6aadba553c998db91c4b36be0fac52
+Patch-mainline: v4.3-rc1
+References: bsc#930145
+
+Steps to reproduce the problem:
+	1) Enable RTC wake-up option in BIOS Setup
+	2) Issue one of these commands in the OS: "poweroff"
+	   or "shutdown -h now"
+	3) System will shut down and then reboot automatically
+
+Root-cause of the issue:
+	1) During the shutdown process, the hwclock utility is used
+	   to save the system clock to hardware clock (RTC).
+	2) The hwclock utility invokes ioctl() with RTC_UIE_ON. The
+	   kernel configures the RTC alarm for the periodic interrupt
+	   (every 1 second).
+	3) The hwclock uitlity closes the /dev/rtc0 device, and the
+	   kernel disables the RTC alarm irq (AIE bit of Register B)
+	   via ioctl() with RTC_UIE_OFF. But, the configured alarm
+	   time is the current_time + 1.
+	4) After the next 1 second is elapsed, the AF (alarm
+	   interrupt flag) of Register C is set.
+	5) The S5 handler in BIOS is invoked to configure alarm
+	   registers (enable AIE bit and configure alarm date/time).
+	   But, BIOS does not clear the previous interrupt status
+	   during alarm configuration. Therefore, "AF=AIE=1" causes
+	   the rtc device to trigger an interrupt.
+	6) So, the machine reboots automatically right after shutdown.
+
+This patch cancels the alarm timer if the following condictions are
+met (suggested by Alexandre):
+	1) The configured alarm time is equal to current_time + 1
+	   seconds.
+	2) The AIE timer is not in use.
+
+The member 'alarm_expires' is introduced in struct cmos_rtc because
+of the following reasons:
+	1) The configured alarm time can be retrieved from
+	   cmos_read_alarm(), but we need to take the 'wrapped
+	   timestamp' and 'time rollover' into consideration. The
+	   function __rtc_read_alarm() eliminates the concerns. To
+	   avoid the duplicated code in the lower level RTC driver,
+	   invoking __rtc_read_alarm from the lower level RTC driver
+	   is not encouraged. Moreover, the compilation error 'the
+	   undefined __rtc_read_alarm" is observed if the lower level
+	   RTC driver is compiled as a kernel module.
+	2) The uie_rtctimer.node.expires and aie_timer.node.expires can
+	   be retrieved for the configured alarm time. But, the problem
+	   is that either of them might configure the CMOS alarm time.
+	   We cannot make sure UIE timer or AIE tiemr configured the
+	   CMOS alarm time before. (uie_rtctimer or aie_timer is enabled
+	   and then is disabled).
+	3) The patch introduces the member 'alarm_expires' to keep the
+	   newly configured alarm time, so the above-mentioned concerns
+	   can be eliminated.
+
+The issue goes away after 20-time shutdown tests.
+
+Signed-off-by: Adrian Huang <ahuang12@lenovo.com>
+Tested-by: Egbert Eich <eich@suse.de>
+Tested-by: Diego Ercolani <diego.ercolani@gmail.com>
+Cc: Borislav Petkov <bp@suse.de>
+Signed-off-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
+Acked-by: Borislav Petkov <bp@suse.de>
+---
+ drivers/rtc/rtc-cmos.c |   64 +++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 60 insertions(+), 4 deletions(-)
+
+--- a/drivers/rtc/rtc-cmos.c
++++ b/drivers/rtc/rtc-cmos.c
+@@ -48,6 +48,7 @@ struct cmos_rtc {
+ 	struct device		*dev;
+ 	int			irq;
+ 	struct resource		*iomem;
++	unsigned long		alarm_expires;
+ 
+ 	void			(*wake_on)(struct device *);
+ 	void			(*wake_off)(struct device *);
+@@ -374,6 +375,8 @@ static int cmos_set_alarm(struct device
+ 
+ 	spin_unlock_irq(&rtc_lock);
+ 
++	rtc_tm_to_time(&t->time, &cmos->alarm_expires);
++
+ 	return 0;
+ }
+ 
+@@ -786,6 +789,51 @@ static void __exit cmos_do_remove(struct
+ 	dev_set_drvdata(dev, NULL);
+ }
+ 
++static int cmos_aie_poweroff(struct device *dev)
++{
++	struct cmos_rtc	*cmos = dev_get_drvdata(dev);
++	struct rtc_time now;
++	unsigned long t_now;
++	int retval = 0;
++	unsigned char rtc_control;
++
++	if (!cmos->alarm_expires)
++		return -EINVAL;
++
++	spin_lock_irq(&rtc_lock);
++	rtc_control = CMOS_READ(RTC_CONTROL);
++	spin_unlock_irq(&rtc_lock);
++
++	/* We only care about the situation where AIE is disabled. */
++	if (rtc_control & RTC_AIE)
++		return -EBUSY;
++
++	cmos_read_time(dev, &now);
++	rtc_tm_to_time(&now, &t_now);
++
++	/*
++	 * When enabling "RTC wake-up" in BIOS setup, the machine reboots
++	 * automatically right after shutdown on some buggy boxes.
++	 * This automatic rebooting issue won't happen when the alarm
++	 * time is larger than now+1 seconds.
++	 *
++	 * If the alarm time is equal to now+1 seconds, the issue can be
++	 * prevented by cancelling the alarm.
++	 */
++	if (cmos->alarm_expires == t_now + 1) {
++		struct rtc_wkalrm alarm;
++
++		/* Cancel the AIE timer by configuring the past time. */
++		rtc_time_to_tm(t_now - 1, &alarm.time);
++		alarm.enabled = 0;
++		retval = cmos_set_alarm(dev, &alarm);
++	} else if (cmos->alarm_expires > t_now + 1) {
++		retval = -EBUSY;
++	}
++
++	return retval;
++}
++
+ #ifdef	CONFIG_PM
+ 
+ static int cmos_suspend(struct device *dev)
+@@ -1030,8 +1078,12 @@ static int cmos_pnp_resume(struct pnp_de
+ 
+ static void cmos_pnp_shutdown(struct pnp_dev *pnp)
+ {
+-	if (system_state == SYSTEM_POWER_OFF && !cmos_poweroff(&pnp->dev))
+-		return;
++	if (system_state == SYSTEM_POWER_OFF) {
++		int retval = cmos_poweroff(&pnp->dev);
++
++		if (cmos_aie_poweroff(&pnp->dev) < 0 && !retval)
++			return;
++	}
+ 
+ 	cmos_do_shutdown();
+ }
+@@ -1123,8 +1175,12 @@ static int __exit cmos_platform_remove(s
+ 
+ static void cmos_platform_shutdown(struct platform_device *pdev)
+ {
+-	if (system_state == SYSTEM_POWER_OFF && !cmos_poweroff(&pdev->dev))
+-		return;
++	if (system_state == SYSTEM_POWER_OFF) {
++		int retval = cmos_poweroff(&pdev->dev);
++
++		if (cmos_aie_poweroff(&pdev->dev) < 0 && !retval)
++			return;
++	}
+ 
+ 	cmos_do_shutdown();
+ }
