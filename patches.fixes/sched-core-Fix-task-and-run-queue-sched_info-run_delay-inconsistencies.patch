@@ -1,0 +1,267 @@
+From 1de64443d755f83af8ba8b558fded0c61afaef47 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Wed, 30 Sep 2015 17:44:13 +0200
+Subject: sched/core: Fix task and run queue sched_info::run_delay inconsistencies
+Patch-mainline: Queued in subsystem maintainer repository
+Git-commit: 1de64443d755f83af8ba8b558fded0c61afaef47
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+References: bnc#949100
+
+Mike Meyer reported the following bug:
+
+> During evaluation of some performance data, it was discovered thread
+> and run queue run_delay accounting data was inconsistent with the other
+> accounting data that was collected.  Further investigation found under
+> certain circumstances execution time was leaking into the task and
+> run queue accounting of run_delay.
+>
+> Consider the following sequence:
+>
+>     a. thread is running.
+>     b. thread moves beween cgroups, changes scheduling class or priority.
+>     c. thread sleeps OR
+>     d. thread involuntarily gives up cpu.
+>
+> a. implies:
+>
+>     thread->sched_info.last_queued = 0
+>
+> a. and b. results in the following:
+>
+>     1. dequeue_task(rq, thread)
+>
+>            sched_info_dequeued(rq, thread)
+>                delta = 0
+>
+>                sched_info_reset_dequeued(thread)
+>                    thread->sched_info.last_queued = 0
+>
+>                thread->sched_info.run_delay += delta
+>
+>     2. enqueue_task(rq, thread)
+>
+>            sched_info_queued(rq, thread)
+>
+>                /* thread is still on cpu at this point. */
+>                thread->sched_info.last_queued = task_rq(thread)->clock;
+>
+> c. results in:
+>
+>     dequeue_task(rq, thread)
+>
+>         sched_info_dequeued(rq, thread)
+>
+>             /* delta is execution time not run_delay. */
+>             delta = task_rq(thread)->clock - thread->sched_info.last_queued
+>
+>         sched_info_reset_dequeued(thread)
+>             thread->sched_info.last_queued = 0
+>
+>         thread->sched_info.run_delay += delta
+>
+>     Since thread was running between enqueue_task(rq, thread) and
+>     dequeue_task(rq, thread), the delta above is really execution
+>     time and not run_delay.
+>
+> d. results in:
+>
+>     __sched_info_switch(thread, next_thread)
+>
+>         sched_info_depart(rq, thread)
+>
+>             sched_info_queued(rq, thread)
+>
+>                 /* last_queued not updated due to being non-zero */
+>                 return
+>
+>     Since thread was running between enqueue_task(rq, thread) and
+>     __sched_info_switch(thread, next_thread), the execution time
+>     between enqueue_task(rq, thread) and
+>     __sched_info_switch(thread, next_thread) now will become
+>     associated with run_delay due to when last_queued was last updated.
+>
+
+This alternative patch solves the problem by not calling
+sched_info_{de,}queued() in {de,en}queue_task(). Therefore the
+sched_info state is preserved and things work as expected.
+
+By inlining the {de,en}queue_task() functions the new condition
+becomes (mostly) a compile-time constant and we'll not emit any new
+branch instructions.
+
+It even shrinks the code (due to inlining {en,de}queue_task()):
+
+$ size defconfig-build/kernel/sched/core.o defconfig-build/kernel/sched/core.o.orig
+   text    data     bss     dec     hex filename
+  64019   23378    2344   89741   15e8d defconfig-build/kernel/sched/core.o
+  64149   23378    2344   89871   15f0f defconfig-build/kernel/sched/core.o.orig
+
+Reported-by: Mike Meyer <Mike.Meyer@Teradata.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: linux-kernel@vger.kernel.org
+Link: http://lkml.kernel.org/r/20150930154413.GO3604@twins.programming.kicks-ass.net
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Mike Galbraith <mgalbraith@suse.de>
+---
+ include/linux/sched.h |   12 +++++++-----
+ kernel/sched.c        |   39 ++++++++++++++++++++++++---------------
+ 2 files changed, 31 insertions(+), 20 deletions(-)
+
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1094,15 +1094,17 @@ struct sched_domain;
+ #define WF_FORK		0x02		/* child wakeup after fork */
+ #define WF_MIGRATED	0x04		/* internal use, task got migrated */
+ 
+-#define ENQUEUE_WAKEUP		1
+-#define ENQUEUE_HEAD		2
++#define ENQUEUE_WAKEUP		0x01
++#define ENQUEUE_HEAD		0x02
+ #ifdef CONFIG_SMP
+-#define ENQUEUE_WAKING		4	/* sched_class::task_waking was called */
++#define ENQUEUE_WAKING		0x04	/* sched_class::task_waking was called */
+ #else
+-#define ENQUEUE_WAKING		0
++#define ENQUEUE_WAKING		0x00
+ #endif
++#define ENQUEUE_RESTORE		0x08
+ 
+-#define DEQUEUE_SLEEP		1
++#define DEQUEUE_SLEEP		0x01
++#define DEQUEUE_SAVE		0x02
+ 
+ struct sched_class {
+ 	const struct sched_class *next;
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -2022,17 +2022,19 @@ static void set_load_weight(struct task_
+ 	load->inv_weight = prio_to_wmult[prio];
+ }
+ 
+-static void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
++static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
+ {
+ 	update_rq_clock(rq);
+-	sched_info_queued(p);
++	if (!(flags & ENQUEUE_RESTORE))
++		sched_info_queued(p);
+ 	p->sched_class->enqueue_task(rq, p, flags);
+ }
+ 
+-static void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
++static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
+ {
+ 	update_rq_clock(rq);
+-	sched_info_dequeued(p);
++	if (!(flags & DEQUEUE_SAVE))
++		sched_info_dequeued(p);
+ 	p->sched_class->dequeue_task(rq, p, flags);
+ }
+ 
+@@ -2686,7 +2688,7 @@ ttwu_stat(struct task_struct *p, int cpu
+ #endif /* CONFIG_SCHEDSTATS */
+ }
+ 
+-static void ttwu_activate(struct rq *rq, struct task_struct *p, int en_flags)
++static inline void ttwu_activate(struct rq *rq, struct task_struct *p, int en_flags)
+ {
+ 	activate_task(rq, p, en_flags);
+ 	p->on_rq = 1;
+@@ -5130,7 +5132,7 @@ EXPORT_SYMBOL(sleep_on_timeout);
+  */
+ void rt_mutex_setprio(struct task_struct *p, int prio)
+ {
+-	int oldprio, on_rq, running;
++	int oldprio, on_rq, running, enqueue_flag = ENQUEUE_RESTORE;
+ 	struct rq *rq;
+ 	const struct sched_class *prev_class;
+ 
+@@ -5162,7 +5164,7 @@ void rt_mutex_setprio(struct task_struct
+ 	on_rq = p->on_rq;
+ 	running = task_current(rq, p);
+ 	if (on_rq)
+-		dequeue_task(rq, p, 0);
++		dequeue_task(rq, p, DEQUEUE_SAVE);
+ 	if (running)
+ 		p->sched_class->put_prev_task(rq, p);
+ 
+@@ -5175,8 +5177,11 @@ void rt_mutex_setprio(struct task_struct
+ 
+ 	if (running)
+ 		p->sched_class->set_curr_task(rq);
+-	if (on_rq)
+-		enqueue_task(rq, p, oldprio < prio ? ENQUEUE_HEAD : 0);
++	if (on_rq) {
++		if (oldprio < prio)
++			enqueue_flag |= ENQUEUE_HEAD;
++		enqueue_task(rq, p, enqueue_flag);
++	}
+ 
+ 	check_class_changed(rq, p, prev_class, oldprio);
+ out_unlock:
+@@ -5210,7 +5215,7 @@ void set_user_nice(struct task_struct *p
+ 	}
+ 	on_rq = p->on_rq;
+ 	if (on_rq)
+-		dequeue_task(rq, p, 0);
++		dequeue_task(rq, p, DEQUEUE_SAVE);
+ 
+ 	p->static_prio = NICE_TO_PRIO(nice);
+ 	set_load_weight(p);
+@@ -5219,7 +5224,7 @@ void set_user_nice(struct task_struct *p
+ 	delta = p->prio - old_prio;
+ 
+ 	if (on_rq) {
+-		enqueue_task(rq, p, 0);
++		enqueue_task(rq, p, ENQUEUE_RESTORE);
+ 		/*
+ 		 * If the task increased its priority or is running and
+ 		 * lowered its priority, then reschedule its CPU:
+@@ -5545,7 +5550,7 @@ static int __sched_setscheduler(struct t
+ 	on_rq = p->on_rq;
+ 	running = task_current(rq, p);
+ 	if (on_rq)
+-		deactivate_task(rq, p, 0);
++		deactivate_task(rq, p, DEQUEUE_SAVE);
+ 	if (running)
+ 		p->sched_class->put_prev_task(rq, p);
+ 
+@@ -5555,11 +5560,15 @@ static int __sched_setscheduler(struct t
+ 	if (running)
+ 		p->sched_class->set_curr_task(rq);
+ 	if (on_rq) {
++		int enqueue_flags = ENQUEUE_RESTORE;
+ 		/*
+ 		 * We enqueue to tail when the priority of a task is
+ 		 * increased (user space view).
+ 		 */
+-		activate_task(rq, p, oldprio <= p->prio ? ENQUEUE_HEAD : 0);
++		if (oldprio <= p->prio)
++			enqueue_flags |= ENQUEUE_HEAD;
++
++		activate_task(rq, p, enqueue_flags);
+ 	}
+ 
+ 	check_class_changed(rq, p, prev_class, oldprio);
+@@ -9053,7 +9062,7 @@ void sched_move_task(struct task_struct
+ 	on_rq = tsk->on_rq;
+ 
+ 	if (on_rq)
+-		dequeue_task(rq, tsk, 0);
++		dequeue_task(rq, tsk, DEQUEUE_SAVE);
+ 	if (unlikely(running))
+ 		tsk->sched_class->put_prev_task(rq, tsk);
+ 
+@@ -9073,7 +9082,7 @@ void sched_move_task(struct task_struct
+ 	if (unlikely(running))
+ 		tsk->sched_class->set_curr_task(rq);
+ 	if (on_rq)
+-		enqueue_task(rq, tsk, 0);
++		enqueue_task(rq, tsk, ENQUEUE_RESTORE);
+ 
+ 	task_rq_unlock(rq, tsk, &flags);
+ }
