@@ -2,9 +2,11 @@
 touch /boot/do_purge_kernels
 
 suffix=
-if test "@FLAVOR@" = "vanilla"; then
-    suffix=-@FLAVOR@
-fi
+case @FLAVOR@ in
+    xen*|ec2|vanilla)
+	suffix=-@FLAVOR@
+	;;
+esac
 for x in /boot/@IMAGE@ /boot/initrd; do
     rm -f $x$suffix
     ln -s ${x##*/}-@KERNELRELEASE@-@FLAVOR@ $x$suffix
