@@ -1,0 +1,176 @@
+From: Hidehiro Kawai <hidehiro.kawai.ez@hitachi.com>
+Subject: [V3 PATCH 2/4] panic/x86: Allow cpus to save registers even if they
+Patch-mainline: not yet, still under review
+References: bnc#940946
+
+mhocko@suse.cz:
+Had to tweak it because the upstream code has been refactored considerably.
+This is a bit fragile because a new shootdown_callback callback might use
+more parameters than nmi_panic_self_stop offers...
+
+When cpu-A panics on NMI just after cpu-B has panicked, cpu-A loops
+infinitely in NMI context.  Especially for x86, cpu-B issues NMI IPI
+to other cpus to save their register states and do some cleanups if
+kdump is enabled, but cpu-A can't handle the NMI and fails to save
+register states.
+
+To solve thie issue, we wait for the timing of the NMI IPI, then
+call the NMI handler which saves register states.
+
+V3: 
+- Newly introduced
+
+Signed-off-by: Hidehiro Kawai <hidehiro.kawai.ez@hitachi.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Eric Biederman <ebiederm@xmission.com>
+Cc: Vivek Goyal <vgoyal@redhat.com>
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+
+---
+ arch/x86/kernel/reboot.c |   22 ++++++++++++++++++++++
+ arch/x86/kernel/traps.c  |    6 +++---
+ include/linux/kernel.h   |   12 ++++++++++--
+ kernel/panic.c           |   10 ++++++++++
+ kernel/watchdog.c        |    2 +-
+ 5 files changed, 46 insertions(+), 6 deletions(-)
+
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -791,6 +791,7 @@ static int crashing_cpu;
+ static nmi_shootdown_cb shootdown_callback;
+ 
+ static atomic_t waiting_for_crash_ipi;
++static int crash_ipi_done;
+ 
+ #ifdef CONFIG_KDB_KDUMP
+ void halt_current_cpu(struct pt_regs *regs)
+@@ -881,6 +882,7 @@ void nmi_shootdown_cpus(nmi_shootdown_cb
+ 	wmb();
+ 
+ 	smp_send_nmi_allbutself();
++	crash_ipi_done = 1; /* Kick cpus looping in nmi context */
+ 
+ 	msecs = 1000; /* Wait at most a second for the other cpus to stop */
+ 	while ((atomic_read(&waiting_for_crash_ipi) > 0) && msecs) {
+@@ -890,6 +892,26 @@ void nmi_shootdown_cpus(nmi_shootdown_cb
+ 
+ 	/* Leave the nmi callback set */
+ }
++
++void nmi_panic_self_stop(struct pt_regs *regs)
++{
++	struct die_args data = {.regs = regs};
++
++	while (crash_ipi_done == 0)
++		cpu_relax();
++
++	/*
++	 * This is an ungly hack but we cannot use the notifier
++	 * API here. So we have to steal akk guts and call shootdown_callback
++	 * directly. nmi_shootdown_cpus should have already configured
++	 * the correct callback.
++	 * We currently have on 2 callbacks:
++	 * 	- kdump_nmi_callback cares only about regs
++	 * 	- vmxoff_nmi ignores paramteres altogether
++	 */
++	shootdown_callback(safe_smp_processor_id(), &data); /* Shouldn't return */
++}
++
+ #else /* !CONFIG_SMP */
+ void nmi_shootdown_cpus(nmi_shootdown_cb callback)
+ {
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -340,7 +340,7 @@ pci_serr_error(unsigned char reason, str
+ #endif
+ 
+ 	if (panic_on_unrecovered_nmi)
+-		nmi_panic("NMI: Not continuing");
++		nmi_panic(regs, "NMI: Not continuing");
+ 
+ 	pr_emerg("Dazed and confused, but trying to continue\n");
+ 
+@@ -364,7 +364,7 @@ io_check_error(unsigned char reason, str
+ 	show_registers(regs);
+ 
+ 	if (panic_on_io_nmi) {
+-		nmi_panic("NMI IOCK error: Not continuing");
++		nmi_panic(regs, "NMI IOCK error: Not continuing");
+ 
+ 		/*
+ 		 * If we return from here, we've already being in panic.
+@@ -429,7 +429,7 @@ unknown_nmi_error(unsigned char reason,
+ 
+ 	pr_emerg("Do you have a strange power saving mode enabled?\n");
+ 	if (unknown_nmi_panic || panic_on_unrecovered_nmi)
+-		nmi_panic("NMI: Not continuing");
++		nmi_panic(regs, "NMI: Not continuing");
+ 
+ 	pr_emerg("Dazed and confused, but trying to continue\n");
+ }
+--- a/include/linux/kernel.h
++++ b/include/linux/kernel.h
+@@ -200,6 +200,7 @@ extern struct atomic_notifier_head panic
+ extern long (*panic_blink)(int state);
+ NORET_TYPE void panic(const char * fmt, ...)
+ 	__attribute__ ((NORET_AND format (printf, 1, 2))) __cold;
++void nmi_panic_self_stop(struct pt_regs *);
+ extern void oops_enter(void);
+ extern void oops_exit(void);
+ void print_oops_end_marker(void);
+@@ -418,12 +419,19 @@ extern atomic_t panic_cpu;
+ /*
+  * A variant of panic() called from NMI context.
+  * If we've already panicked on this cpu, return from here.
++ * If another cpu already panicked, loop in nmi_panic_self_stop() which
++ * can provide architecture dependent code such as saving register states
++ * for crash dump.
+  */
+-#define nmi_panic(fmt, ...)						\
++#define nmi_panic(regs, fmt, ...)					\
+ 	do {								\
++		int old_cpu;						\
+ 		int this_cpu = raw_smp_processor_id();			\
+-		if (atomic_cmpxchg(&panic_cpu, -1, this_cpu) != this_cpu) \
++		old_cpu = atomic_cmpxchg(&panic_cpu, -1, this_cpu);	\
++		if (old_cpu == -1)					\
+ 			panic(fmt, ##__VA_ARGS__);			\
++		else if (old_cpu != this_cpu)				\
++			nmi_panic_self_stop(regs);			\
+ 	} while (0)
+ 
+ /*
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -61,6 +61,16 @@ void __weak panic_smp_self_stop(void)
+ 		cpu_relax();
+ }
+ 
++/*
++ * Stop ourself in NMI context if another cpu has already panicked.
++ * Architecture code may override this to prepare for crash dumping
++ * (e.g. save register information).
++ */
++void __weak nmi_panic_self_stop(struct pt_regs *regs)
++{
++	panic_smp_self_stop();
++}
++
+ atomic_t panic_cpu = ATOMIC_INIT(-1);
+ 
+ /**
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@ -235,7 +235,7 @@ static void watchdog_overflow_callback(s
+ 			return;
+ 
+ 		if (hardlockup_panic)
+-			nmi_panic("Watchdog detected hard LOCKUP on cpu %d", this_cpu);
++			nmi_panic(regs, "Watchdog detected hard LOCKUP on cpu %d", this_cpu);
+ 		else
+ 			WARN(1, "Watchdog detected hard LOCKUP on cpu %d", this_cpu);
+ 
