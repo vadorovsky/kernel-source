@@ -1,0 +1,197 @@
+From: Petr Mladek <pmladek@suse.cz>
+Date: Thu, 18 Dec 2014 17:15:36 +0100
+Subject: kgr: allow to search various types of struct kgr_patch_fun
+Patch-mainline: submitted for review
+References: fate#313296
+
+kgr_get_last_pf() returns the last variant of struct kgr_patch_fun
+that has set KGR_PATCH_APPLIED state. We will need to search and
+check also another variants of the function on the stack in
+the upcoming patches.
+
+This patch adds the needed support by renaming kgr_get_last_pf() to
+kgr_get_patch_fun() and extending the functionality. It looks
+for struct patch_fun by the information in the given struct
+kgr_patch_fun. In most cases only the function name is used.
+The right search mode is defined by a new enum kgr_find_type.
+The currently supported types are:
+
+  + KGR_PREVIOUS: look for the previous patch_fun in respect to
+    stacking; it searches both finalized patches (kgr_patches) and
+    also the patch in progress (kgr_patch); the patch in progress
+    is considered to be on top of the stack
+
+  + KGR_LAST_FINALIZED: look for the last finalized patch_fun;
+    it searches only the patches in kgr_patches list
+
+  + KGR_LAST_EXISTING: look for the last existing patch_fun;
+    it searches both kgr_patch and kgr_patches
+
+  + KGR_IN_PROGRESS: look if the function in the given patch_fun
+    is modified also by the patch in progress; it searches
+    _only_ kgr_patch
+
+Note that the patch modifies the meaning of the function but not the
+behavior. Regarding the meaning:
+
+  + kgr_get_last_pf() looked for the last applied patch_fun and checked
+    the state KGR_PATCH_APPLIED.
+
+  + kgr_get_patch_fun() ignores states and is interested only into the patch
+    order. The search for KGR_PREVIOUS patch_fun stops when it meets the given
+    patch_fun, the check is done by pointer to the struct kgr_patch_fun.
+
+Regarding the behavior, the function is currently used only in
+four situations:
+
+  + initializing fops for new patch; it is used only for existing
+    symbols that are completely new or already applied; it means
+    the check for KGR_PATCH_APPLIED always passes; it will be
+    the same for the pointer check because the struct is new
+
+  + looking for old_ops when modifying patches. Also here it is
+    called only when KGR_PATCH_APPLIED always passes; it will
+    be the same with pointer because the pointer won't be
+    accessible from kgr_patches
+
+  + initializing fops in kgr_handle_patch_for_loaded_module();
+    we strictly need the previous patch here; it works by chance
+    because we set the KGR_PATCH_APPLIED state in the patches
+    in the right order; this is the tricky usage that could
+    break with further changes
+
+  + looking for old fops in kgr_handle_patch_for_loaded_module();
+    same situation as in the previous case
+
+Finally, note that only the KGR_PREVIOUS type is used now.
+
+Signed-off-by: Petr Mladek <pmladek@suse.cz>
+Acked-by: Jiri Kosina <jkosina@suse.cz>
+Reviewed-by: Miroslav Benes <mbenes@suse.cz>
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ kernel/kgraft.c | 86 +++++++++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 77 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/kgraft.c b/kernel/kgraft.c
+index 663c58a90a35..a9b9b45b9c50 100644
+--- a/kernel/kgraft.c
++++ b/kernel/kgraft.c
+@@ -368,29 +368,97 @@ static void kgr_handle_irqs(void)
+ 	schedule_on_each_cpu(kgr_handle_irq_cpu);
+ }
+ 
++/*
++ * There might be different variants of a function in different patches.
++ * The patches are stacked in the order in which they are added. The variant
++ * of a function from a newer patch takes precedence over the older variants
++ * and makes the older variants unused.
++ *
++ * There might be an interim time when two variants of the same function
++ * might be used by the system. Therefore we split the patches into two
++ * categories.
++ *
++ * One patch might be in progress. It is either being added or being reverted.
++ * In each case, there might be threads that are using the code from this patch
++ * and also threads that are using the old code. Where the old code is the
++ * original code or the code from the previous patch if any. This patch
++ * might be found in the variable kgr_patch.
++ *
++ * The other patches are finalized. It means that the whole system started
++ * using them at some point. Note that some parts of the patches might be
++ * unused when there appeared new variants in newer patches. Also some threads
++ * might already started using the patch in progress. Anyway, the finalized
++ * patches might be found in the list kgr_patches.
++ *
++ * When manipulating the patches, we need to search and check the right variant
++ * of a function on the stack. The following types are used to define
++ * the requested variant.
++ */
++enum kgr_find_type {
++	/*
++	 * Find previous function variant in respect to stacking. Take
++	 * into account even the patch in progress that is considered to be
++	 * on top of the stack.
++	 */
++	KGR_PREVIOUS,
++	/* Find the last finalized variant of the function on the stack. */
++	KGR_LAST_FINALIZED,
++	/*
++	 * Find the last variant of the function on the stack. Take into
++	 * account even the patch in progress.
++	 */
++	KGR_LAST_EXISTING,
++	/* Find the variant of the function _only_ in the patch in progress. */
++	KGR_IN_PROGRESS,
++	/*
++	 * This is the first unused find type. It can be used to check for
++	 * invalid value.
++	 */
++	KGR_LAST_TYPE
++};
++
++/*
++ * This function takes information about the patched function from the given
++ * struct kgr_patch_fun and tries to find the requested variant of the
++ * function. It returns NULL when the requested variant cannot be found.
++ */
+ static struct kgr_patch_fun *
+-kgr_get_last_pf(const struct kgr_patch_fun *patch_fun)
++kgr_get_patch_fun(const struct kgr_patch_fun *patch_fun,
++		  enum kgr_find_type type)
+ {
+ 	const char *name = patch_fun->name;
+-	struct kgr_patch_fun *pf, *last_pf = NULL;
++	struct kgr_patch_fun *pf, *found_pf = NULL;
+ 	struct kgr_patch *p;
+ 
++	if (type < 0 || type >= KGR_LAST_TYPE) {
++		pr_warn("kgr_get_patch_fun: invalid find type: %d\n", type);
++		return NULL;
++	}
++
++	if (kgr_patch && (type == KGR_IN_PROGRESS || type == KGR_LAST_EXISTING))
++		kgr_for_each_patch_fun(kgr_patch, pf)
++			if (!strcmp(pf->name, name))
++				return pf;
++
++	if (type == KGR_IN_PROGRESS)
++		goto out;
++
+ 	list_for_each_entry(p, &kgr_patches, list) {
+ 		kgr_for_each_patch_fun(p, pf) {
+-			if (pf->state != KGR_PATCH_APPLIED)
+-				continue;
++			if (type == KGR_PREVIOUS && pf == patch_fun)
++				goto out;
+ 
+ 			if (!strcmp(pf->name, name))
+-				last_pf = pf;
++				found_pf = pf;
+ 		}
+ 	}
+-
+-	return last_pf;
++out:
++	return found_pf;
+ }
+ 
+ static unsigned long kgr_get_old_fun(const struct kgr_patch_fun *patch_fun)
+ {
+-	struct kgr_patch_fun *pf = kgr_get_last_pf(patch_fun);
++	struct kgr_patch_fun *pf = kgr_get_patch_fun(patch_fun, KGR_PREVIOUS);
+ 
+ 	if (pf)
+ 		return ftrace_function_to_fentry((unsigned long)pf->new_fun);
+@@ -405,7 +473,7 @@ static unsigned long kgr_get_old_fun(const struct kgr_patch_fun *patch_fun)
+ static struct ftrace_ops *
+ kgr_get_old_fops(const struct kgr_patch_fun *patch_fun)
+ {
+-	struct kgr_patch_fun *pf = kgr_get_last_pf(patch_fun);
++	struct kgr_patch_fun *pf = kgr_get_patch_fun(patch_fun, KGR_PREVIOUS);
+ 
+ 	return pf ? &pf->ftrace_ops_fast : NULL;
+ }
+-- 
+2.2.1
+

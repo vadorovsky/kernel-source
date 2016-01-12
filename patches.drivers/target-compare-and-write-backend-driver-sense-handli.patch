@@ -1,0 +1,150 @@
+From 37a1f712b356c8561646131e38ae614bdc2c4eab Mon Sep 17 00:00:00 2001
+From: Mike Christie <michaelc@cs.wisc.edu>
+Date: Wed, 29 Jul 2015 04:23:49 -0500
+Subject: [PATCH] target: compare and write backend driver sense handling
+References: fate#318836
+Patch-mainline: Not yet, SES2 clustered LIO/RBD
+
+Currently, backend drivers seem to only fail IO with
+SAM_STAT_CHECK_CONDITION which gets us
+TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE.
+For compare and write support we will want to be able to fail with
+TCM_MISCOMPARE_VERIFY. This patch adds a new helper that allows backend
+drivers to fail with specific sense codes.
+
+It also allows the backend driver to set the miscompare offset.
+
+Signed-off-by: Mike Christie <michaelc@cs.wisc.edu>
+Acked-by: David Disseldorp <ddiss@suse.de>
+
+---
+ drivers/target/target_core_transport.c |   33 ++++++++++++++++++++++++++++-----
+ include/target/target_core_backend.h   |    1 +
+ include/target/target_core_base.h      |    5 ++++-
+ 3 files changed, 33 insertions(+), 6 deletions(-)
+
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -624,8 +624,7 @@ static void target_complete_failure_work
+ {
+ 	struct se_cmd *cmd = container_of(work, struct se_cmd, work);
+ 
+-	transport_generic_request_failure(cmd,
+-			TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE);
++	transport_generic_request_failure(cmd, cmd->sense_reason);
+ }
+ 
+ /*
+@@ -651,14 +650,15 @@ static unsigned char *transport_get_sens
+ 	return cmd->sense_buffer;
+ }
+ 
+-void target_complete_cmd(struct se_cmd *cmd, u8 scsi_status)
++static void __target_complete_cmd(struct se_cmd *cmd, u8 scsi_status,
++				  sense_reason_t sense_reason)
+ {
+ 	struct se_device *dev = cmd->se_dev;
+ 	int success = scsi_status == GOOD;
+ 	unsigned long flags;
+ 
+ 	cmd->scsi_status = scsi_status;
+-
++	cmd->sense_reason = sense_reason;
+ 
+ 	spin_lock_irqsave(&cmd->t_state_lock, flags);
+ 	cmd->transport_state &= ~CMD_T_BUSY;
+@@ -701,8 +701,22 @@ void target_complete_cmd(struct se_cmd *
+ 
+ 	queue_work(target_completion_wq, &cmd->work);
+ }
++
++void target_complete_cmd(struct se_cmd *cmd, u8 scsi_status)
++{
++	__target_complete_cmd(cmd, scsi_status, scsi_status ?
++			     TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE :
++			     TCM_NO_SENSE);
++}
+ EXPORT_SYMBOL(target_complete_cmd);
+ 
++void target_complete_cmd_with_sense(struct se_cmd *cmd,
++				    sense_reason_t sense_reason)
++{
++	__target_complete_cmd(cmd, SAM_STAT_CHECK_CONDITION, sense_reason);
++}
++EXPORT_SYMBOL(target_complete_cmd_with_sense);
++
+ void target_complete_cmd_with_length(struct se_cmd *cmd, u8 scsi_status, int length)
+ {
+ 	if (scsi_status == SAM_STAT_GOOD && length < cmd->data_length) {
+@@ -1635,6 +1649,7 @@ void transport_generic_request_failure(s
+ 	case TCM_LOGICAL_BLOCK_GUARD_CHECK_FAILED:
+ 	case TCM_LOGICAL_BLOCK_APP_TAG_CHECK_FAILED:
+ 	case TCM_LOGICAL_BLOCK_REF_TAG_CHECK_FAILED:
++	case TCM_MISCOMPARE_VERIFY:
+ 		break;
+ 	case TCM_OUT_OF_RESOURCES:
+ 		sense_reason = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+@@ -2619,12 +2634,19 @@ void transport_err_sector_info(unsigned
+ 	buffer[SPC_ADD_SENSE_LEN_OFFSET] = 0xc;
+ 	buffer[SPC_DESC_TYPE_OFFSET] = 0; /* Information */
+ 	buffer[SPC_ADDITIONAL_DESC_LEN_OFFSET] = 0xa;
+-	buffer[SPC_VALIDITY_OFFSET] = 0x80;
++	buffer[SPC_CMD_INFO_VALIDITY_OFFSET] = 0x80;
+ 
+ 	/* Descriptor Information: failing sector */
+ 	put_unaligned_be64(bad_sector, &buffer[12]);
+ }
+ 
++static void transport_err_sense_info(unsigned char *buffer, u32 info)
++{
++	buffer[SPC_INFO_VALIDITY_OFFSET] |= 0x80;
++	/* Sense Information */
++	put_unaligned_be32(info, &buffer[3]);
++}
++
+ int
+ transport_send_check_condition_and_sense(struct se_cmd *cmd,
+ 		sense_reason_t reason, int from_transport)
+@@ -2817,6 +2839,7 @@ transport_send_check_condition_and_sense
+ 		/* MISCOMPARE DURING VERIFY OPERATION */
+ 		buffer[SPC_ASC_KEY_OFFSET] = 0x1d;
+ 		buffer[SPC_ASCQ_KEY_OFFSET] = 0x00;
++		transport_err_sense_info(buffer, cmd->sense_info);
+ 		break;
+ 	case TCM_LOGICAL_BLOCK_GUARD_CHECK_FAILED:
+ 		/* CURRENT ERROR */
+--- a/include/target/target_core_backend.h
++++ b/include/target/target_core_backend.h
+@@ -60,6 +60,7 @@ int	transport_subsystem_register(struct
+ void	transport_subsystem_release(struct se_subsystem_api *);
+ 
+ void	target_complete_cmd(struct se_cmd *, u8);
++void	target_complete_cmd_with_sense(struct se_cmd *, sense_reason_t);
+ void	target_complete_cmd_with_length(struct se_cmd *, u8, int);
+ 
+ sense_reason_t	spc_parse_cdb(struct se_cmd *cmd, unsigned int *size);
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -35,11 +35,12 @@
+  */
+ #define TRANSPORT_SENSE_BUFFER			SCSI_SENSE_BUFFERSIZE
+ /* Used by transport_send_check_condition_and_sense() */
++#define SPC_INFO_VALIDITY_OFFSET		0
+ #define SPC_SENSE_KEY_OFFSET			2
+ #define SPC_ADD_SENSE_LEN_OFFSET		7
+ #define SPC_DESC_TYPE_OFFSET			8
+ #define SPC_ADDITIONAL_DESC_LEN_OFFSET		9
+-#define SPC_VALIDITY_OFFSET			10
++#define SPC_CMD_INFO_VALIDITY_OFFSET		10
+ #define SPC_ASC_KEY_OFFSET			12
+ #define SPC_ASCQ_KEY_OFFSET			13
+ #define TRANSPORT_IQN_LEN			224
+@@ -475,6 +476,8 @@ struct se_dif_v1_tuple {
+ };
+ 
+ struct se_cmd {
++	sense_reason_t		sense_reason;
++	u32			sense_info;
+ 	/* SAM response code being sent to initiator */
+ 	u8			scsi_status;
+ 	u8			scsi_asc;

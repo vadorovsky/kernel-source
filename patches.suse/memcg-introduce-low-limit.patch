@@ -1,0 +1,270 @@
+Subject: [PATCH] mm: memcg: introduce low_limit reclaim
+From: Michal Hocko <mhocko@suse.cz>
+Patch-mainline: never
+References: fate#312101
+
+This is an alternative to 241994ed8649 ("mm: memcontrol: default hierarchy
+interface for memory") which has introduced low along with other limits in the
+new cgroup (unified hierarchy) API. As this API is still in devel mode as of
+3.12 ()and even 4.0) I've decided to only pick up relevant parts from the above
+commit. The credit for the original code goes to Johannes Weiner
+<hannes@cmpxchg.org>.
+
+I have chosen to only take the low limit part from the new API as the high
+limit wasn't requested yet (but we will prepare kabi to allow its addition
+later on).
+
+The semantic of the low limit is exactly same as the upstream implementation.
+The only difference is the naming to prevent from any confusion. The knob which
+represents the limit is called low_limit_in_bytes to conform to the current
+naming.
+
+The low limit is defined as (quoting from the original patch):
+"
+memory.low configures the lower end of the cgroup's expected
+memory consumption range.  The kernel considers memory below that
+boundary to be a reserve - the minimum that the workload needs in
+order to make forward progress - and generally avoids reclaiming
+it, unless there is an imminent risk of entering an OOM situation.
+"
+
+The feature is disabled by default (set to 0) so it doesn't have any impact on
+the reclaim.  In our expected usecases the low limit will be configured to
+guard an important workload from an unrelated reclaim activity. If the memory
+consumption of a memcg is bellow then it doesn't get reclaimed and the memory
+pressure is conveyed to other memcgs.
+
+Although this adds an user visible API that will never be merged upstream
+this shouldn't be a problem for maintainability because the code implementing
+the feature and semantic is _the same_. The only thinkg to be aware of is to
+not mix low_limit_in_bytes and soft_limit_in_bytes inside one memcg. Such a
+setup is not supported and the kernel will complain about that in the log.
+
+Future products should move on to the new cgroup API once it gets stable. This
+will require to change other configuration knobs already so low_limit_in_bytes
+should make much of a difference.
+
+Please note that the soft limit is not compatible with the low limit and such
+a combination is not supported. The kernel will complain if this is attempted.
+
+Signed-off-by: Michal Hocko <mhocko@suse.cz>
+
+---
+ Documentation/cgroups/memory.txt |    7 ++++
+ include/linux/memcontrol.h       |    8 +++++
+ mm/memcontrol.c                  |   57 +++++++++++++++++++++++++++++++++++++++
+ mm/vmscan.c                      |   21 ++++++++++++--
+ 4 files changed, 90 insertions(+), 3 deletions(-)
+
+--- a/Documentation/cgroups/memory.txt
++++ b/Documentation/cgroups/memory.txt
+@@ -58,6 +58,7 @@ Brief summary of control files.
+ 				 (See 5.5 for details)
+  memory.limit_in_bytes		 # set/show limit of memory usage
+  memory.memsw.limit_in_bytes	 # set/show limit of memory+Swap usage
++ memory.low_limit_in_bytes	 # set/show low limit for reclaim protection
+  memory.failcnt			 # show the number of memory usage hits limits
+  memory.memsw.failcnt		 # show the number of memory+Swap hits limits
+  memory.max_usage_in_bytes	 # show max memory usage recorded
+@@ -246,6 +247,12 @@ The reclaim algorithm has not been modif
+ pages that are selected for reclaiming come from the per-cgroup LRU
+ list.
+ 
++A memcg might be protected from the reclaim by setting low_limit_in_bytes.
++Groups which are under this limit are excluded from the reclaim and the
++memory pressure is conveyed to other memcgs. If there is no memcg eligible
++for the reclaim because of the low limit, though, the limit is ignored
++before the OOM killer is invoked.
++
+ NOTE: Reclaim does not work for the root cgroup, since we cannot set any
+ limits on the root cgroup.
+ 
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -54,6 +54,8 @@ struct mem_cgroup_reclaim_cookie {
+ };
+ 
+ #ifdef CONFIG_MEMCG
++bool mem_cgroup_low(struct mem_cgroup *root, struct mem_cgroup *memcg);
++
+ int mem_cgroup_try_charge(struct page *page, struct mm_struct *mm,
+ 			  gfp_t gfp_mask, struct mem_cgroup **memcgp);
+ void mem_cgroup_commit_charge(struct page *page, struct mem_cgroup *memcg,
+@@ -181,6 +183,12 @@ void mem_cgroup_print_bad_page(struct pa
+ #else /* CONFIG_MEMCG */
+ struct mem_cgroup;
+ 
++static inline bool mem_cgroup_low(struct mem_cgroup *root,
++				  struct mem_cgroup *memcg)
++{
++	return false;
++}
++
+ static inline int mem_cgroup_try_charge(struct page *page, struct mm_struct *mm,
+ 					gfp_t gfp_mask,
+ 					struct mem_cgroup **memcgp)
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -248,6 +248,8 @@ struct mem_cgroup {
+ 	struct page_counter memsw;
+ 	struct page_counter kmem;
+ 
++	unsigned long low_limit;
++
+ 	unsigned long soft_limit;
+ 
+ 	/* vmpressure notifications */
+@@ -4219,6 +4221,7 @@ enum {
+ 	RES_MAX_USAGE,
+ 	RES_FAILCNT,
+ 	RES_SOFT_LIMIT,
++	RES_LOW_LIMIT,
+ };
+  
+ static ssize_t mem_cgroup_read(struct cgroup_subsys_state *css,
+@@ -4266,6 +4269,9 @@ static ssize_t mem_cgroup_read(struct cg
+ 	case RES_SOFT_LIMIT:
+ 		val = (u64)memcg->soft_limit * PAGE_SIZE;
+ 		break;
++	case RES_LOW_LIMIT:
++		val = (u64)memcg->low_limit * PAGE_SIZE;
++		break;
+ 	default:
+ 		BUG();
+ 	}
+@@ -4438,9 +4444,17 @@ static int mem_cgroup_write(struct cgrou
+ 		}
+ 		break;
+ 	case RES_SOFT_LIMIT:
++		WARN(nr_pages != PAGE_COUNTER_MAX && memcg->low_limit,
++				"Using soft limit with low limit is not supported.\n");
+ 		memcg->soft_limit = nr_pages;
+ 		ret = 0;
+ 		break;
++	case RES_LOW_LIMIT:
++		WARN(nr_pages && memcg->soft_limit != PAGE_COUNTER_MAX,
++				"Using soft limit with low limit is not supported.\n");
++		memcg->low_limit = nr_pages;
++		ret = 0;
++		break;
+ 	}
+ 	return ret;
+ }
+@@ -5110,6 +5124,12 @@ static struct cftype mem_cgroup_files[]
+ 		.read = mem_cgroup_read,
+ 	},
+ 	{
++		.name = "low_limit_in_bytes",
++		.private = MEMFILE_PRIVATE(_MEM, RES_LOW_LIMIT),
++		.write_string = mem_cgroup_write,
++		.read = mem_cgroup_read,
++	},
++	{
+ 		.name = "failcnt",
+ 		.private = MEMFILE_PRIVATE(_MEM, RES_FAILCNT),
+ 		.trigger = mem_cgroup_reset,
+@@ -6171,6 +6191,43 @@ static void __init enable_swap_cgroup(vo
+ }
+ #endif
+ 
++/**
++ * mem_cgroup_low - check if memory consumption is below the normal range
++ * @root: the highest ancestor to consider
++ * @memcg: the memory cgroup to check
++ *
++ * Returns %true if memory consumption of @memcg, and that of all
++ * configurable ancestors up to @root, is below the normal range.
++ */
++bool mem_cgroup_low(struct mem_cgroup *root, struct mem_cgroup *memcg)
++{
++	if (mem_cgroup_disabled())
++		return false;
++
++	/*
++	 * The toplevel group doesn't have a configurable range, so
++	 * it's never low when looked at directly, and it is not
++	 * considered an ancestor when assessing the hierarchy.
++	 */
++
++	if (memcg == root_mem_cgroup)
++		return false;
++
++	if (page_counter_read(&memcg->memory) > memcg->low_limit)
++		return false;
++
++	while (memcg != root) {
++		memcg = parent_mem_cgroup(memcg);
++
++		if (memcg == root_mem_cgroup)
++			break;
++
++		if (page_counter_read(&memcg->memory) > memcg->low_limit)
++			return false;
++	}
++	return true;
++}
++
+ #ifdef CONFIG_MEMCG_SWAP
+ /**
+  * mem_cgroup_swapout - transfer a memsw charge to swap
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -88,6 +88,9 @@ struct scan_control {
+ 	/* Can pages be swapped as part of reclaim? */
+ 	unsigned int may_swap:1;
+ 
++	/* Can cgroups be reclaimed below their normal consumption range? */
++	unsigned int may_thrash:1;
++
+ 	unsigned int hibernation_mode:1;
+ 
+ 	/* One of the zones is ready for compaction */
+@@ -2250,6 +2253,11 @@ static bool shrink_zone(struct zone *zon
+ 			struct lruvec *lruvec;
+ 			int swappiness;
+ 
++			if (mem_cgroup_low(root, memcg)) {
++				if (!sc->may_thrash)
++					continue;
++			}
++
+ 			lruvec = mem_cgroup_zone_lruvec(zone, memcg);
+ 			swappiness = mem_cgroup_swappiness(memcg);
+ 
+@@ -2270,8 +2278,7 @@ static bool shrink_zone(struct zone *zon
+ 				mem_cgroup_iter_break(root, memcg);
+ 				break;
+ 			}
+-			memcg = mem_cgroup_iter(root, memcg, &reclaim);
+-		} while (memcg);
++		} while ((memcg = mem_cgroup_iter(root, memcg, &reclaim)));
+ 
+ 		vmpressure(sc->gfp_mask, sc->target_mem_cgroup,
+ 			   sc->nr_scanned - nr_scanned,
+@@ -2471,10 +2478,11 @@ static bool shrink_zones(struct zonelist
+ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
+ 					  struct scan_control *sc)
+ {
++	int initial_priority = sc->priority;
+ 	unsigned long total_scanned = 0;
+ 	unsigned long writeback_threshold;
+ 	bool zones_reclaimable;
+-
++retry:
+ 	delayacct_freepages_start();
+ 
+ 	if (global_reclaim(sc))
+@@ -2524,6 +2532,13 @@ static unsigned long do_try_to_free_page
+ 	if (sc->compaction_ready)
+ 		return 1;
+ 
++	/* Untapped cgroup reserves?  Don't OOM, retry. */
++	if (!sc->may_thrash) {
++		sc->priority = initial_priority;
++		sc->may_thrash = 1;
++		goto retry;
++	}
++
+ 	/* Any of the zones still reclaimable?  Don't OOM. */
+ 	if (zones_reclaimable)
+ 		return 1;

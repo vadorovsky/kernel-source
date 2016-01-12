@@ -1,0 +1,220 @@
+From: Petr Mladek <pmladek@suse.cz>
+Date: Wed, 7 May 2014 15:21:56 +0200
+Subject: [RFC PATCH 09/11] printk: merge and flush NMI buffer predictably via IRQ
+ work
+Patch-mainline: Submitted, https://lkml.org/lkml/2014/5/9/143
+References: bnc#831949
+
+pmladek@suse.cz:
+This patch needed some modifications for SLED12 to avoid KABI changes.
+They were done using:
+
+    sed -i \
+	-e "s/struct printk_log \*/enum printk_log_type /g" \
+	-e "s/struct printk_msg/struct printk_log/g" \
+	-e "s/main_logbuf_lock/logbuf_lock/g" \
+	-e "s/nmi_log\.buf/nmi_log_buf/g" \
+	-e "s/&main_log/MAIN_LOG/g" \
+	-e "s/&nmi_log/NMI_LOG/g" \
+	-e "s/NMI_LOGbuf_lock/\&nmi_logbuf_lock/g" \
+	-e "s/main_log\.cont/\&main_cont/g" \
+	-e "s/msg_from_idx/log_from_idx/g" \
+	-e "s/get_dict/log_dict/g" \
+	-e "s/get_text/get_dict/g" \
+	-e "s/nmi_log\.nmi\.first_id/nmi_log_first_id/g" \
+	-e "s/nmi_log\.nmi\.next_id/nmi_log_next_id/g" \
+	orig.patch
+
+Then the second and the last hunk were merged manually. The difference was
+that we did not have the last commits that modified printk_sched()
+to printk_deferred().
+
+
+It might take ages until users see messages from NMI context. They cannot
+be flushed to the console because the operation involves taking and releasing
+a bunch of locks. If the main lock is not available then then messages are even
+temporary put into the NMI log buf. Everything gets fixed by the followup printk
+in normal context but it is not predictable.
+
+The same problem has printk_sched() and this patch reuses the existing solution.
+
+There is no special printk() variant for NMI context. Hence the IRQ work
+need to get queued from vprintk_emit(). This is why the functions are
+moved to the top of the source file and irq_work_queue() call is removed
+from printk_sched().
+
+In addition, wake_up_klogd_work_func() is extended to merge the NMI log buffer
+when needed.
+
+Oops messages are still merged and flushed immediately. We need to make sure
+that they are visible before the system dies.
+
+Signed-off-by: Petr Mladek <pmladek@suse.cz>
+---
+ kernel/printk/printk.c | 126 ++++++++++++++++++++++++++++---------------------
+ 1 file changed, 71 insertions(+), 55 deletions(-)
+
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@ -326,6 +326,10 @@ static u64 console_seq;
+ static u32 console_idx;
+ static enum log_flags console_prev;
+ 
++/* the next printk record to merge from NMI log buffer */
++static u64 nmi_merge_seq;
++static u32 nmi_merge_idx;
++
+ /* the next printk record to read after the last 'clear' command */
+ static u64 clear_seq;
+ static u32 clear_idx;
+@@ -1800,6 +1804,69 @@ static inline void printk_delay(void)
+ 	}
+ }
+ 
++/*
++ * Delayed printk version, for scheduler-internal messages:
++ */
++#define PRINTK_PENDING_WAKEUP	0x01
++#define PRINTK_PENDING_OUTPUT	0x02
++
++static DEFINE_PER_CPU(int, printk_pending);
++
++static void merge_nmi_delayed_printk(void);
++
++static void wake_up_klogd_work_func(struct irq_work *irq_work)
++{
++	int pending = __this_cpu_xchg(printk_pending, 0);
++	u64 nmi_next_id = ACCESS_ONCE(nmi_log_next_id);
++
++	/*
++	 * Check if there are any pending messages in NMI log buffer.
++	 * We do not need any lock. If new message are being added,
++	 * another IRQ work is automatically scheduled.
++	 */
++	if (ACCESS_ONCE(nmi_merge_seq) != seq_from_id(nmi_next_id)) {
++		raw_spin_lock(&logbuf_lock);
++		merge_nmi_delayed_printk();
++		raw_spin_unlock(&logbuf_lock);
++	}
++
++	if (pending & PRINTK_PENDING_OUTPUT) {
++		/* If trylock fails, someone else is doing the printing */
++		if (console_trylock())
++			console_unlock();
++	}
++
++	if (pending & PRINTK_PENDING_WAKEUP)
++		wake_up_interruptible(&log_wait);
++}
++
++static DEFINE_PER_CPU(struct irq_work, wake_up_klogd_work) = {
++	.func = wake_up_klogd_work_func,
++	.flags = IRQ_WORK_LAZY,
++};
++
++void wake_up_klogd(void)
++{
++	preempt_disable();
++	if (waitqueue_active(&log_wait)) {
++		this_cpu_or(printk_pending, PRINTK_PENDING_WAKEUP);
++		irq_work_queue(&__get_cpu_var(wake_up_klogd_work));
++	}
++	preempt_enable();
++}
++
++int printk_deferred(const char *fmt, ...)
++{
++	va_list args;
++	int r;
++
++	va_start(args, fmt);
++	r = vprintk_emit(0, SCHED_MESSAGE_LOGLEVEL, NULL, 0, fmt, args);
++	va_end(args);
++
++	return r;
++}
++
+ static void cont_flush(enum printk_log_type log, enum log_flags flags)
+ {
+ 	struct printk_cont *cont = get_cont(log);
+@@ -1989,8 +2056,6 @@ static int nmi_seq_is_invalid(u64 seq, u
+  */
+ static void merge_nmi_delayed_printk(void)
+ {
+-	static u64 nmi_merge_seq;
+-	static u32 nmi_merge_idx;
+ 	unsigned long nmi_first_id, nmi_next_id;
+ 	u32 old_main_next_idx;
+ 	u64 old_main_next_seq;
+@@ -2279,8 +2344,11 @@ asmlinkage int vprintk_emit(int facility
+ 	 * relevant locks have been forcefully dropped above. We have to try
+ 	 * to get the console, otherwise the last messages would get lost.
+ 	 */
+-	if (in_sched || (in_nmi() && !oops_in_progress))
++	if (in_sched || (in_nmi() && !oops_in_progress)) {
++		__this_cpu_or(printk_pending, PRINTK_PENDING_OUTPUT);
++		irq_work_queue(&__get_cpu_var(wake_up_klogd_work));
+ 		return printed_len;
++	}
+ 
+       	lockdep_off();
+       	/*
+@@ -3209,58 +3277,6 @@ late_initcall(printk_late_init);
+ 
+ #if defined CONFIG_PRINTK
+ /*
+- * Delayed printk version, for scheduler-internal messages:
+- */
+-#define PRINTK_PENDING_WAKEUP	0x01
+-#define PRINTK_PENDING_OUTPUT	0x02
+-
+-static DEFINE_PER_CPU(int, printk_pending);
+-
+-static void wake_up_klogd_work_func(struct irq_work *irq_work)
+-{
+-	int pending = __this_cpu_xchg(printk_pending, 0);
+-
+-	if (pending & PRINTK_PENDING_OUTPUT) {
+-		/* If trylock fails, someone else is doing the printing */
+-		if (console_trylock())
+-			console_unlock();
+-	}
+-
+-	if (pending & PRINTK_PENDING_WAKEUP)
+-		wake_up_interruptible(&log_wait);
+-}
+-
+-static DEFINE_PER_CPU(struct irq_work, wake_up_klogd_work) = {
+-	.func = wake_up_klogd_work_func,
+-	.flags = IRQ_WORK_LAZY,
+-};
+-
+-void wake_up_klogd(void)
+-{
+-	preempt_disable();
+-	if (waitqueue_active(&log_wait)) {
+-		this_cpu_or(printk_pending, PRINTK_PENDING_WAKEUP);
+-		irq_work_queue(&__get_cpu_var(wake_up_klogd_work));
+-	}
+-	preempt_enable();
+-}
+-
+-int printk_deferred(const char *fmt, ...)
+-{
+-	va_list args;
+-	int r;
+-
+-	va_start(args, fmt);
+-	r = vprintk_emit(0, SCHED_MESSAGE_LOGLEVEL, NULL, 0, fmt, args);
+-	va_end(args);
+-
+-	__this_cpu_or(printk_pending, PRINTK_PENDING_OUTPUT);
+-	irq_work_queue(&__get_cpu_var(wake_up_klogd_work));
+-
+-	return r;
+-}
+-
+-/*
+  * printk rate limiting, lifted from the networking subsystem.
+  *
+  * This enforces a rate limit: not more than 10 kernel messages

@@ -1,0 +1,169 @@
+From: Nathan Zimmer <nzimmer@sgi.com>
+Date: Fri, 11 Dec 2015 15:26:06 +1100
+Subject: mm/mempolicy.c: convert the shared_policy lock to a rwlock
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/mhocko/mm.git
+Git-commit: a48e974ef8b7e3eeaa0e8543a0a802f42f797c5a
+Git-commit: aafe33456929e825e85d1ff7d3c65738d5c5ed63
+References: VM Performance, bnc#959436
+
+When running the SPECint_rate gcc on some very large boxes it was noticed
+that the system was spending lots of time in mpol_shared_policy_lookup().
+The gamess benchmark can also show it and is what I mostly used to chase
+down the issue since the setup for that I found to be easier.
+
+To be clear the binaries were on tmpfs because of disk I/O requirements.
+We then used text replication to avoid icache misses and having all the
+copies banging on the memory where the instruction code resides.  This
+results in us hitting a bottleneck in mpol_shared_policy_lookup() since
+lookup is serialised by the shared_policy lock.
+
+I have only reproduced this on very large (3k+ cores) boxes.  The problem
+starts showing up at just a few hundred ranks getting worse until it
+threatens to livelock once it gets large enough.  For example on the
+gamess benchmark at 128 ranks this area consumes only ~1% of time, at 512
+ranks it consumes nearly 13%, and at 2k ranks it is over 90%.
+
+To alleviate the contention in this area I converted the spinlock to an
+rwlock.  This allows a large number of lookups to happen simultaneously.
+The results were quite good reducing this consumtion at max ranks to
+around 2%.
+
+Signed-off-by: Nathan Zimmer <nzimmer@sgi.com>
+Acked-by: David Rientjes <rientjes@google.com>
+Cc: Nadia Yvette Chambers <nyc@holomorphy.com>
+Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+---
+ fs/hugetlbfs/inode.c      |    2 +-
+ include/linux/mempolicy.h |    2 +-
+ mm/mempolicy.c            |   30 +++++++++++++++++-------------
+ 3 files changed, 19 insertions(+), 15 deletions(-)
+
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -492,7 +492,7 @@ static struct inode *hugetlbfs_get_inode
+ 		/*
+ 		 * The policy is initialized here even if we are creating a
+ 		 * private inode because initialization simply creates an
+-		 * an empty rb tree and calls spin_lock_init(), later when we
++		 * an empty rb tree and calls rwlock_init(), later when we
+ 		 * call mpol_free_shared_policy() it will just return because
+ 		 * the rb tree will still be empty.
+ 		 */
+--- a/include/linux/mempolicy.h
++++ b/include/linux/mempolicy.h
+@@ -122,7 +122,7 @@ struct sp_node {
+ 
+ struct shared_policy {
+ 	struct rb_root root;
+-	spinlock_t lock;
++	rwlock_t lock;
+ };
+ 
+ int vma_dup_policy(struct vm_area_struct *src, struct vm_area_struct *dst);
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -2212,12 +2212,14 @@ bool __mpol_equal(struct mempolicy *a, s
+  *
+  * Remember policies even when nobody has shared memory mapped.
+  * The policies are kept in Red-Black tree linked from the inode.
+- * They are protected by the sp->lock spinlock, which should be held
++ * They are protected by the sp->lock rwlock, which should be held
+  * for any accesses to the tree.
+  */
+ 
+-/* lookup first element intersecting start-end */
+-/* Caller holds sp->lock */
++/*
++ * lookup first element intersecting start-end.  Caller holds sp->lock for
++ * reading or for writing
++ */
+ static struct sp_node *
+ sp_lookup(struct shared_policy *sp, unsigned long start, unsigned long end)
+ {
+@@ -2248,8 +2250,10 @@ sp_lookup(struct shared_policy *sp, unsi
+ 	return rb_entry(n, struct sp_node, nd);
+ }
+ 
+-/* Insert a new shared policy into the list. */
+-/* Caller holds sp->lock */
++/*
++ * Insert a new shared policy into the list.  Caller holds sp->lock for
++ * writing.
++ */
+ static void sp_insert(struct shared_policy *sp, struct sp_node *new)
+ {
+ 	struct rb_node **p = &sp->root.rb_node;
+@@ -2281,13 +2285,13 @@ mpol_shared_policy_lookup(struct shared_
+ 
+ 	if (!sp->root.rb_node)
+ 		return NULL;
+-	spin_lock(&sp->lock);
++	read_lock(&sp->lock);
+ 	sn = sp_lookup(sp, idx, idx+1);
+ 	if (sn) {
+ 		mpol_get(sn->policy);
+ 		pol = sn->policy;
+ 	}
+-	spin_unlock(&sp->lock);
++	read_unlock(&sp->lock);
+ 	return pol;
+ }
+ 
+@@ -2502,7 +2506,7 @@ static int shared_policy_replace(struct
+ 	int ret = 0;
+ 
+ restart:
+-	spin_lock(&sp->lock);
++	write_lock(&sp->lock);
+ 	n = sp_lookup(sp, start, end);
+ 	/* Take care of old policies in the same range. */
+ 	while (n && n->start < end) {
+@@ -2535,7 +2539,7 @@ restart:
+ 	}
+ 	if (new)
+ 		sp_insert(sp, new);
+-	spin_unlock(&sp->lock);
++	write_unlock(&sp->lock);
+ 	ret = 0;
+ 
+ err_out:
+@@ -2547,7 +2551,7 @@ err_out:
+ 	return ret;
+ 
+ alloc_new:
+-	spin_unlock(&sp->lock);
++	write_unlock(&sp->lock);
+ 	ret = -ENOMEM;
+ 	n_new = kmem_cache_alloc(sn_cache, GFP_KERNEL);
+ 	if (!n_new)
+@@ -2573,7 +2577,7 @@ void mpol_shared_policy_init(struct shar
+ 	int ret;
+ 
+ 	sp->root = RB_ROOT;		/* empty tree == default mempolicy */
+-	spin_lock_init(&sp->lock);
++	rwlock_init(&sp->lock);
+ 
+ 	if (mpol) {
+ 		struct vm_area_struct pvma;
+@@ -2639,14 +2643,14 @@ void mpol_free_shared_policy(struct shar
+ 
+ 	if (!p->root.rb_node)
+ 		return;
+-	spin_lock(&p->lock);
++	write_lock(&p->lock);
+ 	next = rb_first(&p->root);
+ 	while (next) {
+ 		n = rb_entry(next, struct sp_node, nd);
+ 		next = rb_next(&n->nd);
+ 		sp_delete(p, n);
+ 	}
+-	spin_unlock(&p->lock);
++	write_unlock(&p->lock);
+ }
+ 
+ #ifdef CONFIG_NUMA_BALANCING

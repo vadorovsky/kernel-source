@@ -1,0 +1,130 @@
+From: Jon Derrick <jonathan.derrick@intel.com>
+Date: Wed, 10 Jun 2015 10:41:30 -0600
+Subject: [PATCH] NVMe: Stripe queue IRQ vector assignments
+Patch-mainline: Never, in nvme-legacy repository
+Git-commit: e29e0f239889ab4d66ed025041391e28a262e434
+Git-repo: http://git.infradead.org/users/kbusch/nvme-legacy.git
+References: bsc#948374
+
+This patch will stripe io queue IRQ vector assignments across the
+available vector resources. This also changes the current implementation
+which reduces the number of io queues to the number of vectors enabled.
+This fixes another issue where the admin queue and io queue 0 were
+unnecessarily sharing an vector.
+
+The benefits of this are two-fold:
+a) There is a known issue in one controller where irq coalescing cannot
+occur on vectors to which the admin queue is assigned. This patch assigns
+the admin queue its own vector, as long as there are enough vectors
+available to assign one to each io queue and the admin queue.
+b) If a suitable number of vector resources cannot be acquired to match
+the number of io queues, the current implementation will reduce the
+number of io queues. There is a likely performance benefit to keeping
+the number of io queues equal to the number of possible cpus, even if
+the vectors have to be shared among the queues.
+
+Signed-off-by: Jon Derrick <jonathan.derrick@intel.com>
+Signed-off-by: Keith Busch <keith.busch@intel.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/block/nvme-core.c |   27 +++++++++++++++++----------
+ include/linux/nvme.h      |    1 +
+ 2 files changed, 18 insertions(+), 10 deletions(-)
+
+--- a/drivers/block/nvme-core.c
++++ b/drivers/block/nvme-core.c
+@@ -1367,7 +1367,7 @@ static void nvme_disable_queue(struct nv
+ }
+ 
+ static struct nvme_queue *nvme_alloc_queue(struct nvme_dev *dev, int qid,
+-							int depth, int vector)
++							int depth)
+ {
+ 	struct device *dmadev = &dev->pci_dev->dev;
+ 	unsigned extra = nvme_queue_extra(depth);
+@@ -1401,7 +1401,6 @@ static struct nvme_queue *nvme_alloc_que
+ 	INIT_LIST_HEAD(&nvmeq->iod_bio);
+ 	nvmeq->q_db = &dev->dbs[qid * 2 * dev->db_stride];
+ 	nvmeq->q_depth = depth;
+-	nvmeq->cq_vector = vector;
+ 	nvmeq->qid = qid;
+ 	nvmeq->q_suspended = 1;
+ 	dev->queue_count++;
+@@ -1455,6 +1454,7 @@ static int nvme_create_queue(struct nvme
+ 	struct nvme_dev *dev = nvmeq->dev;
+ 	int result;
+ 
++	nvmeq->cq_vector = qid % dev->vec_count;
+ 	result = adapter_alloc_cq(dev, qid, nvmeq);
+ 	if (result < 0)
+ 		return result;
+@@ -1579,7 +1579,7 @@ static int nvme_configure_admin_queue(st
+ 
+ 	nvmeq = raw_nvmeq(dev, 0);
+ 	if (!nvmeq) {
+-		nvmeq = nvme_alloc_queue(dev, 0, 256, 0);
++		nvmeq = nvme_alloc_queue(dev, 0, 256);
+ 		if (!nvmeq)
+ 			return -ENOMEM;
+ 	}
+@@ -2191,7 +2191,7 @@ static void nvme_create_io_queues(struct
+ 
+ 	max = min(dev->max_qid, num_online_cpus());
+ 	for (i = dev->queue_count; i <= max; i++)
+-		if (!nvme_alloc_queue(dev, i, dev->q_depth, i - 1))
++		if (!nvme_alloc_queue(dev, i, dev->q_depth))
+ 			break;
+ 
+ 	max = min(dev->queue_count - 1, num_online_cpus());
+@@ -2367,11 +2367,18 @@ static int nvme_setup_io_queues(struct n
+ 	if (!pdev->irq)
+ 		pci_disable_msix(pdev);
+ 
+-	for (i = 0; i < nr_io_queues; i++)
++	/*
++	 * If we enable msix early due to not intx, disable it again before
++	 * setting up the full range we need.
++	 */
++	if (!pdev->irq)
++		pci_disable_msix(pdev);
++
++	for (i = 0; i <= nr_io_queues; i++)
+ 		dev->entry[i].entry = i;
+-	vecs = pci_enable_msix_range(pdev, dev->entry, 1, nr_io_queues);
++	vecs = pci_enable_msix_range(pdev, dev->entry, 1, nr_io_queues + 1);
+ 	if (vecs < 0) {
+-		vecs = pci_enable_msi_range(pdev, 1, min(nr_io_queues, 32));
++		vecs = pci_enable_msi_range(pdev, 1, min(nr_io_queues + 1, 32));
+ 		if (vecs < 0) {
+ 			vecs = 1;
+ 		} else {
+@@ -2386,7 +2393,7 @@ static int nvme_setup_io_queues(struct n
+ 	 * path to scale better, even if the receive path is limited by the
+ 	 * number of interrupts.
+ 	 */
+-	nr_io_queues = vecs;
++	dev->vec_count = vecs;
+ 	dev->max_qid = nr_io_queues;
+ 
+ 	result = queue_request_irq(dev, adminq, adminq->irqname);
+@@ -3048,8 +3055,8 @@ static int nvme_probe(struct pci_dev *pd
+ 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+ 	if (!dev)
+ 		return -ENOMEM;
+-	dev->entry = kcalloc(num_possible_cpus(), sizeof(*dev->entry),
+-								GFP_KERNEL);
++	dev->entry = kzalloc((num_possible_cpus() + 1) * sizeof(*dev->entry),
++							GFP_KERNEL);
+ 	if (!dev->entry)
+ 		goto free;
+ 	dev->queues = kcalloc(num_possible_cpus() + 1, sizeof(void *),
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -76,6 +76,7 @@ struct nvme_dev {
+ 	struct dma_pool *prp_small_pool;
+ 	int instance;
+ 	unsigned queue_count;
++	unsigned vec_count;
+ 	unsigned online_queues;
+ 	unsigned max_qid;
+ 	int q_depth;
