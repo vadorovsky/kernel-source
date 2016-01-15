@@ -1,0 +1,153 @@
+From: Hidehiro Kawai <hidehiro.kawai.ez@hitachi.com>
+Date: Mon, 14 Dec 2015 11:19:13 +0100
+Subject: x86/nmi: Save regs in crash dump on external NMI
+Git-commit: b279d67df88a49c6ca32b3eebd195660254be394
+Patch-mainline: v4.5-rc1
+References: bsc#940946, bsc#937444
+
+Now, multiple CPUs can receive an external NMI simultaneously by
+specifying the "apic_extnmi=all" command line parameter. When we take
+a crash dump by using external NMI with this option, we fail to save
+registers into the crash dump. This happens as follows:
+
+  CPU 0                              CPU 1
+  ================================   =============================
+  receive an external NMI
+  default_do_nmi()                   receive an external NMI
+    spin_lock(&nmi_reason_lock)      default_do_nmi()
+    io_check_error()                   spin_lock(&nmi_reason_lock)
+      panic()                            busy loop
+      ...
+        kdump_nmi_shootdown_cpus()
+          issue NMI IPI -----------> blocked until IRET
+                                         busy loop...
+
+Here, since CPU 1 is in NMI context, an additional NMI from CPU 0
+remains unhandled until CPU 1 IRETs. However, CPU 1 will never execute
+IRET so the NMI is not handled and the callback function to save
+registers is never called.
+
+To solve this issue, we check if the IPI for crash dumping was issued
+while waiting for nmi_reason_lock to be released, and if so, call its
+callback function directly. If the IPI is not issued (e.g. kdump is
+disabled), the actual behavior doesn't change.
+
+Signed-off-by: Hidehiro Kawai <hidehiro.kawai.ez@hitachi.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Dave Young <dyoung@redhat.com>
+Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Jiang Liu <jiang.liu@linux.intel.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: kexec@lists.infradead.org
+Cc: linux-doc@vger.kernel.org
+Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stefan Lippers-Hollmann <s.l-h@gmx.de>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vivek Goyal <vgoyal@redhat.com>
+Cc: x86-ml <x86@kernel.org>
+Link: http://lkml.kernel.org/r/20151210065245.4587.39316.stgit@softrs
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+---
+ arch/x86/include/asm/reboot.h |  1 +
+ arch/x86/kernel/nmi.c         | 16 ++++++++++++++--
+ arch/x86/kernel/reboot.c      | 24 +++++++++++++++++-------
+ 3 files changed, 32 insertions(+), 9 deletions(-)
+
+diff --git a/arch/x86/include/asm/reboot.h b/arch/x86/include/asm/reboot.h
+index a82c4f1b4d83..2cb1cc253d51 100644
+--- a/arch/x86/include/asm/reboot.h
++++ b/arch/x86/include/asm/reboot.h
+@@ -25,5 +25,6 @@ void __noreturn machine_real_restart(unsigned int type);
+ 
+ typedef void (*nmi_shootdown_cb)(int, struct pt_regs*);
+ void nmi_shootdown_cpus(nmi_shootdown_cb callback);
++void run_crash_ipi_callback(struct pt_regs *regs);
+ 
+ #endif /* _ASM_X86_REBOOT_H */
+diff --git a/arch/x86/kernel/nmi.c b/arch/x86/kernel/nmi.c
+index 424aec4a4c71..8a2cdd736fa4 100644
+--- a/arch/x86/kernel/nmi.c
++++ b/arch/x86/kernel/nmi.c
+@@ -29,6 +29,7 @@
+ #include <asm/mach_traps.h>
+ #include <asm/nmi.h>
+ #include <asm/x86_init.h>
++#include <asm/reboot.h>
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/nmi.h>
+@@ -356,8 +357,19 @@ static void default_do_nmi(struct pt_regs *regs)
+ 		return;
+ 	}
+ 
+-	/* Non-CPU-specific NMI: NMI sources can be processed on any CPU */
+-	raw_spin_lock(&nmi_reason_lock);
++	/*
++	 * Non-CPU-specific NMI: NMI sources can be processed on any CPU.
++	 *
++	 * Another CPU may be processing panic routines while holding
++	 * nmi_reason_lock. Check if the CPU issued the IPI for crash dumping,
++	 * and if so, call its callback directly.  If there is no CPU preparing
++	 * crash dump, we simply loop here.
++	 */
++	while (!raw_spin_trylock(&nmi_reason_lock)) {
++		run_crash_ipi_callback(regs);
++		cpu_relax();
++	}
++
+ 	reason = x86_platform.get_nmi_reason();
+ 
+ 	if (reason & NMI_REASON_MASK) {
+diff --git a/arch/x86/kernel/reboot.c b/arch/x86/kernel/reboot.c
+index 1da13022d544..d64889aa2d46 100644
+--- a/arch/x86/kernel/reboot.c
++++ b/arch/x86/kernel/reboot.c
+@@ -793,17 +793,23 @@ void nmi_shootdown_cpus(nmi_shootdown_cb callback)
+ 	/* Leave the nmi callback set */
+ }
+ 
++/*
++ * Check if the crash dumping IPI got issued and if so, call its callback
++ * directly. This function is used when we have already been in NMI handler.
++ * It doesn't return.
++ */
++void run_crash_ipi_callback(struct pt_regs *regs)
++{
++	if (crash_ipi_issued)
++		crash_nmi_callback(0, regs);
++}
++
+ /* Override the weak function in kernel/panic.c */
+ void nmi_panic_self_stop(struct pt_regs *regs)
+ {
+ 	while (1) {
+-		/*
+-		 * Wait for the crash dumping IPI to be issued, and then
+-		 * call its callback directly.
+-		 */
+-		if (READ_ONCE(crash_ipi_issued))
+-			crash_nmi_callback(0, regs); /* Don't return */
+-
++		/* If no CPU is preparing crash dump, we simply loop here. */
++		run_crash_ipi_callback(regs);
+ 		cpu_relax();
+ 	}
+ }
+@@ -813,4 +819,8 @@ void nmi_shootdown_cpus(nmi_shootdown_cb callback)
+ {
+ 	/* No other CPUs to shoot down */
+ }
++
++void run_crash_ipi_callback(struct pt_regs *regs)
++{
++}
+ #endif
+
