@@ -1,0 +1,2742 @@
+From: Linux Kernel Mailing List <linux-kernel@vger.kernel.org>
+Subject: xen: Linux: 4.4
+Patch-mainline: Never, SUSE-Xen specific
+
+ This patch contains the differences between 4.3 and 4.4.
+
+Automatically created from "patch-4.4" by xen-port-patches.py
+Acked-by: jbeulich@suse.com
+
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@ -351,7 +351,7 @@ __visible inline void syscall_return_slo
+  * in workloads that use it, and it's usually called from
+  * do_fast_syscall_32, so forcibly inline it to improve performance.
+  */
+-#ifdef CONFIG_X86_32
++#if defined(CONFIG_X86_32) || defined(CONFIG_XEN)
+ /* 32-bit kernels use a trap gate for INT80, and the asm code calls here. */
+ __visible
+ #else
+@@ -393,7 +393,7 @@ __always_inline void do_syscall_32_irqs_
+ 	syscall_return_slowpath(regs);
+ }
+ 
+-#ifdef CONFIG_X86_64
++#if defined(CONFIG_X86_64) && !defined(CONFIG_XEN)
+ /* Handles INT80 on 64-bit kernels */
+ __visible void do_syscall_32_irqs_off(struct pt_regs *regs)
+ {
+@@ -425,7 +425,9 @@ __visible long do_fast_syscall_32(struct
+ 	 *
+ 	 * WARNING: We are in CONTEXT_USER and RCU isn't paying attention!
+ 	 */
++#ifndef CONFIG_X86_64_XEN
+ 	local_irq_enable();
++#endif
+ 	if (
+ #ifdef CONFIG_X86_64
+ 		/*
+@@ -453,7 +455,9 @@ __visible long do_fast_syscall_32(struct
+ 	/* Now this is just like a normal syscall. */
+ 	do_syscall_32_irqs_on(regs);
+ 
+-#ifdef CONFIG_X86_64
++#if defined(CONFIG_X86_64_XEN)
++	return 0;
++#elif defined(CONFIG_X86_64)
+ 	/*
+ 	 * Opportunistic SYSRETL: if possible, try to return using SYSRETL.
+ 	 * SYSRETL is available on all 64-bit CPUs, so we don't need to
+--- a/arch/x86/entry/entry_32-xen.S
++++ b/arch/x86/entry/entry_32-xen.S
+@@ -3,7 +3,7 @@
+  *
+  * entry_32.S contains the system-call and low-level fault and trap handling routines.
+  *
+- * Stack layout in 'syscall_exit':
++ * Stack layout while running C code:
+  *	ptrace needs to have all registers on the stack.
+  *	If the order here is changed, it needs to be
+  *	updated in fork.c:copy_process(), signal.c:do_signal(),
+@@ -157,13 +157,13 @@ NMI_MASK	= 0x80000000
+ 
+ #endif /* CONFIG_X86_32_LAZY_GS */
+ 
+-.macro SAVE_ALL
++.macro SAVE_ALL pt_regs_ax=%eax
+ 	cld
+ 	PUSH_GS
+ 	pushl	%fs
+ 	pushl	%es
+ 	pushl	%ds
+-	pushl	%eax
++	pushl	\pt_regs_ax
+ 	pushl	%ebp
+ 	pushl	%edi
+ 	pushl	%esi
+@@ -215,7 +215,11 @@ ENTRY(ret_from_fork)
+ 	popl	%eax
+ 	pushl	$0x0202				# Reset kernel eflags
+ 	popfl
+-	jmp	syscall_exit
++
++	/* When we fork, we trace the syscall return in the child, too. */
++	movl    %esp, %eax
++	call    syscall_return_slowpath
++	jmp     restore_all
+ END(ret_from_fork)
+ 
+ ENTRY(ret_from_kernel_thread)
+@@ -228,7 +232,15 @@ ENTRY(ret_from_kernel_thread)
+ 	movl	PT_EBP(%esp), %eax
+ 	call	*PT_EBX(%esp)
+ 	movl	$0, PT_EAX(%esp)
+-	jmp	syscall_exit
++
++	/*
++	 * Kernel threads return to userspace as if returning from a syscall.
++	 * We should check whether anything actually uses this path and, if so,
++	 * consider switching it over to ret_from_fork.
++	 */
++	movl    %esp, %eax
++	call    syscall_return_slowpath
++	jmp     restore_all
+ ENDPROC(ret_from_kernel_thread)
+ 
+ /*
+@@ -259,7 +271,6 @@ ret_from_intr:
+ 	jb	resume_kernel			# not returning to v8086 or userspace
+ 
+ ENTRY(resume_userspace)
+-	LOCKDEP_SYS_EXIT
+ 	DISABLE_INTERRUPTS(CLBR_ANY)
+ 	TRACE_IRQS_OFF
+ 	movl	%esp, %eax
+@@ -280,76 +291,48 @@ need_resched:
+ END(resume_kernel)
+ #endif
+ 
+-/*
+- * SYSENTER_RETURN points to after the SYSENTER instruction
+- * in the vsyscall page.  See vsyscall-sysentry.S, which defines
+- * the symbol.
+- */
+-
+ 	# SYSENTER  call handler stub
+ ENTRY(entry_SYSENTER_32)
+ 	movl	SYSENTER_stack_sp0(%esp), %esp
+ sysenter_past_esp:
++	pushl	$__USER_DS		/* pt_regs->ss */
++	pushl	%ebp			/* pt_regs->sp (stashed in bp) */
++	pushfl				/* pt_regs->flags (except IF = 0) */
++	orl	$X86_EFLAGS_IF, (%esp)	/* Fix IF */
++	pushl	$__USER_CS		/* pt_regs->cs */
++	pushl	$0			/* pt_regs->ip = 0 (placeholder) */
++	pushl	%eax			/* pt_regs->orig_ax */
++	SAVE_ALL pt_regs_ax=$-ENOSYS	/* save rest */
++
+ 	/*
+-	 * Interrupts are disabled here, but we can't trace it until
+-	 * enough kernel state to call TRACE_IRQS_OFF can be called - but
+-	 * we immediately enable interrupts at that point anyway.
+-	 */
+-	pushl	$__USER_DS
+-	pushl	%ebp
+-	pushfl
+-	orl	$X86_EFLAGS_IF, (%esp)
+-	pushl	$__USER_CS
+-	/*
+-	 * Push current_thread_info()->sysenter_return to the stack.
+-	 * A tiny bit of offset fixup is necessary: TI_sysenter_return
+-	 * is relative to thread_info, which is at the bottom of the
+-	 * kernel stack page.  4*4 means the 4 words pushed above;
+-	 * TOP_OF_KERNEL_STACK_PADDING takes us to the top of the stack;
+-	 * and THREAD_SIZE takes us to the bottom.
++	 * User mode is traced as though IRQs are on, and SYSENTER
++	 * turned them off.
+ 	 */
+-	pushl	((TI_sysenter_return) - THREAD_SIZE + TOP_OF_KERNEL_STACK_PADDING + 4*4)(%esp)
+-
+-	pushl	%eax
+-	SAVE_ALL
+-	ENABLE_INTERRUPTS(CLBR_NONE)
+-
+-/*
+- * Load the potential sixth argument from user stack.
+- * Careful about security.
+- */
+-	cmpl	$__PAGE_OFFSET-3, %ebp
+-	jae	syscall_fault
+-	ASM_STAC
+-1:	movl	(%ebp), %ebp
+-	ASM_CLAC
+-	movl	%ebp, PT_EBP(%esp)
+-	_ASM_EXTABLE(1b, syscall_fault)
+-
+-	GET_THREAD_INFO(%ebp)
+-
+-	testl	$_TIF_WORK_SYSCALL_ENTRY, TI_flags(%ebp)
+-	jnz	syscall_trace_entry
+-sysenter_do_call:
+-	cmpl	$(NR_syscalls), %eax
+-	jae	sysenter_badsys
+-	call	*sys_call_table(, %eax, 4)
+-sysenter_after_call:
+-	movl	%eax, PT_EAX(%esp)
+-	LOCKDEP_SYS_EXIT
+-	DISABLE_INTERRUPTS(CLBR_ANY)
+ 	TRACE_IRQS_OFF
+-	movl	TI_flags(%ebp), %ecx
+-	testl	$_TIF_ALLWORK_MASK, %ecx
+-	jnz	syscall_exit_work_irqs_off
+-sysenter_exit:
+-/* if something modifies registers it must also disable sysexit */
+-	movl	PT_EIP(%esp), %edx
+-	movl	PT_OLDESP(%esp), %ecx
+-	xorl	%ebp, %ebp
+-	TRACE_IRQS_ON
++
++	movl	%esp, %eax
++	call	do_fast_syscall_32
++	/* XEN PV guests always use IRET path */
++	ALTERNATIVE "testl %eax, %eax; jz .Lsyscall_32_done", \
++		    "jmp .Lsyscall_32_done", X86_FEATURE_XENPV
++
++/* Opportunistic SYSEXIT */
++	TRACE_IRQS_ON			/* User mode traces as IRQs on. */
++	movl	PT_EIP(%esp), %edx	/* pt_regs->ip */
++	movl	PT_OLDESP(%esp), %ecx	/* pt_regs->sp */
+ 1:	mov	PT_FS(%esp), %fs
+ 	PTGS_TO_GS
++	popl	%ebx			/* pt_regs->bx */
++	addl	$2*4, %esp		/* skip pt_regs->cx and pt_regs->dx */
++	popl	%esi			/* pt_regs->si */
++	popl	%edi			/* pt_regs->di */
++	popl	%ebp			/* pt_regs->bp */
++	popl	%eax			/* pt_regs->ax */
++
++	/*
++	 * Return back to the vDSO, which will pop ecx and edx.
++	 * Don't bother with DS and ES (they already contain __USER_DS).
++	 */
+ 	ENABLE_INTERRUPTS_SYSEXIT
+ 
+ .pushsection .fixup, "ax"
+@@ -363,43 +346,33 @@ ENDPROC(entry_SYSENTER_32)
+ 	# pv sysenter call handler stub
+ ENTRY(entry_SYSENTER_PV32)
+ 	ASM_CLAC
++	movl	%ecx, 12(%esp)
++.Lentry_SYS_PV32:
+ 	movl	$__USER_DS, 16(%esp)
+-	movl	%ebp, 12(%esp)
+ 	movl	$__USER_CS, 4(%esp)
+-	addl	$4, %esp
+-	/* +5*4 is SS:ESP,EFLAGS,CS:EIP. +8 is esp0 setting. */
+-	pushl	TI_sysenter_return-THREAD_SIZE+8+4*4(%esp)
+-/*
+- * Load the potential sixth argument from user stack.
+- * Careful about security.
+- */
+-	cmpl	$__PAGE_OFFSET-3, %ebp
+-	jae	syscall_fault
+-	ASM_STAC
+-1:	movl	(%ebp), %ebp
+-	ASM_CLAC
+-	_ASM_EXTABLE(1b,syscall_fault)
+-	jmp	entry_INT80_32
++	pushl	%eax			/* pt_regs->orig_ax */
++	SAVE_ALL pt_regs_ax=$-ENOSYS	/* save rest */
++
++	movl	%esp, %eax
++	call	do_fast_syscall_32
++	jmp	.Lsyscall_32_done
+ ENDPROC(entry_SYSENTER_PV32)
+ 
+ 	# system call handler stub
+ ENTRY(entry_INT80_32)
+ 	ASM_CLAC
+-	pushl	%eax				# save orig_eax
+-	SAVE_ALL
+-	GET_THREAD_INFO(%ebp)
+-						# system call tracing in operation / emulation
+-	testl	$_TIF_WORK_SYSCALL_ENTRY, TI_flags(%ebp)
+-	jnz	syscall_trace_entry
+-	cmpl	$(NR_syscalls), %eax
+-	jae	syscall_badsys
+-syscall_call:
+-	call	*sys_call_table(, %eax, 4)
+-syscall_after_call:
+-	movl	%eax, PT_EAX(%esp)		# store the return value
+-syscall_exit:
+-	LOCKDEP_SYS_EXIT
+-	jmp	syscall_exit_work
++	pushl	%eax			/* pt_regs->orig_ax */
++	SAVE_ALL pt_regs_ax=$-ENOSYS	/* save rest */
++
++	/*
++	 * User mode is traced as though IRQs are on.  Unlike the 64-bit
++	 * case, INT80 is a trap gate on 32-bit kernels, so interrupts
++	 * are already on (unless user code is messing around with iopl).
++	 */
++
++	movl	%esp, %eax
++	call	do_syscall_32_irqs_on
++.Lsyscall_32_done:
+ 
+ restore_all:
+ 	TRACE_IRQS_IRET
+@@ -507,47 +480,6 @@ hypervisor_iret:
+ #endif
+ ENDPROC(entry_INT80_32)
+ 
+-	# perform syscall exit tracing
+-	ALIGN
+-syscall_trace_entry:
+-	movl	$-ENOSYS, PT_EAX(%esp)
+-	movl	%esp, %eax
+-	call	syscall_trace_enter
+-	/* What it returned is what we'll actually use.  */
+-	cmpl	$(NR_syscalls), %eax
+-	jnae	syscall_call
+-	jmp	syscall_exit
+-END(syscall_trace_entry)
+-
+-	# perform syscall exit tracing
+-	ALIGN
+-syscall_exit_work_irqs_off:
+-	TRACE_IRQS_ON
+-	ENABLE_INTERRUPTS(CLBR_ANY)
+-
+-syscall_exit_work:
+-	movl	%esp, %eax
+-	call	syscall_return_slowpath
+-	jmp	restore_all
+-END(syscall_exit_work)
+-
+-syscall_fault:
+-	ASM_CLAC
+-	GET_THREAD_INFO(%ebp)
+-	movl	$-EFAULT, PT_EAX(%esp)
+-	jmp	resume_userspace
+-END(syscall_fault)
+-
+-syscall_badsys:
+-	movl	$-ENOSYS, %eax
+-	jmp	syscall_after_call
+-END(syscall_badsys)
+-
+-sysenter_badsys:
+-	movl	$-ENOSYS, %eax
+-	jmp	sysenter_after_call
+-END(sysenter_badsys)
+-
+ #ifndef CONFIG_XEN
+ .macro FIXUP_ESPFIX_STACK
+ /*
+@@ -1061,121 +993,12 @@ return_to_handler:
+ 	jmp	*%ecx
+ #endif
+ 
+-#ifdef TIF_CSTAR
++#ifdef CONFIG_CPU_SUP_AMD
+ 	# pv syscall call handler stub
+ ENTRY(entry_SYSCALL_PV32)
+ 	ASM_CLAC
+-	movl	$__USER_DS, 16(%esp)
+-	movl	%ebp, %ecx
+-	movl	$__USER_CS, 4(%esp)
+-	movl	12(%esp), %ebp
+-	pushl	%eax				# save orig_eax
+-/*
+- * Load the potential sixth argument from user stack.
+- * Careful about security.
+- */
+-	cmpl	$__PAGE_OFFSET-4, %ebp
+-	ja	cstar_fault
+-	ASM_STAC
+-1:	movl	(%ebp), %ebp
+-	ASM_CLAC
+-	_ASM_EXTABLE(1b,cstar_fault)
+-	SAVE_ALL
+-	GET_THREAD_INFO(%ebp)
+-	testl	$_TIF_WORK_SYSCALL_ENTRY, TI_flags(%ebp)
+-	jnz	cstar_trace_entry
+-	cmpl	$NR_syscalls, %eax
+-	jae	cstar_badsys
+-.Lcstar_call:
+-	btl	%eax, cstar_special
+-	jc	.Lcstar_special
+-	call	*cstar_call_table(,%eax,4)
+-.Lcstar_after_call:
+-	movl	%eax, PT_EAX(%esp)		# store the return value
+-.Lcstar_exit:
+-	movl	PT_ECX(%esp), %ecx
+-	movl	%ecx, PT_EBP(%esp)		# put user EBP back in place
+-	jmp	syscall_exit
+-.Lcstar_special:
+-	movl	PT_ECX(%esp), %ecx
+-	movl	%ecx,PT_EBP(%esp)		# put user EBP back in place
+-	jmp	syscall_call
+-GLOBAL(cstar_set_tif)
+-	movl	$cstar_clear_tif, (%esp)	# replace return address
+-	LOCK_PREFIX
+-	orl	$_TIF_CSTAR, TI_flags(%ebp)
+-	jmp	*sys_call_table(,%eax,4)
+-cstar_clear_tif:
+-	LOCK_PREFIX
+-	andl	$~_TIF_CSTAR, TI_flags(%ebp)
+-	jmp	.Lcstar_after_call
+-cstar_trace_entry:
+-	movl	$-ENOSYS, PT_EAX(%esp)
+-	cmpl	$NR_syscalls, %eax
+-	jae	1f
+-	btl	%eax, cstar_special
+-	jc	.Lcstar_trace_special
+-1:	movl	%esp, %eax
+-	LOCK_PREFIX
+-	orl	$_TIF_CSTAR, TI_flags(%ebp)
+-	call	syscall_trace_enter
+-	LOCK_PREFIX
+-	andl	$~_TIF_CSTAR, TI_flags(%ebp)
+-	/* What it returned is what we'll actually use.  */
+-	cmpl	$NR_syscalls, %eax
+-	jb	.Lcstar_call
+-	jmp	.Lcstar_exit
+-.Lcstar_trace_special:
+-	movl	PT_ECX(%esp), %ecx
+-	movl	%esp, %eax
+-	movl	%ecx, PT_EBP(%esp)		# put user EBP back in place
+-	call	syscall_trace_enter
+-	/* What it returned is what we'll actually use.  */
+-	cmpl	$NR_syscalls, %eax
+-	jb	syscall_call
+-	jmp	syscall_exit
+-cstar_badsys:
+-	movl	$-ENOSYS, %eax
+-	jmp	.Lcstar_after_call
+-cstar_fault:
+-	ASM_CLAC
+-	movl	$-EFAULT, %eax
+-	SAVE_ALL
+-	GET_THREAD_INFO(%ebp)
+-	movl	PT_ECX(%esp), %ecx
+-	movl	%ecx, PT_EBP(%esp)		# put user EBP back in place
+-	jmp	resume_userspace
+-ENDPROC(entry_SYSCALL_PV32)
+-
+-ENTRY(cstar_ret_from_fork)
+-	movl	PT_ECX(%esp), %ecx
+-	GET_THREAD_INFO(%ebp)
+-	movl	%ecx, PT_EBP(%esp)		# put user EBP back in place
+-	LOCK_PREFIX
+-	andl	$~_TIF_CSTAR, TI_flags(%ebp)
+-	jmp	ret_from_fork
+-END(cstar_ret_from_fork)
+-
+-#include <asm/unistd.h>
+-.pushsection .rodata,"a"
+-.balign 4
+-cstar_special:
+-nr=0
+-mask=0
+-.rept NR_syscalls+31
+- .irp n, __NR_sigreturn, __NR_rt_sigreturn
+-  .if nr == \n
+-   mask = mask | (1 << (\n & 31))
+-  .endif
+- .endr
+- nr = nr + 1
+- .if (nr & 31) == 0
+-  .long mask
+-  mask = 0
+- .endif
+-.endr
+-.popsection
+-#endif /* TIF_CSTAR */
++	jmp	.Lentry_SYS_PV32
++#endif
+ 
+ #ifdef CONFIG_TRACING
+ ENTRY(trace_page_fault)
+--- a/arch/x86/entry/entry_64-xen.S
++++ b/arch/x86/entry/entry_64-xen.S
+@@ -309,20 +309,16 @@ GLOBAL(stub_execveat)
+ 	jmp	return_from_execve
+ END(stub_execveat)
+ 
+-#if defined(CONFIG_X86_X32_ABI) || defined(CONFIG_IA32_EMULATION)
++#if defined(CONFIG_X86_X32_ABI)
+ 	.align	8
+ GLOBAL(stub_x32_execve)
+-GLOBAL(stub32_execve)
+ 	call	compat_sys_execve
+ 	jmp	return_from_execve
+-END(stub32_execve)
+ END(stub_x32_execve)
+ 	.align	8
+ GLOBAL(stub_x32_execveat)
+-GLOBAL(stub32_execveat)
+ 	call	compat_sys_execveat
+ 	jmp	return_from_execve
+-END(stub32_execveat)
+ END(stub_x32_execveat)
+ #endif
+ 
+@@ -423,7 +419,7 @@ retint_kernel:
+  * At this label, code paths which return to kernel and to user,
+  * which come from interrupts/exception and from syscalls, merge.
+  */
+-restore_regs_and_iret:
++GLOBAL(restore_regs_and_iret)
+ 	RESTORE_EXTRA_REGS
+ restore_c_regs_and_iret:
+ 	movl	EFLAGS(%rsp), %eax
+@@ -753,13 +749,19 @@ ENTRY(error_entry)
+ 	SWAPGS
+ 
+ .Lerror_entry_from_usermode_after_swapgs:
++	/*
++	 * We need to tell lockdep that IRQs are off.  We can't do this until
++	 * we fix gsbase, and we should do it before enter_from_user_mode
++	 * (which can take locks).
++	 */
++	TRACE_IRQS_OFF
+ #ifdef CONFIG_CONTEXT_TRACKING
+ 	call enter_from_user_mode
+ #endif
++	ret
+ 
+ .Lerror_entry_done:
+ #endif
+-
+ 	TRACE_IRQS_OFF
+ 	ret
+ 
+--- a/arch/x86/entry/entry_64_compat-xen.S
++++ b/arch/x86/entry/entry_64_compat-xen.S
+@@ -16,11 +16,6 @@
+ #include <linux/linkage.h>
+ #include <linux/err.h>
+ 
+-/* Avoid __ASSEMBLER__'ifying <linux/audit.h> just for this.  */
+-#include <linux/elf-em.h>
+-#define AUDIT_ARCH_I386		(EM_386|__AUDIT_ARCH_LE)
+-#define __AUDIT_ARCH_LE		0x40000000
+-
+ 	.section .entry.text, "ax"
+ 
+ #ifdef CONFIG_PARAVIRT
+@@ -53,90 +48,12 @@ ENDPROC(native_usergs_sysret32)
+  * with the int 0x80 path.
+  */
+ ENTRY(entry_SYSENTER_compat)
++	/* Interrupts are on upon entry. */
+ 	movq	8(%rsp),%r11
+-	popq	%rcx
+-
+-	/* Zero-extending 32-bit regs, do not remove */
+-	movl	%ebp, %ebp
+-	movl	%eax, %eax
+-	movl	ASM_THREAD_INFO(TI_sysenter_return, %rsp, 6*8), %r10d
+-	movl	$__USER32_DS,40(%rsp)
+-	movq	%rbp,32(%rsp)
+-	movl	$__USER32_CS,16(%rsp)
+-	movq	%r10,8(%rsp)
+-
+-	/* Construct struct pt_regs on stack */
+-	movq	%rax,(%rsp)		/* pt_regs->orig_ax */
+-	pushq	%rdi			/* pt_regs->di */
+-	pushq	%rsi			/* pt_regs->si */
+-	pushq	%rdx			/* pt_regs->dx */
+-	pushq	%rcx			/* pt_regs->cx */
+-	pushq	$-ENOSYS		/* pt_regs->ax */
++	movq	0(%rsp),%rcx
++	movq	%rbp,5*8(%rsp)		/* pt_regs->sp */
+ 	cld
+-	sub	$(10*8), %rsp /* pt_regs->r8-11, bp, bx, r12-15 not saved */
+-
+-	/*
+-	 * no need to do an access_ok check here because rbp has been
+-	 * 32-bit zero extended
+-	 */
+-	ASM_STAC
+-1:	movl	(%rbp), %ebp
+-	_ASM_EXTABLE(1b, ia32_badarg)
+-	ASM_CLAC
+-	orl     $TS_COMPAT, ASM_THREAD_INFO(TI_status, %rsp, SIZEOF_PTREGS)
+-	testl   $_TIF_WORK_SYSCALL_ENTRY, ASM_THREAD_INFO(TI_flags, %rsp, SIZEOF_PTREGS)
+-	jnz	sysenter_tracesys
+-	jmp	ia32_do_call
+-
+-#ifdef CONFIG_AUDITSYSCALL
+-	.macro auditsys_entry_common
+-	/*
+-	 * At this point, registers hold syscall args in the 32-bit syscall ABI:
+-	 * EAX is syscall number, the 6 args are in EBX,ECX,EDX,ESI,EDI,EBP.
+-	 *
+-	 * We want to pass them to __audit_syscall_entry(), which is a 64-bit
+-	 * C function with 5 parameters, so shuffle them to match what
+-	 * the function expects: RDI,RSI,RDX,RCX,R8.
+-	 */
+-	movl	%esi, %r8d		/* arg5 (R8 ) <= 4th syscall arg (ESI) */
+-	xchg	%ecx, %edx		/* arg4 (RCX) <= 3rd syscall arg (EDX) */
+-					/* arg3 (RDX) <= 2nd syscall arg (ECX) */
+-	movl	%ebx, %esi		/* arg2 (RSI) <= 1st syscall arg (EBX) */
+-	movl	%eax, %edi		/* arg1 (RDI) <= syscall number  (EAX) */
+-	call	__audit_syscall_entry
+-
+-	/*
+-	 * We are going to jump back to the syscall dispatch code.
+-	 * Prepare syscall args as required by the 64-bit C ABI.
+-	 * Registers clobbered by __audit_syscall_entry() are
+-	 * loaded from pt_regs on stack:
+-	 */
+-	movl	ORIG_RAX(%rsp), %eax	/* syscall number */
+-	movl	%ebx, %edi		/* arg1 */
+-	movl	RCX(%rsp), %esi		/* arg2 */
+-	movl	RDX(%rsp), %edx		/* arg3 */
+-	movl	RSI(%rsp), %ecx		/* arg4 */
+-	movl	RDI(%rsp), %r8d		/* arg5 */
+-	.endm
+-
+-sysenter_auditsys:
+-	auditsys_entry_common
+-	movl	%ebp, %r9d		/* reload 6th syscall arg */
+-	jmp	.Lia32_dispatch
+-#endif
+-
+-sysenter_tracesys:
+-#ifdef CONFIG_AUDITSYSCALL
+-	testl	$(_TIF_WORK_SYSCALL_ENTRY & ~_TIF_SYSCALL_AUDIT), ASM_THREAD_INFO(TI_flags, %rsp, SIZEOF_PTREGS)
+-	jz	sysenter_auditsys
+-#endif
+-	SAVE_EXTRA_REGS
+-	xorl	%eax, %eax		/* Do not leak kernel information */
+-	movq	%rax, R11(%rsp)
+-	movq	%rax, R10(%rsp)
+-	movq	%rax, R9(%rsp)
+-	movq	%rax, R8(%rsp)
+-	jmp	.Ltracesys
++	/* jmp	entry_SYSCALL_compat */
+ ENDPROC(entry_SYSENTER_compat)
+ 
+ /*
+@@ -164,13 +81,9 @@ ENDPROC(entry_SYSENTER_compat)
+  * edi  arg5
+  * esp  user stack
+  * 0(%esp) arg6
+- *
+- * This is purely a fast path. For anything complicated we use the int 0x80
+- * path below. We set up a complete hardware stack frame to share code
+- * with the int 0x80 path.
+  */
+ ENTRY(entry_SYSCALL_compat)
+-	movl	RSP-RIP+16(%rsp), %r8d
++	/* Interrupts are on upon entry. */
+ 
+ 	/* Zero-extending 32-bit regs, do not remove */
+ 	movl	%eax, %eax
+@@ -182,103 +95,25 @@ ENTRY(entry_SYSCALL_compat)
+ 	movq	%rdi, 0(%rsp)		/* pt_regs->di */
+ 	pushq	%rsi			/* pt_regs->si */
+ 	pushq	%rdx			/* pt_regs->dx */
+-	pushq	%rbp			/* pt_regs->cx */
+-	movl	%ebp, %ecx
++	pushq	%rbp			/* pt_regs->cx (stashed in bp) */
+ 	pushq	$-ENOSYS		/* pt_regs->ax */
+-	sub	$(10*8), %rsp		/* pt_regs->r8-11, bp, bx, r12-15 not saved */
+-
+-	/*
+-	 * No need to do an access_ok check here because r8 has been
+-	 * 32-bit zero extended:
+-	 */
+-	ASM_STAC
+-1:	movl	(%r8), %r9d
+-	_ASM_EXTABLE(1b, ia32_badarg)
+-	ASM_CLAC
+-	orl	$TS_COMPAT, ASM_THREAD_INFO(TI_status, %rsp, SIZEOF_PTREGS)
+-	testl	$_TIF_WORK_SYSCALL_ENTRY, ASM_THREAD_INFO(TI_flags, %rsp, SIZEOF_PTREGS)
+-	jnz	cstar_tracesys
+-cstar_do_call:
+-	/* 32-bit syscall -> 64-bit C ABI argument conversion */
+-	movl	%edi, %r8d		/* arg5 */
+-	/* r9 already loaded */		/* arg6 */
+-	jmp	.Lia32_arg_fixup_common
+-
+-#ifdef CONFIG_AUDITSYSCALL
+-cstar_auditsys:
+-	movl	%r9d, R9(%rsp)		/* register to be clobbered by call */
+-	auditsys_entry_common
+-	movl	R9(%rsp), %r9d		/* reload 6th syscall arg */
+-	jmp	.Lia32_dispatch
+-#endif
+-
+-cstar_tracesys:
+-#ifdef CONFIG_AUDITSYSCALL
+-	testl	$(_TIF_WORK_SYSCALL_ENTRY & ~_TIF_SYSCALL_AUDIT), ASM_THREAD_INFO(TI_flags, %rsp, SIZEOF_PTREGS)
+-	jz	cstar_auditsys
+-#endif
+-	xchgl	%r9d, %ebp
+-	SAVE_EXTRA_REGS
+-	xorl	%eax, %eax		/* Do not leak kernel information */
+-	movq	%rax, R11(%rsp)
+-	movq	%rax, R10(%rsp)
+-	movq	%r9, R9(%rsp)
+-	movq	%rax, R8(%rsp)
+-	movq	%rsp, %rdi		/* &pt_regs -> arg1 */
+-	call	syscall_trace_enter
+-	movl	R9(%rsp), %r9d
+-
+-	/* Reload arg registers from stack. (see sysenter_tracesys) */
+-	movl	RCX(%rsp), %ecx
+-	movl	RDX(%rsp), %edx
+-	movl	RSI(%rsp), %esi
+-	movl	RDI(%rsp), %edi
+-	movl	%eax, %eax		/* zero extension */
+-
+-	RESTORE_EXTRA_REGS
+-	xchgl	%ebp, %r9d
+-	jmp	cstar_do_call
++	xorq    %r8,%r8
++	pushq   %r8                     /* pt_regs->r8  = 0 */
++	pushq   %r8                     /* pt_regs->r9  = 0 */
++	pushq   %r8                     /* pt_regs->r10 = 0 */
++	pushq   %r8                     /* pt_regs->r11 = 0 */
++	pushq   %rbx                    /* pt_regs->rbx */
++	pushq   %rbp                    /* pt_regs->rbp (will be overwritten) */
++	pushq   %r8                     /* pt_regs->r12 = 0 */
++	pushq   %r8                     /* pt_regs->r13 = 0 */
++	pushq   %r8                     /* pt_regs->r14 = 0 */
++	pushq   %r8                     /* pt_regs->r15 = 0 */
++
++	movq	%rsp, %rdi
++	call	do_fast_syscall_32
++	jmp	.Lsyscall_32_done
+ END(entry_SYSCALL_compat)
+ 
+-ia32_badarg:
+-	/*
+-	 * So far, we've entered kernel mode, set AC, turned on IRQs, and
+-	 * saved C regs except r8-r11.  We haven't done any of the other
+-	 * standard entry work, though.  We want to bail, but we shouldn't
+-	 * treat this as a syscall entry since we don't even know what the
+-	 * args are.  Instead, treat this as a non-syscall entry, finish
+-	 * the entry work, and immediately exit after setting AX = -EFAULT.
+-	 *
+-	 * We're really just being polite here.  Killing the task outright
+-	 * would be a reasonable action, too.  Given that the only valid
+-	 * way to have gotten here is through the vDSO, and we already know
+-	 * that the stack pointer is bad, the task isn't going to survive
+-	 * for long no matter what we do.
+-	 */
+-
+-	ASM_CLAC			/* undo STAC */
+-	movq	$-EFAULT, RAX(%rsp)	/* return -EFAULT if possible */
+-
+-	/* Fill in the rest of pt_regs */
+-	xorl	%eax, %eax
+-	movq	%rax, R11(%rsp)
+-	movq	%rax, R10(%rsp)
+-	movq	%rax, R9(%rsp)
+-	movq	%rax, R8(%rsp)
+-	SAVE_EXTRA_REGS
+-
+-	/* Turn IRQs back off. */
+-	DISABLE_INTERRUPTS(CLBR_NONE)
+-	TRACE_IRQS_OFF
+-
+-	/* Now finish entering normal kernel mode. */
+-#ifdef CONFIG_CONTEXT_TRACKING
+-	call enter_from_user_mode
+-#endif
+-
+-	/* And exit again. */
+-	jmp retint_user
+-
+ /*
+  * Emulated IA32 system calls via int 0x80.
+  *
+@@ -304,7 +139,13 @@ ENTRY(entry_INT80_compat)
+ 	movq	8(%rsp),%r11
+ 	popq	%rcx
+ 
+-	/* Zero-extending 32-bit regs, do not remove */
++	/*
++	 * User tracing code (ptrace or signal handlers) might assume that
++	 * the saved RAX contains a 32-bit number when we're invoking a 32-bit
++	 * syscall.  Just in case the high bits are nonzero, zero-extend
++	 * the syscall number.  (This could almost certainly be deleted
++	 * with no ill effects.)
++	 */
+ 	movl	%eax, %eax
+ 
+ 	/* Construct struct pt_regs on stack (iret frame is already on stack) */
+@@ -314,70 +155,31 @@ ENTRY(entry_INT80_compat)
+ 	pushq	%rdx			/* pt_regs->dx */
+ 	pushq	%rcx			/* pt_regs->cx */
+ 	pushq	$-ENOSYS		/* pt_regs->ax */
+-	pushq	$0			/* pt_regs->r8 */
+-	pushq	$0			/* pt_regs->r9 */
+-	pushq	$0			/* pt_regs->r10 */
+-	pushq	$0			/* pt_regs->r11 */
++	xorq    %r8,%r8
++	pushq   %r8                     /* pt_regs->r8  = 0 */
++	pushq   %r8                     /* pt_regs->r9  = 0 */
++	pushq   %r8                     /* pt_regs->r10 = 0 */
++	pushq   %r8                     /* pt_regs->r11 = 0 */
++	pushq   %rbx                    /* pt_regs->rbx */
++	pushq   %rbp                    /* pt_regs->rbp */
++	pushq   %r12                    /* pt_regs->r12 */
++	pushq   %r13                    /* pt_regs->r13 */
++	pushq   %r14                    /* pt_regs->r14 */
++	pushq   %r15                    /* pt_regs->r15 */
+ 	cld
+-	sub	$(6*8), %rsp /* pt_regs->bp, bx, r12-15 not saved */
+ 
+-	orl	$TS_COMPAT, ASM_THREAD_INFO(TI_status, %rsp, SIZEOF_PTREGS)
+-	testl	$_TIF_WORK_SYSCALL_ENTRY, ASM_THREAD_INFO(TI_flags, %rsp, SIZEOF_PTREGS)
+-	jnz	ia32_tracesys
+-
+-ia32_do_call:
+-	/* 32-bit syscall -> 64-bit C ABI argument conversion */
+-	movl	%edi, %r8d		/* arg5 */
+-	movl	%ebp, %r9d		/* arg6 */
+-.Lia32_arg_fixup_common:
+-	xchg	%ecx, %esi		/* rsi:arg2, rcx:arg4 */
+-	movl	%ebx, %edi		/* arg1 */
+-	movl	%edx, %edx		/* arg3 (zero extension) */
+-.Lia32_dispatch:
+-	cmpq	$(IA32_NR_syscalls-1), %rax
+-	ja	1f
+-
+-	call	*ia32_sys_call_table(, %rax, 8)
+-	movq	%rax, RAX(%rsp)
+-1:
+-	jmp	int_ret_from_sys_call
+-
+-ia32_tracesys:
+-	SAVE_EXTRA_REGS
+-.Ltracesys:
+-	movq	%rsp, %rdi			/* &pt_regs -> arg1 */
+-	call	syscall_trace_enter
+-	/*
+-	 * Reload arg registers from stack in case ptrace changed them.
+-	 * Don't reload %eax because syscall_trace_enter() returned
+-	 * the %rax value we should see.  But do truncate it to 32 bits.
+-	 * If it's -1 to make us punt the syscall, then (u32)-1 is still
+-	 * an appropriately invalid value.
+-	 */
+-	movl	RCX(%rsp), %ecx
+-	movl	RDX(%rsp), %edx
+-	movl	RSI(%rsp), %esi
+-	movl	RDI(%rsp), %edi
+-	movl	%eax, %eax		/* zero extension */
+-	RESTORE_EXTRA_REGS
+-	jmp	ia32_do_call
++	movq	%rsp, %rdi
++	call	do_syscall_32_irqs_on
++.Lsyscall_32_done:
++
++	/* Go back to user mode. */
++	TRACE_IRQS_ON
++	SWAPGS
++	jmp	restore_regs_and_iret
+ END(entry_INT80_compat)
+ 
+-	.macro PTREGSCALL label, func
+-	ALIGN
+-GLOBAL(\label)
+-	leaq	\func(%rip), %rax
+-	jmp	ia32_ptregs_common
+-	.endm
+-
+-	PTREGSCALL stub32_rt_sigreturn,	sys32_rt_sigreturn
+-	PTREGSCALL stub32_sigreturn,	sys32_sigreturn
+-	PTREGSCALL stub32_fork,		sys_fork
+-	PTREGSCALL stub32_vfork,	sys_vfork
+-
+ 	ALIGN
+ GLOBAL(stub32_clone)
+-	leaq	sys_clone(%rip), %rax
+ 	/*
+ 	 * The 32-bit clone ABI is: clone(..., int tls_val, int *child_tidptr).
+ 	 * The 64-bit clone ABI is: clone(..., int *child_tidptr, int tls_val).
+@@ -386,12 +188,4 @@ GLOBAL(stub32_clone)
+ 	 * so we need to swap arguments here before calling it:
+ 	 */
+ 	xchg	%r8, %rcx
+-	jmp	ia32_ptregs_common
+-
+-	ALIGN
+-ia32_ptregs_common:
+-	SAVE_EXTRA_REGS 8
+-	call	*%rax
+-	RESTORE_EXTRA_REGS 8
+-	ret
+-END(ia32_ptregs_common)
++	jmp	sys_clone
+--- a/arch/x86/entry/syscall_32-xen.c
++++ /dev/null
+@@ -1,20 +0,0 @@
+-#include "syscall_32.c"
+-
+-#include <linux/thread_info.h>
+-
+-#ifdef TIF_CSTAR
+-extern asmlinkage void cstar_set_tif(void);
+-
+-#define	ptregs_fork cstar_set_tif
+-#define	ptregs_clone cstar_set_tif
+-#define	ptregs_vfork cstar_set_tif
+-
+-__visible const sys_call_ptr_t cstar_call_table[__NR_syscall_compat_max+1] = {
+-	/*
+-	 * Smells like a compiler bug -- it doesn't work
+-	 * when the & below is removed.
+-	 */
+-	[0 ... __NR_syscall_compat_max] = &sys_ni_syscall,
+-#include <asm/syscalls_32.h>
+-};
+-#endif /* TIF_CSTAR */
+--- a/arch/x86/entry/vdso/vdso32-setup-xen.c
++++ b/arch/x86/entry/vdso/vdso32-setup-xen.c
+@@ -50,31 +50,11 @@ __setup("vdso32=", vdso32_setup);
+ __setup_param("vdso=", vdso_setup, vdso32_setup, 0);
+ #endif
+ 
+-#ifdef CONFIG_X86_64
+-
+-#define	vdso32_sysenter()	(boot_cpu_has(X86_FEATURE_SYSENTER32))
+-#define	vdso32_syscall()	(boot_cpu_has(X86_FEATURE_SYSCALL32))
+-
+-#else  /* CONFIG_X86_32 */
+-
+-#define vdso32_sysenter()	(boot_cpu_has(X86_FEATURE_SEP))
+-#ifndef TIF_CSTAR
+-#define vdso32_syscall()	0
+-#else
+-#define vdso32_syscall()	(boot_cpu_has(X86_FEATURE_SYSCALL32))
+-#endif
+-
+-#endif	/* CONFIG_X86_64 */
+-
+-#if defined(CONFIG_X86_32) || defined(CONFIG_COMPAT)
+-const struct vdso_image *selected_vdso32;
+-#endif
+-
+ int __init sysenter_setup(void)
+ {
+ #ifdef CONFIG_X86_32
+ 	if (boot_cpu_has(X86_FEATURE_SYSCALL)) {
+-# ifdef TIF_CSTAR
++# ifdef CONFIG_CPU_SUP_AMD
+ 		extern asmlinkage void entry_SYSCALL_PV32(void);
+ 		static const struct callback_register __initconst cstar = {
+ 			.type = CALLBACKTYPE_syscall32,
+@@ -93,17 +73,7 @@ int __init sysenter_setup(void)
+ 	}
+ #endif
+ 
+-#if defined(CONFIG_COMPAT) || defined(CONFIG_X86_XEN)
+-	if (vdso32_syscall())
+-		selected_vdso32 = &vdso_image_32_syscall;
+-	else
+-#endif
+-	if (vdso32_sysenter())
+-		selected_vdso32 = &vdso_image_32_sysenter;
+-	else
+-		selected_vdso32 = &vdso_image_32_int80;
+-
+-	init_vdso_image(selected_vdso32);
++	init_vdso_image(&vdso_image_32);
+ 
+ 	return 0;
+ }
+--- a/arch/x86/entry/vdso/vdso32/system_call.S
++++ b/arch/x86/entry/vdso/vdso32/system_call.S
+@@ -60,6 +60,10 @@ __kernel_vsyscall:
+ 	/* If SYSENTER (Intel) or SYSCALL32 (AMD) is available, use it. */
+ 	ALTERNATIVE_2 "", SYSENTER_SEQUENCE, X86_FEATURE_SYSENTER32, \
+ 	                  SYSCALL_SEQUENCE,  X86_FEATURE_SYSCALL32
++#elif defined(CONFIG_XEN) && defined(CONFIG_CPU_SUP_AMD)
++	/* If SYSCALL32 or SYSENTER is available, use it. */
++	ALTERNATIVE_2 "", SYSCALL_SEQUENCE,  X86_FEATURE_SYSCALL32, \
++	                  SYSENTER_SEQUENCE, X86_FEATURE_SEP
+ #else
+ 	ALTERNATIVE "", SYSENTER_SEQUENCE, X86_FEATURE_SEP
+ #endif
+--- a/arch/x86/include/asm/acpi.h
++++ b/arch/x86/include/asm/acpi.h
+@@ -171,7 +171,11 @@ static inline pgprot_t arch_apei_get_mem
+ 	 * require the equivalent of PAGE_KERNEL_NOCACHE), return that
+ 	 * until we know differently.
+ 	 */
++#ifndef CONFIG_XEN
+ 	 return PAGE_KERNEL;
++#else
++	 return PAGE_KERNEL_IO;
++#endif
+ }
+ #endif
+ 
+--- a/arch/x86/include/asm/microcode.h
++++ b/arch/x86/include/asm/microcode.h
+@@ -54,11 +54,13 @@ struct ucode_cpu_info {
+ };
+ extern struct ucode_cpu_info ucode_cpu_info[];
+ 
++#ifndef CONFIG_XEN
+ #ifdef CONFIG_MICROCODE
+ int __init microcode_init(void);
+ #else
+ static inline int __init microcode_init(void)	{ return 0; };
+ #endif
++#endif
+ 
+ #ifdef CONFIG_MICROCODE_INTEL
+ extern struct microcode_ops * __init init_intel_microcode(void);
+@@ -80,6 +82,7 @@ static inline struct microcode_ops * __i
+ static inline void __exit exit_amd_microcode(void) {}
+ #endif
+ 
++#ifndef CONFIG_XEN
+ #define MAX_UCODE_COUNT 128
+ 
+ #define QCHAR(a, b, c, d) ((a) + ((b) << 8) + ((c) << 16) + ((d) << 24))
+@@ -153,8 +156,9 @@ static inline unsigned int x86_model(uns
+ 
+ 	return model;
+ }
++#endif /* CONFIG_XEN */
+ 
+-#ifdef CONFIG_MICROCODE
++#if defined(CONFIG_MICROCODE) && !defined(CONFIG_XEN)
+ extern void __init load_ucode_bsp(void);
+ extern void load_ucode_ap(void);
+ extern int __init save_microcode_in_initrd(void);
+--- a/arch/x86/include/asm/thread_info.h
++++ b/arch/x86/include/asm/thread_info.h
+@@ -110,9 +110,6 @@ struct thread_info {
+ #define TIF_SYSCALL_TRACEPOINT	28	/* syscall tracepoint instrumentation */
+ #define TIF_ADDR32		29	/* 32-bit address space on 64 bits */
+ #define TIF_X32			30	/* 32-bit native x86-64 binary */
+-#if defined(CONFIG_X86_XEN) && defined(CONFIG_CPU_SUP_AMD)
+-#define TIF_CSTAR		31      /* cstar-based syscall (special handling) */
+-#endif
+ 
+ #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
+ #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
+@@ -136,7 +133,6 @@ struct thread_info {
+ #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
+ #define _TIF_ADDR32		(1 << TIF_ADDR32)
+ #define _TIF_X32		(1 << TIF_X32)
+-#define _TIF_CSTAR		(1 << TIF_CSTAR)
+ 
+ /* work to do in syscall_trace_enter() */
+ #define _TIF_WORK_SYSCALL_ENTRY	\
+--- a/arch/x86/include/mach-xen/asm/highmem.h
++++ b/arch/x86/include/mach-xen/asm/highmem.h
+@@ -67,7 +67,6 @@ void *kmap_atomic(struct page *page);
+ void __kunmap_atomic(void *kvaddr);
+ void *kmap_atomic_pfn(unsigned long pfn);
+ void *kmap_atomic_prot_pfn(unsigned long pfn, pgprot_t prot);
+-struct page *kmap_atomic_to_page(void *ptr);
+ 
+ #define kmap_atomic_pte(page) \
+ 	kmap_atomic_prot(page, \
+--- a/arch/x86/include/mach-xen/asm/pgtable.h
++++ b/arch/x86/include/mach-xen/asm/pgtable.h
+@@ -19,6 +19,13 @@
+ #include <asm/x86_init.h>
+ 
+ void ptdump_walk_pgd_level(struct seq_file *m, pgd_t *pgd);
++void ptdump_walk_pgd_level_checkwx(void);
++
++#ifdef CONFIG_DEBUG_WX
++#define debug_checkwx() ptdump_walk_pgd_level_checkwx()
++#else
++#define debug_checkwx() do { } while (0)
++#endif
+ 
+ /*
+  * ZERO_PAGE is a global shared page that is always zero: used
+@@ -138,12 +145,12 @@ static inline int pte_special(pte_t pte)
+ 
+ static inline unsigned long pmd_pfn(pmd_t pmd)
+ {
+-	return (pmd_val(pmd) & PTE_PFN_MASK) >> PAGE_SHIFT;
++	return (pmd_val(pmd) & pmd_pfn_mask(pmd)) >> PAGE_SHIFT;
+ }
+ 
+ static inline unsigned long pud_pfn(pud_t pud)
+ {
+-	return (pud_val(pud) & PTE_PFN_MASK) >> PAGE_SHIFT;
++	return (pud_val(pud) & pud_pfn_mask(pud)) >> PAGE_SHIFT;
+ }
+ 
+ static inline int pmd_large(pmd_t pte)
+@@ -316,6 +323,18 @@ static inline pmd_t pmd_mksoft_dirty(pmd
+ }
+ #endif
+ 
++static inline pte_t pte_clear_soft_dirty(pte_t pte)
++{
++	return pte_clear_flags(pte, _PAGE_SOFT_DIRTY);
++}
++
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++static inline pmd_t pmd_clear_soft_dirty(pmd_t pmd)
++{
++	return pmd_clear_flags(pmd, _PAGE_SOFT_DIRTY);
++}
++#endif
++
+ #endif /* CONFIG_HAVE_ARCH_SOFT_DIRTY */
+ 
+ /*
+@@ -379,7 +398,9 @@ static inline pgprot_t pgprot_modify(pgp
+ 	return __pgprot(preservebits | addbits);
+ }
+ 
+-#define pte_pgprot(x) __pgprot(pte_flags(x) & PTE_FLAGS_MASK)
++#define pte_pgprot(x) __pgprot(pte_flags(x))
++#define pmd_pgprot(x) __pgprot(pmd_flags(x))
++#define pud_pgprot(x) __pgprot(pud_flags(x))
+ 
+ #define canon_pgprot(p) __pgprot(massage_pgprot(p))
+ 
+@@ -508,14 +529,15 @@ static inline int pmd_none(pmd_t pmd)
+ 
+ static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+ {
+-	return (unsigned long)__va(pmd_val(pmd) & PTE_PFN_MASK);
++	return (unsigned long)__va(pmd_val(pmd) & pmd_pfn_mask(pmd));
+ }
+ 
+ /*
+  * Currently stuck as a macro due to indirect forward reference to
+  * linux/mmzone.h's __section_mem_map_addr() definition:
+  */
+-#define pmd_page(pmd)	pfn_to_page((pmd_val(pmd) & PTE_PFN_MASK) >> PAGE_SHIFT)
++#define pmd_page(pmd)		\
++	pfn_to_page((pmd_val(pmd) & pmd_pfn_mask(pmd)) >> PAGE_SHIFT)
+ 
+ /*
+  * the pmd page can be thought of an array like this: pmd_t[PTRS_PER_PMD]
+@@ -584,14 +606,15 @@ static inline int pud_present(pud_t pud)
+ 
+ static inline unsigned long pud_page_vaddr(pud_t pud)
+ {
+-	return (unsigned long)__va((unsigned long)pud_val(pud) & PTE_PFN_MASK);
++	return (unsigned long)__va(pud_val(pud) & pud_pfn_mask(pud));
+ }
+ 
+ /*
+  * Currently stuck as a macro due to indirect forward reference to
+  * linux/mmzone.h's __section_mem_map_addr() definition:
+  */
+-#define pud_page(pud)		pfn_to_page(pud_val(pud) >> PAGE_SHIFT)
++#define pud_page(pud)		\
++	pfn_to_page((pud_val(pud) & pud_pfn_mask(pud)) >> PAGE_SHIFT)
+ 
+ /* Find an entry in the second-level page table.. */
+ static inline pmd_t *pmd_offset(pud_t *pud, unsigned long address)
+--- a/arch/x86/include/mach-xen/asm/pgtable_types.h
++++ b/arch/x86/include/mach-xen/asm/pgtable_types.h
+@@ -218,10 +218,10 @@ enum page_cache_mode {
+ 
+ #include <linux/types.h>
+ 
+-/* PTE_PFN_MASK extracts the PFN from a (pte|pmd|pud|pgd)val_t */
++/* Extracts the PFN from a (pte|pmd|pud|pgd)val_t of a 4KB page */
+ #define PTE_PFN_MASK		((pteval_t)PHYSICAL_PAGE_MASK)
+ 
+-/* PTE_FLAGS_MASK extracts the flags from a (pte|pmd|pud|pgd)val_t */
++/* Extracts the flags from a (pte|pmd|pud|pgd)val_t of a 4KB page */
+ #define PTE_FLAGS_MASK		(~PTE_PFN_MASK)
+ 
+ typedef struct pgprot { pgprotval_t pgprot; } pgprot_t;
+@@ -321,14 +321,40 @@ static inline pmdval_t xen_pmd_val(pmd_t
+ }
+ #endif
+ 
++static inline pudval_t pud_pfn_mask(pud_t pud)
++{
++	if (__pud_val(pud) & _PAGE_PSE)
++		return PHYSICAL_PUD_PAGE_MASK;
++	else
++		return PTE_PFN_MASK;
++}
++
++static inline pudval_t pud_flags_mask(pud_t pud)
++{
++	return ~pud_pfn_mask(pud);
++}
++
+ static inline pudval_t pud_flags(pud_t pud)
+ {
+-	return __pud_val(pud) & PTE_FLAGS_MASK;
++	return __pud_val(pud) & pud_flags_mask(pud);
++}
++
++static inline pmdval_t pmd_pfn_mask(pmd_t pmd)
++{
++	if (__pmd_val(pmd) & _PAGE_PSE)
++		return PHYSICAL_PMD_PAGE_MASK;
++	else
++		return PTE_PFN_MASK;
++}
++
++static inline pmdval_t pmd_flags_mask(pmd_t pmd)
++{
++	return ~pmd_pfn_mask(pmd);
+ }
+ 
+ static inline pmdval_t pmd_flags(pmd_t pmd)
+ {
+-	return __pmd_val(pmd) & PTE_FLAGS_MASK;
++	return __pmd_val(pmd) & pmd_flags_mask(pmd);
+ }
+ 
+ #define __pte_ma(x) ((pte_t) { .pte = (x) } )
+--- a/arch/x86/include/mach-xen/asm/processor.h
++++ b/arch/x86/include/mach-xen/asm/processor.h
+@@ -11,7 +11,7 @@ struct vm86;
+ #include <asm/math_emu.h>
+ #include <asm/segment.h>
+ #include <asm/types.h>
+-#include <asm/sigcontext.h>
++#include <uapi/asm/sigcontext.h>
+ #include <asm/current.h>
+ #include <asm/cpufeature.h>
+ #include <asm/page.h>
+@@ -561,12 +561,12 @@ static inline unsigned int cpuid_edx(uns
+ }
+ 
+ /* REP NOP (PAUSE) is a good thing to insert into busy-wait loops. */
+-static inline void rep_nop(void)
++static __always_inline void rep_nop(void)
+ {
+ 	asm volatile("rep; nop" ::: "memory");
+ }
+ 
+-static inline void cpu_relax(void)
++static __always_inline void cpu_relax(void)
+ {
+ 	rep_nop();
+ }
+--- a/arch/x86/kernel/apic/io_apic-xen.c
++++ b/arch/x86/kernel/apic/io_apic-xen.c
+@@ -591,7 +591,7 @@ static void __eoi_ioapic_pin(int apic, i
+ 	}
+ }
+ 
+-void eoi_ioapic_pin(int vector, struct mp_chip_data *data)
++static void eoi_ioapic_pin(int vector, struct mp_chip_data *data)
+ {
+ 	unsigned long flags;
+ 	struct irq_pin_list *entry;
+--- a/arch/x86/kernel/apic/vector-xen.c
++++ b/arch/x86/kernel/apic/vector-xen.c
+@@ -370,7 +370,11 @@ int __init arch_probe_nr_irqs(void)
+ 	if (nr < nr_irqs)
+ 		nr_irqs = nr;
+ 
+-	return nr_legacy_irqs();
++	/*
++	 * We don't know if PIC is present at this point so we need to do
++	 * probe() to get the right number of legacy IRQs.
++	 */
++	return legacy_pic->probe();
+ }
+ 
+ #ifdef	CONFIG_X86_IO_APIC
+--- a/arch/x86/kernel/cpu/common-xen.c
++++ b/arch/x86/kernel/cpu/common-xen.c
+@@ -295,8 +295,9 @@ static __always_inline void setup_smap(s
+ {
+ 	unsigned long eflags;
+ 
++	asm ("pushf;" __ASM_SIZE(pop) "%0" : "=rm" (eflags));
++
+ 	/* This should have been cleared long ago */
+-	raw_local_save_flags(eflags);
+ 	BUG_ON(eflags & X86_EFLAGS_AC);
+ 
+ 	if (cpu_has(c, X86_FEATURE_SMAP)) {
+@@ -712,6 +713,7 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
+ 
+ 		c->x86_virt_bits = (eax >> 8) & 0xff;
+ 		c->x86_phys_bits = eax & 0xff;
++		c->x86_capability[13] = cpuid_ebx(0x80000008);
+ 	}
+ #ifdef CONFIG_X86_32
+ 	else if (cpu_has(c, X86_FEATURE_PAE) || cpu_has(c, X86_FEATURE_PSE36))
+@@ -1046,7 +1048,7 @@ void enable_sep_cpu(void)
+ 		.address = { __KERNEL_CS, (unsigned long)entry_SYSENTER_PV32 },
+ 	};
+ 
+-# ifdef TIF_CSTAR
++# ifdef CONFIG_CPU_SUP_AMD
+ 	if (boot_cpu_has(X86_FEATURE_SYSCALL32)) {
+ 		extern asmlinkage void entry_SYSCALL_PV32(void);
+ 		static const struct callback_register cstar = {
+--- a/arch/x86/kernel/cpu/microcode/core-xen.c
++++ b/arch/x86/kernel/cpu/microcode/core-xen.c
+@@ -5,6 +5,12 @@
+  *	      2006	Shaohua Li <shaohua.li@intel.com>
+  *	      2013-2015	Borislav Petkov <bp@alien8.de>
+  *
++ * X86 CPU microcode early update for Linux:
++ *
++ *	Copyright (C) 2012 Fenghua Yu <fenghua.yu@intel.com>
++ *			   H Peter Anvin" <hpa@zytor.com>
++ *		  (C) 2015 Borislav Petkov <bp@alien8.de>
++ *
+  * This driver allows to upgrade microcode on x86 processors.
+  *
+  * This program is free software; you can redistribute it and/or
+@@ -13,7 +19,7 @@
+  * 2 of the License, or (at your option) any later version.
+  */
+ 
+-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++#define pr_fmt(fmt) "microcode: " fmt
+ 
+ #include <linux/platform_device.h>
+ #include <linux/miscdevice.h>
+@@ -32,13 +38,9 @@
+ #include <asm/processor.h>
+ #include <asm/cpu_device_id.h>
+ 
+-MODULE_DESCRIPTION("Microcode Update Driver");
+-MODULE_AUTHOR("Tigran Aivazian <tigran@aivazian.fsnet.co.uk>");
+-MODULE_LICENSE("GPL");
++#define MICROCODE_VERSION	"2.01-xen"
+ 
+-#define MICROCODE_VERSION	"2.00-xen"
+-
+-bool dis_ucode_ldr;
++static bool dis_ucode_ldr;
+ module_param(dis_ucode_ldr, bool, 0);
+ 
+ /*
+@@ -139,9 +141,6 @@ static void __exit microcode_dev_exit(vo
+ {
+ 	misc_deregister(&microcode_dev);
+ }
+-
+-MODULE_ALIAS_MISCDEV(MICROCODE_MINOR);
+-MODULE_ALIAS("devname:cpu/microcode");
+ #else
+ #define microcode_dev_init()	0
+ #define microcode_dev_exit()	do { } while (0)
+@@ -181,20 +180,6 @@ static int request_microcode(const char
+ 	return error;
+ }
+ 
+-#ifdef MODULE
+-/* Autoload on Intel and AMD systems */
+-static const struct x86_cpu_id __initconst microcode_id[] = {
+-#ifdef CONFIG_MICROCODE_INTEL
+-	{ X86_VENDOR_INTEL, X86_FAMILY_ANY, X86_MODEL_ANY, },
+-#endif
+-#ifdef CONFIG_MICROCODE_AMD
+-	{ X86_VENDOR_AMD, X86_FAMILY_ANY, X86_MODEL_ANY, },
+-#endif
+-	{}
+-};
+-MODULE_DEVICE_TABLE(x86cpu, microcode_id);
+-#endif
+-
+ static int __init microcode_init(void)
+ {
+ 	const struct cpuinfo_x86 *c = &boot_cpu_data;
+@@ -238,13 +223,4 @@ static int __init microcode_init(void)
+ 
+ 	return 0;
+ }
+-module_init(microcode_init);
+-
+-static void __exit microcode_exit(void)
+-{
+-	microcode_dev_exit();
+-	platform_device_unregister(microcode_pdev);
+-
+-	pr_info("Microcode Update Driver: v" MICROCODE_VERSION " removed.\n");
+-}
+-module_exit(microcode_exit);
++late_initcall(microcode_init);
+--- a/arch/x86/kernel/e820-xen.c
++++ b/arch/x86/kernel/e820-xen.c
+@@ -1023,7 +1023,7 @@ void __init finish_e820_parsing(void)
+ 	}
+ }
+ 
+-static inline const char *e820_type_to_string(int e820_type)
++static const char *e820_type_to_string(int e820_type)
+ {
+ 	switch (e820_type) {
+ 	case E820_RESERVED_KERN:
+--- a/arch/x86/kernel/early_printk-xen.c
++++ b/arch/x86/kernel/early_printk-xen.c
+@@ -194,14 +194,14 @@ static __init void early_serial_init(cha
+ #ifdef CONFIG_PCI
+ static void mem32_serial_out(unsigned long addr, int offset, int value)
+ {
+-	u32 *vaddr = (u32 *)addr;
++	u32 __iomem *vaddr = (u32 __iomem *)addr;
+ 	/* shift implied by pointer type */
+ 	writel(value, vaddr + offset);
+ }
+ 
+ static unsigned int mem32_serial_in(unsigned long addr, int offset)
+ {
+-	u32 *vaddr = (u32 *)addr;
++	u32 __iomem *vaddr = (u32 __iomem *)addr;
+ 	/* shift implied by pointer type */
+ 	return readl(vaddr + offset);
+ }
+@@ -343,7 +343,7 @@ static struct console early_serial_conso
+ 	.index =	-1,
+ };
+ 
+-static inline void early_console_register(struct console *con, int keep_early)
++static void early_console_register(struct console *con, int keep_early)
+ {
+ 	if (con->index != -1) {
+ 		printk(KERN_CRIT "ERROR: earlyprintk= %s already used\n",
+--- a/arch/x86/kernel/pci-dma-xen.c
++++ b/arch/x86/kernel/pci-dma-xen.c
+@@ -131,7 +131,7 @@ again:
+ #endif
+ 	page = NULL;
+ 	/* CMA can be used only in the context which permits sleeping */
+-	if (flag & __GFP_WAIT) {
++	if (gfpflags_allow_blocking(flag)) {
+ 		page = dma_alloc_from_contiguous(dev, count, order);
+ 		if (page && page_to_phys(page) + size > dma_mask) {
+ 			dma_release_from_contiguous(dev, page, count);
+--- a/arch/x86/kernel/process_32-xen.c
++++ b/arch/x86/kernel/process_32-xen.c
+@@ -171,10 +171,6 @@ int copy_thread_tls(unsigned long clone_
+ 	tsk = current;
+ 	err = -ENOMEM;
+ 
+-#ifdef TIF_CSTAR
+-	if (test_tsk_thread_flag(tsk, TIF_CSTAR))
+-		p->thread.ip = (unsigned long) cstar_ret_from_fork;
+-#endif
+ 	if (unlikely(test_tsk_thread_flag(tsk, TIF_IO_BITMAP))) {
+ 		p->thread.io_bitmap_ptr = kmemdup(tsk->thread.io_bitmap_ptr,
+ 						IO_BITMAP_BYTES, GFP_KERNEL);
+@@ -348,14 +344,6 @@ __switch_to(struct task_struct *prev_p,
+ 	}
+ 
+ 	/*
+-	 * If it were not for PREEMPT_ACTIVE we could guarantee that the
+-	 * preempt_count of all tasks was equal here and this would not be
+-	 * needed.
+-	 */
+-	task_thread_info(prev_p)->saved_preempt_count = this_cpu_read(__preempt_count);
+-	this_cpu_write(__preempt_count, task_thread_info(next_p)->saved_preempt_count);
+-
+-	/*
+ 	 * Now maybe handle debug registers
+ 	 */
+ 	if (unlikely(task_thread_info(prev_p)->flags & _TIF_WORK_CTXSW_PREV ||
+--- a/arch/x86/kernel/process_64-xen.c
++++ b/arch/x86/kernel/process_64-xen.c
+@@ -410,7 +410,7 @@ __switch_to(struct task_struct *prev_p,
+ 	/*
+ 	 * Switch FS and GS.
+ 	 *
+-	 * These are even more complicated than FS and GS: they have
++	 * These are even more complicated than DS and ES: they have
+ 	 * 64-bit bases are that controlled by arch_prctl.  Those bases
+ 	 * only differ from the values in the GDT or LDT if the selector
+ 	 * is 0.
+@@ -461,14 +461,6 @@ __switch_to(struct task_struct *prev_p,
+ 	 */
+ 	this_cpu_write(current_task, next_p);
+ 
+-	/*
+-	 * If it were not for PREEMPT_ACTIVE we could guarantee that the
+-	 * preempt_count of all tasks was equal here and this would not be
+-	 * needed.
+-	 */
+-	task_thread_info(prev_p)->saved_preempt_count = this_cpu_read(__preempt_count);
+-	this_cpu_write(__preempt_count, task_thread_info(next_p)->saved_preempt_count);
+-
+ 	/* This changes current_thread_info(). */
+ 	this_cpu_write(cpu_sp0,
+ 		(unsigned long)task_stack_page(next_p) + THREAD_SIZE);
+--- a/arch/x86/kernel/rtc.c
++++ b/arch/x86/kernel/rtc.c
+@@ -195,11 +195,6 @@ static __init int add_rtc_cmos(void)
+ 	if (intel_mid_identify_cpu())
+ 		return -ENODEV;
+ 
+-#ifdef CONFIG_XEN
+-	if (!is_initial_xendomain())
+-		return -ENODEV;
+-#endif
+-
+ #ifdef CONFIG_ACPI
+ 	if (acpi_gbl_FADT.boot_flags & ACPI_FADT_NO_CMOS_RTC) {
+ 		/* This warning can likely go away again in a year or two. */
+@@ -208,7 +203,11 @@ static __init int add_rtc_cmos(void)
+ 	}
+ #endif
+ 
++#ifdef CONFIG_XEN
++	if (!is_initial_xendomain())
++#else
+ 	if (paravirt_enabled() && !paravirt_has(RTC))
++#endif
+ 		return -ENODEV;
+ 
+ 	platform_device_register(&rtc_device);
+--- a/arch/x86/kernel/setup-xen.c
++++ b/arch/x86/kernel/setup-xen.c
+@@ -550,34 +550,34 @@ static void __init memblock_x86_reserve_
+ 
+ #if defined(CONFIG_KEXEC_CORE) && !defined(CONFIG_XEN)
+ 
++/* 16M alignment for crash kernel regions */
++#define CRASH_ALIGN		(16 << 20)
++
+ /*
+  * Keep the crash kernel below this limit.  On 32 bits earlier kernels
+  * would limit the kernel to the low 512 MiB due to mapping restrictions.
+  * On 64bit, old kexec-tools need to under 896MiB.
+  */
+ #ifdef CONFIG_X86_32
+-# define CRASH_KERNEL_ADDR_LOW_MAX	(512 << 20)
+-# define CRASH_KERNEL_ADDR_HIGH_MAX	(512 << 20)
++# define CRASH_ADDR_LOW_MAX	(512 << 20)
++# define CRASH_ADDR_HIGH_MAX	(512 << 20)
+ #else
+-# define CRASH_KERNEL_ADDR_LOW_MAX	(896UL<<20)
+-# define CRASH_KERNEL_ADDR_HIGH_MAX	MAXMEM
++# define CRASH_ADDR_LOW_MAX	(896UL << 20)
++# define CRASH_ADDR_HIGH_MAX	MAXMEM
+ #endif
+ 
+-static void __init reserve_crashkernel_low(void)
++static int __init reserve_crashkernel_low(void)
+ {
+ #ifdef CONFIG_X86_64
+-	const unsigned long long alignment = 16<<20;	/* 16M */
+-	unsigned long long low_base = 0, low_size = 0;
++	unsigned long long base, low_base = 0, low_size = 0;
+ 	unsigned long total_low_mem;
+-	unsigned long long base;
+-	bool auto_set = false;
+ 	int ret;
+ 
+-	total_low_mem = memblock_mem_size(1UL<<(32-PAGE_SHIFT));
++	total_low_mem = memblock_mem_size(1UL << (32 - PAGE_SHIFT));
++
+ 	/* crashkernel=Y,low */
+-	ret = parse_crashkernel_low(boot_command_line, total_low_mem,
+-						&low_size, &base);
+-	if (ret != 0) {
++	ret = parse_crashkernel_low(boot_command_line, total_low_mem, &low_size, &base);
++	if (ret) {
+ 		/*
+ 		 * two parts from lib/swiotlb.c:
+ 		 * -swiotlb size: user-specified with swiotlb= or default.
+@@ -587,52 +587,52 @@ static void __init reserve_crashkernel_l
+ 		 * make sure we allocate enough extra low memory so that we
+ 		 * don't run out of DMA buffers for 32-bit devices.
+ 		 */
+-		low_size = max(swiotlb_size_or_default() + (8UL<<20), 256UL<<20);
+-		auto_set = true;
++		low_size = max(swiotlb_size_or_default() + (8UL << 20), 256UL << 20);
+ 	} else {
+ 		/* passed with crashkernel=0,low ? */
+ 		if (!low_size)
+-			return;
++			return 0;
+ 	}
+ 
+-	low_base = memblock_find_in_range(low_size, (1ULL<<32),
+-					low_size, alignment);
+-
++	low_base = memblock_find_in_range(low_size, 1ULL << 32, low_size, CRASH_ALIGN);
+ 	if (!low_base) {
+-		if (!auto_set)
+-			pr_info("crashkernel low reservation failed - No suitable area found.\n");
++		pr_err("Cannot reserve %ldMB crashkernel low memory, please try smaller size.\n",
++		       (unsigned long)(low_size >> 20));
++		return -ENOMEM;
++	}
+ 
+-		return;
++	ret = memblock_reserve(low_base, low_size);
++	if (ret) {
++		pr_err("%s: Error reserving crashkernel low memblock.\n", __func__);
++		return ret;
+ 	}
+ 
+-	memblock_reserve(low_base, low_size);
+ 	pr_info("Reserving %ldMB of low memory at %ldMB for crashkernel (System low RAM: %ldMB)\n",
+-			(unsigned long)(low_size >> 20),
+-			(unsigned long)(low_base >> 20),
+-			(unsigned long)(total_low_mem >> 20));
++		(unsigned long)(low_size >> 20),
++		(unsigned long)(low_base >> 20),
++		(unsigned long)(total_low_mem >> 20));
++
+ 	crashk_low_res.start = low_base;
+ 	crashk_low_res.end   = low_base + low_size - 1;
+ 	insert_resource(&iomem_resource, &crashk_low_res);
+ #endif
++	return 0;
+ }
+ 
+ static void __init reserve_crashkernel(void)
+ {
+-	const unsigned long long alignment = 16<<20;	/* 16M */
+-	unsigned long long total_mem;
+-	unsigned long long crash_size, crash_base;
++	unsigned long long crash_size, crash_base, total_mem;
+ 	bool high = false;
+ 	int ret;
+ 
+ 	total_mem = memblock_phys_mem_size();
+ 
+ 	/* crashkernel=XM */
+-	ret = parse_crashkernel(boot_command_line, total_mem,
+-			&crash_size, &crash_base);
++	ret = parse_crashkernel(boot_command_line, total_mem, &crash_size, &crash_base);
+ 	if (ret != 0 || crash_size <= 0) {
+ 		/* crashkernel=X,high */
+ 		ret = parse_crashkernel_high(boot_command_line, total_mem,
+-				&crash_size, &crash_base);
++					     &crash_size, &crash_base);
+ 		if (ret != 0 || crash_size <= 0)
+ 			return;
+ 		high = true;
+@@ -643,11 +643,10 @@ static void __init reserve_crashkernel(v
+ 		/*
+ 		 *  kexec want bzImage is below CRASH_KERNEL_ADDR_MAX
+ 		 */
+-		crash_base = memblock_find_in_range(alignment,
+-					high ? CRASH_KERNEL_ADDR_HIGH_MAX :
+-					       CRASH_KERNEL_ADDR_LOW_MAX,
+-					crash_size, alignment);
+-
++		crash_base = memblock_find_in_range(CRASH_ALIGN,
++						    high ? CRASH_ADDR_HIGH_MAX
++							 : CRASH_ADDR_LOW_MAX,
++						    crash_size, CRASH_ALIGN);
+ 		if (!crash_base) {
+ 			pr_info("crashkernel reservation failed - No suitable area found.\n");
+ 			return;
+@@ -657,26 +656,32 @@ static void __init reserve_crashkernel(v
+ 		unsigned long long start;
+ 
+ 		start = memblock_find_in_range(crash_base,
+-				 crash_base + crash_size, crash_size, 1<<20);
++					       crash_base + crash_size,
++					       crash_size, 1 << 20);
+ 		if (start != crash_base) {
+ 			pr_info("crashkernel reservation failed - memory is in use.\n");
+ 			return;
+ 		}
+ 	}
+-	memblock_reserve(crash_base, crash_size);
++	ret = memblock_reserve(crash_base, crash_size);
++	if (ret) {
++		pr_err("%s: Error reserving crashkernel memblock.\n", __func__);
++		return;
++	}
++
++	if (crash_base >= (1ULL << 32) && reserve_crashkernel_low()) {
++		memblock_free(crash_base, crash_size);
++		return;
++	}
+ 
+-	printk(KERN_INFO "Reserving %ldMB of memory at %ldMB "
+-			"for crashkernel (System RAM: %ldMB)\n",
+-			(unsigned long)(crash_size >> 20),
+-			(unsigned long)(crash_base >> 20),
+-			(unsigned long)(total_mem >> 20));
++	pr_info("Reserving %ldMB of memory at %ldMB for crashkernel (System RAM: %ldMB)\n",
++		(unsigned long)(crash_size >> 20),
++		(unsigned long)(crash_base >> 20),
++		(unsigned long)(total_mem >> 20));
+ 
+ 	crashk_res.start = crash_base;
+ 	crashk_res.end   = crash_base + crash_size - 1;
+ 	insert_resource(&iomem_resource, &crashk_res);
+-
+-	if (crash_base >= (1ULL<<32))
+-		reserve_crashkernel_low();
+ }
+ #else
+ static void __init reserve_crashkernel(void)
+@@ -1224,8 +1229,10 @@ void __init setup_arch(char **cmdline_p)
+ 	memblock_set_current_limit(ISA_END_ADDRESS);
+ 	memblock_x86_fill();
+ 
+-	if (efi_enabled(EFI_BOOT))
++	if (efi_enabled(EFI_BOOT)) {
++		efi_fake_memmap();
+ 		efi_find_mirror();
++	}
+ 
+ 	/*
+ 	 * The EFI specification says that boot service code won't be called
+@@ -1336,7 +1343,7 @@ void __init setup_arch(char **cmdline_p)
+ 	 */
+ 	clone_pgd_range(initial_page_table,
+ 			swapper_pg_dir     + KERNEL_PGD_BOUNDARY,
+-			KERNEL_PGD_PTRS);
++			min(KERNEL_PGD_PTRS, KERNEL_PGD_BOUNDARY));
+ #endif
+ 
+ 	tboot_probe();
+--- a/arch/x86/kernel/traps-xen.c
++++ b/arch/x86/kernel/traps-xen.c
+@@ -367,7 +367,7 @@ dotraplinkage void do_double_fault(struc
+ 
+ dotraplinkage void do_bounds(struct pt_regs *regs, long error_code)
+ {
+-	const struct bndcsr *bndcsr;
++	const struct mpx_bndcsr *bndcsr;
+ 	siginfo_t *info;
+ 
+ 	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+@@ -390,7 +390,7 @@ dotraplinkage void do_bounds(struct pt_r
+ 	 * which is all zeros which indicates MPX was not
+ 	 * responsible for the exception.
+ 	 */
+-	bndcsr = get_xsave_field_ptr(XSTATE_BNDCSR);
++	bndcsr = get_xsave_field_ptr(XFEATURE_MASK_BNDCSR);
+ 	if (!bndcsr)
+ 		goto exit_trap;
+ 
+--- a/arch/x86/mm/dump_pagetables-xen.c
++++ b/arch/x86/mm/dump_pagetables-xen.c
+@@ -35,6 +35,8 @@ struct pg_state {
+ 	const struct addr_marker *marker;
+ 	unsigned long lines;
+ 	bool to_dmesg;
++	bool check_wx;
++	unsigned long wx_pages;
+ };
+ 
+ struct addr_marker {
+@@ -168,7 +170,7 @@ static void printk_prot(struct seq_file
+ 			pt_dump_cont_printf(m, dmsg, "    ");
+ 		if ((level == 4 && pr & _PAGE_PAT) ||
+ 		    ((level == 3 || level == 2) && pr & _PAGE_PAT_LARGE))
+-			pt_dump_cont_printf(m, dmsg, "pat ");
++			pt_dump_cont_printf(m, dmsg, "PAT ");
+ 		else
+ 			pt_dump_cont_printf(m, dmsg, "    ");
+ 		if (pr & _PAGE_GLOBAL)
+@@ -211,8 +213,8 @@ static void note_page(struct seq_file *m
+ 	 * we have now. "break" is either changing perms, levels or
+ 	 * address space marker.
+ 	 */
+-	prot = pgprot_val(new_prot) & PTE_FLAGS_MASK;
+-	cur = pgprot_val(st->current_prot) & PTE_FLAGS_MASK;
++	prot = pgprot_val(new_prot);
++	cur = pgprot_val(st->current_prot);
+ 
+ 	if (!st->level) {
+ 		/* First entry */
+@@ -227,6 +229,16 @@ static void note_page(struct seq_file *m
+ 		const char *unit = units;
+ 		unsigned long delta;
+ 		int width = sizeof(unsigned long) * 2;
++		pgprotval_t pr = pgprot_val(st->current_prot);
++
++		if (st->check_wx && (pr & _PAGE_RW) && !(pr & _PAGE_NX)) {
++			WARN_ONCE(1,
++				  "x86/mm: Found insecure W+X mapping at address %p/%pS\n",
++				  (void *)st->start_address,
++				  (void *)st->start_address);
++			st->wx_pages += (st->current_address -
++					 st->start_address) / PAGE_SIZE;
++		}
+ 
+ 		/*
+ 		 * Now print the actual finished series
+@@ -282,13 +294,13 @@ static void walk_pte_level(struct seq_fi
+ {
+ 	int i;
+ 	pte_t *start;
++	pgprotval_t prot;
+ 
+ 	start = (pte_t *) pmd_page_vaddr(addr);
+ 	for (i = 0; i < PTRS_PER_PTE; i++) {
+-		pgprot_t prot = pte_pgprot(*start);
+-
++		prot = pte_flags(*start);
+ 		st->current_address = normalize_addr(P + i * PTE_LEVEL_MULT);
+-		note_page(m, st, prot, 4);
++		note_page(m, st, __pgprot(prot), 4);
+ 		start++;
+ 	}
+ }
+@@ -300,19 +312,20 @@ static void walk_pmd_level(struct seq_fi
+ {
+ 	int i;
+ 	pmd_t *start;
++	pgprotval_t prot;
+ 
+ 	start = (pmd_t *) pud_page_vaddr(addr);
+ 	for (i = 0; i < PTRS_PER_PMD; i++) {
+ 		st->current_address = normalize_addr(P + i * PMD_LEVEL_MULT);
+ 		if (!hypervisor_space(st->current_address)
+ 		    && !pmd_none(*start)) {
+-			pgprotval_t prot = __pmd_val(*start) & PTE_FLAGS_MASK;
+-
+-			if (pmd_large(*start) || !pmd_present(*start))
++			if (pmd_large(*start) || !pmd_present(*start)) {
++				prot = pmd_flags(*start);
+ 				note_page(m, st, __pgprot(prot), 3);
+-			else
++			} else {
+ 				walk_pte_level(m, st, *start,
+ 					       P + i * PMD_LEVEL_MULT);
++			}
+ 		} else
+ 			note_page(m, st, __pgprot(0), 3);
+ 		start++;
+@@ -332,6 +345,7 @@ static void walk_pud_level(struct seq_fi
+ {
+ 	int i;
+ 	pud_t *start;
++	pgprotval_t prot;
+ 
+ 	start = (pud_t *) pgd_page_vaddr(addr);
+ 
+@@ -339,13 +353,13 @@ static void walk_pud_level(struct seq_fi
+ 		st->current_address = normalize_addr(P + i * PUD_LEVEL_MULT);
+ 		if (!hypervisor_space(st->current_address)
+ 		    && !pud_none(*start)) {
+-			pgprotval_t prot = __pud_val(*start) & PTE_FLAGS_MASK;
+-
+-			if (pud_large(*start) || !pud_present(*start))
++			if (pud_large(*start) || !pud_present(*start)) {
++				prot = pud_flags(*start);
+ 				note_page(m, st, __pgprot(prot), 2);
+-			else
++			} else {
+ 				walk_pmd_level(m, st, *start,
+ 					       P + i * PUD_LEVEL_MULT);
++			}
+ 		} else
+ 			note_page(m, st, __pgprot(0), 2);
+ 
+@@ -360,13 +374,30 @@ static void walk_pud_level(struct seq_fi
+ #define pgd_none(a)  pud_none(__pud_ma(__pgd_val(a)))
+ #endif
+ 
+-void ptdump_walk_pgd_level(struct seq_file *m, pgd_t *pgd)
++#ifdef CONFIG_X86_64
++static inline bool is_hypervisor_range(int idx)
++{
++	/*
++	 * ffff800000000000 - ffff87ffffffffff is reserved for
++	 * the hypervisor.
++	 */
++	return paravirt_enabled() &&
++		(idx >= pgd_index(__PAGE_OFFSET) - 16) &&
++		(idx < pgd_index(__PAGE_OFFSET));
++}
++#else
++static inline bool is_hypervisor_range(int idx) { return false; }
++#endif
++
++static void ptdump_walk_pgd_level_core(struct seq_file *m, pgd_t *pgd,
++				       bool checkwx)
+ {
+ #ifdef CONFIG_X86_64
+ 	pgd_t *start = (pgd_t *) &init_level4_pgt;
+ #else
+ 	pgd_t *start = swapper_pg_dir;
+ #endif
++	pgprotval_t prot;
+ 	int i;
+ 	struct pg_state st = {};
+ 
+@@ -375,16 +406,20 @@ void ptdump_walk_pgd_level(struct seq_fi
+ 		st.to_dmesg = true;
+ 	}
+ 
++	st.check_wx = checkwx;
++	if (checkwx)
++		st.wx_pages = 0;
++
+ 	for (i = 0; i < PTRS_PER_PGD; i++) {
+ 		st.current_address = normalize_addr(i * PGD_LEVEL_MULT);
+-		if (!pgd_none(*start)) {
+-			pgprotval_t prot = __pgd_val(*start) & PTE_FLAGS_MASK;
+-
+-			if (pgd_large(*start) || !pgd_present(*start))
++		if (!pgd_none(*start) && !is_hypervisor_range(i)) {
++			if (pgd_large(*start) || !pgd_present(*start)) {
++				prot = pgd_flags(*start);
+ 				note_page(m, &st, __pgprot(prot), 1);
+-			else
++			} else {
+ 				walk_pud_level(m, &st, *start,
+ 					       i * PGD_LEVEL_MULT);
++			}
+ 		} else
+ 			note_page(m, &st, __pgprot(0), 1);
+ 
+@@ -394,8 +429,26 @@ void ptdump_walk_pgd_level(struct seq_fi
+ 	/* Flush out the last page */
+ 	st.current_address = normalize_addr(PTRS_PER_PGD*PGD_LEVEL_MULT);
+ 	note_page(m, &st, __pgprot(0), 0);
++	if (!checkwx)
++		return;
++	if (st.wx_pages)
++		pr_info("x86/mm: Checked W+X mappings: FAILED, %lu W+X pages found.\n",
++			st.wx_pages);
++	else
++		pr_info("x86/mm: Checked W+X mappings: passed, no W+X pages found.\n");
++}
++
++void ptdump_walk_pgd_level(struct seq_file *m, pgd_t *pgd)
++{
++	ptdump_walk_pgd_level_core(m, pgd, false);
++}
++
++void ptdump_walk_pgd_level_checkwx(void)
++{
++	ptdump_walk_pgd_level_core(NULL, NULL, true);
+ }
+ 
++#ifdef CONFIG_X86_PTDUMP
+ static int ptdump_show(struct seq_file *m, void *v)
+ {
+ 	ptdump_walk_pgd_level(m, NULL);
+@@ -413,10 +466,13 @@ static const struct file_operations ptdu
+ 	.llseek		= seq_lseek,
+ 	.release	= single_release,
+ };
++#endif
+ 
+ static int __init pt_dump_init(void)
+ {
++#ifdef CONFIG_X86_PTDUMP
+ 	struct dentry *pe;
++#endif
+ 
+ #ifdef CONFIG_X86_32
+ 	/* Not a compile-time constant on x86-32 */
+@@ -429,10 +485,12 @@ static int __init pt_dump_init(void)
+ 	address_markers[XEN_SPACE_NR].start_address = hypervisor_virt_start;
+ #endif
+ 
++#ifdef CONFIG_X86_PTDUMP
+ 	pe = debugfs_create_file("kernel_page_tables", 0600, NULL, NULL,
+ 				 &ptdump_fops);
+ 	if (!pe)
+ 		return -ENOMEM;
++#endif
+ 
+ 	return 0;
+ }
+--- a/arch/x86/mm/highmem_32-xen.c
++++ b/arch/x86/mm/highmem_32-xen.c
+@@ -116,7 +116,6 @@ struct page *kmap_atomic_to_page(void *p
+ 	pte = kmap_pte - (idx - FIX_KMAP_BEGIN);
+ 	return pte_page(*pte);
+ }
+-EXPORT_SYMBOL(kmap_atomic_to_page);
+ 
+ void clear_highpage(struct page *page)
+ {
+--- a/arch/x86/mm/init-xen.c
++++ b/arch/x86/mm/init-xen.c
+@@ -375,7 +375,7 @@ static int __meminit split_mem_range(str
+ 	}
+ 
+ 	for (i = 0; i < nr_range; i++)
+-		printk(KERN_DEBUG " [mem %#010lx-%#010lx] page %s\n",
++		pr_debug(" [mem %#010lx-%#010lx] page %s\n",
+ 				mr[i].start, mr[i].end - 1,
+ 				page_size_string(&mr[i]));
+ 
+@@ -422,7 +422,7 @@ unsigned long __init_refok init_memory_m
+ 	unsigned long ret = 0;
+ 	int nr_range, i;
+ 
+-	pr_info("init_memory_mapping: [mem %#010lx-%#010lx]\n",
++	pr_debug("init_memory_mapping: [mem %#010lx-%#010lx]\n",
+ 	       start, end - 1);
+ 
+ 	memset(mr, 0, sizeof(mr));
+@@ -732,14 +732,12 @@ void free_initmem(void)
+ #ifdef CONFIG_BLK_DEV_INITRD
+ void __init free_initrd_mem(unsigned long start, unsigned long end)
+ {
+-#ifdef CONFIG_MICROCODE_EARLY
+ 	/*
+ 	 * Remember, initrd memory may contain microcode or other useful things.
+ 	 * Before we lose initrd mem, we need to find a place to hold them
+ 	 * now that normal virtual memory is enabled.
+ 	 */
+ 	save_microcode_in_initrd();
+-#endif
+ 
+ 	/*
+ 	 * end could be not aligned, and We can not align that,
+--- a/arch/x86/mm/init_32-xen.c
++++ b/arch/x86/mm/init_32-xen.c
+@@ -965,6 +965,8 @@ void mark_rodata_ro(void)
+ 	set_pages_ro(virt_to_page(start), size >> PAGE_SHIFT);
+ #endif
+ 	mark_nxdata_nx();
++	if (__supported_pte_mask & _PAGE_NX)
++		debug_checkwx();
+ }
+ #endif
+ 
+--- a/arch/x86/mm/init_64-xen.c
++++ b/arch/x86/mm/init_64-xen.c
+@@ -1481,6 +1481,8 @@ void mark_rodata_ro(void)
+ 	free_init_pages("unused kernel",
+ 			(unsigned long) __va(__pa_symbol(rodata_end)),
+ 			(unsigned long) __va(__pa_symbol(_sdata)));
++
++	debug_checkwx();
+ }
+ 
+ #endif
+@@ -1614,7 +1616,7 @@ static int __meminit vmemmap_populate_hu
+ 				/* check to see if we have contiguous blocks */
+ 				if (p_end != p || node_start != node) {
+ 					if (p_start)
+-						printk(KERN_DEBUG " [%lx-%lx] PMD -> [%p-%p] on node %d\n",
++						pr_debug(" [%lx-%lx] PMD -> [%p-%p] on node %d\n",
+ 						       addr_start, addr_end-1, p_start, p_end-1, node_start);
+ 					addr_start = addr;
+ 					node_start = node;
+@@ -1712,7 +1714,7 @@ void register_page_bootmem_memmap(unsign
+ void __meminit vmemmap_populate_print_last(void)
+ {
+ 	if (p_start) {
+-		printk(KERN_DEBUG " [%lx-%lx] PMD -> [%p-%p] on node %d\n",
++		pr_debug(" [%lx-%lx] PMD -> [%p-%p] on node %d\n",
+ 			addr_start, addr_end-1, p_start, p_end-1, node_start);
+ 		p_start = NULL;
+ 		p_end = NULL;
+--- a/arch/x86/mm/pageattr-xen.c
++++ b/arch/x86/mm/pageattr-xen.c
+@@ -414,18 +414,28 @@ pmd_t *lookup_pmd_address(unsigned long
+ phys_addr_t slow_virt_to_phys(void *__virt_addr)
+ {
+ 	unsigned long virt_addr = (unsigned long)__virt_addr;
+-	phys_addr_t phys_addr;
+-	unsigned long offset;
++	unsigned long phys_addr, offset;
+ 	enum pg_level level;
+-	unsigned long pmask;
+ 	pte_t *pte;
+ 
+ 	pte = lookup_address(virt_addr, &level);
+ 	BUG_ON(!pte);
+-	pmask = page_level_mask(level);
+-	offset = virt_addr & ~pmask;
+-	phys_addr = (phys_addr_t)pte_pfn(*pte) << PAGE_SHIFT;
+-	return (phys_addr | offset);
++
++	switch (level) {
++	case PG_LEVEL_1G:
++		phys_addr = pud_pfn(*(pud_t *)pte) << PAGE_SHIFT;
++		offset = virt_addr & ~PUD_PAGE_MASK;
++		break;
++	case PG_LEVEL_2M:
++		phys_addr = pmd_pfn(*(pmd_t *)pte) << PAGE_SHIFT;
++		offset = virt_addr & ~PMD_PAGE_MASK;
++		break;
++	default:
++		phys_addr = pte_pfn(*pte) << PAGE_SHIFT;
++		offset = virt_addr & ~PAGE_MASK;
++	}
++
++	return (phys_addr_t)(phys_addr | offset);
+ }
+ EXPORT_SYMBOL_GPL(slow_virt_to_phys);
+ 
+@@ -470,7 +480,7 @@ static int
+ try_preserve_large_page(pte_t *kpte, unsigned long address,
+ 			struct cpa_data *cpa)
+ {
+-	unsigned long nextpage_addr, numpages, pmask, psize, addr, pfn;
++	unsigned long nextpage_addr, numpages, pmask, psize, addr, pfn, old_pfn;
+ 	pte_t new_pte, old_pte, *tmp;
+ 	pgprot_t old_prot, new_prot, req_prot;
+ 	int i, do_split = 1;
+@@ -490,17 +500,21 @@ try_preserve_large_page(pte_t *kpte, uns
+ 
+ 	switch (level) {
+ 	case PG_LEVEL_2M:
+-#ifdef CONFIG_X86_64
++		old_prot = pmd_pgprot(*(pmd_t *)kpte);
++		old_pfn = pmd_pfn(*(pmd_t *)kpte);
++		break;
+ 	case PG_LEVEL_1G:
+-#endif
+-		psize = page_level_size(level);
+-		pmask = page_level_mask(level);
++		old_prot = pud_pgprot(*(pud_t *)kpte);
++		old_pfn = pud_pfn(*(pud_t *)kpte);
+ 		break;
+ 	default:
+ 		do_split = -EINVAL;
+ 		goto out_unlock;
+ 	}
+ 
++	psize = page_level_size(level);
++	pmask = page_level_mask(level);
++
+ 	/*
+ 	 * Calculate the number of pages, which fit into this large
+ 	 * page starting at address:
+@@ -516,7 +530,7 @@ try_preserve_large_page(pte_t *kpte, uns
+ 	 * up accordingly.
+ 	 */
+ 	old_pte = *kpte;
+-	old_prot = req_prot = pgprot_large_2_4k(pte_pgprot(old_pte));
++	req_prot = pgprot_large_2_4k(old_prot);
+ 
+ 	pgprot_val(req_prot) &= ~pgprot_val(cpa->mask_clr);
+ 	pgprot_val(req_prot) |= pgprot_val(cpa->mask_set);
+@@ -542,10 +556,10 @@ try_preserve_large_page(pte_t *kpte, uns
+ 	req_prot = canon_pgprot(req_prot);
+ 
+ 	/*
+-	 * old_pte points to the large page base address. So we need
++	 * old_pfn points to the large page base pfn. So we need
+ 	 * to add the offset of the virtual address:
+ 	 */
+-	pfn = pte_pfn(old_pte) + ((address & (psize - 1)) >> PAGE_SHIFT);
++	pfn = old_pfn + ((address & (psize - 1)) >> PAGE_SHIFT);
+ 	cpa->pfn = pfn;
+ 
+ 	new_prot = static_protections(req_prot, address, pfn);
+@@ -556,7 +570,7 @@ try_preserve_large_page(pte_t *kpte, uns
+ 	 * the pages in the range we try to preserve:
+ 	 */
+ 	addr = address & pmask;
+-	pfn = pte_pfn(old_pte);
++	pfn = old_pfn;
+ 	for (i = 0; i < (psize >> PAGE_SHIFT) && pfn < max_mapnr;
+ 	     i++, addr += PAGE_SIZE, pfn++) {
+ 		pgprot_t chk_prot = static_protections(req_prot, addr, pfn);
+@@ -587,7 +601,7 @@ try_preserve_large_page(pte_t *kpte, uns
+ 		 * The address is aligned and the number of pages
+ 		 * covers the full page.
+ 		 */
+-		new_pte = pfn_pte_ma(__pte_mfn(old_pte), new_prot);
++		new_pte = pfn_pte(old_pfn, new_prot);
+ 		__set_pmd_pte(kpte, address, level, new_pte);
+ 		cpa->flags |= CPA_FLUSHTLB;
+ 		do_split = 0;
+@@ -604,7 +618,7 @@ __split_large_page(struct cpa_data *cpa,
+ 		   struct page *base)
+ {
+ 	pte_t *pbase = (pte_t *)page_address(base);
+-	unsigned long mfn, mfninc = 1;
++	unsigned long ref_mfn, mfn, mfninc = 1;
+ 	unsigned int i, level;
+ 	pte_t *tmp;
+ 	pgprot_t ref_prot;
+@@ -621,26 +635,33 @@ __split_large_page(struct cpa_data *cpa,
+ 	}
+ 
+ 	paravirt_alloc_pte(&init_mm, page_to_pfn(base));
+-	ref_prot = pte_pgprot(pte_clrhuge(*kpte));
+ 
+-	/* promote PAT bit to correct position */
+-	if (level == PG_LEVEL_2M)
++	switch (level) {
++	case PG_LEVEL_2M:
++		ref_prot = pmd_pgprot(*(pmd_t *)kpte);
++		/* clear PSE and promote PAT bit to correct position */
+ 		ref_prot = pgprot_large_2_4k(ref_prot);
++		ref_mfn = __pte_mfn(*kpte);
++		break;
+ 
+-#ifdef CONFIG_X86_64
+-	if (level == PG_LEVEL_1G) {
++	case PG_LEVEL_1G:
++		ref_prot = pud_pgprot(*(pud_t *)kpte);
++		ref_mfn = __pte_mfn(*kpte);
+ 		mfninc = PMD_PAGE_SIZE >> PAGE_SHIFT;
++
+ 		/*
+-		 * Set the PSE flags only if the PRESENT flag is set
++		 * Clear the PSE flags if the PRESENT flag is not set
+ 		 * otherwise pmd_present/pmd_huge will return true
+ 		 * even on a non present pmd.
+ 		 */
+-		if (pgprot_val(ref_prot) & _PAGE_PRESENT)
+-			pgprot_val(ref_prot) |= _PAGE_PSE;
+-		else
++		if (!(pgprot_val(ref_prot) & _PAGE_PRESENT))
+ 			pgprot_val(ref_prot) &= ~_PAGE_PSE;
++		break;
++
++	default:
++		spin_unlock(&pgd_lock);
++		return 1;
+ 	}
+-#endif
+ 
+ 	/*
+ 	 * Set the GLOBAL flags only if the PRESENT flag is set
+@@ -656,13 +677,16 @@ __split_large_page(struct cpa_data *cpa,
+ 	/*
+ 	 * Get the target mfn from the original entry:
+ 	 */
+-	mfn = __pte_mfn(*kpte);
++	mfn = ref_mfn;
+ 	for (i = 0; i < PTRS_PER_PTE; i++, mfn += mfninc)
+ 		set_pte(&pbase[i], pfn_pte_ma(mfn, canon_pgprot(ref_prot)));
+ 
+-	if (pfn_range_is_mapped(PFN_DOWN(__pa(address)),
+-				PFN_DOWN(__pa(address)) + 1))
+-		split_page_count(level);
++	if (virt_addr_valid(address)) {
++		unsigned long pfn = PFN_DOWN(__pa(address));
++
++		if (pfn_range_is_mapped(pfn, pfn + 1))
++			split_page_count(level);
++	}
+ 
+ 	/*
+ 	 * Install the new, split up pagetable.
+--- a/arch/x86/ras/Kconfig
++++ b/arch/x86/ras/Kconfig
+@@ -1,6 +1,6 @@
+ config AMD_MCE_INJ
+ 	tristate "Simple MCE injection interface for AMD processors"
+-	depends on RAS && EDAC_DECODE_MCE && DEBUG_FS && AMD_NB
++	depends on RAS && EDAC_DECODE_MCE && DEBUG_FS && AMD_NB && !XEN
+ 	default n
+ 	help
+ 	  This is a simple debugfs interface to inject MCEs and test different
+--- a/drivers/acpi/apei/ghes.c
++++ b/drivers/acpi/apei/ghes.c
+@@ -147,17 +147,23 @@ static void ghes_ioremap_exit(void)
+ static void __iomem *ghes_ioremap_pfn_nmi(u64 pfn)
+ {
+ 	unsigned long vaddr;
++	phys_addr_t paddr;
++	pgprot_t prot;
+ 
+ 	vaddr = (unsigned long)GHES_IOREMAP_NMI_PAGE(ghes_ioremap_area->addr);
+-	ioremap_page_range(vaddr, vaddr + PAGE_SIZE,
+-			   pfn << PAGE_SHIFT, PAGE_KERNEL);
++
++	paddr = pfn << PAGE_SHIFT;
++	prot = arch_apei_get_mem_attribute(paddr);
++
++	ioremap_page_range(vaddr, vaddr + PAGE_SIZE, paddr, prot);
+ 
+ 	return (void __iomem *)vaddr;
+ }
+ 
+ static void __iomem *ghes_ioremap_pfn_irq(u64 pfn)
+ {
+-	unsigned long vaddr, paddr;
++	unsigned long vaddr;
++	phys_addr_t paddr;
+ 	pgprot_t prot;
+ 
+ 	vaddr = (unsigned long)GHES_IOREMAP_IRQ_PAGE(ghes_ioremap_area->addr);
+--- a/drivers/hwmon/coretemp-xen.c
++++ b/drivers/hwmon/coretemp-xen.c
+@@ -53,7 +53,7 @@ module_param_named(tjmax, force_tjmax, i
+ MODULE_PARM_DESC(tjmax, "TjMax value in degrees Celsius");
+ 
+ #define BASE_SYSFS_ATTR_NO	2	/* Sysfs Base attr no for coretemp */
+-#define NUM_REAL_CORES		32	/* Number of Real cores per cpu */
++#define NUM_REAL_CORES		128	/* Number of Real cores per cpu */
+ #define CORETEMP_NAME_LENGTH	19	/* String Length of attrs */
+ #define MAX_CORE_ATTRS		4	/* Maximum no of basic attrs */
+ #define TOTAL_ATTRS		(MAX_CORE_ATTRS + 1)
+--- a/drivers/xen/Makefile
++++ b/drivers/xen/Makefile
+@@ -4,9 +4,7 @@ xen-balloon_$(CONFIG_PARAVIRT_XEN) := xe
+ xen-evtchn-name-$(CONFIG_PARAVIRT_XEN) := xen-evtchn
+ xen-privcmd_$(CONFIG_PARAVIRT_XEN) := xen-privcmd.o
+ 
+-ifeq ($(filter y, $(CONFIG_ARM) $(CONFIG_ARM64)),)
+ obj-$(CONFIG_HOTPLUG_CPU)	+= $(xen-hotplug-y)
+-endif
+ obj-$(CONFIG_X86)		+= fallback.o
+ obj-$(CONFIG_PARAVIRT_XEN)	+= grant-table.o features.o balloon.o manage.o preempt.o
+ obj-$(CONFIG_PARAVIRT_XEN)	+= events/
+--- a/drivers/xen/blktap2-new/request.c
++++ b/drivers/xen/blktap2-new/request.c
+@@ -305,7 +305,7 @@ __mempool_page_alloc(gfp_t gfp_mask, voi
+ {
+ 	struct page *page;
+ 
+-	if (!(gfp_mask & __GFP_WAIT))
++	if (!gfpflags_allow_blocking(gfp_mask))
+ 		return NULL;
+ 
+ 	page = alloc_page(gfp_mask);
+--- a/drivers/xen/xenbus/xenbus_client.c
++++ b/drivers/xen/xenbus/xenbus_client.c
+@@ -55,6 +55,10 @@
+ #if defined(CONFIG_PARAVIRT_XEN)
+ #include "xenbus_probe.h"
+ 
++#define XENBUS_PAGES(_grants)	(DIV_ROUND_UP(_grants, XEN_PFN_PER_PAGE))
++
++#define XENBUS_MAX_RING_PAGES	(XENBUS_PAGES(XENBUS_MAX_RING_GRANTS))
++
+ struct xenbus_map_node {
+ 	struct list_head next;
+ 	union {
+@@ -63,10 +67,11 @@ struct xenbus_map_node {
+ 		} pv;
+ 		struct {
+ 			struct page *pages[XENBUS_MAX_RING_PAGES];
++			unsigned long addrs[XENBUS_MAX_RING_GRANTS];
+ 			void *addr;
+ 		} hvm;
+ 	};
+-	grant_handle_t handles[XENBUS_MAX_RING_PAGES];
++	grant_handle_t handles[XENBUS_MAX_RING_GRANTS];
+ 	unsigned int   nr_handles;
+ };
+ 
+@@ -420,7 +425,7 @@ int xenbus_grant_ring(struct xenbus_devi
+ 		}
+ 		grefs[i] = err;
+ 
+-		vaddr = vaddr + PAGE_SIZE;
++		vaddr = vaddr + XEN_PAGE_SIZE;
+ 	}
+ 
+ 	return 0;
+@@ -510,12 +515,12 @@ static int __xenbus_map_ring(struct xenb
+ 			     unsigned int flags,
+ 			     bool *leaked)
+ {
+-	struct gnttab_map_grant_ref map[XENBUS_MAX_RING_PAGES];
+-	struct gnttab_unmap_grant_ref unmap[XENBUS_MAX_RING_PAGES];
++	struct gnttab_map_grant_ref map[XENBUS_MAX_RING_GRANTS];
++	struct gnttab_unmap_grant_ref unmap[XENBUS_MAX_RING_GRANTS];
+ 	int i, j;
+ 	int err = GNTST_okay;
+ 
+-	if (nr_grefs > XENBUS_MAX_RING_PAGES)
++	if (nr_grefs > XENBUS_MAX_RING_GRANTS)
+ 		return -EINVAL;
+ 
+ 	for (i = 0; i < nr_grefs; i++) {
+@@ -571,22 +576,22 @@ static int xenbus_map_ring_valloc_pv(str
+ {
+ 	struct xenbus_map_node *node;
+ 	struct vm_struct *area;
+-	pte_t *ptes[XENBUS_MAX_RING_PAGES];
+-	phys_addr_t phys_addrs[XENBUS_MAX_RING_PAGES];
++	pte_t *ptes[XENBUS_MAX_RING_GRANTS];
++	phys_addr_t phys_addrs[XENBUS_MAX_RING_GRANTS];
+ 	int err = GNTST_okay;
+ 	int i;
+ 	bool leaked;
+ 
+ 	*vaddr = NULL;
+ 
+-	if (nr_grefs > XENBUS_MAX_RING_PAGES)
++	if (nr_grefs > XENBUS_MAX_RING_GRANTS)
+ 		return -EINVAL;
+ 
+ 	node = kzalloc(sizeof(*node), GFP_KERNEL);
+ 	if (!node)
+ 		return -ENOMEM;
+ 
+-	area = alloc_vm_area(PAGE_SIZE * nr_grefs, ptes);
++	area = alloc_vm_area(XEN_PAGE_SIZE * nr_grefs, ptes);
+ 	if (!area) {
+ 		kfree(node);
+ 		return -ENOMEM;
+@@ -622,21 +627,44 @@ failed:
+ 	return err;
+ }
+ 
++struct map_ring_valloc_hvm
++{
++	unsigned int idx;
++
++	/* Why do we need two arrays? See comment of __xenbus_map_ring */
++	phys_addr_t phys_addrs[XENBUS_MAX_RING_GRANTS];
++	unsigned long addrs[XENBUS_MAX_RING_GRANTS];
++};
++
++static void xenbus_map_ring_setup_grant_hvm(unsigned long gfn,
++					    unsigned int goffset,
++					    unsigned int len,
++					    void *data)
++{
++	struct map_ring_valloc_hvm *info = data;
++	unsigned long vaddr = (unsigned long)gfn_to_virt(gfn);
++
++	info->phys_addrs[info->idx] = vaddr;
++	info->addrs[info->idx] = vaddr;
++
++	info->idx++;
++}
++
+ static int xenbus_map_ring_valloc_hvm(struct xenbus_device *dev,
+ 				      grant_ref_t *gnt_ref,
+ 				      unsigned int nr_grefs,
+ 				      void **vaddr)
+ {
+ 	struct xenbus_map_node *node;
+-	int i;
+ 	int err;
+ 	void *addr;
+ 	bool leaked = false;
+-	/* Why do we need two arrays? See comment of __xenbus_map_ring */
+-	phys_addr_t phys_addrs[XENBUS_MAX_RING_PAGES];
+-	unsigned long addrs[XENBUS_MAX_RING_PAGES];
++	struct map_ring_valloc_hvm info = {
++		.idx = 0,
++	};
++	unsigned int nr_pages = XENBUS_PAGES(nr_grefs);
+ 
+-	if (nr_grefs > XENBUS_MAX_RING_PAGES)
++	if (nr_grefs > XENBUS_MAX_RING_GRANTS)
+ 		return -EINVAL;
+ 
+ 	*vaddr = NULL;
+@@ -645,25 +673,22 @@ static int xenbus_map_ring_valloc_hvm(st
+ 	if (!node)
+ 		return -ENOMEM;
+ 
+-	err = alloc_xenballooned_pages(nr_grefs, node->hvm.pages,
+-				       false /* lowmem */);
++	err = alloc_xenballooned_pages(nr_pages, node->hvm.pages);
+ 	if (err)
+ 		goto out_err;
+ 
+-	for (i = 0; i < nr_grefs; i++) {
+-		unsigned long pfn = page_to_pfn(node->hvm.pages[i]);
+-		phys_addrs[i] = (unsigned long)pfn_to_kaddr(pfn);
+-		addrs[i] = (unsigned long)pfn_to_kaddr(pfn);
+-	}
++	gnttab_foreach_grant(node->hvm.pages, nr_grefs,
++			     xenbus_map_ring_setup_grant_hvm,
++			     &info);
+ 
+ 	err = __xenbus_map_ring(dev, gnt_ref, nr_grefs, node->handles,
+-				phys_addrs, GNTMAP_host_map, &leaked);
++				info.phys_addrs, GNTMAP_host_map, &leaked);
+ 	node->nr_handles = nr_grefs;
+ 
+ 	if (err)
+ 		goto out_free_ballooned_pages;
+ 
+-	addr = vmap(node->hvm.pages, nr_grefs, VM_MAP | VM_IOREMAP,
++	addr = vmap(node->hvm.pages, nr_pages, VM_MAP | VM_IOREMAP,
+ 		    PAGE_KERNEL);
+ 	if (!addr) {
+ 		err = -ENOMEM;
+@@ -681,14 +706,13 @@ static int xenbus_map_ring_valloc_hvm(st
+ 
+  out_xenbus_unmap_ring:
+ 	if (!leaked)
+-		xenbus_unmap_ring(dev, node->handles, node->nr_handles,
+-				  addrs);
++		xenbus_unmap_ring(dev, node->handles, nr_grefs, info.addrs);
+ 	else
+ 		pr_alert("leaking %p size %u page(s)",
+-			 addr, nr_grefs);
++			 addr, nr_pages);
+  out_free_ballooned_pages:
+ 	if (!leaked)
+-		free_xenballooned_pages(nr_grefs, node->hvm.pages);
++		free_xenballooned_pages(nr_pages, node->hvm.pages);
+  out_err:
+ 	kfree(node);
+ 	return err;
+@@ -718,10 +742,10 @@ int xenbus_map_ring(struct xenbus_device
+ 		    unsigned int nr_grefs, grant_handle_t *handles,
+ 		    unsigned long *vaddrs, bool *leaked)
+ {
+-	phys_addr_t phys_addrs[XENBUS_MAX_RING_PAGES];
++	phys_addr_t phys_addrs[XENBUS_MAX_RING_GRANTS];
+ 	int i;
+ 
+-	if (nr_grefs > XENBUS_MAX_RING_PAGES)
++	if (nr_grefs > XENBUS_MAX_RING_GRANTS)
+ 		return -EINVAL;
+ 
+ 	for (i = 0; i < nr_grefs; i++)
+@@ -754,7 +778,7 @@ EXPORT_SYMBOL_GPL(xenbus_unmap_ring_vfre
+ static int xenbus_unmap_ring_vfree_pv(struct xenbus_device *dev, void *vaddr)
+ {
+ 	struct xenbus_map_node *node;
+-	struct gnttab_unmap_grant_ref unmap[XENBUS_MAX_RING_PAGES];
++	struct gnttab_unmap_grant_ref unmap[XENBUS_MAX_RING_GRANTS];
+ 	unsigned int level;
+ 	int i;
+ 	bool leaked = false;
+@@ -781,7 +805,7 @@ static int xenbus_unmap_ring_vfree_pv(st
+ 		unsigned long addr;
+ 
+ 		memset(&unmap[i], 0, sizeof(unmap[i]));
+-		addr = (unsigned long)vaddr + (PAGE_SIZE * i);
++		addr = (unsigned long)vaddr + (XEN_PAGE_SIZE * i);
+ 		unmap[i].host_addr = arbitrary_virt_to_machine(
+ 			lookup_address(addr, &level)).maddr;
+ 		unmap[i].dev_bus_addr = 0;
+@@ -814,13 +838,33 @@ static int xenbus_unmap_ring_vfree_pv(st
+ 	return err;
+ }
+ 
++struct unmap_ring_vfree_hvm
++{
++	unsigned int idx;
++	unsigned long addrs[XENBUS_MAX_RING_GRANTS];
++};
++
++static void xenbus_unmap_ring_setup_grant_hvm(unsigned long gfn,
++					      unsigned int goffset,
++					      unsigned int len,
++					      void *data)
++{
++	struct unmap_ring_vfree_hvm *info = data;
++
++	info->addrs[info->idx] = (unsigned long)gfn_to_virt(gfn);
++
++	info->idx++;
++}
++
+ static int xenbus_unmap_ring_vfree_hvm(struct xenbus_device *dev, void *vaddr)
+ {
+ 	int rv;
+ 	struct xenbus_map_node *node;
+ 	void *addr;
+-	unsigned long addrs[XENBUS_MAX_RING_PAGES];
+-	int i;
++	struct unmap_ring_vfree_hvm info = {
++		.idx = 0,
++	};
++	unsigned int nr_pages;
+ 
+ 	spin_lock(&xenbus_valloc_lock);
+ 	list_for_each_entry(node, &xenbus_valloc_pages, next) {
+@@ -840,18 +884,20 @@ static int xenbus_unmap_ring_vfree_hvm(s
+ 		return GNTST_bad_virt_addr;
+ 	}
+ 
+-	for (i = 0; i < node->nr_handles; i++)
+-		addrs[i] = (unsigned long)pfn_to_kaddr(page_to_pfn(node->hvm.pages[i]));
++	nr_pages = XENBUS_PAGES(node->nr_handles);
++
++	gnttab_foreach_grant(node->hvm.pages, node->nr_handles,
++			     xenbus_unmap_ring_setup_grant_hvm,
++			     &info);
+ 
+ 	rv = xenbus_unmap_ring(dev, node->handles, node->nr_handles,
+-			       addrs);
++			       info.addrs);
+ 	if (!rv) {
+ 		vunmap(vaddr);
+-		free_xenballooned_pages(node->nr_handles, node->hvm.pages);
++		free_xenballooned_pages(nr_pages, node->hvm.pages);
+ 	}
+ 	else
+-		WARN(1, "Leaking %p, size %u page(s)\n", vaddr,
+-		     node->nr_handles);
++		WARN(1, "Leaking %p, size %u page(s)\n", vaddr, nr_pages);
+ 
+ 	kfree(node);
+ 	return rv;
+@@ -872,11 +918,11 @@ int xenbus_unmap_ring(struct xenbus_devi
+ 		      grant_handle_t *handles, unsigned int nr_handles,
+ 		      unsigned long *vaddrs)
+ {
+-	struct gnttab_unmap_grant_ref unmap[XENBUS_MAX_RING_PAGES];
++	struct gnttab_unmap_grant_ref unmap[XENBUS_MAX_RING_GRANTS];
+ 	int i;
+ 	int err;
+ 
+-	if (nr_handles > XENBUS_MAX_RING_PAGES)
++	if (nr_handles > XENBUS_MAX_RING_GRANTS)
+ 		return -EINVAL;
+ 
+ 	for (i = 0; i < nr_handles; i++)
+--- a/drivers/xen/xenbus/xenbus_probe.c
++++ b/drivers/xen/xenbus/xenbus_probe.c
+@@ -1444,7 +1444,8 @@ xenbus_init(void)
+ 			goto out_error;
+ 		xen_store_gfn = (unsigned long)v;
+ 		xen_store_interface =
+-			xen_remap(xen_store_gfn << PAGE_SHIFT, PAGE_SIZE);
++			xen_remap(xen_store_gfn << XEN_PAGE_SHIFT,
++				  XEN_PAGE_SIZE);
+ 		break;
+ 	default:
+ 		pr_warn("Xenstore state unknown\n");
+--- a/include/linux/msi.h
++++ b/include/linux/msi.h
+@@ -171,6 +171,7 @@ struct msi_controller {
+ };
+ #else /* CONFIG_XEN */
+ struct msi_msg;
++struct pci_dev;
+ #endif /* CONFIG_XEN */
+ 
+ #ifdef CONFIG_GENERIC_MSI_IRQ_DOMAIN
+--- a/include/uapi/xen/public/gntdev.h
++++ b/include/uapi/xen/public/gntdev.h
+@@ -33,11 +33,13 @@
+ #ifndef __LINUX_PUBLIC_GNTDEV_H__
+ #define __LINUX_PUBLIC_GNTDEV_H__
+ 
++#include <linux/types.h>
++
+ struct ioctl_gntdev_grant_ref {
+ 	/* The domain ID of the grant to be mapped. */
+-	uint32_t domid;
++	__u32 domid;
+ 	/* The grant reference of the grant to be mapped. */
+-	uint32_t ref;
++	__u32 ref;
+ };
+ 
+ /*
+@@ -50,11 +52,11 @@ _IOC(_IOC_NONE, 'G', 0, sizeof(struct io
+ struct ioctl_gntdev_map_grant_ref {
+ 	/* IN parameters */
+ 	/* The number of grants to be mapped. */
+-	uint32_t count;
+-	uint32_t pad;
++	__u32 count;
++	__u32 pad;
+ 	/* OUT parameters */
+ 	/* The offset to be used on a subsequent call to mmap(). */
+-	uint64_t index;
++	__u64 index;
+ 	/* Variable IN parameter. */
+ 	/* Array of grant references, of size @count. */
+ 	struct ioctl_gntdev_grant_ref refs[1];
+@@ -70,10 +72,10 @@ _IOC(_IOC_NONE, 'G', 1, sizeof(struct io
+ struct ioctl_gntdev_unmap_grant_ref {
+ 	/* IN parameters */
+ 	/* The offset was returned by the corresponding map operation. */
+-	uint64_t index;
++	__u64 index;
+ 	/* The number of pages to be unmapped. */
+-	uint32_t count;
+-	uint32_t pad;
++	__u32 count;
++	__u32 pad;
+ };
+ 
+ /*
+@@ -93,13 +95,13 @@ _IOC(_IOC_NONE, 'G', 2, sizeof(struct io
+ struct ioctl_gntdev_get_offset_for_vaddr {
+ 	/* IN parameters */
+ 	/* The virtual address of the first mapped page in a range. */
+-	uint64_t vaddr;
++	__u64 vaddr;
+ 	/* OUT parameters */
+ 	/* The offset that was used in the initial mmap() operation. */
+-	uint64_t offset;
++	__u64 offset;
+ 	/* The number of pages mapped in the VM area that begins at @vaddr. */
+-	uint32_t count;
+-	uint32_t pad;
++	__u32 count;
++	__u32 pad;
+ };
+ 
+ /*
+@@ -113,7 +115,7 @@ _IOC(_IOC_NONE, 'G', 3, sizeof(struct io
+ struct ioctl_gntdev_set_max_grants {
+ 	/* IN parameter */
+ 	/* The maximum number of grants that may be mapped at once. */
+-	uint32_t count;
++	__u32 count;
+ };
+ 
+ /*
+@@ -135,11 +137,11 @@ struct ioctl_gntdev_unmap_notify {
+ 	 * be cleared. Otherwise, it can be any byte in the page whose
+ 	 * notification we are adjusting.
+ 	 */
+-	uint64_t index;
++	__u64 index;
+ 	/* Action(s) to take on unmap */
+-	uint32_t action;
++	__u32 action;
+ 	/* Event channel to notify */
+-	uint32_t event_channel_port;
++	__u32 event_channel_port;
+ };
+ 
+ /* Clear (set to zero) the byte specified by index */
+--- a/include/xen/balloon.h
++++ b/include/xen/balloon.h
+@@ -65,30 +65,24 @@ struct balloon_stats {
+ 	/* We aim for 'current allocation' == 'target allocation'. */
+ 	unsigned long current_pages;
+ 	unsigned long target_pages;
++	unsigned long target_unpopulated;
+ 	/* Number of pages in high- and low-memory balloons. */
+ 	unsigned long balloon_low;
+ 	unsigned long balloon_high;
++	unsigned long total_pages;
+ 	unsigned long schedule_delay;
+ 	unsigned long max_schedule_delay;
+ 	unsigned long retry_count;
+ 	unsigned long max_retry_count;
+-#ifdef CONFIG_XEN_BALLOON_MEMORY_HOTPLUG
+-	unsigned long hotplug_pages;
+-	unsigned long balloon_hotplug;
+-#endif
+ };
+ 
+ extern struct balloon_stats balloon_stats;
+ 
+ void balloon_set_new_target(unsigned long target);
+ 
+-int alloc_xenballooned_pages(int nr_pages, struct page **pages,
+-		bool highmem);
++int alloc_xenballooned_pages(int nr_pages, struct page **pages);
+ void free_xenballooned_pages(int nr_pages, struct page **pages);
+ 
+-struct page *get_balloon_scratch_page(void);
+-void put_balloon_scratch_page(void);
+-
+ #endif /* CONFIG_PARAVIRT_XEN */
+ 
+ struct device;
+--- a/include/xen/xenbus.h
++++ b/include/xen/xenbus.h
+@@ -48,8 +48,8 @@
+ #include <xen/interface/io/xenbus.h>
+ #include <xen/interface/io/xs_wire.h>
+ 
+-#define XENBUS_MAX_RING_PAGE_ORDER 4
+-#define XENBUS_MAX_RING_PAGES      (1U << XENBUS_MAX_RING_PAGE_ORDER)
++#define XENBUS_MAX_RING_GRANT_ORDER 4
++#define XENBUS_MAX_RING_GRANTS      (1U << XENBUS_MAX_RING_GRANT_ORDER)
+ #define INVALID_GRANT_HANDLE       (~0U)
+ 
+ /* Register callback to watch this node. */
