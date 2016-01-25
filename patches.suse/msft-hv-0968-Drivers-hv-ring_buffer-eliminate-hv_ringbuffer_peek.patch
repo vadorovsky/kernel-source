@@ -1,0 +1,202 @@
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Mon, 14 Dec 2015 19:02:01 -0800
+Patch-mainline: v4.5-rc1
+Subject: Drivers: hv: ring_buffer: eliminate hv_ringbuffer_peek()
+Git-commit: 940b68e2c3e4ebf032885203c3970e9649f814af
+Reference: fate#315887
+
+Currently, there is only one user for hv_ringbuffer_read()/
+hv_ringbuffer_peak() functions and the usage of these functions is:
+- insecure as we drop ring_lock between them, someone else (in theory
+  only) can acquire it in between;
+- non-optimal as we do a number of things (acquire/release the above
+  mentioned lock, calculate available space on the ring, ...) twice and
+  this path is performance-critical.
+
+Remove hv_ringbuffer_peek() moving the logic from __vmbus_recvpacket() to
+hv_ringbuffer_read().
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: <ohering@suse.de>
+---
+ drivers/hv/channel.c      | 30 ++--------------------
+ drivers/hv/hyperv_vmbus.h | 11 +++-----
+ drivers/hv/ring_buffer.c  | 65 +++++++++++++++++++++++++++--------------------
+ 3 files changed, 42 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/hv/channel.c b/drivers/hv/channel.c
+index dd6de7f..1161d68 100644
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@ -927,37 +927,11 @@ __vmbus_recvpacket(struct vmbus_channel *channel, void *buffer,
+ 		   u32 bufferlen, u32 *buffer_actual_len, u64 *requestid,
+ 		   bool raw)
+ {
+-	struct vmpacket_descriptor desc;
+-	u32 packetlen;
+-	u32 userlen;
+ 	int ret;
+ 	bool signal = false;
+ 
+-	*buffer_actual_len = 0;
+-	*requestid = 0;
+-
+-
+-	ret = hv_ringbuffer_peek(&channel->inbound, &desc,
+-			     sizeof(struct vmpacket_descriptor));
+-	if (ret != 0)
+-		return 0;
+-
+-	packetlen = desc.len8 << 3;
+-	if (!raw)
+-		userlen = packetlen - (desc.offset8 << 3);
+-	else
+-		userlen = packetlen;
+-
+-	*buffer_actual_len = userlen;
+-
+-	if (userlen > bufferlen)
+-		return -ENOBUFS;
+-
+-	*requestid = desc.trans_id;
+-
+-	/* Copy over the packet to the user buffer */
+-	ret = hv_ringbuffer_read(&channel->inbound, buffer, userlen,
+-				 raw ? 0 : desc.offset8 << 3, &signal);
++	ret = hv_ringbuffer_read(&channel->inbound, buffer, bufferlen,
++				 buffer_actual_len, requestid, &signal, raw);
+ 
+ 	if (signal)
+ 		vmbus_setevent(channel);
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+index 4d67e98..0411b7b 100644
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -619,14 +619,9 @@ int hv_ringbuffer_write(struct hv_ring_buffer_info *ring_info,
+ 		    struct kvec *kv_list,
+ 		    u32 kv_count, bool *signal);
+ 
+-int hv_ringbuffer_peek(struct hv_ring_buffer_info *ring_info, void *buffer,
+-		   u32 buflen);
+-
+-int hv_ringbuffer_read(struct hv_ring_buffer_info *ring_info,
+-		   void *buffer,
+-		   u32 buflen,
+-		   u32 offset, bool *signal);
+-
++int hv_ringbuffer_read(struct hv_ring_buffer_info *inring_info,
++		       void *buffer, u32 buflen, u32 *buffer_actual_len,
++		       u64 *requestid, bool *signal, bool raw);
+ 
+ void hv_ringbuffer_get_debuginfo(struct hv_ring_buffer_info *ring_info,
+ 			    struct hv_ring_buffer_debug_info *debug_info);
+diff --git a/drivers/hv/ring_buffer.c b/drivers/hv/ring_buffer.c
+index 07f9408..b53702c 100644
+--- a/drivers/hv/ring_buffer.c
++++ b/drivers/hv/ring_buffer.c
+@@ -380,30 +380,59 @@ int hv_ringbuffer_write(struct hv_ring_buffer_info *outring_info,
+ 	return 0;
+ }
+ 
+-static inline int __hv_ringbuffer_read(struct hv_ring_buffer_info *inring_info,
+-				       void *buffer, u32 buflen, u32 offset,
+-				       bool *signal, bool advance)
++int hv_ringbuffer_read(struct hv_ring_buffer_info *inring_info,
++		       void *buffer, u32 buflen, u32 *buffer_actual_len,
++		       u64 *requestid, bool *signal, bool raw)
+ {
+ 	u32 bytes_avail_towrite;
+ 	u32 bytes_avail_toread;
+ 	u32 next_read_location = 0;
+ 	u64 prev_indices = 0;
+ 	unsigned long flags;
++	struct vmpacket_descriptor desc;
++	u32 offset;
++	u32 packetlen;
++	int ret = 0;
+ 
+ 	if (buflen <= 0)
+ 		return -EINVAL;
+ 
+ 	spin_lock_irqsave(&inring_info->ring_lock, flags);
+ 
++	*buffer_actual_len = 0;
++	*requestid = 0;
++
+ 	hv_get_ringbuffer_availbytes(inring_info,
+ 				&bytes_avail_toread,
+ 				&bytes_avail_towrite);
+ 
+ 	/* Make sure there is something to read */
+-	if (bytes_avail_toread < buflen) {
+-		spin_unlock_irqrestore(&inring_info->ring_lock, flags);
++	if (bytes_avail_toread < sizeof(desc)) {
++		/*
++		 * No error is set when there is even no header, drivers are
++		 * supposed to analyze buffer_actual_len.
++		 */
++		goto out_unlock;
++	}
+ 
+-		return -EAGAIN;
++	next_read_location = hv_get_next_read_location(inring_info);
++	next_read_location = hv_copyfrom_ringbuffer(inring_info, &desc,
++						    sizeof(desc),
++						    next_read_location);
++
++	offset = raw ? 0 : (desc.offset8 << 3);
++	packetlen = (desc.len8 << 3) - offset;
++	*buffer_actual_len = packetlen;
++	*requestid = desc.trans_id;
++
++	if (bytes_avail_toread < packetlen + offset) {
++		ret = -EAGAIN;
++		goto out_unlock;
++	}
++
++	if (packetlen > buflen) {
++		ret = -ENOBUFS;
++		goto out_unlock;
+ 	}
+ 
+ 	next_read_location =
+@@ -411,12 +440,9 @@ static inline int __hv_ringbuffer_read(struct hv_ring_buffer_info *inring_info,
+ 
+ 	next_read_location = hv_copyfrom_ringbuffer(inring_info,
+ 						buffer,
+-						buflen,
++						packetlen,
+ 						next_read_location);
+ 
+-	if (!advance)
+-		goto out_unlock;
+-
+ 	next_read_location = hv_copyfrom_ringbuffer(inring_info,
+ 						&prev_indices,
+ 						sizeof(u64),
+@@ -436,22 +462,5 @@ static inline int __hv_ringbuffer_read(struct hv_ring_buffer_info *inring_info,
+ 
+ out_unlock:
+ 	spin_unlock_irqrestore(&inring_info->ring_lock, flags);
+-	return 0;
+-}
+-
+-/* Read from ring buffer without advancing the read index. */
+-int hv_ringbuffer_peek(struct hv_ring_buffer_info *inring_info,
+-		       void *buffer, u32 buflen)
+-{
+-	return __hv_ringbuffer_read(inring_info, buffer, buflen,
+-				    0, NULL, false);
+-}
+-
+-/* Read from ring buffer and advance the read index. */
+-int hv_ringbuffer_read(struct hv_ring_buffer_info *inring_info,
+-		       void *buffer, u32 buflen, u32 offset,
+-		       bool *signal)
+-{
+-	return __hv_ringbuffer_read(inring_info, buffer, buflen,
+-				    offset, signal, true);
++	return ret;
+ }
