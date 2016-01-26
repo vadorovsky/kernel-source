@@ -1,0 +1,209 @@
+From cd0272fab785077c121aa91ec2401090965bbc37 Mon Sep 17 00:00:00 2001
+From: Waiman Long <Waiman.Long@hpe.com>
+Date: Mon, 9 Nov 2015 19:09:27 -0500
+Subject: [PATCH 9/9] locking/pvqspinlock: Queue node adaptive spinning
+Git-commit: 64d816cba06c67eeee455b8c78ebcda349d49c24
+Patch-mainline: 4.5
+References: fate#320355
+
+In an overcommitted guest where some vCPUs have to be halted to make
+forward progress in other areas, it is highly likely that a vCPU later
+in the spinlock queue will be spinning while the ones earlier in the
+queue would have been halted. The spinning in the later vCPUs is then
+just a waste of precious CPU cycles because they are not going to
+get the lock soon as the earlier ones have to be woken up and take
+their turn to get the lock.
+
+This patch implements an adaptive spinning mechanism where the vCPU
+will call pv_wait() if the previous vCPU is not running.
+
+Linux kernel builds were run in KVM guest on an 8-socket, 4
+cores/socket Westmere-EX system and a 4-socket, 8 cores/socket
+Haswell-EX system. Both systems are configured to have 32 physical
+CPUs. The kernel build times before and after the patch were:
+
+		    Westmere			Haswell
+  Patch		32 vCPUs    48 vCPUs	32 vCPUs    48 vCPUs
+  -----		--------    --------    --------    --------
+  Before patch   3m02.3s     5m00.2s     1m43.7s     3m03.5s
+  After patch    3m03.0s     4m37.5s	 1m43.0s     2m47.2s
+
+For 32 vCPUs, this patch doesn't cause any noticeable change in
+performance. For 48 vCPUs (over-committed), there is about 8%
+performance improvement.
+
+Signed-off-by: Waiman Long <Waiman.Long@hpe.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Douglas Hatch <doug.hatch@hpe.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Scott J Norton <scott.norton@hpe.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1447114167-47185-8-git-send-email-Waiman.Long@hpe.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+---
+ kernel/locking/qspinlock.c          |  5 ++--
+ kernel/locking/qspinlock_paravirt.h | 46 +++++++++++++++++++++++++++++++++++--
+ kernel/locking/qspinlock_stat.h     |  3 +++
+ 3 files changed, 50 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/locking/qspinlock.c b/kernel/locking/qspinlock.c
+index 2ea4299..393d187 100644
+--- a/kernel/locking/qspinlock.c
++++ b/kernel/locking/qspinlock.c
+@@ -248,7 +248,8 @@ static __always_inline void set_locked(struct qspinlock *lock)
+  */
+ 
+ static __always_inline void __pv_init_node(struct mcs_spinlock *node) { }
+-static __always_inline void __pv_wait_node(struct mcs_spinlock *node) { }
++static __always_inline void __pv_wait_node(struct mcs_spinlock *node,
++					   struct mcs_spinlock *prev) { }
+ static __always_inline void __pv_kick_node(struct qspinlock *lock,
+ 					   struct mcs_spinlock *node) { }
+ static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
+@@ -407,7 +408,7 @@ queue:
+ 		prev = decode_tail(old);
+ 		WRITE_ONCE(prev->next, node);
+ 
+-		pv_wait_node(node);
++		pv_wait_node(node, prev);
+ 		arch_mcs_spin_lock_contended(&node->locked);
+ 
+ 		/*
+diff --git a/kernel/locking/qspinlock_paravirt.h b/kernel/locking/qspinlock_paravirt.h
+index ace60a4..87bb235 100644
+--- a/kernel/locking/qspinlock_paravirt.h
++++ b/kernel/locking/qspinlock_paravirt.h
+@@ -23,6 +23,20 @@
+ #define _Q_SLOW_VAL	(3U << _Q_LOCKED_OFFSET)
+ 
+ /*
++ * Queue Node Adaptive Spinning
++ *
++ * A queue node vCPU will stop spinning if the vCPU in the previous node is
++ * not running. The one lock stealing attempt allowed at slowpath entry
++ * mitigates the slight slowdown for non-overcommitted guest with this
++ * aggressive wait-early mechanism.
++ *
++ * The status of the previous node will be checked at fixed interval
++ * controlled by PV_PREV_CHECK_MASK. This is to ensure that we won't
++ * pound on the cacheline of the previous node too heavily.
++ */
++#define PV_PREV_CHECK_MASK	0xff
++
++/*
+  * Queue node uses: vcpu_running & vcpu_halted.
+  * Queue head uses: vcpu_running & vcpu_hashed.
+  */
+@@ -235,6 +249,20 @@ static struct pv_node *pv_unhash(struct qspinlock *lock)
+ }
+ 
+ /*
++ * Return true if when it is time to check the previous node which is not
++ * in a running state.
++ */
++static inline bool
++pv_wait_early(struct pv_node *prev, int loop)
++{
++
++	if ((loop & PV_PREV_CHECK_MASK) != 0)
++		return false;
++
++	return READ_ONCE(prev->state) != vcpu_running;
++}
++
++/*
+  * Initialize the PV part of the mcs_spinlock node.
+  */
+ static void pv_init_node(struct mcs_spinlock *node)
+@@ -252,17 +280,23 @@ static void pv_init_node(struct mcs_spinlock *node)
+  * pv_kick_node() is used to set _Q_SLOW_VAL and fill in hash table on its
+  * behalf.
+  */
+-static void pv_wait_node(struct mcs_spinlock *node)
++static void pv_wait_node(struct mcs_spinlock *node, struct mcs_spinlock *prev)
+ {
+ 	struct pv_node *pn = (struct pv_node *)node;
++	struct pv_node *pp = (struct pv_node *)prev;
+ 	int waitcnt = 0;
+ 	int loop;
++	bool wait_early;
+ 
+ 	/* waitcnt processing will be compiled out if !QUEUED_LOCK_STAT */
+ 	for (;; waitcnt++) {
+-		for (loop = SPIN_THRESHOLD; loop; loop--) {
++		for (wait_early = false, loop = SPIN_THRESHOLD; loop; loop--) {
+ 			if (READ_ONCE(node->locked))
+ 				return;
++			if (pv_wait_early(pp, loop)) {
++				wait_early = true;
++				break;
++			}
+ 			cpu_relax();
+ 		}
+ 
+@@ -280,6 +314,7 @@ static void pv_wait_node(struct mcs_spinlock *node)
+ 		if (!READ_ONCE(node->locked)) {
+ 			qstat_inc(qstat_pv_wait_node, true);
+ 			qstat_inc(qstat_pv_wait_again, waitcnt);
++			qstat_inc(qstat_pv_wait_early, wait_early);
+ 			pv_wait(&pn->state, vcpu_halted);
+ 		}
+ 
+@@ -365,6 +400,12 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
+ 
+ 	for (;; waitcnt++) {
+ 		/*
++		 * Set correct vCPU state to be used by queue node wait-early
++		 * mechanism.
++		 */
++		WRITE_ONCE(pn->state, vcpu_running);
++
++		/*
+ 		 * Set the pending bit in the active lock spinning loop to
+ 		 * disable lock stealing before attempting to acquire the lock.
+ 		 */
+@@ -402,6 +443,7 @@ pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
+ 				goto gotlock;
+ 			}
+ 		}
++		WRITE_ONCE(pn->state, vcpu_halted);
+ 		qstat_inc(qstat_pv_wait_head, true);
+ 		qstat_inc(qstat_pv_wait_again, waitcnt);
+ 		pv_wait(&l->locked, _Q_SLOW_VAL);
+diff --git a/kernel/locking/qspinlock_stat.h b/kernel/locking/qspinlock_stat.h
+index 94d4533..640dcec 100644
+--- a/kernel/locking/qspinlock_stat.h
++++ b/kernel/locking/qspinlock_stat.h
+@@ -25,6 +25,7 @@
+  *   pv_lock_stealing	- # of lock stealing operations
+  *   pv_spurious_wakeup	- # of spurious wakeups
+  *   pv_wait_again	- # of vCPU wait's that happened after a vCPU kick
++ *   pv_wait_early	- # of early vCPU wait's
+  *   pv_wait_head	- # of vCPU wait's at the queue head
+  *   pv_wait_node	- # of vCPU wait's at a non-head queue node
+  *
+@@ -47,6 +48,7 @@ enum qlock_stats {
+ 	qstat_pv_lock_stealing,
+ 	qstat_pv_spurious_wakeup,
+ 	qstat_pv_wait_again,
++	qstat_pv_wait_early,
+ 	qstat_pv_wait_head,
+ 	qstat_pv_wait_node,
+ 	qstat_num,	/* Total number of statistical counters */
+@@ -70,6 +72,7 @@ static const char * const qstat_names[qstat_num + 1] = {
+ 	[qstat_pv_latency_wake]    = "pv_latency_wake",
+ 	[qstat_pv_lock_stealing]   = "pv_lock_stealing",
+ 	[qstat_pv_wait_again]      = "pv_wait_again",
++	[qstat_pv_wait_early]      = "pv_wait_early",
+ 	[qstat_pv_wait_head]       = "pv_wait_head",
+ 	[qstat_pv_wait_node]       = "pv_wait_node",
+ 	[qstat_reset_cnts]         = "reset_counters",
+-- 
+2.1.4
+
