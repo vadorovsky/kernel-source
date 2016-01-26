@@ -1,0 +1,387 @@
+From 1c4941fd53afb46ab15826628e4819866d008a28 Mon Sep 17 00:00:00 2001
+From: Waiman Long <Waiman.Long@hpe.com>
+Date: Tue, 10 Nov 2015 16:18:56 -0500
+Subject: [PATCH 8/9] locking/pvqspinlock: Allow limited lock stealing
+Git-commit: 64d816cba06c67eeee455b8c78ebcda349d49c24
+Patch-mainline: 4.5
+References: fate#320355
+
+This patch allows one attempt for the lock waiter to steal the lock
+when entering the PV slowpath. To prevent lock starvation, the pending
+bit will be set by the queue head vCPU when it is in the active lock
+spinning loop to disable any lock stealing attempt.  This helps to
+reduce the performance penalty caused by lock waiter preemption while
+not having much of the downsides of a real unfair lock.
+
+The pv_wait_head() function was renamed as pv_wait_head_or_lock()
+as it was modified to acquire the lock before returning. This is
+necessary because of possible lock stealing attempts from other tasks.
+
+Linux kernel builds were run in KVM guest on an 8-socket, 4
+cores/socket Westmere-EX system and a 4-socket, 8 cores/socket
+Haswell-EX system. Both systems are configured to have 32 physical
+CPUs. The kernel build times before and after the patch were:
+
+                    Westmere                    Haswell
+  Patch         32 vCPUs    48 vCPUs    32 vCPUs    48 vCPUs
+  -----         --------    --------    --------    --------
+  Before patch   3m15.6s    10m56.1s     1m44.1s     5m29.1s
+  After patch    3m02.3s     5m00.2s     1m43.7s     3m03.5s
+
+For the overcommited case (48 vCPUs), this patch is able to reduce
+kernel build time by more than 54% for Westmere and 44% for Haswell.
+
+Signed-off-by: Waiman Long <Waiman.Long@hpe.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Douglas Hatch <doug.hatch@hpe.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Scott J Norton <scott.norton@hpe.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1447190336-53317-1-git-send-email-Waiman.Long@hpe.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+---
+ kernel/locking/qspinlock.c          |  26 +++++--
+ kernel/locking/qspinlock_paravirt.h | 141 ++++++++++++++++++++++++++++++------
+ kernel/locking/qspinlock_stat.h     |  16 ++++
+ 3 files changed, 155 insertions(+), 28 deletions(-)
+
+diff --git a/kernel/locking/qspinlock.c b/kernel/locking/qspinlock.c
+index ed9d967..2ea4299 100644
+--- a/kernel/locking/qspinlock.c
++++ b/kernel/locking/qspinlock.c
+@@ -251,15 +251,16 @@ static __always_inline void __pv_init_node(struct mcs_spinlock *node) { }
+ static __always_inline void __pv_wait_node(struct mcs_spinlock *node) { }
+ static __always_inline void __pv_kick_node(struct qspinlock *lock,
+ 					   struct mcs_spinlock *node) { }
+-static __always_inline void __pv_wait_head(struct qspinlock *lock,
+-					   struct mcs_spinlock *node) { }
++static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
++						   struct mcs_spinlock *node)
++						   { return 0; }
+ 
+ #define pv_enabled()		false
+ 
+ #define pv_init_node		__pv_init_node
+ #define pv_wait_node		__pv_wait_node
+ #define pv_kick_node		__pv_kick_node
+-#define pv_wait_head		__pv_wait_head
++#define pv_wait_head_or_lock	__pv_wait_head_or_lock
+ 
+ #ifdef CONFIG_PARAVIRT_SPINLOCKS
+ #define queued_spin_lock_slowpath	native_queued_spin_lock_slowpath
+@@ -431,10 +432,22 @@ queue:
+ 	 * sequentiality; this is because the set_locked() function below
+ 	 * does not imply a full barrier.
+ 	 *
++	 * The PV pv_wait_head_or_lock function, if active, will acquire
++	 * the lock and return a non-zero value. So we have to skip the
++	 * smp_load_acquire() call. As the next PV queue head hasn't been
++	 * designated yet, there is no way for the locked value to become
++	 * _Q_SLOW_VAL. So both the set_locked() and the
++	 * atomic_cmpxchg_relaxed() calls will be safe.
++	 *
++	 * If PV isn't active, 0 will be returned instead.
++	 *
+ 	 */
+-	pv_wait_head(lock, node);
++	if ((val = pv_wait_head_or_lock(lock, node)))
++		goto locked;
++
+ 	smp_cond_acquire(!((val = atomic_read(&lock->val)) & _Q_LOCKED_PENDING_MASK));
+ 
++locked:
+ 	/*
+ 	 * claim the lock:
+ 	 *
+@@ -446,7 +459,8 @@ queue:
+ 	 * to grab the lock.
+ 	 */
+ 	for (;;) {
+-		if (val != tail) {
++		/* In the PV case we might already have _Q_LOCKED_VAL set */
++		if ((val & _Q_TAIL_MASK) != tail) {
+ 			set_locked(lock);
+ 			break;
+ 		}
+@@ -493,7 +507,7 @@ EXPORT_SYMBOL(queued_spin_lock_slowpath);
+ #undef pv_init_node
+ #undef pv_wait_node
+ #undef pv_kick_node
+-#undef pv_wait_head
++#undef pv_wait_head_or_lock
+ 
+ #undef  queued_spin_lock_slowpath
+ #define queued_spin_lock_slowpath	__pv_queued_spin_lock_slowpath
+diff --git a/kernel/locking/qspinlock_paravirt.h b/kernel/locking/qspinlock_paravirt.h
+index aaeeefb..ace60a4 100644
+--- a/kernel/locking/qspinlock_paravirt.h
++++ b/kernel/locking/qspinlock_paravirt.h
+@@ -41,6 +41,89 @@ struct pv_node {
+ };
+ 
+ /*
++ * By replacing the regular queued_spin_trylock() with the function below,
++ * it will be called once when a lock waiter enter the PV slowpath before
++ * being queued. By allowing one lock stealing attempt here when the pending
++ * bit is off, it helps to reduce the performance impact of lock waiter
++ * preemption without the drawback of lock starvation.
++ */
++#define queued_spin_trylock(l)	pv_queued_spin_steal_lock(l)
++static inline bool pv_queued_spin_steal_lock(struct qspinlock *lock)
++{
++	struct __qspinlock *l = (void *)lock;
++
++	return !(atomic_read(&lock->val) & _Q_LOCKED_PENDING_MASK) &&
++		(cmpxchg(&l->locked, 0, _Q_LOCKED_VAL) == 0);
++}
++
++/*
++ * The pending bit is used by the queue head vCPU to indicate that it
++ * is actively spinning on the lock and no lock stealing is allowed.
++ */
++#if _Q_PENDING_BITS == 8
++static __always_inline void set_pending(struct qspinlock *lock)
++{
++	struct __qspinlock *l = (void *)lock;
++
++	WRITE_ONCE(l->pending, 1);
++}
++
++static __always_inline void clear_pending(struct qspinlock *lock)
++{
++	struct __qspinlock *l = (void *)lock;
++
++	WRITE_ONCE(l->pending, 0);
++}
++
++/*
++ * The pending bit check in pv_queued_spin_steal_lock() isn't a memory
++ * barrier. Therefore, an atomic cmpxchg() is used to acquire the lock
++ * just to be sure that it will get it.
++ */
++static __always_inline int trylock_clear_pending(struct qspinlock *lock)
++{
++	struct __qspinlock *l = (void *)lock;
++
++	return !READ_ONCE(l->locked) &&
++	       (cmpxchg(&l->locked_pending, _Q_PENDING_VAL, _Q_LOCKED_VAL)
++			== _Q_PENDING_VAL);
++}
++#else /* _Q_PENDING_BITS == 8 */
++static __always_inline void set_pending(struct qspinlock *lock)
++{
++	atomic_set_mask(_Q_PENDING_VAL, &lock->val);
++}
++
++static __always_inline void clear_pending(struct qspinlock *lock)
++{
++	atomic_clear_mask(_Q_PENDING_VAL, &lock->val);
++}
++
++static __always_inline int trylock_clear_pending(struct qspinlock *lock)
++{
++	int val = atomic_read(&lock->val);
++
++	for (;;) {
++		int old, new;
++
++		if (val  & _Q_LOCKED_MASK)
++			break;
++
++		/*
++		 * Try to clear pending bit & set locked bit
++		 */
++		old = val;
++		new = (val & ~_Q_PENDING_MASK) | _Q_LOCKED_VAL;
++		val = atomic_cmpxchg(&lock->val, old, new);
++
++		if (val == old)
++			return 1;
++	}
++	return 0;
++}
++#endif /* _Q_PENDING_BITS == 8 */
++
++/*
+  * Include queued spinlock statistics code
+  */
+ #include "qspinlock_stat.h"
+@@ -202,8 +285,8 @@ static void pv_wait_node(struct mcs_spinlock *node)
+ 
+ 		/*
+ 		 * If pv_kick_node() changed us to vcpu_hashed, retain that
+-		 * value so that pv_wait_head() knows to not also try to hash
+-		 * this lock.
++		 * value so that pv_wait_head_or_lock() knows to not also try
++		 * to hash this lock.
+ 		 */
+ 		cmpxchg(&pn->state, vcpu_halted, vcpu_running);
+ 
+@@ -227,8 +310,9 @@ static void pv_wait_node(struct mcs_spinlock *node)
+ /*
+  * Called after setting next->locked = 1 when we're the lock owner.
+  *
+- * Instead of waking the waiters stuck in pv_wait_node() advance their state such
+- * that they're waiting in pv_wait_head(), this avoids a wake/sleep cycle.
++ * Instead of waking the waiters stuck in pv_wait_node() advance their state
++ * such that they're waiting in pv_wait_head_or_lock(), this avoids a
++ * wake/sleep cycle.
+  */
+ static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
+ {
+@@ -257,10 +341,14 @@ static void pv_kick_node(struct qspinlock *lock, struct mcs_spinlock *node)
+ }
+ 
+ /*
+- * Wait for l->locked to become clear; halt the vcpu after a short spin.
++ * Wait for l->locked to become clear and acquire the lock;
++ * halt the vcpu after a short spin.
+  * __pv_queued_spin_unlock() will wake us.
++ *
++ * The current value of the lock will be returned for additional processing.
+  */
+-static void pv_wait_head(struct qspinlock *lock, struct mcs_spinlock *node)
++static u32
++pv_wait_head_or_lock(struct qspinlock *lock, struct mcs_spinlock *node)
+ {
+ 	struct pv_node *pn = (struct pv_node *)node;
+ 	struct __qspinlock *l = (void *)lock;
+@@ -276,11 +364,18 @@ static void pv_wait_head(struct qspinlock *lock, struct mcs_spinlock *node)
+ 		lp = (struct qspinlock **)1;
+ 
+ 	for (;; waitcnt++) {
++		/*
++		 * Set the pending bit in the active lock spinning loop to
++		 * disable lock stealing before attempting to acquire the lock.
++		 */
++		set_pending(lock);
+ 		for (loop = SPIN_THRESHOLD; loop; loop--) {
+-			if (!READ_ONCE(l->locked))
+-				return;
++			if (trylock_clear_pending(lock))
++				goto gotlock;
+ 			cpu_relax();
+ 		}
++		clear_pending(lock);
++
+ 
+ 		if (!lp) { /* ONCE */
+ 			lp = pv_hash(lock, pn);
+@@ -296,36 +391,38 @@ static void pv_wait_head(struct qspinlock *lock, struct mcs_spinlock *node)
+ 			 *
+ 			 * Matches the smp_rmb() in __pv_queued_spin_unlock().
+ 			 */
+-			if (!cmpxchg(&l->locked, _Q_LOCKED_VAL, _Q_SLOW_VAL)) {
++			if (xchg(&l->locked, _Q_SLOW_VAL) == 0) {
+ 				/*
+-				 * The lock is free and _Q_SLOW_VAL has never
+-				 * been set. Therefore we need to unhash before
+-				 * getting the lock.
++				 * The lock was free and now we own the lock.
++				 * Change the lock value back to _Q_LOCKED_VAL
++				 * and unhash the table.
+ 				 */
++				WRITE_ONCE(l->locked, _Q_LOCKED_VAL);
+ 				WRITE_ONCE(*lp, NULL);
+-				return;
++				goto gotlock;
+ 			}
+ 		}
+ 		qstat_inc(qstat_pv_wait_head, true);
+ 		qstat_inc(qstat_pv_wait_again, waitcnt);
+ 		pv_wait(&l->locked, _Q_SLOW_VAL);
+ 
+-		if (!READ_ONCE(l->locked))
+-			return;
+ 		/*
+ 		 * The unlocker should have freed the lock before kicking the
+ 		 * CPU. So if the lock is still not free, it is a spurious
+-		 * wakeup and so the vCPU should wait again after spinning for
+-		 * a while.
++		 * wakeup or another vCPU has stolen the lock. The current
++		 * vCPU should spin again.
+ 		 */
+-		qstat_inc(qstat_pv_spurious_wakeup, true);
++		qstat_inc(qstat_pv_spurious_wakeup, READ_ONCE(l->locked));
+ 	}
+ 
+ 	/*
+-	 * Lock is unlocked now; the caller will acquire it without waiting.
+-	 * As with pv_wait_node() we rely on the caller to do a load-acquire
+-	 * for us.
++	 * The cmpxchg() or xchg() call before coming here provides the
++	 * acquire semantics for locking. The dummy ORing of _Q_LOCKED_VAL
++	 * here is to indicate to the compiler that the value will always
++	 * be nozero to enable better code optimization.
+ 	 */
++gotlock:
++	return (u32)(atomic_read(&lock->val) | _Q_LOCKED_VAL);
+ }
+ 
+ /*
+@@ -350,7 +447,7 @@ __pv_queued_spin_unlock_slowpath(struct qspinlock *lock, u8 locked)
+ 	 * so we need a barrier to order the read of the node data in
+ 	 * pv_unhash *after* we've read the lock being _Q_SLOW_VAL.
+ 	 *
+-	 * Matches the cmpxchg() in pv_wait_head() setting _Q_SLOW_VAL.
++	 * Matches the cmpxchg() in pv_wait_head_or_lock() setting _Q_SLOW_VAL.
+ 	 */
+ 	smp_rmb();
+ 
+diff --git a/kernel/locking/qspinlock_stat.h b/kernel/locking/qspinlock_stat.h
+index b1553ad..94d4533 100644
+--- a/kernel/locking/qspinlock_stat.h
++++ b/kernel/locking/qspinlock_stat.h
+@@ -22,6 +22,7 @@
+  *   pv_kick_wake	- # of vCPU kicks used for computing pv_latency_wake
+  *   pv_latency_kick	- average latency (ns) of vCPU kick operation
+  *   pv_latency_wake	- average latency (ns) from vCPU kick to wakeup
++ *   pv_lock_stealing	- # of lock stealing operations
+  *   pv_spurious_wakeup	- # of spurious wakeups
+  *   pv_wait_again	- # of vCPU wait's that happened after a vCPU kick
+  *   pv_wait_head	- # of vCPU wait's at the queue head
+@@ -43,6 +44,7 @@ enum qlock_stats {
+ 	qstat_pv_kick_wake,
+ 	qstat_pv_latency_kick,
+ 	qstat_pv_latency_wake,
++	qstat_pv_lock_stealing,
+ 	qstat_pv_spurious_wakeup,
+ 	qstat_pv_wait_again,
+ 	qstat_pv_wait_head,
+@@ -66,6 +68,7 @@ static const char * const qstat_names[qstat_num + 1] = {
+ 	[qstat_pv_spurious_wakeup] = "pv_spurious_wakeup",
+ 	[qstat_pv_latency_kick]	   = "pv_latency_kick",
+ 	[qstat_pv_latency_wake]    = "pv_latency_wake",
++	[qstat_pv_lock_stealing]   = "pv_lock_stealing",
+ 	[qstat_pv_wait_again]      = "pv_wait_again",
+ 	[qstat_pv_wait_head]       = "pv_wait_head",
+ 	[qstat_pv_wait_node]       = "pv_wait_node",
+@@ -273,6 +276,19 @@ static inline void __pv_wait(u8 *ptr, u8 val)
+ #define pv_kick(c)	__pv_kick(c)
+ #define pv_wait(p, v)	__pv_wait(p, v)
+ 
++/*
++ * PV unfair trylock count tracking function
++ */
++static inline int qstat_spin_steal_lock(struct qspinlock *lock)
++{
++	int ret = pv_queued_spin_steal_lock(lock);
++
++	qstat_inc(qstat_pv_lock_stealing, ret);
++	return ret;
++}
++#undef  queued_spin_trylock
++#define queued_spin_trylock(l)	qstat_spin_steal_lock(l)
++
+ #else /* CONFIG_QUEUED_LOCK_STAT */
+ 
+ static inline void qstat_inc(enum qlock_stats stat, bool cond)	{ }
+-- 
+2.1.4
+
