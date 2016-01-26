@@ -1,0 +1,203 @@
+From d78045306c41bd9334b956e4e7fa77cc72f06a40 Mon Sep 17 00:00:00 2001
+From: Waiman Long <Waiman.Long@hpe.com>
+Date: Mon, 9 Nov 2015 19:09:24 -0500
+Subject: [PATCH 4/9] locking/pvqspinlock, x86: Optimize the PV unlock code path
+Git-commit: 64d816cba06c67eeee455b8c78ebcda349d49c24
+Patch-mainline: 4.5
+References: fate#320355
+
+The unlock function in queued spinlocks was optimized for better
+performance on bare metal systems at the expense of virtualized guests.
+
+For x86-64 systems, the unlock call needs to go through a
+PV_CALLEE_SAVE_REGS_THUNK() which saves and restores 8 64-bit
+registers before calling the real __pv_queued_spin_unlock()
+function. The thunk code may also be in a separate cacheline from
+__pv_queued_spin_unlock().
+
+This patch optimizes the PV unlock code path by:
+
+ 1) Moving the unlock slowpath code from the fastpath into a separate
+    __pv_queued_spin_unlock_slowpath() function to make the fastpath
+    as simple as possible..
+
+ 2) For x86-64, hand-coded an assembly function to combine the register
+    saving thunk code with the fastpath code. Only registers that
+    are used in the fastpath will be saved and restored. If the
+    fastpath fails, the slowpath function will be called via another
+    PV_CALLEE_SAVE_REGS_THUNK(). For 32-bit, it falls back to the C
+    __pv_queued_spin_unlock() code as the thunk saves and restores
+    only one 32-bit register.
+
+With a microbenchmark of 5M lock-unlock loop, the table below shows
+the execution times before and after the patch with different number
+of threads in a VM running on a 32-core Westmere-EX box with x86-64
+4.2-rc1 based kernels:
+
+  Threads	Before patch	After patch	% Change
+  -------	------------	-----------	--------
+     1		   134.1 ms	  119.3 ms	  -11%
+     2		   1286  ms	   953  ms	  -26%
+     3		   3715  ms	  3480  ms	  -6.3%
+     4		   4092  ms	  3764  ms	  -8.0%
+
+Signed-off-by: Waiman Long <Waiman.Long@hpe.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Douglas Hatch <doug.hatch@hpe.com>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Scott J Norton <scott.norton@hpe.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1447114167-47185-5-git-send-email-Waiman.Long@hpe.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+---
+ arch/x86/include/asm/qspinlock_paravirt.h | 59 +++++++++++++++++++++++++++++++
+ kernel/locking/qspinlock_paravirt.h       | 43 +++++++++++++---------
+ 2 files changed, 86 insertions(+), 16 deletions(-)
+
+diff --git a/arch/x86/include/asm/qspinlock_paravirt.h b/arch/x86/include/asm/qspinlock_paravirt.h
+index b002e71..9f92c18 100644
+--- a/arch/x86/include/asm/qspinlock_paravirt.h
++++ b/arch/x86/include/asm/qspinlock_paravirt.h
+@@ -1,6 +1,65 @@
+ #ifndef __ASM_QSPINLOCK_PARAVIRT_H
+ #define __ASM_QSPINLOCK_PARAVIRT_H
+ 
++/*
++ * For x86-64, PV_CALLEE_SAVE_REGS_THUNK() saves and restores 8 64-bit
++ * registers. For i386, however, only 1 32-bit register needs to be saved
++ * and restored. So an optimized version of __pv_queued_spin_unlock() is
++ * hand-coded for 64-bit, but it isn't worthwhile to do it for 32-bit.
++ */
++#ifdef CONFIG_64BIT
++
++PV_CALLEE_SAVE_REGS_THUNK(__pv_queued_spin_unlock_slowpath);
++#define __pv_queued_spin_unlock	__pv_queued_spin_unlock
++#define PV_UNLOCK		"__raw_callee_save___pv_queued_spin_unlock"
++#define PV_UNLOCK_SLOWPATH	"__raw_callee_save___pv_queued_spin_unlock_slowpath"
++
++/*
++ * Optimized assembly version of __raw_callee_save___pv_queued_spin_unlock
++ * which combines the registers saving trunk and the body of the following
++ * C code:
++ *
++ * void __pv_queued_spin_unlock(struct qspinlock *lock)
++ * {
++ *	struct __qspinlock *l = (void *)lock;
++ *	u8 lockval = cmpxchg(&l->locked, _Q_LOCKED_VAL, 0);
++ *
++ *	if (likely(lockval == _Q_LOCKED_VAL))
++ *		return;
++ *	pv_queued_spin_unlock_slowpath(lock, lockval);
++ * }
++ *
++ * For x86-64,
++ *   rdi = lock              (first argument)
++ *   rsi = lockval           (second argument)
++ *   rdx = internal variable (set to 0)
++ */
++asm    (".pushsection .text;"
++	".globl " PV_UNLOCK ";"
++	".align 4,0x90;"
++	PV_UNLOCK ": "
++	"push  %rdx;"
++	"mov   $0x1,%eax;"
++	"xor   %edx,%edx;"
++	"lock cmpxchg %dl,(%rdi);"
++	"cmp   $0x1,%al;"
++	"jne   .slowpath;"
++	"pop   %rdx;"
++	"ret;"
++	".slowpath: "
++	"push   %rsi;"
++	"movzbl %al,%esi;"
++	"call " PV_UNLOCK_SLOWPATH ";"
++	"pop    %rsi;"
++	"pop    %rdx;"
++	"ret;"
++	".size " PV_UNLOCK ", .-" PV_UNLOCK ";"
++	".popsection");
++
++#else /* CONFIG_64BIT */
++
++extern void __pv_queued_spin_unlock(struct qspinlock *lock);
+ PV_CALLEE_SAVE_REGS_THUNK(__pv_queued_spin_unlock);
+ 
++#endif /* CONFIG_64BIT */
+ #endif
+diff --git a/kernel/locking/qspinlock_paravirt.h b/kernel/locking/qspinlock_paravirt.h
+index f0450ff..4bd323d 100644
+--- a/kernel/locking/qspinlock_paravirt.h
++++ b/kernel/locking/qspinlock_paravirt.h
+@@ -308,23 +308,14 @@ static void pv_wait_head(struct qspinlock *lock, struct mcs_spinlock *node)
+ }
+ 
+ /*
+- * PV version of the unlock function to be used in stead of
+- * queued_spin_unlock().
++ * PV versions of the unlock fastpath and slowpath functions to be used
++ * instead of queued_spin_unlock().
+  */
+-__visible void __pv_queued_spin_unlock(struct qspinlock *lock)
++__visible void
++__pv_queued_spin_unlock_slowpath(struct qspinlock *lock, u8 locked)
+ {
+ 	struct __qspinlock *l = (void *)lock;
+ 	struct pv_node *node;
+-	u8 locked;
+-
+-	/*
+-	 * We must not unlock if SLOW, because in that case we must first
+-	 * unhash. Otherwise it would be possible to have multiple @lock
+-	 * entries, which would be BAD.
+-	 */
+-	locked = cmpxchg(&l->locked, _Q_LOCKED_VAL, 0);
+-	if (likely(locked == _Q_LOCKED_VAL))
+-		return;
+ 
+ 	if (unlikely(locked != _Q_SLOW_VAL)) {
+ 		WARN(!debug_locks_silent,
+@@ -363,12 +354,32 @@ __visible void __pv_queued_spin_unlock(struct qspinlock *lock)
+ 	 */
+ 	pv_kick(node->cpu);
+ }
++
+ /*
+  * Include the architecture specific callee-save thunk of the
+  * __pv_queued_spin_unlock(). This thunk is put together with
+- * __pv_queued_spin_unlock() near the top of the file to make sure
+- * that the callee-save thunk and the real unlock function are close
+- * to each other sharing consecutive instruction cachelines.
++ * __pv_queued_spin_unlock() to make the callee-save thunk and the real unlock
++ * function close to each other sharing consecutive instruction cachelines.
++ * Alternatively, architecture specific version of __pv_queued_spin_unlock()
++ * can be defined.
+  */
+ #include <asm/qspinlock_paravirt.h>
+ 
++#ifndef __pv_queued_spin_unlock
++__visible void __pv_queued_spin_unlock(struct qspinlock *lock)
++{
++	struct __qspinlock *l = (void *)lock;
++	u8 locked;
++
++	/*
++	 * We must not unlock if SLOW, because in that case we must first
++	 * unhash. Otherwise it would be possible to have multiple @lock
++	 * entries, which would be BAD.
++	 */
++	locked = cmpxchg(&l->locked, _Q_LOCKED_VAL, 0);
++	if (likely(locked == _Q_LOCKED_VAL))
++		return;
++
++	__pv_queued_spin_unlock_slowpath(lock, locked);
++}
++#endif /* __pv_queued_spin_unlock */
+-- 
+2.1.4
+
