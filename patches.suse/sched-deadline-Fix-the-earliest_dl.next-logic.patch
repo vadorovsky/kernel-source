@@ -1,0 +1,144 @@
+From: Wanpeng Li <kernellwp@gmail.com>
+Date: Thu, 3 Dec 2015 17:42:10 +0800
+Subject: sched/deadline: Fix the earliest_dl.next logic
+Git-commit: 7d92de3a8285ab3dfd68aa3a99823acd5b190444
+Patch-mainline: v4.5-rc1
+References: 
+
+earliest_dl.next should cache deadline of the earliest ready task that
+is also enqueued in the pushable rbtree, as pull algorithm uses this
+information to find candidates for migration: if the earliest_dl.next
+deadline of source rq is earlier than the earliest_dl.curr deadline of
+destination rq, the task from the source rq can be pulled.
+
+However, current implementation only guarantees that earliest_dl.next is
+the deadline of the next ready task instead of the next pushable task;
+which will result in potentially holding both rqs' lock and find nothing
+to migrate because of affinity constraints. In addition, current logic
+doesn't update the next candidate for pushing in pick_next_task_dl(),
+even if the running task is never eligible.
+
+This patch fixes both problems by updating earliest_dl.next when
+pushable dl task is enqueued/dequeued, similar to what we already do for
+RT.
+
+Tested-by: Luca Abeni <luca.abeni@unitn.it>
+Signed-off-by: Wanpeng Li <wanpeng.li@hotmail.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Juri Lelli <juri.lelli@arm.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/1449135730-27202-1-git-send-email-wanpeng.li@hotmail.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Mike Galbraith <mgalbraith@suse.de>
+---
+ kernel/sched/deadline.c |   59 +++++-------------------------------------------
+ 1 file changed, 7 insertions(+), 52 deletions(-)
+
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -176,8 +176,10 @@ static void enqueue_pushable_dl_task(str
+ 		}
+ 	}
+ 
+-	if (leftmost)
++	if (leftmost) {
+ 		dl_rq->pushable_dl_tasks_leftmost = &p->pushable_dl_tasks;
++		dl_rq->earliest_dl.next = p->dl.deadline;
++	}
+ 
+ 	rb_link_node(&p->pushable_dl_tasks, parent, link);
+ 	rb_insert_color(&p->pushable_dl_tasks, &dl_rq->pushable_dl_tasks_root);
+@@ -195,6 +197,10 @@ static void dequeue_pushable_dl_task(str
+ 
+ 		next_node = rb_next(&p->pushable_dl_tasks);
+ 		dl_rq->pushable_dl_tasks_leftmost = next_node;
++		if (next_node) {
++			dl_rq->earliest_dl.next = rb_entry(next_node,
++				struct task_struct, pushable_dl_tasks)->dl.deadline;
++		}
+ 	}
+ 
+ 	rb_erase(&p->pushable_dl_tasks, &dl_rq->pushable_dl_tasks_root);
+@@ -782,42 +788,14 @@ static void update_curr_dl(struct rq *rq
+ 
+ #ifdef CONFIG_SMP
+ 
+-static struct task_struct *pick_next_earliest_dl_task(struct rq *rq, int cpu);
+-
+-static inline u64 next_deadline(struct rq *rq)
+-{
+-	struct task_struct *next = pick_next_earliest_dl_task(rq, rq->cpu);
+-
+-	if (next && dl_prio(next->prio))
+-		return next->dl.deadline;
+-	else
+-		return 0;
+-}
+-
+ static void inc_dl_deadline(struct dl_rq *dl_rq, u64 deadline)
+ {
+ 	struct rq *rq = rq_of_dl_rq(dl_rq);
+ 
+ 	if (dl_rq->earliest_dl.curr == 0 ||
+ 	    dl_time_before(deadline, dl_rq->earliest_dl.curr)) {
+-		/*
+-		 * If the dl_rq had no -deadline tasks, or if the new task
+-		 * has shorter deadline than the current one on dl_rq, we
+-		 * know that the previous earliest becomes our next earliest,
+-		 * as the new task becomes the earliest itself.
+-		 */
+-		dl_rq->earliest_dl.next = dl_rq->earliest_dl.curr;
+ 		dl_rq->earliest_dl.curr = deadline;
+ 		cpudl_set(&rq->rd->cpudl, rq->cpu, deadline, 1);
+-	} else if (dl_rq->earliest_dl.next == 0 ||
+-		   dl_time_before(deadline, dl_rq->earliest_dl.next)) {
+-		/*
+-		 * On the other hand, if the new -deadline task has a
+-		 * a later deadline than the earliest one on dl_rq, but
+-		 * it is earlier than the next (if any), we must
+-		 * recompute the next-earliest.
+-		 */
+-		dl_rq->earliest_dl.next = next_deadline(rq);
+ 	}
+ }
+ 
+@@ -839,7 +817,6 @@ static void dec_dl_deadline(struct dl_rq
+ 
+ 		entry = rb_entry(leftmost, struct sched_dl_entity, rb_node);
+ 		dl_rq->earliest_dl.curr = entry->deadline;
+-		dl_rq->earliest_dl.next = next_deadline(rq);
+ 		cpudl_set(&rq->rd->cpudl, rq->cpu, entry->deadline, 1);
+ 	}
+ }
+@@ -1274,28 +1251,6 @@ static int pick_dl_task(struct rq *rq, s
+ 	return 0;
+ }
+ 
+-/* Returns the second earliest -deadline task, NULL otherwise */
+-static struct task_struct *pick_next_earliest_dl_task(struct rq *rq, int cpu)
+-{
+-	struct rb_node *next_node = rq->dl.rb_leftmost;
+-	struct sched_dl_entity *dl_se;
+-	struct task_struct *p = NULL;
+-
+-next_node:
+-	next_node = rb_next(next_node);
+-	if (next_node) {
+-		dl_se = rb_entry(next_node, struct sched_dl_entity, rb_node);
+-		p = dl_task_of(dl_se);
+-
+-		if (pick_dl_task(rq, p, cpu))
+-			return p;
+-
+-		goto next_node;
+-	}
+-
+-	return NULL;
+-}
+-
+ /*
+  * Return the earliest pushable rq's task, which is suitable to be executed
+  * on the CPU, NULL otherwise:
