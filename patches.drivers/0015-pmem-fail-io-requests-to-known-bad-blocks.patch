@@ -1,0 +1,126 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Wed, 6 Jan 2016 12:03:41 -0800
+Subject: pmem: fail io-requests to known bad blocks
+Git-commit: e10624f8c09710b3b0740ea3847627ea02f55c39
+Patch-mainline: v4.5-rc1
+References: FATE#320460
+
+Check the sectors specified in a read bio to see if they hit a known bad
+block, and return an error code pmem_do_bvec().
+
+Note that the ->rw_page() is not in a position to return errors.  For
+now, copy the same layering violation present in zram_rw_page() to avoid
+crashes of the form:
+
+ kernel BUG at mm/filemap.c:822!
+ [..]
+ Call Trace:
+  [<ffffffff811c540e>] page_endio+0x1e/0x60
+  [<ffffffff81290d29>] mpage_end_io+0x39/0x60
+  [<ffffffff8141c4ef>] bio_endio+0x3f/0x60
+  [<ffffffffa005c491>] pmem_make_request+0x111/0x230 [nd_pmem]
+
+...i.e. unlock a page that was already unlocked via pmem_rw_page() =>
+page_endio().
+
+Reported-by: Vishal Verma <vishal.l.verma@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.com>
+---
+ drivers/nvdimm/pmem.c | 46 +++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 39 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/nvdimm/pmem.c b/drivers/nvdimm/pmem.c
+index 2b1f300..d00c659 100644
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -47,7 +47,20 @@ struct pmem_device {
+ 
+ static int pmem_major;
+ 
+-static void pmem_do_bvec(struct pmem_device *pmem, struct page *page,
++static bool is_bad_pmem(struct badblocks *bb, sector_t sector, unsigned int len)
++{
++	if (bb->count) {
++		sector_t first_bad;
++		int num_bad;
++
++		return !!badblocks_check(bb, sector, len / 512, &first_bad,
++				&num_bad);
++	}
++
++	return false;
++}
++
++static int pmem_do_bvec(struct pmem_device *pmem, struct page *page,
+ 			unsigned int len, unsigned int off, int rw,
+ 			sector_t sector)
+ {
+@@ -56,6 +69,8 @@ static void pmem_do_bvec(struct pmem_device *pmem, struct page *page,
+ 	void __pmem *pmem_addr = pmem->virt_addr + pmem_off;
+ 
+ 	if (rw == READ) {
++		if (unlikely(is_bad_pmem(&pmem->bb, sector, len)))
++			return -EIO;
+ 		memcpy_from_pmem(mem + off, pmem_addr, len);
+ 		flush_dcache_page(page);
+ 	} else {
+@@ -64,10 +79,12 @@ static void pmem_do_bvec(struct pmem_device *pmem, struct page *page,
+ 	}
+ 
+ 	kunmap_atomic(mem);
++	return 0;
+ }
+ 
+ static blk_qc_t pmem_make_request(struct request_queue *q, struct bio *bio)
+ {
++	int rc = 0;
+ 	bool do_acct;
+ 	unsigned long start;
+ 	struct bio_vec bvec;
+@@ -76,9 +93,15 @@ static blk_qc_t pmem_make_request(struct request_queue *q, struct bio *bio)
+ 	struct pmem_device *pmem = bdev->bd_disk->private_data;
+ 
+ 	do_acct = nd_iostat_start(bio, &start);
+-	bio_for_each_segment(bvec, bio, iter)
+-		pmem_do_bvec(pmem, bvec.bv_page, bvec.bv_len, bvec.bv_offset,
+-				bio_data_dir(bio), iter.bi_sector);
++	bio_for_each_segment(bvec, bio, iter) {
++		rc = pmem_do_bvec(pmem, bvec.bv_page, bvec.bv_len,
++				bvec.bv_offset, bio_data_dir(bio),
++				iter.bi_sector);
++		if (rc) {
++			bio->bi_error = rc;
++			break;
++		}
++	}
+ 	if (do_acct)
+ 		nd_iostat_end(bio, start);
+ 
+@@ -93,13 +116,22 @@ static int pmem_rw_page(struct block_device *bdev, sector_t sector,
+ 		       struct page *page, int rw)
+ {
+ 	struct pmem_device *pmem = bdev->bd_disk->private_data;
++	int rc;
+ 
+-	pmem_do_bvec(pmem, page, PAGE_CACHE_SIZE, 0, rw, sector);
++	rc = pmem_do_bvec(pmem, page, PAGE_CACHE_SIZE, 0, rw, sector);
+ 	if (rw & WRITE)
+ 		wmb_pmem();
+-	page_endio(page, rw & WRITE, 0);
+ 
+-	return 0;
++	/*
++	 * The ->rw_page interface is subtle and tricky.  The core
++	 * retries on any error, so we can only invoke page_endio() in
++	 * the successful completion case.  Otherwise, we'll see crashes
++	 * caused by double completion.
++	 */
++	if (rc == 0)
++		page_endio(page, rw & WRITE, 0);
++
++	return rc;
+ }
+ 
+ static long pmem_direct_access(struct block_device *bdev, sector_t sector,
+
