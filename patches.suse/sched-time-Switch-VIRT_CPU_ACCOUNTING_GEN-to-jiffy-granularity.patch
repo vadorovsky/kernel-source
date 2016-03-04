@@ -1,0 +1,168 @@
+From: Rik van Riel <riel@redhat.com>
+Date: Wed, 10 Feb 2016 20:08:27 -0500
+Subject: sched, time: Switch VIRT_CPU_ACCOUNTING_GEN to jiffy granularity
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+Git-commit: ff9a9b4c4334b53b52ee9279f30bd5dd92ea9bdd
+Patch-mainline: Queued in subsystem maintainer repository
+References: Performance,fate#318845
+
+When profiling syscall overhead on nohz-full kernels,
+after removing __acct_update_integrals() from the profile,
+native_sched_clock() remains as the top CPU user. This can be
+reduced by moving VIRT_CPU_ACCOUNTING_GEN to jiffy granularity.
+
+This will reduce timing accuracy on nohz_full CPUs to jiffy
+based sampling, just like on normal CPUs. It results in
+totally removing native_sched_clock from the profile, and
+significantly speeding up the syscall entry and exit path,
+as well as irq entry and exit, and KVM guest entry & exit.
+
+Additionally, only call the more expensive functions (and
+advance the seqlock) when jiffies actually changed.
+
+This code relies on another CPU advancing jiffies when the
+system is busy. On a nohz_full system, this is done by a
+housekeeping CPU.
+
+A microbenchmark calling an invalid syscall number 10 million
+times in a row speeds up an additional 30% over the numbers
+with just the previous patches, for a total speedup of about
+40% over 4.4 and 4.5-rc1.
+
+Run times for the microbenchmark:
+
+ 4.4				3.8 seconds
+ 4.5-rc1			3.7 seconds
+ 4.5-rc1 + first patch		3.3 seconds
+ 4.5-rc1 + first 3 patches	3.1 seconds
+ 4.5-rc1 + all patches		2.3 seconds
+
+A non-NOHZ_FULL cpu (not the housekeeping CPU):
+
+ all kernels			1.86 seconds
+
+Signed-off-by: Rik van Riel <riel@redhat.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: clark@redhat.com
+Cc: eric.dumazet@gmail.com
+Cc: fweisbec@gmail.com
+Cc: luto@amacapital.net
+Link: http://lkml.kernel.org/r/1455152907-18495-5-git-send-email-riel@redhat.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Mike Galbraith <mgalbraith@suse.de>
+---
+ kernel/sched/cputime.c |   39 +++++++++++++++++++++++----------------
+ 1 file changed, 23 insertions(+), 16 deletions(-)
+
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -665,26 +665,25 @@ void thread_group_cputime_adjusted(struc
+ #endif /* !CONFIG_VIRT_CPU_ACCOUNTING_NATIVE */
+ 
+ #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+-static unsigned long long vtime_delta(struct task_struct *tsk)
++static cputime_t vtime_delta(struct task_struct *tsk)
+ {
+-	unsigned long long clock;
++	unsigned long now = READ_ONCE(jiffies);
+ 
+-	clock = local_clock();
+-	if (clock < tsk->vtime_snap)
++	if (time_before(now, (unsigned long)tsk->vtime_snap))
+ 		return 0;
+ 
+-	return clock - tsk->vtime_snap;
++	return jiffies_to_cputime(now - tsk->vtime_snap);
+ }
+ 
+ static cputime_t get_vtime_delta(struct task_struct *tsk)
+ {
+-	unsigned long long delta = vtime_delta(tsk);
++	unsigned long now = READ_ONCE(jiffies);
++	unsigned long delta = now - tsk->vtime_snap;
+ 
+ 	WARN_ON_ONCE(tsk->vtime_snap_whence == VTIME_INACTIVE);
+-	tsk->vtime_snap += delta;
++	tsk->vtime_snap = now;
+ 
+-	/* CHECKME: always safe to convert nsecs to cputime? */
+-	return nsecs_to_cputime(delta);
++	return jiffies_to_cputime(delta);
+ }
+ 
+ static void __vtime_account_system(struct task_struct *tsk)
+@@ -696,6 +695,9 @@ static void __vtime_account_system(struc
+ 
+ void vtime_account_system(struct task_struct *tsk)
+ {
++	if (!vtime_delta(tsk))
++		return;
++
+ 	write_seqcount_begin(&tsk->vtime_seqcount);
+ 	__vtime_account_system(tsk);
+ 	write_seqcount_end(&tsk->vtime_seqcount);
+@@ -704,7 +706,8 @@ void vtime_account_system(struct task_st
+ void vtime_gen_account_irq_exit(struct task_struct *tsk)
+ {
+ 	write_seqcount_begin(&tsk->vtime_seqcount);
+-	__vtime_account_system(tsk);
++	if (vtime_delta(tsk))
++		__vtime_account_system(tsk);
+ 	if (context_tracking_in_user())
+ 		tsk->vtime_snap_whence = VTIME_USER;
+ 	write_seqcount_end(&tsk->vtime_seqcount);
+@@ -715,16 +718,19 @@ void vtime_account_user(struct task_stru
+ 	cputime_t delta_cpu;
+ 
+ 	write_seqcount_begin(&tsk->vtime_seqcount);
+-	delta_cpu = get_vtime_delta(tsk);
+ 	tsk->vtime_snap_whence = VTIME_SYS;
+-	account_user_time(tsk, delta_cpu, cputime_to_scaled(delta_cpu));
++	if (vtime_delta(tsk)) {
++		delta_cpu = get_vtime_delta(tsk);
++		account_user_time(tsk, delta_cpu, cputime_to_scaled(delta_cpu));
++	}
+ 	write_seqcount_end(&tsk->vtime_seqcount);
+ }
+ 
+ void vtime_user_enter(struct task_struct *tsk)
+ {
+ 	write_seqcount_begin(&tsk->vtime_seqcount);
+-	__vtime_account_system(tsk);
++	if (vtime_delta(tsk))
++		__vtime_account_system(tsk);
+ 	tsk->vtime_snap_whence = VTIME_USER;
+ 	write_seqcount_end(&tsk->vtime_seqcount);
+ }
+@@ -739,7 +745,8 @@ void vtime_guest_enter(struct task_struc
+ 	 * that can thus safely catch up with a tickless delta.
+ 	 */
+ 	write_seqcount_begin(&tsk->vtime_seqcount);
+-	__vtime_account_system(tsk);
++	if (vtime_delta(tsk))
++		__vtime_account_system(tsk);
+ 	current->flags |= PF_VCPU;
+ 	write_seqcount_end(&tsk->vtime_seqcount);
+ }
+@@ -769,7 +776,7 @@ void arch_vtime_task_switch(struct task_
+ 
+ 	write_seqcount_begin(&current->vtime_seqcount);
+ 	current->vtime_snap_whence = VTIME_SYS;
+-	current->vtime_snap = sched_clock_cpu(smp_processor_id());
++	current->vtime_snap = jiffies;
+ 	write_seqcount_end(&current->vtime_seqcount);
+ }
+ 
+@@ -780,7 +787,7 @@ void vtime_init_idle(struct task_struct
+ 	local_irq_save(flags);
+ 	write_seqcount_begin(&t->vtime_seqcount);
+ 	t->vtime_snap_whence = VTIME_SYS;
+-	t->vtime_snap = sched_clock_cpu(cpu);
++	t->vtime_snap = jiffies;
+ 	write_seqcount_end(&t->vtime_seqcount);
+ 	local_irq_restore(flags);
+ }
