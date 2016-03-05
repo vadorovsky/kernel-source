@@ -1,0 +1,160 @@
+From: Daniel Borkmann <dborkman@redhat.com>
+Date: Wed, 5 Nov 2014 20:27:38 +0100
+Subject: ipv6: mld: fix add_grhead skb_over_panic for devs with large MTUs
+Patch-mainline: v3.19-rc1
+Git-commit: 4c672e4b42bc8046d63a6eb0a2c6a450a501af32
+References: bsc#956852
+
+It has been reported that generating an MLD listener report on
+devices with large MTUs (e.g. 9000) and a high number of IPv6
+addresses can trigger a skb_over_panic():
+
+skbuff: skb_over_panic: text:ffffffff80612a5d len:3776 put:20
+head:ffff88046d751000 data:ffff88046d751010 tail:0xed0 end:0xec0
+dev:port1
+ ------------[ cut here ]------------
+kernel BUG at net/core/skbuff.c:100!
+invalid opcode: 0000 [#1] SMP
+Modules linked in: ixgbe(O)
+CPU: 3 PID: 0 Comm: swapper/3 Tainted: G O 3.14.23+ #4
+[...]
+Call Trace:
+ <IRQ>
+ [<ffffffff80578226>] ? skb_put+0x3a/0x3b
+ [<ffffffff80612a5d>] ? add_grhead+0x45/0x8e
+ [<ffffffff80612e3a>] ? add_grec+0x394/0x3d4
+ [<ffffffff80613222>] ? mld_ifc_timer_expire+0x195/0x20d
+ [<ffffffff8061308d>] ? mld_dad_timer_expire+0x45/0x45
+ [<ffffffff80255b5d>] ? call_timer_fn.isra.29+0x12/0x68
+ [<ffffffff80255d16>] ? run_timer_softirq+0x163/0x182
+ [<ffffffff80250e6f>] ? __do_softirq+0xe0/0x21d
+ [<ffffffff8025112b>] ? irq_exit+0x4e/0xd3
+ [<ffffffff802214bb>] ? smp_apic_timer_interrupt+0x3b/0x46
+ [<ffffffff8063f10a>] ? apic_timer_interrupt+0x6a/0x70
+
+mld_newpack() skb allocations are usually requested with dev->mtu
+in size, since commit 72e09ad107e7 ("ipv6: avoid high order allocations")
+we have changed the limit in order to be less likely to fail.
+
+However, in MLD/IGMP code, we have some rather ugly AVAILABLE(skb)
+macros, which determine if we may end up doing an skb_put() for
+adding another record. To avoid possible fragmentation, we check
+the skb's tailroom as skb->dev->mtu - skb->len, which is a wrong
+assumption as the actual max allocation size can be much smaller.
+
+The IGMP case doesn't have this issue as commit 57e1ab6eaddc
+("igmp: refine skb allocations") stores the allocation size in
+the cb[].
+
+Set a reserved_tailroom to make it fit into the MTU and use
+skb_availroom() helper instead. This also allows to get rid of
+igmp_skb_size().
+
+Reported-by: Wei Liu <lw1a2.jing@gmail.com>
+Fixes: 72e09ad107e7 ("ipv6: avoid high order allocations")
+Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Cc: David L Stevens <david.stevens@oracle.com>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Benjamin Poirier <bpoirier@suse.com>
+---
+ net/ipv4/igmp.c  |   11 +++++------
+ net/ipv6/mcast.c |    9 +++++----
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@ -294,9 +294,7 @@ igmp_scount(struct ip_mc_list *pmc, int
+ 	return scount;
+ }
+ 
+-#define igmp_skb_size(skb) (*(unsigned int *)((skb)->cb))
+-
+-static struct sk_buff *igmpv3_newpack(struct net_device *dev, int size)
++static struct sk_buff *igmpv3_newpack(struct net_device *dev, unsigned int mtu)
+ {
+ 	struct sk_buff *skb;
+ 	struct rtable *rt;
+@@ -304,6 +302,7 @@ static struct sk_buff *igmpv3_newpack(st
+ 	struct igmpv3_report *pig;
+ 	struct net *net = dev_net(dev);
+ 	struct flowi4 fl4;
++	unsigned int size = mtu;
+ 
+ 	while (1) {
+ 		skb = alloc_skb(size + LL_ALLOCATED_SPACE(dev),
+@@ -314,7 +313,6 @@ static struct sk_buff *igmpv3_newpack(st
+ 		if (size < 256)
+ 			return NULL;
+ 	}
+-	igmp_skb_size(skb) = size;
+ 
+ 	rt = ip_route_output_ports(net, &fl4, NULL, IGMPV3_ALL_MCR, 0,
+ 				   0, 0,
+@@ -327,6 +325,8 @@ static struct sk_buff *igmpv3_newpack(st
+ 	skb_dst_set(skb, &rt->dst);
+ 	skb->dev = dev;
+ 
++	skb->reserved_tailroom = skb_end_offset(skb) -
++				 min(mtu, skb_end_offset(skb));
+ 	skb_reserve(skb, LL_RESERVED_SPACE(dev));
+ 
+ 	skb_reset_network_header(skb);
+@@ -396,8 +396,7 @@ static struct sk_buff *add_grhead(struct
+ 	return skb;
+ }
+ 
+-#define AVAILABLE(skb) ((skb) ? ((skb)->dev ? igmp_skb_size(skb) - (skb)->len : \
+-	skb_tailroom(skb)) : 0)
++#define AVAILABLE(skb)	((skb) ? skb_availroom(skb) : 0)
+ 
+ static struct sk_buff *add_grec(struct sk_buff *skb, struct ip_mc_list *pmc,
+ 	int type, int gdeleted, int sdeleted)
+--- a/net/ipv6/mcast.c
++++ b/net/ipv6/mcast.c
+@@ -1335,7 +1335,7 @@ mld_scount(struct ifmcaddr6 *pmc, int ty
+ 	return scount;
+ }
+ 
+-static struct sk_buff *mld_newpack(struct inet6_dev *idev, int size)
++static struct sk_buff *mld_newpack(struct inet6_dev *idev, unsigned int mtu)
+ {
+ 	struct net_device *dev = idev->dev;
+ 	struct net *net = dev_net(dev);
+@@ -1344,13 +1344,13 @@ static struct sk_buff *mld_newpack(struc
+ 	struct mld2_report *pmr;
+ 	struct in6_addr addr_buf;
+ 	const struct in6_addr *saddr;
++	unsigned int size = mtu + LL_ALLOCATED_SPACE(dev);
+ 	int err;
+ 	u8 ra[8] = { IPPROTO_ICMPV6, 0,
+ 		     IPV6_TLV_ROUTERALERT, 2, 0, 0,
+ 		     IPV6_TLV_PADN, 0 };
+ 
+ 	/* we assume size > sizeof(ra) here */
+-	size += LL_ALLOCATED_SPACE(dev);
+ 	/* limit our allocations to order-0 page */
+ 	size = min_t(int, size, SKB_MAX_ORDER(0, 0));
+ 	skb = sock_alloc_send_skb(sk, size, 1, &err);
+@@ -1358,6 +1358,8 @@ static struct sk_buff *mld_newpack(struc
+ 	if (!skb)
+ 		return NULL;
+ 
++	skb->reserved_tailroom = skb_end_offset(skb) -
++				 min(mtu, skb_end_offset(skb));
+ 	skb_reserve(skb, LL_RESERVED_SPACE(dev));
+ 
+ 	if (__ipv6_get_lladdr(idev, &addr_buf, IFA_F_TENTATIVE)) {
+@@ -1477,8 +1479,7 @@ static struct sk_buff *add_grhead(struct
+ 	return skb;
+ }
+ 
+-#define AVAILABLE(skb) ((skb) ? ((skb)->dev ? (skb)->dev->mtu - (skb)->len : \
+-	skb_tailroom(skb)) : 0)
++#define AVAILABLE(skb)	((skb) ? skb_availroom(skb) : 0)
+ 
+ static struct sk_buff *add_grec(struct sk_buff *skb, struct ifmcaddr6 *pmc,
+ 	int type, int gdeleted, int sdeleted)
