@@ -1,0 +1,195 @@
+From: Jeff Layton <jlayton@poochiereds.net>
+Date: Thu, 1 May 2014 06:28:45 -0400
+Subject: [PATCH] nfs4: treat lock owners as opaque values
+Git-commit: 8003d3c4aaa5560400818e14ce5db49cdfd79865
+Patch-mainline: v3.17
+References: bnc#968141
+
+Do the following set of ops with a file on a NFSv4 mount:
+
+    exec 3>>/file/on/nfsv4
+    flock -x 3
+    exec 3>&-
+
+You'll see the LOCK request go across the wire, but no LOCKU when the
+file is closed.
+
+What happens is that the fd is passed across a fork, and the final close
+is done in a different process than the opener. That makes
+__nfs4_find_lock_state miss finding the correct lock state because it
+uses the fl_pid as a search key. A new one is created, and the locking
+code treats it as a delegation stateid (because NFS_LOCK_INITIALIZED
+isn't set).
+
+The root cause of this breakage seems to be commit 77041ed9b49a9e
+(nfsv4: Ensure the lockowners are labelled using the fl_owner and/or
+fl_pid).
+
+That changed it so that flock lockowners are allocated based on the
+fl_pid. I think this is incorrect. flock locks should be "owned" by the
+struct file, and that is already accounted for in the fl_owner field of
+the lock request when it comes through nfs_flock.
+
+This patch basically reverts the above commit and with it, a LOCKU is
+sent in the above reproducer.
+
+Signed-off-by: Jeff Layton <jlayton@poochiereds.net>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Acked-by: NeilBrown <neilb@suse.com>
+
+---
+ fs/nfs/nfs4_fs.h   |   13 +------------
+ fs/nfs/nfs4state.c |   47 ++++++++++-------------------------------------
+ 2 files changed, 11 insertions(+), 49 deletions(-)
+
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@ -154,17 +154,6 @@ enum {
+  * LOCK: one nfs4_state (LOCK) to hold the lock stateid nfs4_state(OPEN)
+  */
+ 
+-struct nfs4_lock_owner {
+-	unsigned int lo_type;
+-#define NFS4_ANY_LOCK_TYPE	(0U)
+-#define NFS4_FLOCK_LOCK_TYPE	(1U << 0)
+-#define NFS4_POSIX_LOCK_TYPE	(1U << 1)
+-	union {
+-		fl_owner_t posix_owner;
+-		pid_t flock_owner;
+-	} lo_u;
+-};
+-
+ struct nfs4_lock_state {
+ 	struct list_head	ls_locks;	/* Other lock stateids */
+ 	struct nfs4_state *	ls_state;	/* Pointer to open state */
+@@ -176,7 +165,7 @@ struct nfs4_lock_state {
+ 	struct nfs_unique_id	ls_id;
+ 	nfs4_stateid		ls_stateid;
+ 	atomic_t		ls_count;
+-	struct nfs4_lock_owner	ls_owner;
++	fl_owner_t		ls_owner;
+ };
+ 
+ /* bits for nfs4_state->flags */
+--- a/fs/nfs/nfs4state.c
++++ b/fs/nfs/nfs4state.c
+@@ -705,21 +705,12 @@ void nfs4_close_sync(struct path *path,
+  * that is compatible with current->files
+  */
+ static struct nfs4_lock_state *
+-__nfs4_find_lock_state(struct nfs4_state *state, fl_owner_t fl_owner, pid_t fl_pid, unsigned int type)
++__nfs4_find_lock_state(struct nfs4_state *state, fl_owner_t fl_owner)
+ {
+ 	struct nfs4_lock_state *pos;
+ 	list_for_each_entry(pos, &state->lock_states, ls_locks) {
+-		if (type != NFS4_ANY_LOCK_TYPE && pos->ls_owner.lo_type != type)
++		if (pos->ls_owner != fl_owner)
+ 			continue;
+-		switch (pos->ls_owner.lo_type) {
+-		case NFS4_POSIX_LOCK_TYPE:
+-			if (pos->ls_owner.lo_u.posix_owner != fl_owner)
+-				continue;
+-			break;
+-		case NFS4_FLOCK_LOCK_TYPE:
+-			if (pos->ls_owner.lo_u.flock_owner != fl_pid)
+-				continue;
+-		}
+ 		atomic_inc(&pos->ls_count);
+ 		return pos;
+ 	}
+@@ -731,7 +722,7 @@ __nfs4_find_lock_state(struct nfs4_state
+  * exists, return an uninitialized one.
+  *
+  */
+-static struct nfs4_lock_state *nfs4_alloc_lock_state(struct nfs4_state *state, fl_owner_t fl_owner, pid_t fl_pid, unsigned int type)
++static struct nfs4_lock_state *nfs4_alloc_lock_state(struct nfs4_state *state, fl_owner_t fl_owner)
+ {
+ 	struct nfs4_lock_state *lsp;
+ 	struct nfs_server *server = state->owner->so_server;
+@@ -746,18 +737,7 @@ static struct nfs4_lock_state *nfs4_allo
+ 	lsp->ls_seqid.sequence = &lsp->ls_sequence;
+ 	atomic_set(&lsp->ls_count, 1);
+ 	lsp->ls_state = state;
+-	lsp->ls_owner.lo_type = type;
+-	switch (lsp->ls_owner.lo_type) {
+-	case NFS4_FLOCK_LOCK_TYPE:
+-		lsp->ls_owner.lo_u.flock_owner = fl_pid;
+-		break;
+-	case NFS4_POSIX_LOCK_TYPE:
+-		lsp->ls_owner.lo_u.posix_owner = fl_owner;
+-		break;
+-	default:
+-		kfree(lsp);
+-		return NULL;
+-	}
++	lsp->ls_owner = fl_owner;
+ 	spin_lock(&clp->cl_lock);
+ 	nfs_alloc_unique_id_locked(&server->lockowner_id, &lsp->ls_id, 1, 64);
+ 	spin_unlock(&clp->cl_lock);
+@@ -782,13 +762,13 @@ static void nfs4_free_lock_state(struct
+  * exists, return an uninitialized one.
+  *
+  */
+-static struct nfs4_lock_state *nfs4_get_lock_state(struct nfs4_state *state, fl_owner_t owner, pid_t pid, unsigned int type)
++static struct nfs4_lock_state *nfs4_get_lock_state(struct nfs4_state *state, fl_owner_t owner)
+ {
+ 	struct nfs4_lock_state *lsp, *new = NULL;
+ 	
+ 	for(;;) {
+ 		spin_lock(&state->state_lock);
+-		lsp = __nfs4_find_lock_state(state, owner, pid, type);
++		lsp = __nfs4_find_lock_state(state, owner);
+ 		if (lsp != NULL)
+ 			break;
+ 		if (new != NULL) {
+@@ -799,7 +779,7 @@ static struct nfs4_lock_state *nfs4_get_
+ 			break;
+ 		}
+ 		spin_unlock(&state->state_lock);
+-		new = nfs4_alloc_lock_state(state, owner, pid, type);
++		new = nfs4_alloc_lock_state(state, owner);
+ 		if (new == NULL)
+ 			return NULL;
+ 	}
+@@ -857,12 +837,7 @@ int nfs4_set_lock_state(struct nfs4_stat
+ 
+ 	if (fl->fl_ops != NULL)
+ 		return 0;
+-	if (fl->fl_flags & FL_POSIX)
+-		lsp = nfs4_get_lock_state(state, fl->fl_owner, 0, NFS4_POSIX_LOCK_TYPE);
+-	else if (fl->fl_flags & FL_FLOCK)
+-		lsp = nfs4_get_lock_state(state, 0, fl->fl_pid, NFS4_FLOCK_LOCK_TYPE);
+-	else
+-		return -EINVAL;
++	lsp = nfs4_get_lock_state(state, fl->fl_owner);
+ 	if (lsp == NULL)
+ 		return -ENOMEM;
+ 	fl->fl_u.nfs4_fl.owner = lsp;
+@@ -876,7 +851,6 @@ static int nfs4_copy_lock_stateid(nfs4_s
+ {
+ 	struct nfs4_lock_state *lsp;
+ 	fl_owner_t fl_owner;
+-	pid_t fl_pid;
+ 	int ret = -ENOENT;
+ 
+ 
+@@ -887,9 +861,8 @@ static int nfs4_copy_lock_stateid(nfs4_s
+ 		goto out;
+ 
+ 	fl_owner = lockowner->l_owner;
+-	fl_pid = lockowner->l_pid;
+ 	spin_lock(&state->state_lock);
+-	lsp = __nfs4_find_lock_state(state, fl_owner, fl_pid, NFS4_ANY_LOCK_TYPE);
++	lsp = __nfs4_find_lock_state(state, fl_owner);
+ 	if (lsp && (lsp->ls_flags & NFS_LOCK_LOST))
+ 		ret = -EIO;
+ 	else if (lsp != NULL &&
+@@ -949,7 +922,7 @@ int nfs4_lock_lost(const struct nfs_open
+ 	    !test_bit(LK_STATE_LOST, &state->flags))
+ 		return 0;
+ 	spin_lock(&state->state_lock);
+-	lsp = __nfs4_find_lock_state(state, l_ctx->lockowner.l_owner, l_ctx->lockowner.l_pid, NFS4_ANY_LOCK_TYPE);
++	lsp = __nfs4_find_lock_state(state, l_ctx->lockowner.l_owner);
+ 	if (lsp != NULL && (lsp->ls_flags & NFS_LOCK_LOST) != 0)
+ 		ret = 1;
+ 	spin_unlock(&state->state_lock);
