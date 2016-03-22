@@ -1,0 +1,2033 @@
+From: Linux Kernel Mailing List <linux-kernel@vger.kernel.org>
+Subject: xen: Linux: 4.5
+Patch-mainline: Never, SUSE-Xen specific
+
+ This patch contains the differences between 4.4 and 4.5.
+
+Automatically created from "kernel.org/patch-4.5" by xen-port-patches.py
+Acked-by: jbeulich@suse.com
+
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -573,7 +573,7 @@ config X86_INTEL_QUARK
+ 
+ config X86_INTEL_LPSS
+ 	bool "Intel Low Power Subsystem Support"
+-	depends on X86 && ACPI
++	depends on X86 && ACPI && !XEN
+ 	select COMMON_CLK
+ 	select PINCTRL
+ 	select IOSF_MBI
+@@ -2767,7 +2767,7 @@ config PMC_ATOM
+ 	depends on PCI && !XEN
+ 
+ config VMD
+-	depends on PCI_MSI
++	depends on PCI_MSI_IRQ_DOMAIN
+ 	tristate "Volume Management Device Driver"
+ 	default N
+ 	---help---
+--- a/arch/x86/entry/entry_32-xen.S
++++ b/arch/x86/entry/entry_32-xen.S
+@@ -298,6 +298,7 @@ sysenter_past_esp:
+ 	pushl	$__USER_DS		/* pt_regs->ss */
+ 	pushl	%ebp			/* pt_regs->sp (stashed in bp) */
+ 	pushfl				/* pt_regs->flags (except IF = 0) */
++	ASM_CLAC			/* Clear AC after saving FLAGS */
+ 	orl	$X86_EFLAGS_IF, (%esp)	/* Fix IF */
+ 	pushl	$__USER_CS		/* pt_regs->cs */
+ 	pushl	$0			/* pt_regs->ip = 0 (placeholder) */
+@@ -333,7 +334,8 @@ sysenter_past_esp:
+ 	 * Return back to the vDSO, which will pop ecx and edx.
+ 	 * Don't bother with DS and ES (they already contain __USER_DS).
+ 	 */
+-	ENABLE_INTERRUPTS_SYSEXIT
++	sti
++	sysexit
+ 
+ .pushsection .fixup, "ax"
+ 2:	movl	$0, PT_FS(%esp)
+@@ -739,11 +741,6 @@ ENTRY(native_iret)
+ 	iret
+ 	_ASM_EXTABLE(native_iret, iret_exc)
+ END(native_iret)
+-
+-ENTRY(native_irq_enable_sysexit)
+-	sti
+-	sysexit
+-END(native_irq_enable_sysexit)
+ #endif
+ 
+ ENTRY(overflow)
+--- a/arch/x86/entry/entry_64-xen.S
++++ b/arch/x86/entry/entry_64-xen.S
+@@ -755,9 +755,7 @@ ENTRY(error_entry)
+ 	 * (which can take locks).
+ 	 */
+ 	TRACE_IRQS_OFF
+-#ifdef CONFIG_CONTEXT_TRACKING
+-	call enter_from_user_mode
+-#endif
++	CALL_enter_from_user_mode
+ 	ret
+ 
+ .Lerror_entry_done:
+--- a/arch/x86/entry/entry_64_compat-xen.S
++++ b/arch/x86/entry/entry_64_compat-xen.S
+@@ -18,13 +18,6 @@
+ 
+ 	.section .entry.text, "ax"
+ 
+-#ifdef CONFIG_PARAVIRT
+-ENTRY(native_usergs_sysret32)
+-	swapgs
+-	sysretl
+-ENDPROC(native_usergs_sysret32)
+-#endif
+-
+ /*
+  * 32-bit SYSENTER instruction entry.
+  *
+--- a/arch/x86/include/mach-xen/asm/fixmap.h
++++ b/arch/x86/include/mach-xen/asm/fixmap.h
+@@ -23,7 +23,6 @@
+ #include <linux/threads.h>
+ #include <asm/kmap_types.h>
+ #else
+-#include <asm/pvclock.h>
+ #include <uapi/asm/vsyscall.h>
+ #endif
+ 
+@@ -72,10 +71,6 @@ enum fixed_addresses {
+ #ifdef CONFIG_X86_VSYSCALL_EMULATION
+ 	VSYSCALL_PAGE = (FIXADDR_TOP - VSYSCALL_ADDR) >> PAGE_SHIFT,
+ #endif
+-#ifdef CONFIG_PARAVIRT_CLOCK
+-	PVCLOCK_FIXMAP_BEGIN,
+-	PVCLOCK_FIXMAP_END = PVCLOCK_FIXMAP_BEGIN+PVCLOCK_VSYSCALL_NR_PAGES-1,
+-#endif
+ #endif
+ 	FIX_DBGP_BASE,
+ 	FIX_EARLYCON_MEM_BASE,
+--- a/arch/x86/include/mach-xen/asm/ipi.h
++++ b/arch/x86/include/mach-xen/asm/ipi.h
+@@ -4,6 +4,7 @@
+ #include <asm/hw_irq.h>
+ #include <asm/smp.h>
+ 
++void xen_send_IPI_single(int cpu, int vector);
+ void xen_send_IPI_mask(const struct cpumask *, int vector);
+ void xen_send_IPI_mask_allbutself(const struct cpumask *, int vector);
+ void xen_send_IPI_allbutself(int vector);
+--- a/arch/x86/include/mach-xen/asm/mmu_context.h
++++ b/arch/x86/include/mach-xen/asm/mmu_context.h
+@@ -169,10 +169,38 @@ static inline void switch_mm(struct mm_s
+ #endif
+ 		cpumask_set_cpu(cpu, mm_cpumask(next));
+ 
+-		/* Re-load page tables: load_cr3(next->pgd) */
++		/*
++		 * Re-load page tables: load_cr3(next->pgd).
++		 *
++		 * This logic has an ordering constraint:
++		 *
++		 *  CPU 0: Write to a PTE for 'next'
++		 *  CPU 0: load bit 1 in mm_cpumask.  if nonzero, send IPI.
++		 *  CPU 1: set bit 1 in next's mm_cpumask
++		 *  CPU 1: load from the PTE that CPU 0 writes (implicit)
++		 *
++		 * We need to prevent an outcome in which CPU 1 observes
++		 * the new PTE value and CPU 0 observes bit 1 clear in
++		 * mm_cpumask.  (If that occurs, then the IPI will never
++		 * be sent, and CPU 0's TLB will contain a stale entry.)
++		 *
++		 * The bad outcome can occur if either CPU's load is
++		 * reordered before that CPU's store, so both CPUs must
++		 * execute full barriers to prevent this from happening.
++		 *
++		 * Thus, switch_mm needs a full barrier between the
++		 * store to mm_cpumask and any operation that could load
++		 * from next->pgd.  TLB fills are special and can happen
++		 * due to instruction fetches or for no reason at all,
++		 * and neither LOCK nor MFENCE orders them.
++		 * Fortunately, load_cr3() is serializing and gives the
++		 * ordering guarantee we need.
++		 *
++		 */
+ 		op->cmd = MMUEXT_NEW_BASEPTR;
+ 		op->arg1.mfn = virt_to_mfn(next->pgd);
+ 		op++;
++
+ 		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
+ 
+ 		/* xen_new_user_pt(__pa(__user_pgd(next->pgd))) */
+@@ -234,10 +262,14 @@ static inline void switch_mm(struct mm_s
+ 			 * schedule, protecting us from simultaneous changes.
+ 			 */
+ 			cpumask_set_cpu(cpu, mm_cpumask(next));
++
+ 			/*
+ 			 * We were in lazy tlb mode and leave_mm disabled
+ 			 * tlb flush IPI delivery. We must reload CR3
+ 			 * to make sure to use no freed page tables.
++			 *
++			 * As above, load_cr3() is serializing and orders TLB
++			 * fills with respect to the mm_cpumask write.
+ 			 */
+ 			load_cr3(next->pgd);
+ 			trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
+--- a/arch/x86/include/mach-xen/asm/pgtable.h
++++ b/arch/x86/include/mach-xen/asm/pgtable.h
+@@ -63,9 +63,6 @@ extern struct mm_struct *pgd_page_get_mm
+ #define pmd_clear(pmd)			xen_pmd_clear(pmd)
+ 
+ #define pte_update(mm, addr, ptep)              do { } while (0)
+-#define pte_update_defer(mm, addr, ptep)        do { } while (0)
+-#define pmd_update(mm, addr, ptep)              do { } while (0)
+-#define pmd_update_defer(mm, addr, ptep)        do { } while (0)
+ 
+ #define pgd_val(x)	xen_pgd_val(x)
+ #define __pgd(x)	xen_make_pgd(x)
+@@ -159,20 +156,22 @@ static inline int pmd_large(pmd_t pte)
+ }
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+-static inline int pmd_trans_splitting(pmd_t pmd)
+-{
+-	return pmd_val(pmd) & _PAGE_SPLITTING;
+-}
+-
+ static inline int pmd_trans_huge(pmd_t pmd)
+ {
+-	return pmd_val(pmd) & _PAGE_PSE;
++	return (pmd_val(pmd) & (_PAGE_PSE|_PAGE_DEVMAP)) == _PAGE_PSE;
+ }
+ 
+ static inline int has_transparent_hugepage(void)
+ {
+ 	return cpu_has_pse;
+ }
++
++#ifdef __HAVE_ARCH_PTE_DEVMAP
++static inline int pmd_devmap(pmd_t pmd)
++{
++	return !!(pmd_val(pmd) & _PAGE_DEVMAP);
++}
++#endif
+ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+ static inline pte_t pte_set_flags(pte_t pte, pteval_t set)
+@@ -249,6 +248,11 @@ static inline pte_t pte_mkspecial(pte_t
+ 	return pte_set_flags(pte, _PAGE_SPECIAL);
+ }
+ 
++static inline pte_t pte_mkdevmap(pte_t pte)
++{
++	return pte_set_flags(pte, _PAGE_SPECIAL|_PAGE_DEVMAP);
++}
++
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ static inline pmd_t pmd_set_flags(pmd_t pmd, pmdval_t set)
+ {
+@@ -269,6 +273,11 @@ static inline pmd_t pmd_mkold(pmd_t pmd)
+ 	return pmd_clear_flags(pmd, _PAGE_ACCESSED);
+ }
+ 
++static inline pmd_t pmd_mkclean(pmd_t pmd)
++{
++	return pmd_clear_flags(pmd, _PAGE_DIRTY);
++}
++
+ static inline pmd_t pmd_wrprotect(pmd_t pmd)
+ {
+ 	return pmd_clear_flags(pmd, _PAGE_RW);
+@@ -279,6 +288,11 @@ static inline pmd_t pmd_mkdirty(pmd_t pm
+ 	return pmd_set_flags(pmd, _PAGE_DIRTY | _PAGE_SOFT_DIRTY);
+ }
+ 
++static inline pmd_t pmd_mkdevmap(pmd_t pmd)
++{
++	return pmd_set_flags(pmd, _PAGE_DEVMAP);
++}
++
+ static inline pmd_t pmd_mkhuge(pmd_t pmd)
+ {
+ 	return pmd_set_flags(pmd, _PAGE_PSE);
+@@ -467,6 +481,13 @@ static inline int pte_present(pte_t a)
+ 	return pte_flags(a) & (_PAGE_PRESENT | _PAGE_PROTNONE);
+ }
+ 
++#ifdef __HAVE_ARCH_PTE_DEVMAP
++static inline int pte_devmap(pte_t a)
++{
++	return (pte_flags(a) & _PAGE_DEVMAP) == _PAGE_DEVMAP;
++}
++#endif
++
+ #define pte_accessible pte_accessible
+ static inline bool pte_accessible(struct mm_struct *mm, pte_t a)
+ {
+@@ -755,14 +776,9 @@ static inline void xen_pte_clear(struct
+  * updates should either be sets, clears, or set_pte_atomic for P->P
+  * transitions, which means this hook should only be called for user PTEs.
+  * This hook implies a P->P protection or access change has taken place, which
+- * requires a subsequent TLB flush.  The notification can optionally be delayed
+- * until the TLB flush event by using the pte_update_defer form of the
+- * interface, but care must be taken to assure that the flush happens while
+- * still holding the same page table lock so that the shadow and primary pages
+- * do not become out of sync on SMP.
++ * requires a subsequent TLB flush.
+  */
+ #define pte_update(mm, addr, ptep)		do { } while (0)
+-#define pte_update_defer(mm, addr, ptep)	do { } while (0)
+ #endif
+ 
+ /*
+@@ -859,10 +875,6 @@ extern int pmdp_clear_flush_young(struct
+ 				  unsigned long address, pmd_t *pmdp);
+ 
+ 
+-#define __HAVE_ARCH_PMDP_SPLITTING_FLUSH
+-extern void pmdp_splitting_flush(struct vm_area_struct *vma,
+-				 unsigned long addr, pmd_t *pmdp);
+-
+ #define __HAVE_ARCH_PMD_WRITE
+ static inline int pmd_write(pmd_t pmd)
+ {
+@@ -874,9 +886,7 @@ static inline int pmd_write(pmd_t pmd)
+ static inline pmd_t pmdp_huge_get_and_clear(struct mm_struct *mm, unsigned long addr,
+ 				       pmd_t *pmdp)
+ {
+-	pmd_t pmd = xen_pmdp_get_and_clear(pmdp);
+-	pmd_update(mm, addr, pmdp);
+-	return pmd;
++	return xen_pmdp_get_and_clear(pmdp);
+ }
+ #endif
+ 
+@@ -886,7 +896,6 @@ static inline void pmdp_set_wrprotect(st
+ 				      unsigned long addr, pmd_t *pmdp)
+ {
+ 	clear_bit(_PAGE_BIT_RW, (unsigned long *)pmdp);
+-	pmd_update(mm, addr, pmdp);
+ }
+ #endif
+ 
+--- a/arch/x86/include/mach-xen/asm/pgtable_types.h
++++ b/arch/x86/include/mach-xen/asm/pgtable_types.h
+@@ -22,11 +22,12 @@
+ #define _PAGE_BIT_PAT_LARGE	12	/* On 2MB or 1GB pages */
+ #define _PAGE_BIT_SPECIAL	_PAGE_BIT_SOFTW1
+ #define _PAGE_BIT_CPA_TEST	_PAGE_BIT_SOFTW1
+-#define _PAGE_BIT_SPLITTING	_PAGE_BIT_SOFTW2 /* only valid on a PSE pmd */
+ #define _PAGE_BIT_IOMAP		_PAGE_BIT_SOFTW2 /* flag used to indicate IO mapping */
+ #define _PAGE_BIT_HIDDEN	_PAGE_BIT_SOFTW3 /* hidden by kmemcheck */
+ #define _PAGE_BIT_SOFT_DIRTY	_PAGE_BIT_SOFTW3 /* software dirty tracking */
+-#define _PAGE_BIT_NX           63       /* No execute: only valid after cpuid check */
++#define _PAGE_BIT_SOFTW4	58	/* available for programmer */
++#define _PAGE_BIT_DEVMAP		_PAGE_BIT_SOFTW4
++#define _PAGE_BIT_NX		63	/* No execute: only valid after cpuid check */
+ 
+ /* If _PAGE_BIT_PRESENT is clear, we use these: */
+ /* - if the user mapped it with PROT_NONE; pte_present gives true */
+@@ -47,7 +48,6 @@
+ #define _PAGE_PAT_LARGE (_AT(pteval_t, 1) << _PAGE_BIT_PAT_LARGE)
+ #define _PAGE_SPECIAL	(_AT(pteval_t, 1) << _PAGE_BIT_SPECIAL)
+ #define _PAGE_CPA_TEST	(_AT(pteval_t, 1) << _PAGE_BIT_CPA_TEST)
+-#define _PAGE_SPLITTING	(_AT(pteval_t, 1) << _PAGE_BIT_SPLITTING)
+ #define __HAVE_ARCH_PTE_SPECIAL
+ 
+ #ifdef CONFIG_KMEMCHECK
+@@ -86,8 +86,11 @@
+ 
+ #if defined(CONFIG_X86_64) || defined(CONFIG_X86_PAE)
+ #define _PAGE_NX	(_AT(pteval_t, 1) << _PAGE_BIT_NX)
++#define _PAGE_DEVMAP	(_AT(u64, 1) << _PAGE_BIT_DEVMAP)
++#define __HAVE_ARCH_PTE_DEVMAP
+ #else
+ #define _PAGE_NX	(_AT(pteval_t, 0))
++#define _PAGE_DEVMAP	(_AT(pteval_t, 0))
+ #endif
+ 
+ #define _PAGE_PROTNONE	(_AT(pteval_t, 1) << _PAGE_BIT_PROTNONE)
+--- a/arch/x86/include/mach-xen/asm/processor.h
++++ b/arch/x86/include/mach-xen/asm/processor.h
+@@ -768,7 +768,7 @@ extern unsigned long thread_saved_pc(str
+  * Return saved PC of a blocked thread.
+  * What is this good for? it will be always the scheduler or ret_from_fork.
+  */
+-#define thread_saved_pc(t)	(*(unsigned long *)((t)->thread.sp - 8))
++#define thread_saved_pc(t)	READ_ONCE_NOCHECK(*(unsigned long *)((t)->thread.sp - 8))
+ 
+ #define task_pt_regs(tsk)	((struct pt_regs *)(tsk)->thread.sp0 - 1)
+ 
+--- a/arch/x86/include/mach-xen/asm/smp.h
++++ b/arch/x86/include/mach-xen/asm/smp.h
+@@ -21,15 +21,6 @@
+ extern unsigned int num_processors;
+ 
+ #ifndef CONFIG_XEN
+-static inline bool cpu_has_ht_siblings(void)
+-{
+-	bool has_siblings = false;
+-#ifdef CONFIG_SMP
+-	has_siblings = cpu_has_ht && smp_num_siblings > 1;
+-#endif
+-	return has_siblings;
+-}
+-
+ DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_sibling_map);
+ DECLARE_PER_CPU_READ_MOSTLY(cpumask_var_t, cpu_core_map);
+ /* cpus sharing the last level cache: */
+--- a/arch/x86/kernel/apic/io_apic-xen.c
++++ b/arch/x86/kernel/apic/io_apic-xen.c
+@@ -2614,6 +2614,7 @@ void __init setup_ioapic_dest(void)
+ {
+ 	int pin, ioapic, irq, irq_entry;
+ 	const struct cpumask *mask;
++	struct irq_desc *desc;
+ 	struct irq_data *idata;
+ 	struct irq_chip *chip;
+ 
+@@ -2629,7 +2630,9 @@ void __init setup_ioapic_dest(void)
+ 		if (irq < 0 || !mp_init_irq_at_boot(ioapic, irq))
+ 			continue;
+ 
+-		idata = irq_get_irq_data(irq);
++		desc = irq_to_desc(irq);
++		raw_spin_lock_irq(&desc->lock);
++		idata = irq_desc_get_irq_data(desc);
+ 
+ 		/*
+ 		 * Honour affinities which have been set in early boot
+@@ -2643,6 +2646,7 @@ void __init setup_ioapic_dest(void)
+ 		/* Might be lapic_chip for irq 0 */
+ 		if (chip->irq_set_affinity)
+ 			chip->irq_set_affinity(idata, mask, false);
++		raw_spin_unlock_irq(&desc->lock);
+ 	}
+ }
+ #endif
+--- a/arch/x86/kernel/apic/ipi-xen.c
++++ b/arch/x86/kernel/apic/ipi-xen.c
+@@ -25,6 +25,14 @@ static inline void __send_IPI_one(unsign
+ 	notify_remote_via_irq(irq);
+ }
+ 
++/*
++ * Helper function for APICs which insist on cpumasks
++ */
++void xen_send_IPI_single(int cpu, int vector)
++{
++	__send_IPI_one(cpu, vector);
++}
++
+ void xen_send_IPI_mask_allbutself(const struct cpumask *cpumask, int vector)
+ {
+ 	unsigned int cpu, this_cpu = smp_processor_id();
+--- a/arch/x86/kernel/apic/probe_32-xen.c
++++ b/arch/x86/kernel/apic/probe_32-xen.c
+@@ -45,6 +45,7 @@ static struct apic apic_xen = {
+ 	.phys_pkg_id			= xen_phys_pkg_id,
+ 
+ #ifdef CONFIG_SMP
++	.send_IPI			= xen_send_IPI_single,
+ 	.send_IPI_mask			= xen_send_IPI_mask,
+ 	.send_IPI_mask_allbutself	= xen_send_IPI_mask_allbutself,
+ 	.send_IPI_allbutself		= xen_send_IPI_allbutself,
+--- a/arch/x86/kernel/apic/vector-xen.c
++++ b/arch/x86/kernel/apic/vector-xen.c
+@@ -30,8 +30,9 @@ struct apic_chip_data {
+ };
+ 
+ struct irq_domain *x86_vector_domain;
++EXPORT_SYMBOL_GPL(x86_vector_domain);
+ static DEFINE_RAW_SPINLOCK(vector_lock);
+-static cpumask_var_t vector_cpumask;
++static cpumask_var_t vector_cpumask, vector_searchmask, searched_cpumask;
+ static struct irq_chip lapic_controller;
+ #ifdef	CONFIG_X86_IO_APIC
+ static struct apic_chip_data *legacy_irq_data[NR_IRQS_LEGACY];
+@@ -72,6 +73,7 @@ struct irq_cfg *irqd_cfg(struct irq_data
+ 	return data ? &data->cfg : NULL;
+ }
+ #endif
++EXPORT_SYMBOL_GPL(irqd_cfg);
+ 
+ struct irq_cfg *irq_cfg(unsigned int irq)
+ {
+@@ -123,35 +125,47 @@ static int __assign_irq_vector(int irq,
+ 	 */
+ 	static int current_vector = FIRST_EXTERNAL_VECTOR + VECTOR_OFFSET_START;
+ 	static int current_offset = VECTOR_OFFSET_START % 16;
+-	int cpu, err;
++	int cpu, vector;
+ 
+-	if (d->move_in_progress)
++	/*
++	 * If there is still a move in progress or the previous move has not
++	 * been cleaned up completely, tell the caller to come back later.
++	 */
++	if (d->move_in_progress ||
++	    cpumask_intersects(d->old_domain, cpu_online_mask))
+ 		return -EBUSY;
+ 
+ 	/* Only try and allocate irqs on cpus that are present */
+-	err = -ENOSPC;
+ 	cpumask_clear(d->old_domain);
++	cpumask_clear(searched_cpumask);
+ 	cpu = cpumask_first_and(mask, cpu_online_mask);
+ 	while (cpu < nr_cpu_ids) {
+-		int new_cpu, vector, offset;
++		int new_cpu, offset;
+ 
++		/* Get the possible target cpus for @mask/@cpu from the apic */
+ 		apic->vector_allocation_domain(cpu, vector_cpumask, mask);
+ 
++		/*
++		 * Clear the offline cpus from @vector_cpumask for searching
++		 * and verify whether the result overlaps with @mask. If true,
++		 * then the call to apic->cpu_mask_to_apicid_and() will
++		 * succeed as well. If not, no point in trying to find a
++		 * vector in this mask.
++		 */
++		cpumask_and(vector_searchmask, vector_cpumask, cpu_online_mask);
++		if (!cpumask_intersects(vector_searchmask, mask))
++			goto next_cpu;
++
+ 		if (cpumask_subset(vector_cpumask, d->domain)) {
+-			err = 0;
+ 			if (cpumask_equal(vector_cpumask, d->domain))
+-				break;
++				goto success;
+ 			/*
+-			 * New cpumask using the vector is a proper subset of
+-			 * the current in use mask. So cleanup the vector
+-			 * allocation for the members that are not used anymore.
++			 * Mark the cpus which are not longer in the mask for
++			 * cleanup.
+ 			 */
+-			cpumask_andnot(d->old_domain, d->domain,
+-				       vector_cpumask);
+-			d->move_in_progress =
+-			   cpumask_intersects(d->old_domain, cpu_online_mask);
+-			cpumask_and(d->domain, d->domain, vector_cpumask);
+-			break;
++			cpumask_andnot(d->old_domain, d->domain, vector_cpumask);
++			vector = d->cfg.vector;
++			goto update;
+ 		}
+ 
+ 		vector = current_vector;
+@@ -163,45 +177,60 @@ next:
+ 			vector = FIRST_EXTERNAL_VECTOR + offset;
+ 		}
+ 
+-		if (unlikely(current_vector == vector)) {
+-			cpumask_or(d->old_domain, d->old_domain,
+-				   vector_cpumask);
+-			cpumask_andnot(vector_cpumask, mask, d->old_domain);
+-			cpu = cpumask_first_and(vector_cpumask,
+-						cpu_online_mask);
+-			continue;
+-		}
++		/* If the search wrapped around, try the next cpu */
++		if (unlikely(current_vector == vector))
++			goto next_cpu;
+ 
+ 		if (test_bit(vector, used_vectors))
+ 			goto next;
+ 
+-		for_each_cpu_and(new_cpu, vector_cpumask, cpu_online_mask) {
++		for_each_cpu(new_cpu, vector_searchmask) {
+ 			if (!IS_ERR_OR_NULL(per_cpu(vector_irq, new_cpu)[vector]))
+ 				goto next;
+ 		}
+ 		/* Found one! */
+ 		current_vector = vector;
+ 		current_offset = offset;
+-		if (d->cfg.vector) {
++		/* Schedule the old vector for cleanup on all cpus */
++		if (d->cfg.vector)
+ 			cpumask_copy(d->old_domain, d->domain);
+-			d->move_in_progress =
+-			   cpumask_intersects(d->old_domain, cpu_online_mask);
+-		}
+-		for_each_cpu_and(new_cpu, vector_cpumask, cpu_online_mask)
++		for_each_cpu(new_cpu, vector_searchmask)
+ 			per_cpu(vector_irq, new_cpu)[vector] = irq_to_desc(irq);
+-		d->cfg.vector = vector;
+-		cpumask_copy(d->domain, vector_cpumask);
+-		err = 0;
+-		break;
+-	}
++		goto update;
+ 
+-	if (!err) {
+-		/* cache destination APIC IDs into cfg->dest_apicid */
+-		err = apic->cpu_mask_to_apicid_and(mask, d->domain,
+-						   &d->cfg.dest_apicid);
++next_cpu:
++		/*
++		 * We exclude the current @vector_cpumask from the requested
++		 * @mask and try again with the next online cpu in the
++		 * result. We cannot modify @mask, so we use @vector_cpumask
++		 * as a temporary buffer here as it will be reassigned when
++		 * calling apic->vector_allocation_domain() above.
++		 */
++		cpumask_or(searched_cpumask, searched_cpumask, vector_cpumask);
++		cpumask_andnot(vector_cpumask, mask, searched_cpumask);
++		cpu = cpumask_first_and(vector_cpumask, cpu_online_mask);
++		continue;
+ 	}
++	return -ENOSPC;
+ 
+-	return err;
++update:
++	/*
++	 * Exclude offline cpus from the cleanup mask and set the
++	 * move_in_progress flag when the result is not empty.
++	 */
++	cpumask_and(d->old_domain, d->old_domain, cpu_online_mask);
++	d->move_in_progress = !cpumask_empty(d->old_domain);
++	d->cfg.vector = vector;
++	cpumask_copy(d->domain, vector_cpumask);
++success:
++	/*
++	 * Cache destination APIC IDs into cfg->dest_apicid. This cannot fail
++	 * as we already established, that mask & d->domain & cpu_online_mask
++	 * is not empty.
++	 */
++	BUG_ON(apic->cpu_mask_to_apicid_and(mask, d->domain,
++					    &d->cfg.dest_apicid));
++	return 0;
+ }
+ 
+ static int assign_irq_vector(int irq, struct apic_chip_data *data,
+@@ -231,10 +260,8 @@ static int assign_irq_vector_policy(int
+ static void clear_irq_vector(int irq, struct apic_chip_data *data)
+ {
+ 	struct irq_desc *desc;
+-	unsigned long flags;
+ 	int cpu, vector;
+ 
+-	raw_spin_lock_irqsave(&vector_lock, flags);
+ 	BUG_ON(!data->cfg.vector);
+ 
+ 	vector = data->cfg.vector;
+@@ -244,10 +271,13 @@ static void clear_irq_vector(int irq, st
+ 	data->cfg.vector = 0;
+ 	cpumask_clear(data->domain);
+ 
+-	if (likely(!data->move_in_progress)) {
+-		raw_spin_unlock_irqrestore(&vector_lock, flags);
++	/*
++	 * If move is in progress or the old_domain mask is not empty,
++	 * i.e. the cleanup IPI has not been processed yet, we need to remove
++	 * the old references to desc from all cpus vector tables.
++	 */
++	if (!data->move_in_progress && cpumask_empty(data->old_domain))
+ 		return;
+-	}
+ 
+ 	desc = irq_to_desc(irq);
+ 	for_each_cpu_and(cpu, data->old_domain, cpu_online_mask) {
+@@ -260,7 +290,6 @@ static void clear_irq_vector(int irq, st
+ 		}
+ 	}
+ 	data->move_in_progress = 0;
+-	raw_spin_unlock_irqrestore(&vector_lock, flags);
+ }
+ #endif /* CONFIG_XEN */
+ 
+@@ -283,19 +312,24 @@ void copy_irq_alloc_info(struct irq_allo
+ static void x86_vector_free_irqs(struct irq_domain *domain,
+ 				 unsigned int virq, unsigned int nr_irqs)
+ {
++	struct apic_chip_data *apic_data;
+ 	struct irq_data *irq_data;
++	unsigned long flags;
+ 	int i;
+ 
+ 	for (i = 0; i < nr_irqs; i++) {
+ 		irq_data = irq_domain_get_irq_data(x86_vector_domain, virq + i);
+ 		if (irq_data && irq_data->chip_data) {
++			raw_spin_lock_irqsave(&vector_lock, flags);
+ 			clear_irq_vector(virq + i, irq_data->chip_data);
+-			free_apic_chip_data(irq_data->chip_data);
++			apic_data = irq_data->chip_data;
++			irq_domain_reset_irq_data(irq_data);
++			raw_spin_unlock_irqrestore(&vector_lock, flags);
++			free_apic_chip_data(apic_data);
+ #ifdef	CONFIG_X86_IO_APIC
+ 			if (virq + i < nr_legacy_irqs())
+ 				legacy_irq_data[virq + i] = NULL;
+ #endif
+-			irq_domain_reset_irq_data(irq_data);
+ 		}
+ 	}
+ }
+@@ -413,6 +447,8 @@ int __init arch_early_irq_init(void)
+ 	arch_init_htirq_domain(x86_vector_domain);
+ 
+ 	BUG_ON(!alloc_cpumask_var(&vector_cpumask, GFP_KERNEL));
++	BUG_ON(!alloc_cpumask_var(&vector_searchmask, GFP_KERNEL));
++	BUG_ON(!alloc_cpumask_var(&searched_cpumask, GFP_KERNEL));
+ 
+ 	return arch_early_ioapic_init();
+ }
+@@ -501,14 +537,7 @@ static int apic_set_affinity(struct irq_
+ 		return -EINVAL;
+ 
+ 	err = assign_irq_vector(irq, data, dest);
+-	if (err) {
+-		if (assign_irq_vector(irq, data,
+-				      irq_data_get_affinity_mask(irq_data)))
+-			pr_err("Failed to recover vector for irq %d\n", irq);
+-		return err;
+-	}
+-
+-	return IRQ_SET_MASK_OK;
++	return err ? err : IRQ_SET_MASK_OK;
+ }
+ 
+ static struct irq_chip lapic_controller = {
+@@ -520,20 +549,12 @@ static struct irq_chip lapic_controller
+ #ifdef CONFIG_SMP
+ static void __send_cleanup_vector(struct apic_chip_data *data)
+ {
+-	cpumask_var_t cleanup_mask;
+-
+-	if (unlikely(!alloc_cpumask_var(&cleanup_mask, GFP_ATOMIC))) {
+-		unsigned int i;
+-
+-		for_each_cpu_and(i, data->old_domain, cpu_online_mask)
+-			apic->send_IPI_mask(cpumask_of(i),
+-					    IRQ_MOVE_CLEANUP_VECTOR);
+-	} else {
+-		cpumask_and(cleanup_mask, data->old_domain, cpu_online_mask);
+-		apic->send_IPI_mask(cleanup_mask, IRQ_MOVE_CLEANUP_VECTOR);
+-		free_cpumask_var(cleanup_mask);
+-	}
++	raw_spin_lock(&vector_lock);
++	cpumask_and(data->old_domain, data->old_domain, cpu_online_mask);
+ 	data->move_in_progress = 0;
++	if (!cpumask_empty(data->old_domain))
++		apic->send_IPI_mask(data->old_domain, IRQ_MOVE_CLEANUP_VECTOR);
++	raw_spin_unlock(&vector_lock);
+ }
+ 
+ void send_cleanup_vector(struct irq_cfg *cfg)
+@@ -577,12 +598,25 @@ asmlinkage __visible void smp_irq_move_c
+ 			goto unlock;
+ 
+ 		/*
+-		 * Check if the irq migration is in progress. If so, we
+-		 * haven't received the cleanup request yet for this irq.
++		 * Nothing to cleanup if irq migration is in progress
++		 * or this cpu is not set in the cleanup mask.
+ 		 */
+-		if (data->move_in_progress)
++		if (data->move_in_progress ||
++		    !cpumask_test_cpu(me, data->old_domain))
+ 			goto unlock;
+ 
++		/*
++		 * We have two cases to handle here:
++		 * 1) vector is unchanged but the target mask got reduced
++		 * 2) vector and the target mask has changed
++		 *
++		 * #1 is obvious, but in #2 we have two vectors with the same
++		 * irq descriptor: the old and the new vector. So we need to
++		 * make sure that we only cleanup the old vector. The new
++		 * vector has the current @vector number in the config and
++		 * this cpu is part of the target mask. We better leave that
++		 * one alone.
++		 */
+ 		if (vector == data->cfg.vector &&
+ 		    cpumask_test_cpu(me, data->domain))
+ 			goto unlock;
+@@ -600,6 +634,7 @@ asmlinkage __visible void smp_irq_move_c
+ 			goto unlock;
+ 		}
+ 		__this_cpu_write(vector_irq[vector], VECTOR_UNUSED);
++		cpumask_clear_cpu(me, data->old_domain);
+ unlock:
+ 		raw_spin_unlock(&desc->lock);
+ 	}
+@@ -628,12 +663,48 @@ void irq_complete_move(struct irq_cfg *c
+ 	__irq_complete_move(cfg, ~get_irq_regs()->orig_ax);
+ }
+ 
+-void irq_force_complete_move(int irq)
++/*
++ * Called with @desc->lock held and interrupts disabled.
++ */
++void irq_force_complete_move(struct irq_desc *desc)
+ {
+-	struct irq_cfg *cfg = irq_cfg(irq);
++	struct irq_data *irqdata = irq_desc_get_irq_data(desc);
++	struct apic_chip_data *data = apic_chip_data(irqdata);
++	struct irq_cfg *cfg = data ? &data->cfg : NULL;
+ 
+-	if (cfg)
+-		__irq_complete_move(cfg, cfg->vector);
++	if (!cfg)
++		return;
++
++	__irq_complete_move(cfg, cfg->vector);
++
++	/*
++	 * This is tricky. If the cleanup of @data->old_domain has not been
++	 * done yet, then the following setaffinity call will fail with
++	 * -EBUSY. This can leave the interrupt in a stale state.
++	 *
++	 * The cleanup cannot make progress because we hold @desc->lock. So in
++	 * case @data->old_domain is not yet cleaned up, we need to drop the
++	 * lock and acquire it again. @desc cannot go away, because the
++	 * hotplug code holds the sparse irq lock.
++	 */
++	raw_spin_lock(&vector_lock);
++	/* Clean out all offline cpus (including ourself) first. */
++	cpumask_and(data->old_domain, data->old_domain, cpu_online_mask);
++	while (!cpumask_empty(data->old_domain)) {
++		raw_spin_unlock(&vector_lock);
++		raw_spin_unlock(&desc->lock);
++		cpu_relax();
++		raw_spin_lock(&desc->lock);
++		/*
++		 * Reevaluate apic_chip_data. It might have been cleared after
++		 * we dropped @desc->lock.
++		 */
++		data = apic_chip_data(irqdata);
++		if (!data)
++			return;
++		raw_spin_lock(&vector_lock);
++	}
++	raw_spin_unlock(&vector_lock);
+ }
+ #endif
+ 
+--- a/arch/x86/kernel/cpu/common-xen.c
++++ b/arch/x86/kernel/cpu/common-xen.c
+@@ -625,14 +625,9 @@ void cpu_detect(struct cpuinfo_x86 *c)
+ 		u32 junk, tfms, cap0, misc;
+ 
+ 		cpuid(0x00000001, &tfms, &misc, &junk, &cap0);
+-		c->x86 = (tfms >> 8) & 0xf;
+-		c->x86_model = (tfms >> 4) & 0xf;
+-		c->x86_mask = tfms & 0xf;
+-
+-		if (c->x86 == 0xf)
+-			c->x86 += (tfms >> 20) & 0xff;
+-		if (c->x86 >= 0x6)
+-			c->x86_model += ((tfms >> 16) & 0xf) << 4;
++		c->x86		= x86_family(tfms);
++		c->x86_model	= x86_model(tfms);
++		c->x86_mask	= x86_stepping(tfms);
+ 
+ 		if (cap0 & (1<<19)) {
+ 			c->x86_clflush_size = ((misc >> 8) & 0xff) * 8;
+@@ -643,50 +638,47 @@ void cpu_detect(struct cpuinfo_x86 *c)
+ 
+ void get_cpu_cap(struct cpuinfo_x86 *c)
+ {
+-	u32 tfms, xlvl;
+-	u32 ebx;
++	u32 eax, ebx, ecx, edx;
+ 
+ 	/* Intel-defined flags: level 0x00000001 */
+ 	if (c->cpuid_level >= 0x00000001) {
+-		u32 capability, excap;
++		cpuid(0x00000001, &eax, &ebx, &ecx, &edx);
+ 
+-		cpuid(0x00000001, &tfms, &ebx, &excap, &capability);
+-		c->x86_capability[0] = capability;
+-		c->x86_capability[4] = excap;
++		c->x86_capability[CPUID_1_ECX] = ecx;
++		c->x86_capability[CPUID_1_EDX] = edx;
+ 	}
+ 
+ 	/* Additional Intel-defined flags: level 0x00000007 */
+ 	if (c->cpuid_level >= 0x00000007) {
+-		u32 eax, ebx, ecx, edx;
+-
+ 		cpuid_count(0x00000007, 0, &eax, &ebx, &ecx, &edx);
+ 
+-		c->x86_capability[9] = ebx;
++		c->x86_capability[CPUID_7_0_EBX] = ebx;
++
++		c->x86_capability[CPUID_6_EAX] = cpuid_eax(0x00000006);
+ 	}
+ 
+ 	/* Extended state features: level 0x0000000d */
+ 	if (c->cpuid_level >= 0x0000000d) {
+-		u32 eax, ebx, ecx, edx;
+-
+ 		cpuid_count(0x0000000d, 1, &eax, &ebx, &ecx, &edx);
+ 
+-		c->x86_capability[10] = eax;
++		c->x86_capability[CPUID_D_1_EAX] = eax;
+ 	}
+ 
+ 	/* Additional Intel-defined flags: level 0x0000000F */
+ 	if (c->cpuid_level >= 0x0000000F) {
+-		u32 eax, ebx, ecx, edx;
+ 
+ 		/* QoS sub-leaf, EAX=0Fh, ECX=0 */
+ 		cpuid_count(0x0000000F, 0, &eax, &ebx, &ecx, &edx);
+-		c->x86_capability[11] = edx;
++		c->x86_capability[CPUID_F_0_EDX] = edx;
++
+ 		if (cpu_has(c, X86_FEATURE_CQM_LLC)) {
+ 			/* will be overridden if occupancy monitoring exists */
+ 			c->x86_cache_max_rmid = ebx;
+ 
+ 			/* QoS sub-leaf, EAX=0Fh, ECX=1 */
+ 			cpuid_count(0x0000000F, 1, &eax, &ebx, &ecx, &edx);
+-			c->x86_capability[12] = edx;
++			c->x86_capability[CPUID_F_1_EDX] = edx;
++
+ 			if (cpu_has(c, X86_FEATURE_CQM_OCCUP_LLC)) {
+ 				c->x86_cache_max_rmid = ecx;
+ 				c->x86_cache_occ_scale = ebx;
+@@ -698,22 +690,24 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
+ 	}
+ 
+ 	/* AMD-defined flags: level 0x80000001 */
+-	xlvl = cpuid_eax(0x80000000);
+-	c->extended_cpuid_level = xlvl;
++	eax = cpuid_eax(0x80000000);
++	c->extended_cpuid_level = eax;
+ 
+-	if ((xlvl & 0xffff0000) == 0x80000000) {
+-		if (xlvl >= 0x80000001) {
+-			c->x86_capability[1] = cpuid_edx(0x80000001);
+-			c->x86_capability[6] = cpuid_ecx(0x80000001);
++	if ((eax & 0xffff0000) == 0x80000000) {
++		if (eax >= 0x80000001) {
++			cpuid(0x80000001, &eax, &ebx, &ecx, &edx);
++
++			c->x86_capability[CPUID_8000_0001_ECX] = ecx;
++			c->x86_capability[CPUID_8000_0001_EDX] = edx;
+ 		}
+ 	}
+ 
+ 	if (c->extended_cpuid_level >= 0x80000008) {
+-		u32 eax = cpuid_eax(0x80000008);
++		cpuid(0x80000008, &eax, &ebx, &ecx, &edx);
+ 
+ 		c->x86_virt_bits = (eax >> 8) & 0xff;
+ 		c->x86_phys_bits = eax & 0xff;
+-		c->x86_capability[13] = cpuid_ebx(0x80000008);
++		c->x86_capability[CPUID_8000_0008_EBX] = ebx;
+ 	}
+ #ifdef CONFIG_X86_32
+ 	else if (cpu_has(c, X86_FEATURE_PAE) || cpu_has(c, X86_FEATURE_PSE36))
+@@ -726,6 +720,11 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
+ 	c->x86_power &= ~(1 << 8);
+ #endif
+ 
++#ifndef CONFIG_XEN
++	if (c->extended_cpuid_level >= 0x8000000a)
++		c->x86_capability[CPUID_8000_000A_EDX] = cpuid_edx(0x8000000a);
++#endif
++
+ 	init_scattered_cpuid_features(c);
+ }
+ 
+@@ -1269,7 +1268,7 @@ void syscall_init(void)
+ 	 * They both write to the same internal register. STAR allows to
+ 	 * set CS/DS but only a 32bit target. LSTAR sets the 64bit rip.
+ 	 */
+-	wrmsrl(MSR_STAR,  ((u64)__USER32_CS)<<48  | ((u64)__KERNEL_CS)<<32);
++	wrmsr(MSR_STAR, 0, (__USER32_CS << 16) | __KERNEL_CS);
+ 	wrmsrl(MSR_LSTAR, (unsigned long)entry_SYSCALL_64);
+ 
+ #ifdef CONFIG_IA32_EMULATION
+@@ -1582,7 +1581,8 @@ void cpu_init(void)
+ 
+ 	printk(KERN_INFO "Initializing CPU#%d\n", cpu);
+ 
+-	if (cpu_feature_enabled(X86_FEATURE_VME) || cpu_has_de)
++	if (cpu_feature_enabled(X86_FEATURE_VME) ||
++	    boot_cpu_has(X86_FEATURE_DE))
+ 		cr4_clear_bits(X86_CR4_VME|X86_CR4_PVI|X86_CR4_TSD|X86_CR4_DE);
+ 
+ 	switch_to_new_gdt(cpu);
+--- a/arch/x86/kernel/fpu/init.c
++++ b/arch/x86/kernel/fpu/init.c
+@@ -9,8 +9,6 @@
+ #include <linux/sched.h>
+ #include <linux/init.h>
+ 
+-static int x86_noxsave_setup(char *);
+-
+ /*
+  * Initialize the TS bit in CR0 according to the style of context-switches
+  * we are using:
+@@ -99,7 +97,7 @@ static void __init fpu__init_system_earl
+ #endif
+ #ifdef CONFIG_XEN
+ 	if (!cpu_has_xsave)
+-		x86_noxsave_setup("");
++		fpu__xstate_clear_all_cpu_caps();
+ #endif
+ }
+ 
+--- a/arch/x86/kernel/head64-xen.c
++++ b/arch/x86/kernel/head64-xen.c
+@@ -210,5 +210,15 @@ void __init x86_64_start_reservations(ch
+ {
+ 	copy_bootdata(__va(real_mode_data));
+ 
++#ifndef CONFIG_XEN
++	switch (boot_params.hdr.hardware_subarch) {
++	case X86_SUBARCH_INTEL_MID:
++		x86_intel_mid_early_setup();
++		break;
++	default:
++		break;
++	}
++#endif
++
+ 	start_kernel();
+ }
+--- a/arch/x86/kernel/irq-xen.c
++++ b/arch/x86/kernel/irq-xen.c
+@@ -490,6 +490,15 @@ void fixup_irqs(void)
+ 		}
+ 
+ 		chip = irq_data_get_irq_chip(data);
++		/*
++		 * The interrupt descriptor might have been cleaned up
++		 * already, but it is not yet removed from the radix tree
++		 */
++		if (!chip) {
++			raw_spin_unlock(&desc->lock);
++			continue;
++		}
++
+ 		if (!irqd_can_move_in_process_context(data) && chip->irq_mask)
+ 			chip->irq_mask(data);
+ 
+--- a/arch/x86/kernel/nmi.c
++++ b/arch/x86/kernel/nmi.c
+@@ -355,7 +355,9 @@ static void default_do_nmi(struct pt_reg
+ 	 * crash dump, we simply loop here.
+ 	 */
+ 	while (!raw_spin_trylock(&nmi_reason_lock)) {
++#ifndef CONFIG_XEN
+ 		run_crash_ipi_callback(regs);
++#endif
+ 		cpu_relax();
+ 	}
+ 
+--- a/arch/x86/kernel/setup-xen.c
++++ b/arch/x86/kernel/setup-xen.c
+@@ -1188,6 +1188,8 @@ void __init setup_arch(char **cmdline_p)
+ 				 PFN_PHYS(max_pfn - xen_start_info->nr_pages));
+ #endif
+ 
++	max_possible_pfn = max_pfn;
++
+ #ifdef CONFIG_X86_32
+ 	/* max_low_pfn get updated here */
+ 	find_low_pfn_range();
+--- a/arch/x86/kernel/smp-xen.c
++++ b/arch/x86/kernel/smp-xen.c
+@@ -124,12 +124,12 @@ void xen_smp_send_reschedule(int cpu)
+ 		WARN_ON(1);
+ 		return;
+ 	}
+-	xen_send_IPI_mask(cpumask_of(cpu), RESCHEDULE_VECTOR);
++	xen_send_IPI_single(cpu, RESCHEDULE_VECTOR);
+ }
+ 
+ void xen_send_call_func_single_ipi(int cpu)
+ {
+-	xen_send_IPI_mask(cpumask_of(cpu), CALL_FUNC_SINGLE_VECTOR);
++	xen_send_IPI_single(cpu, CALL_FUNC_SINGLE_VECTOR);
+ }
+ 
+ void xen_send_call_func_ipi(const struct cpumask *mask)
+--- a/arch/x86/kernel/x86_init-xen.c
++++ b/arch/x86/kernel/x86_init-xen.c
+@@ -70,7 +70,6 @@ struct x86_init_ops x86_init __initdata
+ 
+ 	.timers = {
+ 		.setup_percpu_clockev	= NULL,
+-		.tsc_pre_init		= x86_init_noop,
+ 		.timer_init		= x86_init_noop,
+ 		.wallclock_init		= x86_init_noop,
+ 	},
+--- a/arch/x86/mm/dump_pagetables-xen.c
++++ b/arch/x86/mm/dump_pagetables-xen.c
+@@ -442,38 +442,15 @@ void ptdump_walk_pgd_level(struct seq_fi
+ {
+ 	ptdump_walk_pgd_level_core(m, pgd, false);
+ }
++EXPORT_SYMBOL_GPL(ptdump_walk_pgd_level);
+ 
+ void ptdump_walk_pgd_level_checkwx(void)
+ {
+ 	ptdump_walk_pgd_level_core(NULL, NULL, true);
+ }
+ 
+-#ifdef CONFIG_X86_PTDUMP
+-static int ptdump_show(struct seq_file *m, void *v)
+-{
+-	ptdump_walk_pgd_level(m, NULL);
+-	return 0;
+-}
+-
+-static int ptdump_open(struct inode *inode, struct file *filp)
+-{
+-	return single_open(filp, ptdump_show, NULL);
+-}
+-
+-static const struct file_operations ptdump_fops = {
+-	.open		= ptdump_open,
+-	.read		= seq_read,
+-	.llseek		= seq_lseek,
+-	.release	= single_release,
+-};
+-#endif
+-
+ static int __init pt_dump_init(void)
+ {
+-#ifdef CONFIG_X86_PTDUMP
+-	struct dentry *pe;
+-#endif
+-
+ #ifdef CONFIG_X86_32
+ 	/* Not a compile-time constant on x86-32 */
+ 	address_markers[VMALLOC_START_NR].start_address = VMALLOC_START;
+@@ -485,13 +462,6 @@ static int __init pt_dump_init(void)
+ 	address_markers[XEN_SPACE_NR].start_address = hypervisor_virt_start;
+ #endif
+ 
+-#ifdef CONFIG_X86_PTDUMP
+-	pe = debugfs_create_file("kernel_page_tables", 0600, NULL, NULL,
+-				 &ptdump_fops);
+-	if (!pe)
+-		return -ENOMEM;
+-#endif
+-
+ 	return 0;
+ }
+ 
+--- a/arch/x86/mm/fault-xen.c
++++ b/arch/x86/mm/fault-xen.c
+@@ -295,6 +295,9 @@ static noinline int vmalloc_fault(unsign
+ 	if (!pmd_k)
+ 		return -1;
+ 
++	if (pmd_huge(*pmd_k))
++		return 0;
++
+ 	pte_k = pte_offset_kernel(pmd_k, address);
+ 	if (!pte_present(*pte_k))
+ 		return -1;
+@@ -368,8 +371,6 @@ void vmalloc_sync_all(void)
+  * 64-bit:
+  *
+  *   Handle a fault on the vmalloc area
+- *
+- * This assumes no large pages in there.
+  */
+ static noinline int vmalloc_fault(unsigned long address)
+ {
+@@ -411,17 +412,23 @@ static noinline int vmalloc_fault(unsign
+ 	if (pud_none(*pud_ref))
+ 		return -1;
+ 
+-	if (pud_none(*pud) || pud_page_vaddr(*pud) != pud_page_vaddr(*pud_ref))
++	if (pud_none(*pud) || pud_pfn(*pud) != pud_pfn(*pud_ref))
+ 		BUG();
+ 
++	if (pud_huge(*pud))
++		return 0;
++
+ 	pmd = pmd_offset(pud, address);
+ 	pmd_ref = pmd_offset(pud_ref, address);
+ 	if (pmd_none(*pmd_ref))
+ 		return -1;
+ 
+-	if (pmd_none(*pmd) || pmd_page(*pmd) != pmd_page(*pmd_ref))
++	if (pmd_none(*pmd) || pmd_pfn(*pmd) != pmd_pfn(*pmd_ref))
+ 		BUG();
+ 
++	if (pmd_huge(*pmd))
++		return 0;
++
+ 	pte_ref = pte_offset_kernel(pmd_ref, address);
+ 	if (!pte_present(*pte_ref))
+ 		return -1;
+--- a/arch/x86/mm/init_64-xen.c
++++ b/arch/x86/mm/init_64-xen.c
+@@ -33,6 +33,7 @@
+ #include <linux/module.h>
+ #include <linux/memory.h>
+ #include <linux/memory_hotplug.h>
++#include <linux/memremap.h>
+ #include <linux/nmi.h>
+ #include <linux/gfp.h>
+ #include <linux/kcore.h>
+@@ -1032,6 +1033,12 @@ static void __meminit free_pagetable(str
+ {
+ 	unsigned long magic;
+ 	unsigned int nr_pages = 1 << order;
++	struct vmem_altmap *altmap = to_vmem_altmap((unsigned long) page);
++
++	if (altmap) {
++		vmem_altmap_free(altmap, nr_pages);
++		return;
++	}
+ 
+ 	/* bootmem page has reserved flag */
+ 	if (PageReserved(page)) {
+@@ -1132,8 +1139,7 @@ remove_pte_table(pte_t *pte_start, unsig
+ 		if (phys_addr < (phys_addr_t)0x40000000)
+ 			return;
+ 
+-		if (IS_ALIGNED(addr, PAGE_SIZE) &&
+-		    IS_ALIGNED(next, PAGE_SIZE)) {
++		if (PAGE_ALIGNED(addr) && PAGE_ALIGNED(next)) {
+ 			/*
+ 			 * Do not free direct mapping pages since they were
+ 			 * freed when offlining, or simplely not in use.
+@@ -1336,13 +1342,19 @@ int __ref arch_remove_memory(u64 start,
+ {
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
++	struct page *page = pfn_to_page(start_pfn);
++	struct vmem_altmap *altmap;
+ 	struct zone *zone;
+ 	int ret;
+ 
+-	zone = page_zone(pfn_to_page(start_pfn));
+-	kernel_physical_mapping_remove(start, start + size);
++	/* With altmap the first mapped page is offset from @start */
++	altmap = to_vmem_altmap((unsigned long) page);
++	if (altmap)
++		page += vmem_altmap_offset(altmap);
++	zone = page_zone(page);
+ 	ret = __remove_pages(zone, start_pfn, nr_pages);
+ 	WARN_ON_ONCE(ret);
++	kernel_physical_mapping_remove(start, start + size);
+ 
+ 	return ret;
+ }
+@@ -1593,7 +1605,7 @@ static void __meminitdata *p_start, *p_e
+ static int __meminitdata node_start;
+ 
+ static int __meminit vmemmap_populate_hugepages(unsigned long start,
+-						unsigned long end, int node)
++		unsigned long end, int node, struct vmem_altmap *altmap)
+ {
+ 	unsigned long addr;
+ 	unsigned long next;
+@@ -1616,7 +1628,7 @@ static int __meminit vmemmap_populate_hu
+ 		if (pmd_none(*pmd)) {
+ 			void *p;
+ 
+-			p = vmemmap_alloc_block_buf(PMD_SIZE, node);
++			p = __vmemmap_alloc_block_buf(PMD_SIZE, node, altmap);
+ 			if (p) {
+ 				pte_t entry;
+ 
+@@ -1637,7 +1649,8 @@ static int __meminit vmemmap_populate_hu
+ 				addr_end = addr + PMD_SIZE;
+ 				p_end = p + PMD_SIZE;
+ 				continue;
+-			}
++			} else if (altmap)
++				return -ENOMEM; /* no fallback */
+ 		} else if (pmd_large(*pmd)) {
+ 			vmemmap_verify((pte_t *)pmd, node, addr, next);
+ 			continue;
+@@ -1651,11 +1664,16 @@ static int __meminit vmemmap_populate_hu
+ 
+ int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
+ {
++	struct vmem_altmap *altmap = to_vmem_altmap(start);
+ 	int err;
+ 
+ 	if (cpu_has_pse)
+-		err = vmemmap_populate_hugepages(start, end, node);
+-	else
++		err = vmemmap_populate_hugepages(start, end, node, altmap);
++	else if (altmap) {
++		pr_err_once("%s: no cpu support for altmap allocations\n",
++				__func__);
++		err = -ENOMEM;
++	} else
+ 		err = vmemmap_populate_basepages(start, end, node);
+ 	if (!err)
+ 		sync_global_pgds(start, end - 1, 0);
+--- a/arch/x86/mm/ioremap-xen.c
++++ b/arch/x86/mm/ioremap-xen.c
+@@ -369,8 +369,8 @@ static void __iomem *__ioremap_caller(re
+ 	 * Check if the request spans more than any BAR in the iomem resource
+ 	 * tree.
+ 	 */
+-	WARN_ONCE(iomem_map_sanity_check(unaligned_phys_addr, unaligned_size),
+-		  KERN_INFO "Info: mapping multiple BARs. Your kernel is fine.");
++	if (iomem_map_sanity_check(unaligned_phys_addr, unaligned_size))
++		pr_warn("caller %pS mapping multiple BARs\n", caller);
+ 
+ 	return ret_addr;
+ err_free_area:
+--- a/arch/x86/mm/pageattr-xen.c
++++ b/arch/x86/mm/pageattr-xen.c
+@@ -33,7 +33,7 @@ struct cpa_data {
+ 	pgd_t		*pgd;
+ 	pgprot_t	mask_set;
+ 	pgprot_t	mask_clr;
+-	int		numpages;
++	unsigned long	numpages;
+ 	int		flags;
+ 	unsigned long	pfn;
+ 	unsigned	force_split : 1;
+@@ -66,6 +66,9 @@ void update_page_count(int level, unsign
+ 
+ static void split_page_count(int level)
+ {
++	if (direct_pages_count[level] == 0)
++		return;
++
+ 	direct_pages_count[level]--;
+ 	direct_pages_count[level - 1] += PTRS_PER_PTE;
+ }
+@@ -129,14 +132,16 @@ within(unsigned long addr, unsigned long
+  */
+ void clflush_cache_range(void *vaddr, unsigned int size)
+ {
+-	unsigned long clflush_mask = boot_cpu_data.x86_clflush_size - 1;
++	const unsigned long clflush_size = boot_cpu_data.x86_clflush_size;
++	void *p = (void *)((unsigned long)vaddr & ~(clflush_size - 1));
+ 	void *vend = vaddr + size;
+-	void *p;
++
++	if (p >= vend)
++		return;
+ 
+ 	mb();
+ 
+-	for (p = (void *)((unsigned long)vaddr & ~clflush_mask);
+-	     p < vend; p += boot_cpu_data.x86_clflush_size)
++	for (; p < vend; p += clflush_size)
+ 		clflushopt(p);
+ 
+ 	mb();
+@@ -414,24 +419,30 @@ pmd_t *lookup_pmd_address(unsigned long
+ phys_addr_t slow_virt_to_phys(void *__virt_addr)
+ {
+ 	unsigned long virt_addr = (unsigned long)__virt_addr;
+-	unsigned long phys_addr, offset;
++	phys_addr_t phys_addr;
++	unsigned long offset;
+ 	enum pg_level level;
+ 	pte_t *pte;
+ 
+ 	pte = lookup_address(virt_addr, &level);
+ 	BUG_ON(!pte);
+ 
++	/*
++	 * pXX_pfn() returns unsigned long, which must be cast to phys_addr_t
++	 * before being left-shifted PAGE_SHIFT bits -- this trick is to
++	 * make 32-PAE kernel work correctly.
++	 */
+ 	switch (level) {
+ 	case PG_LEVEL_1G:
+-		phys_addr = pud_pfn(*(pud_t *)pte) << PAGE_SHIFT;
++		phys_addr = (phys_addr_t)pud_pfn(*(pud_t *)pte) << PAGE_SHIFT;
+ 		offset = virt_addr & ~PUD_PAGE_MASK;
+ 		break;
+ 	case PG_LEVEL_2M:
+-		phys_addr = pmd_pfn(*(pmd_t *)pte) << PAGE_SHIFT;
++		phys_addr = (phys_addr_t)pmd_pfn(*(pmd_t *)pte) << PAGE_SHIFT;
+ 		offset = virt_addr & ~PMD_PAGE_MASK;
+ 		break;
+ 	default:
+-		phys_addr = pte_pfn(*pte) << PAGE_SHIFT;
++		phys_addr = (phys_addr_t)pte_pfn(*pte) << PAGE_SHIFT;
+ 		offset = virt_addr & ~PAGE_MASK;
+ 	}
+ 
+@@ -1391,7 +1402,7 @@ static int __change_page_attr_set_clr(st
+ 		 * CPA operation. Either a large page has been
+ 		 * preserved or a single page update happened.
+ 		 */
+-		BUG_ON(cpa->numpages > numpages);
++		BUG_ON(cpa->numpages > numpages || !cpa->numpages);
+ 		numpages -= cpa->numpages;
+ 		if (cpa->flags & (CPA_PAGES_ARRAY | CPA_ARRAY))
+ 			cpa->curpage++;
+--- a/arch/x86/mm/pat-xen.c
++++ b/arch/x86/mm/pat-xen.c
+@@ -12,6 +12,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/pfn_t.h>
+ #include <linux/slab.h>
+ #include <linux/mm.h>
+ #include <linux/fs.h>
+@@ -598,7 +599,7 @@ int free_memtype(u64 start, u64 end)
+ 	entry = rbt_memtype_erase(start, end);
+ 	spin_unlock(&memtype_lock);
+ 
+-	if (!entry) {
++	if (IS_ERR(entry)) {
+ 		pr_info("x86/PAT: %s:%d freeing invalid memtype [mem %#010Lx-%#010Lx]\n",
+ 			current->comm, current->pid, start, end - 1);
+ 		return -EINVAL;
+@@ -943,7 +944,7 @@ int track_pfn_remap(struct vm_area_struc
+ }
+ 
+ int track_pfn_insert(struct vm_area_struct *vma, pgprot_t *prot,
+-		     unsigned long pfn)
++		     pfn_t pfn)
+ {
+ 	enum page_cache_mode pcm;
+ 
+@@ -951,7 +952,7 @@ int track_pfn_insert(struct vm_area_stru
+ 		return 0;
+ 
+ 	/* Set prot based on lookup */
+-	pcm = lookup_memtype((resource_size_t)pfn << PAGE_SHIFT);
++	pcm = lookup_memtype(pfn_t_to_phys(pfn));
+ 	*prot = __pgprot((pgprot_val(vma->vm_page_prot) & (~_PAGE_CACHE_MASK)) |
+ 			 cachemode2protval(pcm));
+ 
+@@ -985,6 +986,16 @@ void untrack_pfn(struct vm_area_struct *
+ 	free_pfn_range(paddr, size);
+ 	vma->vm_flags &= ~VM_PAT;
+ }
++
++/*
++ * untrack_pfn_moved is called, while mremapping a pfnmap for a new region,
++ * with the old vma after its pfnmap page table has been removed.  The new
++ * vma has a new pfnmap to the same pfn & cache type with VM_PAT set.
++ */
++void untrack_pfn_moved(struct vm_area_struct *vma)
++{
++	vma->vm_flags &= ~VM_PAT;
++}
+ #endif /* CONFIG_XEN */
+ 
+ pgprot_t pgprot_writecombine(pgprot_t prot)
+--- a/arch/x86/mm/pgtable-xen.c
++++ b/arch/x86/mm/pgtable-xen.c
+@@ -844,7 +844,6 @@ int pmdp_set_access_flags(struct vm_area
+ 
+ 	if (changed && dirty) {
+ 		*pmdp = entry;
+-		pmd_update_defer(vma->vm_mm, address, pmdp);
+ 		/*
+ 		 * We had a write-protection fault here and changed the pmd
+ 		 * to to more permissive. No need to flush the TLB for that,
+@@ -882,9 +881,6 @@ int pmdp_test_and_clear_young(struct vm_
+ 		ret = test_and_clear_bit(_PAGE_BIT_ACCESSED,
+ 					 (unsigned long *)pmdp);
+ 
+-	if (ret)
+-		pmd_update(vma->vm_mm, addr, pmdp);
+-
+ 	return ret;
+ }
+ #endif
+@@ -918,20 +914,6 @@ int pmdp_clear_flush_young(struct vm_are
+ 
+ 	return young;
+ }
+-
+-void pmdp_splitting_flush(struct vm_area_struct *vma,
+-			  unsigned long address, pmd_t *pmdp)
+-{
+-	int set;
+-	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+-	set = !test_and_set_bit(_PAGE_BIT_SPLITTING,
+-				(unsigned long *)pmdp);
+-	if (set) {
+-		pmd_update(vma->vm_mm, address, pmdp);
+-		/* need tlb flush only to serialize against gup-fast */
+-		flush_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
+-	}
+-}
+ #endif
+ 
+ /**
+--- a/arch/x86/mm/tlb-xen.c
++++ b/arch/x86/mm/tlb-xen.c
+@@ -32,6 +32,9 @@ void flush_tlb_mm_range(struct mm_struct
+ 
+ 	preempt_disable();
+ 	if (current->active_mm != mm || !current->mm) {
++		/* Synchronize with switch_mm. */
++		smp_mb();
++
+ 		if (cpumask_any_but(mask, smp_processor_id()) >= nr_cpu_ids) {
+ 			preempt_enable();
+ 			return;
+@@ -46,6 +49,10 @@ void flush_tlb_mm_range(struct mm_struct
+ 	if ((end != TLB_FLUSH_ALL) && !(vmflag & VM_HUGETLB))
+ 		base_pages_to_flush = (end - start) >> PAGE_SHIFT;
+ 
++	/*
++	 * Both branches below are implicit full barriers (MOV to CR or
++	 * INVLPG) that synchronize with switch_mm.
++	 */
+ 	if (base_pages_to_flush > tlb_single_page_flush_ceiling) {
+ 		base_pages_to_flush = TLB_FLUSH_ALL;
+ 		count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
+--- a/drivers/net/ethernet/netronome/Kconfig
++++ b/drivers/net/ethernet/netronome/Kconfig
+@@ -19,6 +19,7 @@ config NFP_NETVF
+ 	tristate "Netronome(R) NFP4000/NFP6000 VF NIC driver"
+ 	depends on PCI && PCI_MSI
+ 	depends on VXLAN || VXLAN=n
++	depends on !XEN || BROKEN
+ 	---help---
+ 	  This driver supports SR-IOV virtual functions of
+ 	  the Netronome(R) NFP4000/NFP6000 cards working as
+--- a/drivers/pci/msi-xen.c
++++ b/drivers/pci/msi-xen.c
+@@ -939,11 +939,6 @@ int pci_msi_enabled(void)
+ }
+ EXPORT_SYMBOL(pci_msi_enabled);
+ 
+-void pci_msi_init_pci_dev(struct pci_dev *dev)
+-{
+-	INIT_LIST_HEAD(&dev->msi_list);
+-}
+-
+ /**
+  * pci_enable_msi_range - configure device's MSI capability structure
+  * @dev: device to configure
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -1159,6 +1159,11 @@ static void pci_msi_setup_pci_dev(struct
+ 	    && (dev->class >> 8) == PCI_CLASS_SYSTEM_IOMMU
+ 	    && dev->vendor == PCI_VENDOR_ID_AMD)
+ 		return;
++
++#if defined(CONFIG_XEN) && defined(CONFIG_PCI_MSI)
++	INIT_LIST_HEAD(&dev->msi_list);
++#endif
++
+ 	dev->msi_cap = pci_find_capability(dev, PCI_CAP_ID_MSI);
+ 	if (dev->msi_cap && xen_initial_domain())
+ 		pci_msi_set_enable(dev, 0);
+--- a/drivers/xen/Makefile
++++ b/drivers/xen/Makefile
+@@ -6,7 +6,7 @@ xen-privcmd_$(CONFIG_PARAVIRT_XEN) := xe
+ 
+ obj-$(CONFIG_HOTPLUG_CPU)	+= $(xen-hotplug-y)
+ obj-$(CONFIG_X86)		+= fallback.o
+-obj-$(CONFIG_PARAVIRT_XEN)	+= grant-table.o features.o balloon.o manage.o preempt.o
++obj-$(CONFIG_PARAVIRT_XEN)	+= grant-table.o features.o balloon.o manage.o preempt.o time.o
+ obj-$(CONFIG_PARAVIRT_XEN)	+= events/
+ 
+ xen-balloon_$(CONFIG_XEN)	:= balloon/
+--- a/drivers/xen/blkback/common.h
++++ b/drivers/xen/blkback/common.h
+@@ -32,7 +32,6 @@
+ #include <linux/blkdev.h>
+ #include <linux/wait.h>
+ #include <asm/hypervisor.h>
+-#include <xen/barrier.h>
+ #include <xen/blkif.h>
+ #include <xen/xenbus.h>
+ #include <xen/interface/event_channel.h>
+--- a/drivers/xen/blkfront/block.h
++++ b/drivers/xen/blkfront/block.h
+@@ -49,7 +49,6 @@
+ #include <linux/major.h>
+ #include <linux/mutex.h>
+ #include <asm/hypervisor.h>
+-#include <xen/barrier.h>
+ #include <xen/xenbus.h>
+ #include <xen/gnttab.h>
+ #include <xen/interface/xen.h>
+--- a/drivers/xen/blktap/common.h
++++ b/drivers/xen/blktap/common.h
+@@ -31,7 +31,6 @@
+ #include <linux/slab.h>
+ #include <linux/blkdev.h>
+ #include <asm/hypervisor.h>
+-#include <xen/barrier.h>
+ #include <xen/blkif.h>
+ #include <xen/xenbus.h>
+ #include <xen/interface/event_channel.h>
+--- a/drivers/xen/blktap2-new/blktap.h
++++ b/drivers/xen/blktap2-new/blktap.h
+@@ -7,7 +7,6 @@
+ #include <linux/cdev.h>
+ #include <linux/init.h>
+ #include <linux/scatterlist.h>
+-#include <xen/barrier.h>
+ #include <xen/blkif.h>
+ 
+ extern int blktap_debug_level;
+--- a/drivers/xen/blktap2/blktap.h
++++ b/drivers/xen/blktap2/blktap.h
+@@ -7,7 +7,6 @@
+ #include <linux/cdev.h>
+ #include <linux/init.h>
+ #include <linux/scatterlist.h>
+-#include <xen/barrier.h>
+ #include <xen/blkif.h>
+ #include <xen/gnttab.h>
+ #include <xen/xenbus.h>
+--- a/drivers/xen/char/mem.c
++++ b/drivers/xen/char/mem.c
+@@ -193,7 +193,7 @@ static loff_t memory_lseek(struct file *
+ {
+ 	loff_t ret;
+ 
+-	mutex_lock(&file_inode(file)->i_mutex);
++	inode_lock(file_inode(file));
+ 	switch (orig) {
+ 	case SEEK_CUR:
+ 		offset += file->f_pos;
+@@ -210,7 +210,7 @@ static loff_t memory_lseek(struct file *
+ 	default:
+ 		ret = -EINVAL;
+ 	}
+-	mutex_unlock(&file_inode(file)->i_mutex);
++	inode_unlock(file_inode(file));
+ 	return ret;
+ }
+ 
+--- a/drivers/xen/netback/common.h
++++ b/drivers/xen/netback/common.h
+@@ -38,7 +38,6 @@
+ #include <linux/etherdevice.h>
+ #include <linux/wait.h>
+ #include <xen/interface/io/netif.h>
+-#include <xen/barrier.h>
+ #include <xen/xenbus.h>
+ #include <xen/interface/event_channel.h>
+ 
+--- a/drivers/xen/netfront/netfront.c
++++ b/drivers/xen/netfront/netfront.c
+@@ -664,6 +664,7 @@ static void network_tx_buf_gc(struct net
+ 	unsigned short id;
+ 	struct netfront_info *np = netdev_priv(dev);
+ 	struct sk_buff *skb;
++	bool more_to_do;
+ 
+ 	BUG_ON(!netfront_carrier_ok(np));
+ 
+@@ -696,18 +697,8 @@ static void network_tx_buf_gc(struct net
+ 
+ 		np->tx.rsp_cons = prod;
+ 
+-		/*
+-		 * Set a new event, then check for race with update of tx_cons.
+-		 * Note that it is essential to schedule a callback, no matter
+-		 * how few buffers are pending. Even if there is space in the
+-		 * transmit ring, higher layers may be blocked because too much
+-		 * data is outstanding: in such cases notification from Xen is
+-		 * likely to be the only kick that we'll get.
+-		 */
+-		np->tx.sring->rsp_event =
+-			prod + ((np->tx.sring->req_prod - prod) >> 1) + 1;
+-		mb();
+-	} while ((cons == prod) && (prod != np->tx.sring->rsp_prod));
++		RING_FINAL_CHECK_FOR_RESPONSES(&np->tx, more_to_do);
++	} while (more_to_do);
+ 
+ 	network_maybe_wake_tx(dev);
+ }
+--- a/drivers/xen/netfront/netfront.h
++++ b/drivers/xen/netfront/netfront.h
+@@ -33,7 +33,6 @@
+ #ifndef NETFRONT_H
+ #define NETFRONT_H
+ 
+-#include <xen/barrier.h>
+ #include <xen/interface/io/netif.h>
+ #include <linux/slab.h>
+ #include <linux/netdevice.h>
+--- a/drivers/xen/privcmd/compat_privcmd.c
++++ b/drivers/xen/privcmd/compat_privcmd.c
+@@ -19,6 +19,7 @@
+  */
+ 
+ #include <linux/compat.h>
++#include <linux/fs.h>
+ #include <linux/ioctl.h>
+ #include <linux/syscalls.h>
+ #include <asm/hypervisor.h>
+@@ -26,7 +27,7 @@
+ #include <xen/public/privcmd.h>
+ #include <xen/compat_ioctl.h>
+ 
+-int privcmd_ioctl_32(int fd, unsigned int cmd, void __user *arg)
++int privcmd_ioctl_32(struct file *file, unsigned int cmd, void __user *arg)
+ {
+ 	int ret;
+ 
+@@ -43,7 +44,8 @@ int privcmd_ioctl_32(int fd, unsigned in
+ 		    put_user(compat_ptr(n32.entry), &p->entry))
+ 			return -EFAULT;
+ 		
+-		ret = sys_ioctl(fd, IOCTL_PRIVCMD_MMAP, (unsigned long)p);
++		ret = compat_do_ioctl(file, IOCTL_PRIVCMD_MMAP,
++				      (unsigned long)p);
+ 	}
+ 		break;
+ 	case IOCTL_PRIVCMD_MMAPBATCH_32: {
+@@ -80,7 +82,8 @@ int privcmd_ioctl_32(int fd, unsigned in
+ 			return -EFAULT;
+ #endif
+ 		
+-		ret = sys_ioctl(fd, IOCTL_PRIVCMD_MMAPBATCH, (unsigned long)p);
++		ret = compat_do_ioctl(file, IOCTL_PRIVCMD_MMAPBATCH,
++				      (unsigned long)p);
+ 
+ #ifdef xen_pfn32_t
+ 		for (i = 0; !ret && i < n32.num; ++i) {
+@@ -129,7 +132,8 @@ int privcmd_ioctl_32(int fd, unsigned in
+ 			return -EFAULT;
+ #endif
+ 
+-		ret = sys_ioctl(fd, IOCTL_PRIVCMD_MMAPBATCH_V2, (unsigned long)p);
++		ret = compat_do_ioctl(file, IOCTL_PRIVCMD_MMAPBATCH_V2,
++				      (unsigned long)p);
+ 	}
+ 		break;
+ 	default:
+--- a/drivers/xen/scsiback/common.h
++++ b/drivers/xen/scsiback/common.h
+@@ -47,7 +47,6 @@
+ #include <scsi/scsi_dbg.h>
+ #include <scsi/scsi_eh.h>
+ #include <asm/hypervisor.h>
+-#include <xen/barrier.h>
+ #include <xen/xenbus.h>
+ #include <xen/interface/io/ring.h>
+ #include <xen/interface/io/vscsiif.h>
+--- a/drivers/xen/scsifront/common.h
++++ b/drivers/xen/scsifront/common.h
+@@ -45,7 +45,6 @@
+ #include <scsi/scsi_device.h>
+ #include <scsi/scsi.h>
+ #include <scsi/scsi_host.h>
+-#include <xen/barrier.h>
+ #include <xen/xenbus.h>
+ #include <xen/gnttab.h>
+ #include <xen/evtchn.h>
+--- a/drivers/xen/usbback/usbback.h
++++ b/drivers/xen/usbback/usbback.h
+@@ -54,7 +54,6 @@
+ #include <linux/wait.h>
+ #include <linux/list.h>
+ #include <linux/kref.h>
+-#include <xen/barrier.h>
+ #include <xen/xenbus.h>
+ #include <xen/interface/event_channel.h>
+ #include <xen/interface/io/usbif.h>
+--- a/drivers/xen/usbfront/usbfront.h
++++ b/drivers/xen/usbfront/usbfront.h
+@@ -53,7 +53,6 @@
+ #include <linux/wait.h>
+ #include <linux/usb/hcd.h>
+ #include <asm/io.h>
+-#include <xen/barrier.h>
+ #include <xen/xenbus.h>
+ #include <xen/evtchn.h>
+ #include <xen/gnttab.h>
+--- a/drivers/xen/xenbus/xenbus_comms.c
++++ b/drivers/xen/xenbus/xenbus_comms.c
+@@ -155,14 +155,14 @@ int xb_write(const void *data, unsigned
+ 			avail = len;
+ 
+ 		/* Must write data /after/ reading the consumer index. */
+-		mb();
++		virt_mb();
+ 
+ 		memcpy(dst, data, avail);
+ 		data += avail;
+ 		len -= avail;
+ 
+ 		/* Other side must not see new producer until data is there. */
+-		wmb();
++		virt_wmb();
+ 		intf->req_prod += avail;
+ 
+ 		/* Implies mb(): other side will see the updated producer. */
+@@ -212,14 +212,14 @@ int xb_read(void *data, unsigned len)
+ 			avail = len;
+ 
+ 		/* Must read data /after/ reading the producer index. */
+-		rmb();
++		virt_rmb();
+ 
+ 		memcpy(data, src, avail);
+ 		data += avail;
+ 		len -= avail;
+ 
+ 		/* Other side must not see free space until we've copied out */
+-		mb();
++		virt_mb();
+ 		intf->rsp_cons += avail;
+ 
+ 		pr_debug("Finished read of %i bytes (%i to go)\n", avail, len);
+--- a/fs/compat_ioctl.c
++++ b/fs/compat_ioctl.c
+@@ -131,7 +131,8 @@
+ 	get_user(val, srcptr) || put_user(val, dstptr);	\
+ })
+ 
+-static int do_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++int compat_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++#define do_ioctl compat_do_ioctl
+ {
+ 	int err;
+ 
+@@ -1522,7 +1523,7 @@ static long do_ioctl_trans(unsigned int
+ 	case IOCTL_PRIVCMD_MMAP_32:
+ 	case IOCTL_PRIVCMD_MMAPBATCH_32:
+ 	case IOCTL_PRIVCMD_MMAPBATCH_V2_32:
+-		return privcmd_ioctl_32(fd, cmd, argp);
++		return privcmd_ioctl_32(file, cmd, argp);
+ #endif
+ 	}
+ 
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1602,6 +1602,8 @@ struct block_device_operations;
+ #define HAVE_COMPAT_IOCTL 1
+ #define HAVE_UNLOCKED_IOCTL 1
+ 
++int compat_do_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
++
+ /*
+  * These flags let !MMU mmap() govern direct device mapping vs immediate
+  * copying more easily for MAP_PRIVATE, especially for ROM filesystems.
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -453,7 +453,7 @@ static inline void SetPageUptodate(struc
+ CLEARPAGEFLAG(Uptodate, uptodate, PF_NO_TAIL)
+ 
+ #ifdef CONFIG_XEN
+-TESTPAGEFLAG(Foreign, foreign)
++TESTPAGEFLAG(Foreign, foreign, PF_NO_COMPOUND)
+ static inline void SetPageForeign(struct page *page,
+ 				  void (*dtor)(struct page *, unsigned int))
+ {
+@@ -470,8 +470,8 @@ static inline void PageForeignDestructor
+ {
+ 	((void (*)(struct page *, unsigned int))page->index)(page, order);
+ }
+-/*PAGEFLAG(Netback, netback)*/
+-PAGEFLAG(Blkback, blkback)
++/*PAGEFLAG(Netback, netback, PF_???)*/
++PAGEFLAG(Blkback, blkback, PF_NO_COMPOUND)
+ #endif
+ 
+ int test_clear_page_writeback(struct page *page);
+--- a/include/uapi/xen/public/gntdev.h
++++ b/include/uapi/xen/public/gntdev.h
+@@ -144,6 +144,56 @@ struct ioctl_gntdev_unmap_notify {
+ 	__u32 event_channel_port;
+ };
+ 
++struct gntdev_grant_copy_segment {
++	union {
++		void __user *virt;
++		struct {
++			grant_ref_t ref;
++			__u16 offset;
++			domid_t domid;
++		} foreign;
++	} source, dest;
++	__u16 len;
++
++	__u16 flags;  /* GNTCOPY_* */
++	__s16 status; /* GNTST_* */
++};
++
++/*
++ * Copy between grant references and local buffers.
++ *
++ * The copy is split into @count @segments, each of which can copy
++ * to/from one grant reference.
++ *
++ * Each segment is similar to struct gnttab_copy in the hypervisor ABI
++ * except the local buffer is specified using a virtual address
++ * (instead of a GFN and offset).
++ *
++ * The local buffer may cross a Xen page boundary -- the driver will
++ * split segments into multiple ops if required.
++ *
++ * Returns 0 if all segments have been processed and @status in each
++ * segment is valid.  Note that one or more segments may have failed
++ * (status != GNTST_okay).
++ *
++ * If the driver had to split a segment into two or more ops, @status
++ * includes the status of the first failed op for that segment (or
++ * GNTST_okay if all ops were successful).
++ *
++ * If -1 is returned, the status of all segments is undefined.
++ *
++ * EINVAL: A segment has local buffers for both source and
++ *         destination.
++ * EINVAL: A segment crosses the boundary of a foreign page.
++ * EFAULT: A segment's local buffer is not accessible.
++ */
++#define IOCTL_GNTDEV_GRANT_COPY \
++	_IOC(_IOC_NONE, 'G', 8, sizeof(struct ioctl_gntdev_grant_copy))
++struct ioctl_gntdev_grant_copy {
++	unsigned int count;
++	struct gntdev_grant_copy_segment __user *segments;
++};
++
+ /* Clear (set to zero) the byte specified by index */
+ #define UNMAP_NOTIFY_CLEAR_BYTE 0x1
+ /* Send an interrupt on the indicated event channel */
+--- a/include/xen/compat_ioctl.h
++++ b/include/xen/compat_ioctl.h
+@@ -29,7 +29,7 @@
+ #define xen_pfn32_t __u32
+ #endif
+ 
+-int privcmd_ioctl_32(int fd, unsigned int cmd, void __user *arg);
++int privcmd_ioctl_32(struct file *, unsigned int cmd, void __user *arg);
+ 
+ struct privcmd_mmap_32 {
+ 	int num;
+--- a/include/xen/interface/io/blkif.h
++++ b/include/xen/interface/io/blkif.h
+@@ -467,6 +467,54 @@
+  */
+ 
+ /*
++ * Multiple hardware queues/rings:
++ * If supported, the backend will write the key "multi-queue-max-queues" to
++ * the directory for that vbd, and set its value to the maximum supported
++ * number of queues.
++ * Frontends that are aware of this feature and wish to use it can write the
++ * key "multi-queue-num-queues" with the number they wish to use, which must be
++ * greater than zero, and no more than the value reported by the backend in
++ * "multi-queue-max-queues".
++ *
++ * For frontends requesting just one queue, the usual event-channel and
++ * ring-ref keys are written as before, simplifying the backend processing
++ * to avoid distinguishing between a frontend that doesn't understand the
++ * multi-queue feature, and one that does, but requested only one queue.
++ *
++ * Frontends requesting two or more queues must not write the toplevel
++ * event-channel and ring-ref keys, instead writing those keys under sub-keys
++ * having the name "queue-N" where N is the integer ID of the queue/ring for
++ * which those keys belong. Queues are indexed from zero.
++ * For example, a frontend with two queues must write the following set of
++ * queue-related keys:
++ *
++ * /local/domain/1/device/vbd/0/multi-queue-num-queues = "2"
++ * /local/domain/1/device/vbd/0/queue-0 = ""
++ * /local/domain/1/device/vbd/0/queue-0/ring-ref = "<ring-ref#0>"
++ * /local/domain/1/device/vbd/0/queue-0/event-channel = "<evtchn#0>"
++ * /local/domain/1/device/vbd/0/queue-1 = ""
++ * /local/domain/1/device/vbd/0/queue-1/ring-ref = "<ring-ref#1>"
++ * /local/domain/1/device/vbd/0/queue-1/event-channel = "<evtchn#1>"
++ *
++ * It is also possible to use multiple queues/rings together with
++ * feature multi-page ring buffer.
++ * For example, a frontend requests two queues/rings and the size of each ring
++ * buffer is two pages must write the following set of related keys:
++ *
++ * /local/domain/1/device/vbd/0/multi-queue-num-queues = "2"
++ * /local/domain/1/device/vbd/0/ring-page-order = "1"
++ * /local/domain/1/device/vbd/0/queue-0 = ""
++ * /local/domain/1/device/vbd/0/queue-0/ring-ref0 = "<ring-ref#0>"
++ * /local/domain/1/device/vbd/0/queue-0/ring-ref1 = "<ring-ref#1>"
++ * /local/domain/1/device/vbd/0/queue-0/event-channel = "<evtchn#0>"
++ * /local/domain/1/device/vbd/0/queue-1 = ""
++ * /local/domain/1/device/vbd/0/queue-1/ring-ref0 = "<ring-ref#2>"
++ * /local/domain/1/device/vbd/0/queue-1/ring-ref1 = "<ring-ref#3>"
++ * /local/domain/1/device/vbd/0/queue-1/event-channel = "<evtchn#1>"
++ *
++ */
++
++/*
+  * REQUEST CODES.
+  */
+ #define BLKIF_OP_READ              0
+--- a/include/xen/interface/io/ring.h
++++ b/include/xen/interface/io/ring.h
+@@ -29,12 +29,6 @@
+ 
+ #include "../xen-compat.h"
+ 
+-#if __XEN_INTERFACE_VERSION__ < 0x00030208
+-#define xen_mb()  mb()
+-#define xen_rmb() rmb()
+-#define xen_wmb() wmb()
+-#endif
+-
+ typedef unsigned int RING_IDX;
+ 
+ /* Round a 32-bit unsigned constant down to the nearest power of two. */
+@@ -240,12 +234,12 @@ typedef struct __name##_back_ring __name
+     (((_prod) - (_r)->rsp_prod_pvt) > RING_SIZE(_r))
+ 
+ #define RING_PUSH_REQUESTS(_r) do {					\
+-    xen_wmb(); /* back sees requests /before/ updated producer index */	\
++    virt_wmb(); /* back sees requests /before/ updated producer index */	\
+     (_r)->sring->req_prod = (_r)->req_prod_pvt;				\
+ } while (0)
+ 
+ #define RING_PUSH_RESPONSES(_r) do {					\
+-    xen_wmb(); /* front sees resps /before/ updated producer index */	\
++    virt_wmb(); /* front sees resps /before/ updated producer index */	\
+     (_r)->sring->rsp_prod = (_r)->rsp_prod_pvt;				\
+ } while (0)
+ 
+@@ -282,9 +276,9 @@ typedef struct __name##_back_ring __name
+ #define RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(_r, _notify) do {		\
+     RING_IDX __old = (_r)->sring->req_prod;				\
+     RING_IDX __new = (_r)->req_prod_pvt;				\
+-    xen_wmb(); /* back sees requests /before/ updated producer index */	\
++    virt_wmb(); /* back sees requests /before/ updated producer index */	\
+     (_r)->sring->req_prod = __new;					\
+-    xen_mb(); /* back sees new requests /before/ we check req_event */	\
++    virt_mb(); /* back sees new requests /before/ we check req_event */	\
+     (_notify) = ((RING_IDX)(__new - (_r)->sring->req_event) <		\
+ 		 (RING_IDX)(__new - __old));				\
+ } while (0)
+@@ -292,9 +286,9 @@ typedef struct __name##_back_ring __name
+ #define RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(_r, _notify) do {		\
+     RING_IDX __old = (_r)->sring->rsp_prod;				\
+     RING_IDX __new = (_r)->rsp_prod_pvt;				\
+-    xen_wmb(); /* front sees resps /before/ updated producer index */	\
++    virt_wmb(); /* front sees resps /before/ updated producer index */	\
+     (_r)->sring->rsp_prod = __new;					\
+-    xen_mb(); /* front sees new resps /before/ we check rsp_event */	\
++    virt_mb(); /* front sees new resps /before/ we check rsp_event */	\
+     (_notify) = ((RING_IDX)(__new - (_r)->sring->rsp_event) <		\
+ 		 (RING_IDX)(__new - __old));				\
+ } while (0)
+@@ -303,7 +297,7 @@ typedef struct __name##_back_ring __name
+     (_work_to_do) = RING_HAS_UNCONSUMED_REQUESTS(_r);			\
+     if (_work_to_do) break;						\
+     (_r)->sring->req_event = (_r)->req_cons + 1;			\
+-    xen_mb();								\
++    virt_mb();								\
+     (_work_to_do) = RING_HAS_UNCONSUMED_REQUESTS(_r);			\
+ } while (0)
+ 
+@@ -311,7 +305,7 @@ typedef struct __name##_back_ring __name
+     (_work_to_do) = RING_HAS_UNCONSUMED_RESPONSES(_r);			\
+     if (_work_to_do) break;						\
+     (_r)->sring->rsp_event = (_r)->rsp_cons + 1;			\
+-    xen_mb();								\
++    virt_mb();								\
+     (_work_to_do) = RING_HAS_UNCONSUMED_RESPONSES(_r);			\
+ } while (0)
+ 
