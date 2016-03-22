@@ -1,0 +1,281 @@
+From 2d90c160e5f1d784e180f1e1458d56eee4d7f4f4 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 9 Mar 2016 23:11:13 -0500
+Subject: [PATCH 4/4] ext4: more efficient SEEK_DATA implementation
+Git-commit: 2d90c160e5f1d784e180f1e1458d56eee4d7f4f4
+Patch-mainline: v4.6-rc1
+References: bsc#942262 bsc#967077
+
+Using SEEK_DATA in a huge sparse file can easily lead to sotflockups as
+ext4_seek_data() iterates hole block-by-block. Fix the problem by using
+returned hole size from ext4_map_blocks() and thus skip the hole in one
+go.
+
+Update also SEEK_HOLE implementation to follow the same pattern as
+SEEK_DATA to make future maintenance easier.
+
+Furthermore we add cond_resched() to both ext4_seek_data() and
+ext4_seek_hole() to avoid softlockups in case evil user creates huge
+fragmented file and we have to go through lots of extents.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+
+---
+ fs/ext4/ext4.h  |    3 +
+ fs/ext4/file.c  |   97 ++++++++++++++++++++------------------------------------
+ fs/ext4/inode.c |   67 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 106 insertions(+), 61 deletions(-)
+
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -2489,6 +2489,9 @@ extern int ext4_page_mkwrite(struct vm_a
+ extern qsize_t *ext4_get_reserved_space(struct inode *inode);
+ extern void ext4_da_update_reserve_space(struct inode *inode,
+ 					int used, int quota_claim);
++extern int ext4_get_next_extent(struct inode *inode, ext4_lblk_t lblk,
++				unsigned int map_len,
++				struct extent_status *result);
+ 
+ /* indirect.c */
+ extern int ext4_ind_map_blocks(handle_t *handle, struct inode *inode,
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@ -387,7 +387,7 @@ static int ext4_file_open(struct inode *
+  */
+ static int ext4_find_unwritten_pgoff(struct inode *inode,
+ 				     int whence,
+-				     struct ext4_map_blocks *map,
++				     ext4_lblk_t end_blk,
+ 				     loff_t *offset)
+ {
+ 	struct pagevec pvec;
+@@ -402,7 +402,7 @@ static int ext4_find_unwritten_pgoff(str
+ 	blkbits = inode->i_sb->s_blocksize_bits;
+ 	startoff = *offset;
+ 	lastoff = startoff;
+-	endoff = (loff_t)(map->m_lblk + map->m_len) << blkbits;
++	endoff = (loff_t)end_blk << blkbits;
+ 
+ 	index = startoff >> PAGE_CACHE_SHIFT;
+ 	end = endoff >> PAGE_CACHE_SHIFT;
+@@ -520,12 +520,11 @@ out:
+ static loff_t ext4_seek_data(struct file *file, loff_t offset, loff_t maxsize)
+ {
+ 	struct inode *inode = file->f_mapping->host;
+-	struct ext4_map_blocks map;
+ 	struct extent_status es;
+ 	ext4_lblk_t start, last, end;
+ 	loff_t dataoff, isize;
+ 	int blkbits;
+-	int ret = 0;
++	int ret;
+ 
+ 	mutex_lock(&inode->i_mutex);
+ 
+@@ -542,41 +541,32 @@ static loff_t ext4_seek_data(struct file
+ 	dataoff = offset;
+ 
+ 	do {
+-		map.m_lblk = last;
+-		map.m_len = end - last + 1;
+-		ret = ext4_map_blocks(NULL, inode, &map, 0);
+-		if (ret > 0 && !(map.m_flags & EXT4_MAP_UNWRITTEN)) {
+-			if (last != start)
+-				dataoff = (loff_t)last << blkbits;
+-			break;
++		ret = ext4_get_next_extent(inode, last, end - last + 1, &es);
++		if (ret <= 0) {
++			/* No extent found -> no data */
++			if (ret == 0)
++				ret = -ENXIO;
++			mutex_unlock(&inode->i_mutex);
++			return ret;
+ 		}
+ 
+-		/*
+-		 * If there is a delay extent at this offset,
+-		 * it will be as a data.
+-		 */
+-		ext4_es_find_delayed_extent_range(inode, last, last, &es);
+-		if (es.es_len != 0 && in_range(last, es.es_lblk, es.es_len)) {
+-			if (last != start)
+-				dataoff = (loff_t)last << blkbits;
++		last = es.es_lblk;
++		if (last != start)
++			dataoff = (loff_t)last << blkbits;
++		if (!ext4_es_is_unwritten(&es))
+ 			break;
+-		}
+ 
+ 		/*
+ 		 * If there is a unwritten extent at this offset,
+ 		 * it will be as a data or a hole according to page
+ 		 * cache that has data or not.
+ 		 */
+-		if (map.m_flags & EXT4_MAP_UNWRITTEN) {
+-			int unwritten;
+-			unwritten = ext4_find_unwritten_pgoff(inode, SEEK_DATA,
+-							      &map, &dataoff);
+-			if (unwritten)
+-				break;
+-		}
+-
+-		last++;
++		if (ext4_find_unwritten_pgoff(inode, SEEK_DATA,
++					      es.es_lblk + es.es_len, &dataoff))
++			break;
++		last += es.es_len;
+ 		dataoff = (loff_t)last << blkbits;
++		cond_resched();
+ 	} while (last <= end);
+ 
+ 	mutex_unlock(&inode->i_mutex);
+@@ -593,12 +583,11 @@ static loff_t ext4_seek_data(struct file
+ static loff_t ext4_seek_hole(struct file *file, loff_t offset, loff_t maxsize)
+ {
+ 	struct inode *inode = file->f_mapping->host;
+-	struct ext4_map_blocks map;
+ 	struct extent_status es;
+ 	ext4_lblk_t start, last, end;
+ 	loff_t holeoff, isize;
+ 	int blkbits;
+-	int ret = 0;
++	int ret;
+ 
+ 	mutex_lock(&inode->i_mutex);
+ 
+@@ -615,44 +604,30 @@ static loff_t ext4_seek_hole(struct file
+ 	holeoff = offset;
+ 
+ 	do {
+-		map.m_lblk = last;
+-		map.m_len = end - last + 1;
+-		ret = ext4_map_blocks(NULL, inode, &map, 0);
+-		if (ret > 0 && !(map.m_flags & EXT4_MAP_UNWRITTEN)) {
+-			last += ret;
+-			holeoff = (loff_t)last << blkbits;
+-			continue;
++		ret = ext4_get_next_extent(inode, last, end - last + 1, &es);
++		if (ret < 0) {
++			mutex_unlock(&inode->i_mutex);
++			return ret;
+ 		}
+-
+-		/*
+-		 * If there is a delay extent at this offset,
+-		 * we will skip this extent.
+-		 */
+-		ext4_es_find_delayed_extent_range(inode, last, last, &es);
+-		if (es.es_len != 0 && in_range(last, es.es_lblk, es.es_len)) {
+-			last = es.es_lblk + es.es_len;
+-			holeoff = (loff_t)last << blkbits;
+-			continue;
++		/* Found a hole? */
++		if (ret == 0 || es.es_lblk > last) {
++			if (last != start)
++				holeoff = (loff_t)last << blkbits;
++			break;
+ 		}
+-
+ 		/*
+ 		 * If there is a unwritten extent at this offset,
+ 		 * it will be as a data or a hole according to page
+ 		 * cache that has data or not.
+ 		 */
+-		if (map.m_flags & EXT4_MAP_UNWRITTEN) {
+-			int unwritten;
+-			unwritten = ext4_find_unwritten_pgoff(inode, SEEK_HOLE,
+-							      &map, &holeoff);
+-			if (!unwritten) {
+-				last += ret;
+-				holeoff = (loff_t)last << blkbits;
+-				continue;
+-			}
+-		}
++		if (ext4_es_is_unwritten(&es) &&
++		    ext4_find_unwritten_pgoff(inode, SEEK_HOLE,
++					      last + es.es_len, &holeoff))
++			break;
+ 
+-		/* find a hole */
+-		break;
++		last += es.es_len;
++		holeoff = (loff_t)last << blkbits;
++		cond_resched();
+ 	} while (last <= end);
+ 
+ 	mutex_unlock(&inode->i_mutex);
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -5383,3 +5383,70 @@ out:
+ 	sb_end_pagefault(inode->i_sb);
+ 	return ret;
+ }
++
++/*
++ * Find the first extent at or after @lblk in an inode that is not a hole.
++ * Search for @map_len blocks at most. The extent is returned in @result.
++ *
++ * The function returns 1 if we found an extent. The function returns 0 in
++ * case there is no extent at or after @lblk and in that case also sets
++ * @result->es_len to 0. In case of error, the error code is returned.
++ */
++int ext4_get_next_extent(struct inode *inode, ext4_lblk_t lblk,
++			 unsigned int map_len, struct extent_status *result)
++{
++	struct ext4_map_blocks map;
++	struct extent_status es = {};
++	int ret;
++
++	map.m_lblk = lblk;
++	map.m_len = map_len;
++
++	/*
++	 * For non-extent based files this loop may iterate several times since
++	 * we do not determine full hole size.
++	 */
++	while (map.m_len > 0) {
++		ret = ext4_map_blocks(NULL, inode, &map, 0);
++		if (ret < 0)
++			return ret;
++		/* There's extent covering m_lblk? Just return it. */
++		if (ret > 0) {
++			int status;
++
++			ext4_es_store_pblock(result, map.m_pblk);
++			result->es_lblk = map.m_lblk;
++			result->es_len = map.m_len;
++			if (map.m_flags & EXT4_MAP_UNWRITTEN)
++				status = EXTENT_STATUS_UNWRITTEN;
++			else
++				status = EXTENT_STATUS_WRITTEN;
++			ext4_es_store_status(result, status);
++			return 1;
++		}
++		ext4_es_find_delayed_extent_range(inode, map.m_lblk,
++						  map.m_lblk + map.m_len - 1,
++						  &es);
++		/* Is delalloc data before next block in extent tree? */
++		if (es.es_len && es.es_lblk < map.m_lblk + map.m_len) {
++			ext4_lblk_t offset = 0;
++
++			if (es.es_lblk < lblk)
++				offset = lblk - es.es_lblk;
++			result->es_lblk = es.es_lblk + offset;
++			ext4_es_store_pblock(result,
++					     ext4_es_pblock(&es) + offset);
++			result->es_len = es.es_len - offset;
++			ext4_es_store_status(result, ext4_es_status(&es));
++
++			return 1;
++		}
++		/* There's a hole at m_lblk, advance us after it */
++		map.m_lblk += map.m_len;
++		map_len -= map.m_len;
++		map.m_len = map_len;
++		cond_resched();
++	}
++	result->es_len = 0;
++	return 0;
++}
