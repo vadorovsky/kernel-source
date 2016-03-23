@@ -1,0 +1,104 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Mon, 29 Feb 2016 15:59:44 +0100
+Subject: nvme: use a work item to submit async event requests
+Git-commit: 9396dec916c052855dbb5b876c13d163df397319
+Patch-mainline: v4.6-rc1
+References: bsc#964944,FATE#319965
+
+Use a dedicated work item to submit async event requests instead of the
+global kthread.  This simplifies the code and reduces the latencies to
+resubmit a request once an even notification happened.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Keith Busch <keith.busch@intel.com>
+Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
+Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.com>
+---
+ drivers/nvme/host/pci.c |   25 ++++++++++++++++++-------
+ 1 file changed, 18 insertions(+), 7 deletions(-)
+
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -99,6 +99,7 @@ struct nvme_dev {
+ 	struct work_struct reset_work;
+ 	struct work_struct scan_work;
+ 	struct work_struct remove_work;
++	struct work_struct async_work;
+ 	struct mutex shutdown_lock;
+ 	bool subsystem;
+ 	void __iomem *cmb;
+@@ -292,8 +293,11 @@ static void nvme_complete_async_event(st
+ 	u16 status = le16_to_cpu(cqe->status) >> 1;
+ 	u32 result = le32_to_cpu(cqe->result);
+ 
+-	if (status == NVME_SC_SUCCESS || status == NVME_SC_ABORT_REQ)
++	if (status == NVME_SC_SUCCESS || status == NVME_SC_ABORT_REQ) {
+ 		++dev->ctrl.event_limit;
++		queue_work(nvme_workq, &dev->async_work);
++	}
++
+ 	if (status != NVME_SC_SUCCESS)
+ 		return;
+ 
+@@ -835,15 +839,22 @@ static int nvme_poll(struct blk_mq_hw_ct
+ 	return 0;
+ }
+ 
+-static void nvme_submit_async_event(struct nvme_dev *dev)
++static void nvme_async_event_work(struct work_struct *work)
+ {
++	struct nvme_dev *dev = container_of(work, struct nvme_dev, async_work);
++	struct nvme_queue *nvmeq = dev->queues[0];
+ 	struct nvme_command c;
+ 
+ 	memset(&c, 0, sizeof(c));
+ 	c.common.opcode = nvme_admin_async_event;
+-	c.common.command_id = NVME_AQ_BLKMQ_DEPTH + --dev->ctrl.event_limit;
+ 
+-	__nvme_submit_cmd(dev->queues[0], &c);
++	spin_lock_irq(&nvmeq->q_lock);
++	while (dev->ctrl.event_limit > 0) {
++		c.common.command_id = NVME_AQ_BLKMQ_DEPTH +
++			--dev->ctrl.event_limit;
++		__nvme_submit_cmd(nvmeq, &c);
++	}
++	spin_unlock_irq(&nvmeq->q_lock);
+ }
+ 
+ static int adapter_delete_queue(struct nvme_dev *dev, u8 opcode, u16 id)
+@@ -1383,9 +1394,6 @@ static int nvme_kthread(void *data)
+ 					continue;
+ 				spin_lock_irq(&nvmeq->q_lock);
+ 				nvme_process_cq(nvmeq);
+-
+-				while (i == 0 && dev->ctrl.event_limit > 0)
+-					nvme_submit_async_event(dev);
+ 				spin_unlock_irq(&nvmeq->q_lock);
+ 			}
+ 		}
+@@ -1950,6 +1958,7 @@ static void nvme_reset_work(struct work_
+ 		goto out;
+ 
+ 	dev->ctrl.event_limit = NVME_NR_AEN_COMMANDS;
++	queue_work(nvme_workq, &dev->async_work);
+ 
+ 	result = nvme_dev_list_add(dev);
+ 	if (result)
+@@ -2090,6 +2099,7 @@ static int nvme_probe(struct pci_dev *pd
+ 	INIT_WORK(&dev->scan_work, nvme_dev_scan);
+ 	INIT_WORK(&dev->reset_work, nvme_reset_work);
+ 	INIT_WORK(&dev->remove_work, nvme_remove_dead_ctrl_work);
++	INIT_WORK(&dev->async_work, nvme_async_event_work);
+ 	mutex_init(&dev->shutdown_lock);
+ 	init_completion(&dev->ioq_wait);
+ 
+@@ -2143,6 +2153,7 @@ static void nvme_shutdown(struct pci_dev
+ static void nvme_remove(struct pci_dev *pdev)
+ {
+ 	struct nvme_dev *dev = pci_get_drvdata(pdev);
++	flush_work(&dev->async_work);
+ 
+ 	set_bit(NVME_CTRL_REMOVING, &dev->flags);
+ 	pci_set_drvdata(pdev, NULL);
