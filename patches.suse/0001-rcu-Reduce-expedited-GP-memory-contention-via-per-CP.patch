@@ -1,0 +1,136 @@
+From df5bd5144a80a9f6c3807383b11f735dae9caf9d Mon Sep 17 00:00:00 2001
+From: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Date: Thu, 1 Oct 2015 10:26:24 -0700
+Subject: [PATCH] rcu: Reduce expedited GP memory contention via per-CPU variables
+Git-commit: df5bd5144a80a9f6c3807383b11f735dae9caf9d
+Patch-mainline: v4.5-rc1
+References: bsc#971073
+
+Currently, the piggybacked-work checks carried out by sync_exp_work_done()
+atomically increment a small set of variables (the ->expedited_workdone0,
+->expedited_workdone1, ->expedited_workdone2, ->expedited_workdone3
+fields in the rcu_state structure), which will form a memory-contention
+bottleneck given a sufficiently large number of CPUs concurrently invoking
+either synchronize_rcu_expedited() or synchronize_sched_expedited().
+
+This commit therefore moves these for fields to the per-CPU rcu_data
+structure, eliminating the memory contention.  The show_rcuexp() function
+also changes to sum up each field in the rcu_data structures.
+
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+
+---
+ kernel/rcu/tree.c       | 11 +++++------
+ kernel/rcu/tree.h       |  8 ++++----
+ kernel/rcu/tree_trace.c | 18 ++++++++++++------
+ 3 files changed, 21 insertions(+), 16 deletions(-)
+
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index 00f07d6436ce..33d7e2551165 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -3585,7 +3585,7 @@ static bool sync_exp_work_done(struct rcu_state *rsp, struct rcu_node *rnp,
+  */
+ static struct rcu_node *exp_funnel_lock(struct rcu_state *rsp, unsigned long s)
+ {
+-	struct rcu_data *rdp;
++	struct rcu_data *rdp = per_cpu_ptr(rsp->rda, raw_smp_processor_id());
+ 	struct rcu_node *rnp0;
+ 	struct rcu_node *rnp1 = NULL;
+ 
+@@ -3599,7 +3599,7 @@ static struct rcu_node *exp_funnel_lock(struct rcu_state *rsp, unsigned long s)
+ 	if (!mutex_is_locked(&rnp0->exp_funnel_mutex)) {
+ 		if (mutex_trylock(&rnp0->exp_funnel_mutex)) {
+ 			if (sync_exp_work_done(rsp, rnp0, NULL,
+-					       &rsp->expedited_workdone0, s))
++					       &rdp->expedited_workdone0, s))
+ 				return NULL;
+ 			return rnp0;
+ 		}
+@@ -3613,14 +3613,13 @@ static struct rcu_node *exp_funnel_lock(struct rcu_state *rsp, unsigned long s)
+ 	 * can be inexact, as it is just promoting locality and is not
+ 	 * strictly needed for correctness.
+ 	 */
+-	rdp = per_cpu_ptr(rsp->rda, raw_smp_processor_id());
+-	if (sync_exp_work_done(rsp, NULL, NULL, &rsp->expedited_workdone1, s))
++	if (sync_exp_work_done(rsp, NULL, NULL, &rdp->expedited_workdone1, s))
+ 		return NULL;
+ 	mutex_lock(&rdp->exp_funnel_mutex);
+ 	rnp0 = rdp->mynode;
+ 	for (; rnp0 != NULL; rnp0 = rnp0->parent) {
+ 		if (sync_exp_work_done(rsp, rnp1, rdp,
+-				       &rsp->expedited_workdone2, s))
++				       &rdp->expedited_workdone2, s))
+ 			return NULL;
+ 		mutex_lock(&rnp0->exp_funnel_mutex);
+ 		if (rnp1)
+@@ -3630,7 +3629,7 @@ static struct rcu_node *exp_funnel_lock(struct rcu_state *rsp, unsigned long s)
+ 		rnp1 = rnp0;
+ 	}
+ 	if (sync_exp_work_done(rsp, rnp1, rdp,
+-			       &rsp->expedited_workdone3, s))
++			       &rdp->expedited_workdone3, s))
+ 		return NULL;
+ 	return rnp1;
+ }
+diff --git a/kernel/rcu/tree.h b/kernel/rcu/tree.h
+index 8151971a8978..6cbec31f99d6 100644
+--- a/kernel/rcu/tree.h
++++ b/kernel/rcu/tree.h
+@@ -386,6 +386,10 @@ struct rcu_data {
+ 	struct rcu_head oom_head;
+ #endif /* #ifdef CONFIG_RCU_FAST_NO_HZ */
+ 	struct mutex exp_funnel_mutex;
++	atomic_long_t expedited_workdone0;	/* # done by others #0. */
++	atomic_long_t expedited_workdone1;	/* # done by others #1. */
++	atomic_long_t expedited_workdone2;	/* # done by others #2. */
++	atomic_long_t expedited_workdone3;	/* # done by others #3. */
+ 
+ 	/* 7) Callback offloading. */
+ #ifdef CONFIG_RCU_NOCB_CPU
+@@ -500,10 +504,6 @@ struct rcu_state {
+ 	/* End of fields guarded by barrier_mutex. */
+ 
+ 	unsigned long expedited_sequence;	/* Take a ticket. */
+-	atomic_long_t expedited_workdone0;	/* # done by others #0. */
+-	atomic_long_t expedited_workdone1;	/* # done by others #1. */
+-	atomic_long_t expedited_workdone2;	/* # done by others #2. */
+-	atomic_long_t expedited_workdone3;	/* # done by others #3. */
+ 	atomic_long_t expedited_normal;		/* # fallbacks to normal. */
+ 	atomic_t expedited_need_qs;		/* # CPUs left to check in. */
+ 	wait_queue_head_t expedited_wq;		/* Wait for check-ins. */
+diff --git a/kernel/rcu/tree_trace.c b/kernel/rcu/tree_trace.c
+index 8efaba870d96..d43649450ea4 100644
+--- a/kernel/rcu/tree_trace.c
++++ b/kernel/rcu/tree_trace.c
+@@ -183,14 +183,20 @@ static const struct file_operations rcudata_fops = {
+ 
+ static int show_rcuexp(struct seq_file *m, void *v)
+ {
++	int cpu;
+ 	struct rcu_state *rsp = (struct rcu_state *)m->private;
+-
++	struct rcu_data *rdp;
++	unsigned long s0 = 0, s1 = 0, s2 = 0, s3 = 0;
++
++	for_each_possible_cpu(cpu) {
++		rdp = per_cpu_ptr(rsp->rda, cpu);
++		s0 += atomic_long_read(&rdp->expedited_workdone0);
++		s1 += atomic_long_read(&rdp->expedited_workdone1);
++		s2 += atomic_long_read(&rdp->expedited_workdone2);
++		s3 += atomic_long_read(&rdp->expedited_workdone3);
++	}
+ 	seq_printf(m, "s=%lu wd0=%lu wd1=%lu wd2=%lu wd3=%lu n=%lu enq=%d sc=%lu\n",
+-		   rsp->expedited_sequence,
+-		   atomic_long_read(&rsp->expedited_workdone0),
+-		   atomic_long_read(&rsp->expedited_workdone1),
+-		   atomic_long_read(&rsp->expedited_workdone2),
+-		   atomic_long_read(&rsp->expedited_workdone3),
++		   rsp->expedited_sequence, s0, s1, s2, s3,
+ 		   atomic_long_read(&rsp->expedited_normal),
+ 		   atomic_read(&rsp->expedited_need_qs),
+ 		   rsp->expedited_sequence / 2);
+-- 
+2.1.4
+
