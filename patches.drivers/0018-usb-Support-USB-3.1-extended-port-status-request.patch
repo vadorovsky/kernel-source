@@ -1,0 +1,262 @@
+From 243432cbff11bc8a32cf89458669712ee85aaeba Mon Sep 17 00:00:00 2001
+From: Mathias Nyman <mathias.nyman@linux.intel.com>
+Date: Thu, 10 Dec 2015 09:59:29 +0200
+Subject: [PATCH 18/41] usb: Support USB 3.1 extended port status request
+References: FATE#319959
+Git-Commit: 0cdd49a1d1a483d80170d9e592f832274e8bce1b
+Patch-Mainline: v4.6
+
+usb 3.1 extend the hub get-port-status request by adding different
+request types. the new request types return 4 additional bytes called
+extended port status, these bytes are returned after the regular
+portstatus and portchange values.
+
+The extended port status contains a speed ID for the currently used
+sublink speed. A table of supported Speed IDs with details about the link
+is provided by the hub in the device descriptor BOS SuperSpeedPlus
+device capability Sublink Speed Attributes.
+
+Support this new request. Ask for the extended port status after port
+reset if hub supports USB 3.1. If link is running at SuperSpeedPlus
+set the device speed to USB_SPEED_SUPER_PLUS
+
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+---
+ drivers/usb/core/hcd.c        |  8 ++++-
+ drivers/usb/core/hub.c        | 70 +++++++++++++++++++++++++++++++++++++------
+ drivers/usb/core/hub.h        |  7 +++++
+ include/uapi/linux/usb/ch11.h | 21 +++++++++++++
+ 4 files changed, 96 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index afddc0d..1b502cc 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -668,9 +668,15 @@ nongeneric:
+ 		/* non-generic request */
+ 		switch (typeReq) {
+ 		case GetHubStatus:
+-		case GetPortStatus:
+ 			len = 4;
+ 			break;
++		case GetPortStatus:
++			if (wValue == HUB_PORT_STATUS)
++				len = 4;
++			else
++				/* other port status types return 8 bytes */
++				len = 8;
++			break;
+ 		case GetHubDescriptor:
+ 			len = sizeof (struct usb_hub_descriptor);
+ 			break;
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 151bdcf..f48565d 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -537,29 +537,34 @@ static int get_hub_status(struct usb_device *hdev,
+ 
+ /*
+  * USB 2.0 spec Section 11.24.2.7
++ * USB 3.1 takes into use the wValue and wLength fields, spec Section 10.16.2.6
+  */
+ static int get_port_status(struct usb_device *hdev, int port1,
+-		struct usb_port_status *data)
++			   void *data, u16 value, u16 length)
+ {
+ 	int i, status = -ETIMEDOUT;
+ 
+ 	for (i = 0; i < USB_STS_RETRIES &&
+ 			(status == -ETIMEDOUT || status == -EPIPE); i++) {
+ 		status = usb_control_msg(hdev, usb_rcvctrlpipe(hdev, 0),
+-			USB_REQ_GET_STATUS, USB_DIR_IN | USB_RT_PORT, 0, port1,
+-			data, sizeof(*data), USB_STS_TIMEOUT);
++			USB_REQ_GET_STATUS, USB_DIR_IN | USB_RT_PORT, value,
++			port1, data, length, USB_STS_TIMEOUT);
+ 	}
+ 	return status;
+ }
+ 
+-static int hub_port_status(struct usb_hub *hub, int port1,
+-		u16 *status, u16 *change)
++static int hub_ext_port_status(struct usb_hub *hub, int port1, int type,
++			       u16 *status, u16 *change, u32 *ext_status)
+ {
+ 	int ret;
++	int len = 4;
++
++	if (type != HUB_PORT_STATUS)
++		len = 8;
+ 
+ 	mutex_lock(&hub->status_mutex);
+-	ret = get_port_status(hub->hdev, port1, &hub->status->port);
+-	if (ret < 4) {
++	ret = get_port_status(hub->hdev, port1, &hub->status->port, type, len);
++	if (ret < len) {
+ 		if (ret != -ENODEV)
+ 			dev_err(hub->intfdev,
+ 				"%s failed (err = %d)\n", __func__, ret);
+@@ -568,13 +573,22 @@ static int hub_port_status(struct usb_hub *hub, int port1,
+ 	} else {
+ 		*status = le16_to_cpu(hub->status->port.wPortStatus);
+ 		*change = le16_to_cpu(hub->status->port.wPortChange);
+-
++		if (type != HUB_PORT_STATUS && ext_status)
++			*ext_status = le32_to_cpu(
++				hub->status->port.dwExtPortStatus);
+ 		ret = 0;
+ 	}
+ 	mutex_unlock(&hub->status_mutex);
+ 	return ret;
+ }
+ 
++static int hub_port_status(struct usb_hub *hub, int port1,
++		u16 *status, u16 *change)
++{
++	return hub_ext_port_status(hub, port1, HUB_PORT_STATUS,
++				   status, change, NULL);
++}
++
+ static void kick_hub_wq(struct usb_hub *hub)
+ {
+ 	struct usb_interface *intf;
+@@ -2612,6 +2626,32 @@ out_authorized:
+ 	return result;
+ }
+ 
++/*
++ * Return 1 if port speed is SuperSpeedPlus, 0 otherwise
++ * check it from the link protocol field of the current speed ID attribute.
++ * current speed ID is got from ext port status request. Sublink speed attribute
++ * table is returned with the hub BOS SSP device capability descriptor
++ */
++static int port_speed_is_ssp(struct usb_device *hdev, int speed_id)
++{
++	int ssa_count;
++	u32 ss_attr;
++	int i;
++	struct usb_ssp_cap_descriptor *ssp_cap = hdev->bos->ssp_cap;
++
++	if (!ssp_cap)
++		return 0;
++
++	ssa_count = le32_to_cpu(ssp_cap->bmAttributes) &
++		USB_SSP_SUBLINK_SPEED_ATTRIBS;
++
++	for (i = 0; i <= ssa_count; i++) {
++		ss_attr = le32_to_cpu(ssp_cap->bmSublinkSpeedAttr[i]);
++		if (speed_id == (ss_attr & USB_SSP_SUBLINK_SPEED_SSID))
++			return !!(ss_attr & USB_SSP_SUBLINK_SPEED_LP);
++	}
++	return 0;
++}
+ 
+ /* Returns 1 if @hub is a WUSB root hub, 0 otherwise */
+ static unsigned hub_is_wusb(struct usb_hub *hub)
+@@ -2676,6 +2716,7 @@ static int hub_port_wait_reset(struct usb_hub *hub, int port1,
+ 	int delay_time, ret;
+ 	u16 portstatus;
+ 	u16 portchange;
++	u32 ext_portstatus = 0;
+ 
+ 	for (delay_time = 0;
+ 			delay_time < HUB_RESET_TIMEOUT;
+@@ -2684,7 +2725,14 @@ static int hub_port_wait_reset(struct usb_hub *hub, int port1,
+ 		msleep(delay);
+ 
+ 		/* read and decode port status */
+-		ret = hub_port_status(hub, port1, &portstatus, &portchange);
++		if (hub_is_superspeedplus(hub->hdev))
++			ret = hub_ext_port_status(hub, port1,
++						  HUB_EXT_PORT_STATUS,
++						  &portstatus, &portchange,
++						  &ext_portstatus);
++		else
++			ret = hub_port_status(hub, port1, &portstatus,
++					      &portchange);
+ 		if (ret < 0)
+ 			return ret;
+ 
+@@ -2727,6 +2775,10 @@ static int hub_port_wait_reset(struct usb_hub *hub, int port1,
+ 
+ 	if (hub_is_wusb(hub))
+ 		udev->speed = USB_SPEED_WIRELESS;
++	else if (hub_is_superspeedplus(hub->hdev) &&
++		 port_speed_is_ssp(hub->hdev, ext_portstatus &
++				   USB_EXT_PORT_STAT_RX_SPEED_ID))
++		udev->speed = USB_SPEED_SUPER_PLUS;
+ 	else if (hub_is_superspeed(hub->hdev))
+ 		udev->speed = USB_SPEED_SUPER;
+ 	else if (portstatus & USB_PORT_STAT_HIGH_SPEED)
+diff --git a/drivers/usb/core/hub.h b/drivers/usb/core/hub.h
+index 45d070d..34c1a7e 100644
+--- a/drivers/usb/core/hub.h
++++ b/drivers/usb/core/hub.h
+@@ -140,6 +140,13 @@ static inline int hub_is_superspeed(struct usb_device *hdev)
+ 	return hdev->descriptor.bDeviceProtocol == USB_HUB_PR_SS;
+ }
+ 
++static inline int hub_is_superspeedplus(struct usb_device *hdev)
++{
++	return (hdev->descriptor.bDeviceProtocol == USB_HUB_PR_SS &&
++		le16_to_cpu(hdev->descriptor.bcdUSB) >= 0x0310 &&
++		hdev->bos->ssp_cap);
++}
++
+ static inline unsigned hub_power_on_good_delay(struct usb_hub *hub)
+ {
+ 	unsigned delay = hub->descriptor->bPwrOn2PwrGood * 2;
+diff --git a/include/uapi/linux/usb/ch11.h b/include/uapi/linux/usb/ch11.h
+index 331499d..361297e 100644
+--- a/include/uapi/linux/usb/ch11.h
++++ b/include/uapi/linux/usb/ch11.h
+@@ -30,6 +30,14 @@
+ #define USB_RT_PORT	(USB_TYPE_CLASS | USB_RECIP_OTHER)
+ 
+ /*
++ * Port status type for GetPortStatus requests added in USB 3.1
++ * See USB 3.1 spec Table 10-12
++ */
++#define HUB_PORT_STATUS		0
++#define HUB_PORT_PD_STATUS	1
++#define HUB_EXT_PORT_STATUS	2
++
++/*
+  * Hub class requests
+  * See USB 2.0 spec Table 11-16
+  */
+@@ -97,10 +105,13 @@
+ /*
+  * Hub Status and Hub Change results
+  * See USB 2.0 spec Table 11-19 and Table 11-20
++ * USB 3.1 extends the port status request and may return 4 additional bytes.
++ * See USB 3.1 spec section 10.16.2.6 Table 10-12 and 10-15
+  */
+ struct usb_port_status {
+ 	__le16 wPortStatus;
+ 	__le16 wPortChange;
++	__le32 dwExtPortStatus;
+ } __attribute__ ((packed));
+ 
+ /*
+@@ -173,6 +184,16 @@ struct usb_port_status {
+ #define USB_PORT_STAT_C_CONFIG_ERROR	0x0080
+ 
+ /*
++ * USB 3.1 dwExtPortStatus field masks
++ * See USB 3.1 spec 10.16.2.6.3 Table 10-15
++ */
++
++#define USB_EXT_PORT_STAT_RX_SPEED_ID	0x0000000f
++#define USB_EXT_PORT_STAT_TX_SPEED_ID	0x000000f0
++#define USB_EXT_PORT_STAT_RX_LANES	0x00000f00
++#define USB_EXT_PORT_STAT_TX_LANES	0x0000f000
++
++/*
+  * wHubCharacteristics (masks)
+  * See USB 2.0 spec Table 11-13, offset 3
+  */
+-- 
+2.1.4
+
