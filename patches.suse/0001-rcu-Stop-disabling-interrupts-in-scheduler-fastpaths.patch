@@ -1,0 +1,222 @@
+From 46a5d164db53ba6066b11889abb7fa6bddbe5cf7 Mon Sep 17 00:00:00 2001
+From: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+Date: Wed, 7 Oct 2015 09:10:48 -0700
+Subject: [PATCH] rcu: Stop disabling interrupts in scheduler fastpaths
+Git-commit: 46a5d164db53ba6066b11889abb7fa6bddbe5cf7
+Patch-mainline: v4.5-rc1
+References: bsc#971073
+
+We need the scheduler's fastpaths to be, well, fast, and unnecessarily
+disabling and re-enabling interrupts is not necessarily consistent with
+this goal.  Especially given that there are regions of the scheduler that
+already have interrupts disabled.
+
+This commit therefore moves the call to rcu_note_context_switch()
+to one of the interrupts-disabled regions of the scheduler, and
+removes the now-redundant disabling and re-enabling of interrupts from
+rcu_note_context_switch() and the functions it calls.
+
+Reported-by: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+[ paulmck: Shift rcu_note_context_switch() to avoid deadlock, as suggested
+  by Peter Zijlstra. ]
+
+---
+ include/linux/rcutree.h  |  2 +-
+ kernel/rcu/tree.c        | 27 ++++++++++++---------------
+ kernel/rcu/tree_plugin.h | 14 ++++++--------
+ kernel/sched/core.c      |  6 ++++--
+ 4 files changed, 23 insertions(+), 26 deletions(-)
+
+diff --git a/include/linux/rcutree.h b/include/linux/rcutree.h
+index 60d15a080d7c..9d3eda39bcd2 100644
+--- a/include/linux/rcutree.h
++++ b/include/linux/rcutree.h
+@@ -37,7 +37,7 @@ void rcu_cpu_stall_reset(void);
+ /*
+  * Note a virtualization-based context switch.  This is simply a
+  * wrapper around rcu_note_context_switch(), which allows TINY_RCU
+- * to save a few bytes.
++ * to save a few bytes. The caller must have disabled interrupts.
+  */
+ static inline void rcu_virt_note_context_switch(int cpu)
+ {
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index ed3bc0578cc5..93941d3434ad 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -242,8 +242,6 @@ static int rcu_gp_in_progress(struct rcu_state *rsp)
+  */
+ void rcu_sched_qs(void)
+ {
+-	unsigned long flags;
+-
+ 	if (!__this_cpu_read(rcu_sched_data.cpu_no_qs.s))
+ 		return;
+ 	trace_rcu_grace_period(TPS("rcu_sched"),
+@@ -252,13 +250,9 @@ void rcu_sched_qs(void)
+ 	__this_cpu_write(rcu_sched_data.cpu_no_qs.b.norm, false);
+ 	if (!__this_cpu_read(rcu_sched_data.cpu_no_qs.b.exp))
+ 		return;
+-	local_irq_save(flags);
+-	if (__this_cpu_read(rcu_sched_data.cpu_no_qs.b.exp)) {
+-		__this_cpu_write(rcu_sched_data.cpu_no_qs.b.exp, false);
+-		rcu_report_exp_rdp(&rcu_sched_state,
+-				   this_cpu_ptr(&rcu_sched_data), true);
+-	}
+-	local_irq_restore(flags);
++	__this_cpu_write(rcu_sched_data.cpu_no_qs.b.exp, false);
++	rcu_report_exp_rdp(&rcu_sched_state,
++			   this_cpu_ptr(&rcu_sched_data), true);
+ }
+ 
+ void rcu_bh_qs(void)
+@@ -295,17 +289,16 @@ EXPORT_PER_CPU_SYMBOL_GPL(rcu_qs_ctr);
+  * We inform the RCU core by emulating a zero-duration dyntick-idle
+  * period, which we in turn do by incrementing the ->dynticks counter
+  * by two.
++ *
++ * The caller must have disabled interrupts.
+  */
+ static void rcu_momentary_dyntick_idle(void)
+ {
+-	unsigned long flags;
+ 	struct rcu_data *rdp;
+ 	struct rcu_dynticks *rdtp;
+ 	int resched_mask;
+ 	struct rcu_state *rsp;
+ 
+-	local_irq_save(flags);
+-
+ 	/*
+ 	 * Yes, we can lose flag-setting operations.  This is OK, because
+ 	 * the flag will be set again after some delay.
+@@ -335,13 +328,12 @@ static void rcu_momentary_dyntick_idle(void)
+ 		smp_mb__after_atomic(); /* Later stuff after QS. */
+ 		break;
+ 	}
+-	local_irq_restore(flags);
+ }
+ 
+ /*
+  * Note a context switch.  This is a quiescent state for RCU-sched,
+  * and requires special handling for preemptible RCU.
+- * The caller must have disabled preemption.
++ * The caller must have disabled interrupts.
+  */
+ void rcu_note_context_switch(void)
+ {
+@@ -371,9 +363,14 @@ EXPORT_SYMBOL_GPL(rcu_note_context_switch);
+  */
+ void rcu_all_qs(void)
+ {
++	unsigned long flags;
++
+ 	barrier(); /* Avoid RCU read-side critical sections leaking down. */
+-	if (unlikely(raw_cpu_read(rcu_sched_qs_mask)))
++	if (unlikely(raw_cpu_read(rcu_sched_qs_mask))) {
++		local_irq_save(flags);
+ 		rcu_momentary_dyntick_idle();
++		local_irq_restore(flags);
++	}
+ 	this_cpu_inc(rcu_qs_ctr);
+ 	barrier(); /* Avoid RCU read-side critical sections leaking up. */
+ }
+diff --git a/kernel/rcu/tree_plugin.h b/kernel/rcu/tree_plugin.h
+index 8e9d4a4d0326..e6da888cc908 100644
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@ -146,8 +146,8 @@ static void __init rcu_bootup_announce(void)
+  * the corresponding expedited grace period will also be the end of the
+  * normal grace period.
+  */
+-static void rcu_preempt_ctxt_queue(struct rcu_node *rnp, struct rcu_data *rdp,
+-				   unsigned long flags) __releases(rnp->lock)
++static void rcu_preempt_ctxt_queue(struct rcu_node *rnp, struct rcu_data *rdp)
++	__releases(rnp->lock) /* But leaves rrupts disabled. */
+ {
+ 	int blkd_state = (rnp->gp_tasks ? RCU_GP_TASKS : 0) +
+ 			 (rnp->exp_tasks ? RCU_EXP_TASKS : 0) +
+@@ -235,7 +235,7 @@ static void rcu_preempt_ctxt_queue(struct rcu_node *rnp, struct rcu_data *rdp,
+ 		rnp->gp_tasks = &t->rcu_node_entry;
+ 	if (!rnp->exp_tasks && (blkd_state & RCU_EXP_BLKD))
+ 		rnp->exp_tasks = &t->rcu_node_entry;
+-	raw_spin_unlock(&rnp->lock);
++	raw_spin_unlock(&rnp->lock); /* rrupts remain disabled. */
+ 
+ 	/*
+ 	 * Report the quiescent state for the expedited GP.  This expedited
+@@ -250,7 +250,6 @@ static void rcu_preempt_ctxt_queue(struct rcu_node *rnp, struct rcu_data *rdp,
+ 	} else {
+ 		WARN_ON_ONCE(t->rcu_read_unlock_special.b.exp_need_qs);
+ 	}
+-	local_irq_restore(flags);
+ }
+ 
+ /*
+@@ -285,12 +284,11 @@ static void rcu_preempt_qs(void)
+  * predating the current grace period drain, in other words, until
+  * rnp->gp_tasks becomes NULL.
+  *
+- * Caller must disable preemption.
++ * Caller must disable interrupts.
+  */
+ static void rcu_preempt_note_context_switch(void)
+ {
+ 	struct task_struct *t = current;
+-	unsigned long flags;
+ 	struct rcu_data *rdp;
+ 	struct rcu_node *rnp;
+ 
+@@ -300,7 +298,7 @@ static void rcu_preempt_note_context_switch(void)
+ 		/* Possibly blocking in an RCU read-side critical section. */
+ 		rdp = this_cpu_ptr(rcu_state_p->rda);
+ 		rnp = rdp->mynode;
+-		raw_spin_lock_irqsave_rcu_node(rnp, flags);
++		raw_spin_lock_rcu_node(rnp);
+ 		t->rcu_read_unlock_special.b.blocked = true;
+ 		t->rcu_blocked_node = rnp;
+ 
+@@ -316,7 +314,7 @@ static void rcu_preempt_note_context_switch(void)
+ 				       (rnp->qsmask & rdp->grpmask)
+ 				       ? rnp->gpnum
+ 				       : rnp->gpnum + 1);
+-		rcu_preempt_ctxt_queue(rnp, rdp, flags);
++		rcu_preempt_ctxt_queue(rnp, rdp);
+ 	} else if (t->rcu_read_lock_nesting < 0 &&
+ 		   t->rcu_read_unlock_special.s) {
+ 
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 4d568ac9319e..ec72de234feb 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -3085,7 +3085,6 @@ static void __sched notrace __schedule(bool preempt)
+ 
+ 	cpu = smp_processor_id();
+ 	rq = cpu_rq(cpu);
+-	rcu_note_context_switch();
+ 	prev = rq->curr;
+ 
+ 	/*
+@@ -3104,13 +3103,16 @@ static void __sched notrace __schedule(bool preempt)
+ 	if (sched_feat(HRTICK))
+ 		hrtick_clear(rq);
+ 
++	local_irq_disable();
++	rcu_note_context_switch();
++
+ 	/*
+ 	 * Make sure that signal_pending_state()->signal_pending() below
+ 	 * can't be reordered with __set_current_state(TASK_INTERRUPTIBLE)
+ 	 * done by the caller to avoid the race with signal_wake_up().
+ 	 */
+ 	smp_mb__before_spinlock();
+-	raw_spin_lock_irq(&rq->lock);
++	raw_spin_lock(&rq->lock);
+ 	lockdep_pin_lock(&rq->lock);
+ 
+ 	rq->clock_skip_update <<= 1; /* promote REQ to ACT */
+-- 
+2.1.4
+

@@ -1,0 +1,149 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Fri, 30 Oct 2015 20:57:30 +0800
+Subject: block: defer timeouts to a workqueue
+Git-commit: 287922eb0b186e2a5bf54fdd04b734c25c90035c
+Patch-mainline: v4.5-rc1
+References: FATE#319965, bsc#964944
+
+Timer context is not very useful for drivers to perform any meaningful abort
+action from.  So instead of calling the driver from this useless context
+defer it to a workqueue as soon as possible.
+
+Note that while a delayed_work item would seem the right thing here I didn't
+dare to use it due to the magic in blk_add_timer that pokes deep into timer
+internals.  But maybe this encourages Tejun to add a sensible API for that to
+the workqueue API and we'll all be fine in the end :)
+
+Contains a major update from Keith Bush:
+
+"This patch removes synchronizing the timeout work so that the timer can
+ start a freeze on its own queue. The timer enters the queue, so timer
+ context can only start a freeze, but not wait for frozen."
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Acked-by: Keith Busch <keith.busch@intel.com>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.com>
+---
+ block/blk-core.c       |    8 ++++++++
+ block/blk-mq.c         |   11 ++++++++---
+ block/blk-timeout.c    |    8 ++++++--
+ block/blk.h            |    2 +-
+ include/linux/blkdev.h |    1 +
+ 5 files changed, 24 insertions(+), 6 deletions(-)
+
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -680,6 +680,13 @@ static void blk_queue_usage_counter_rele
+ 	wake_up_all(&q->mq_freeze_wq);
+ }
+ 
++static void blk_rq_timed_out_timer(unsigned long data)
++{
++	struct request_queue *q = (struct request_queue *)data;
++
++	kblockd_schedule_work(&q->timeout_work);
++}
++
+ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
+ {
+ 	struct request_queue *q;
+@@ -841,6 +848,7 @@ blk_init_allocated_queue(struct request_
+ 	if (blk_init_rl(&q->root_rl, q, GFP_KERNEL))
+ 		goto fail;
+ 
++	INIT_WORK(&q->timeout_work, blk_timeout_work);
+ 	q->request_fn		= rfn;
+ 	q->prep_rq_fn		= NULL;
+ 	q->unprep_rq_fn		= NULL;
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -615,15 +615,19 @@ static void blk_mq_check_expired(struct
+ 	}
+ }
+ 
+-static void blk_mq_rq_timer(unsigned long priv)
++static void blk_mq_timeout_work(struct work_struct *work)
+ {
+-	struct request_queue *q = (struct request_queue *)priv;
++	struct request_queue *q =
++		container_of(work, struct request_queue, timeout_work);
+ 	struct blk_mq_timeout_data data = {
+ 		.next		= 0,
+ 		.next_set	= 0,
+ 	};
+ 	int i;
+ 
++	if (blk_queue_enter(q, true))
++		return;
++
+ 	blk_mq_queue_tag_busy_iter(q, blk_mq_check_expired, &data);
+ 
+ 	if (data.next_set) {
+@@ -638,6 +642,7 @@ static void blk_mq_rq_timer(unsigned lon
+ 				blk_mq_tag_idle(hctx);
+ 		}
+ 	}
++	blk_queue_exit(q);
+ }
+ 
+ /*
+@@ -2023,7 +2028,7 @@ struct request_queue *blk_mq_init_alloca
+ 	if (!q->nr_hw_queues)
+ 		goto err_hctxs;
+ 
+-	setup_timer(&q->timeout, blk_mq_rq_timer, (unsigned long) q);
++	INIT_WORK(&q->timeout_work, blk_mq_timeout_work);
+ 	blk_queue_rq_timeout(q, set->timeout ? set->timeout : 30 * HZ);
+ 
+ 	q->nr_queues = nr_cpu_ids;
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@ -127,13 +127,16 @@ static void blk_rq_check_expired(struct
+ 	}
+ }
+ 
+-void blk_rq_timed_out_timer(unsigned long data)
++void blk_timeout_work(struct work_struct *work)
+ {
+-	struct request_queue *q = (struct request_queue *) data;
++	struct request_queue *q =
++		container_of(work, struct request_queue, timeout_work);
+ 	unsigned long flags, next = 0;
+ 	struct request *rq, *tmp;
+ 	int next_set = 0;
+ 
++	if (blk_queue_enter(q, true))
++		return;
+ 	spin_lock_irqsave(q->queue_lock, flags);
+ 
+ 	list_for_each_entry_safe(rq, tmp, &q->timeout_list, timeout_list)
+@@ -145,6 +148,7 @@ void blk_rq_timed_out_timer(unsigned lon
+ 		mod_timer(&q->timeout, next);
+ 
+ 	spin_unlock_irqrestore(q->queue_lock, flags);
++	blk_queue_exit(q);
+ }
+ 
+ /**
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -93,7 +93,7 @@ static inline void blk_flush_integrity(v
+ }
+ #endif
+ 
+-void blk_rq_timed_out_timer(unsigned long data);
++void blk_timeout_work(struct work_struct *work);
+ unsigned long blk_rq_timeout(unsigned long timeout);
+ void blk_add_timer(struct request *req);
+ void blk_delete_timer(struct request *);
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -408,6 +408,7 @@ struct request_queue {
+ 
+ 	unsigned int		rq_timeout;
+ 	struct timer_list	timeout;
++	struct work_struct	timeout_work;
+ 	struct list_head	timeout_list;
+ 
+ 	struct list_head	icq_list;
