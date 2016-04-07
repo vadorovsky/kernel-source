@@ -1,0 +1,303 @@
+From: Mike Snitzer <snitzer@redhat.com>
+Date: Mon, 15 Feb 2016 14:25:00 -0500
+Subject: dm mpath: push path selector locking down to path selectors
+References: bnc#974525,FATE#320741
+Patch-Mainline: v4.6-rc1
+Git-commit: 9659f811446a67951127d4e81576204ffce9c86e
+
+Proper locking of the lists used by the path selectors should be handled
+within the selectors (relying on dm-mpath.c code's use of the m->lock
+spinlock was reckless).
+
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Acked-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/md/dm-queue-length.c | 23 ++++++++++++++++++++---
+ drivers/md/dm-round-robin.c  | 24 +++++++++++++++++++-----
+ drivers/md/dm-service-time.c | 23 ++++++++++++++++++++---
+ 3 files changed, 59 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/md/dm-queue-length.c b/drivers/md/dm-queue-length.c
+index 51d8229..aeea3b7 100644
+--- a/drivers/md/dm-queue-length.c
++++ b/drivers/md/dm-queue-length.c
+@@ -29,6 +29,7 @@
+ struct selector {
+ 	struct list_head	valid_paths;
+ 	struct list_head	failed_paths;
++	spinlock_t lock;
+ };
+ 
+ struct path_info {
+@@ -45,6 +46,7 @@ static struct selector *alloc_selector(void)
+ 	if (s) {
+ 		INIT_LIST_HEAD(&s->valid_paths);
+ 		INIT_LIST_HEAD(&s->failed_paths);
++		spin_lock_init(&s->lock);
+ 	}
+ 
+ 	return s;
+@@ -113,6 +115,7 @@ static int ql_add_path(struct path_selector *ps, struct dm_path *path,
+ 	struct path_info *pi;
+ 	unsigned repeat_count = QL_MIN_IO;
+ 	char dummy;
++	unsigned long flags;
+ 
+ 	/*
+ 	 * Arguments: [<repeat_count>]
+@@ -147,7 +150,9 @@ static int ql_add_path(struct path_selector *ps, struct dm_path *path,
+ 
+ 	path->pscontext = pi;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	list_add_tail(&pi->list, &s->valid_paths);
++	spin_unlock_irqrestore(&s->lock, flags);
+ 
+ 	return 0;
+ }
+@@ -156,16 +161,22 @@ static void ql_fail_path(struct path_selector *ps, struct dm_path *path)
+ {
+ 	struct selector *s = ps->context;
+ 	struct path_info *pi = path->pscontext;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	list_move(&pi->list, &s->failed_paths);
++	spin_unlock_irqrestore(&s->lock, flags);
+ }
+ 
+ static int ql_reinstate_path(struct path_selector *ps, struct dm_path *path)
+ {
+ 	struct selector *s = ps->context;
+ 	struct path_info *pi = path->pscontext;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	list_move_tail(&pi->list, &s->valid_paths);
++	spin_unlock_irqrestore(&s->lock, flags);
+ 
+ 	return 0;
+ }
+@@ -178,9 +189,12 @@ static struct dm_path *ql_select_path(struct path_selector *ps,
+ {
+ 	struct selector *s = ps->context;
+ 	struct path_info *pi = NULL, *best = NULL;
++	struct dm_path *ret = NULL;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	if (list_empty(&s->valid_paths))
+-		return NULL;
++		goto out;
+ 
+ 	/* Change preferred (first in list) path to evenly balance. */
+ 	list_move_tail(s->valid_paths.next, &s->valid_paths);
+@@ -195,11 +209,14 @@ static struct dm_path *ql_select_path(struct path_selector *ps,
+ 	}
+ 
+ 	if (!best)
+-		return NULL;
++		goto out;
+ 
+ 	*repeat_count = best->repeat_count;
+ 
+-	return best->path;
++	ret = best->path;
++out:
++	spin_unlock_irqrestore(&s->lock, flags);
++	return ret;
+ }
+ 
+ static int ql_start_io(struct path_selector *ps, struct dm_path *path,
+diff --git a/drivers/md/dm-round-robin.c b/drivers/md/dm-round-robin.c
+index 65ffdc3..be9aa7f 100644
+--- a/drivers/md/dm-round-robin.c
++++ b/drivers/md/dm-round-robin.c
+@@ -46,6 +46,7 @@ static void free_paths(struct list_head *paths)
+ struct selector {
+ 	struct list_head valid_paths;
+ 	struct list_head invalid_paths;
++	spinlock_t lock;
+ };
+ 
+ static struct selector *alloc_selector(void)
+@@ -55,6 +56,7 @@ static struct selector *alloc_selector(void)
+ 	if (s) {
+ 		INIT_LIST_HEAD(&s->valid_paths);
+ 		INIT_LIST_HEAD(&s->invalid_paths);
++		spin_lock_init(&s->lock);
+ 	}
+ 
+ 	return s;
+@@ -74,7 +76,7 @@ static int rr_create(struct path_selector *ps, unsigned argc, char **argv)
+ 
+ static void rr_destroy(struct path_selector *ps)
+ {
+-	struct selector *s = (struct selector *) ps->context;
++	struct selector *s = ps->context;
+ 
+ 	free_paths(&s->valid_paths);
+ 	free_paths(&s->invalid_paths);
+@@ -111,10 +113,11 @@ static int rr_status(struct path_selector *ps, struct dm_path *path,
+ static int rr_add_path(struct path_selector *ps, struct dm_path *path,
+ 		       int argc, char **argv, char **error)
+ {
+-	struct selector *s = (struct selector *) ps->context;
++	struct selector *s = ps->context;
+ 	struct path_info *pi;
+ 	unsigned repeat_count = RR_MIN_IO;
+ 	char dummy;
++	unsigned long flags;
+ 
+ 	if (argc > 1) {
+ 		*error = "round-robin ps: incorrect number of arguments";
+@@ -144,25 +147,33 @@ static int rr_add_path(struct path_selector *ps, struct dm_path *path,
+ 
+ 	path->pscontext = pi;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	list_add_tail(&pi->list, &s->valid_paths);
++	spin_unlock_irqrestore(&s->lock, flags);
+ 
+ 	return 0;
+ }
+ 
+ static void rr_fail_path(struct path_selector *ps, struct dm_path *p)
+ {
+-	struct selector *s = (struct selector *) ps->context;
++	unsigned long flags;
++	struct selector *s = ps->context;
+ 	struct path_info *pi = p->pscontext;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	list_move(&pi->list, &s->invalid_paths);
++	spin_unlock_irqrestore(&s->lock, flags);
+ }
+ 
+ static int rr_reinstate_path(struct path_selector *ps, struct dm_path *p)
+ {
+-	struct selector *s = (struct selector *) ps->context;
++	unsigned long flags;
++	struct selector *s = ps->context;
+ 	struct path_info *pi = p->pscontext;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	list_move(&pi->list, &s->valid_paths);
++	spin_unlock_irqrestore(&s->lock, flags);
+ 
+ 	return 0;
+ }
+@@ -170,14 +181,17 @@ static int rr_reinstate_path(struct path_selector *ps, struct dm_path *p)
+ static struct dm_path *rr_select_path(struct path_selector *ps,
+ 				      unsigned *repeat_count, size_t nr_bytes)
+ {
+-	struct selector *s = (struct selector *) ps->context;
++	unsigned long flags;
++	struct selector *s = ps->context;
+ 	struct path_info *pi = NULL;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	if (!list_empty(&s->valid_paths)) {
+ 		pi = list_entry(s->valid_paths.next, struct path_info, list);
+ 		list_move_tail(&pi->list, &s->valid_paths);
+ 		*repeat_count = pi->repeat_count;
+ 	}
++	spin_unlock_irqrestore(&s->lock, flags);
+ 
+ 	return pi ? pi->path : NULL;
+ }
+diff --git a/drivers/md/dm-service-time.c b/drivers/md/dm-service-time.c
+index 0370eaf..d09bcbe 100644
+--- a/drivers/md/dm-service-time.c
++++ b/drivers/md/dm-service-time.c
+@@ -24,6 +24,7 @@
+ struct selector {
+ 	struct list_head valid_paths;
+ 	struct list_head failed_paths;
++	spinlock_t lock;
+ };
+ 
+ struct path_info {
+@@ -41,6 +42,7 @@ static struct selector *alloc_selector(void)
+ 	if (s) {
+ 		INIT_LIST_HEAD(&s->valid_paths);
+ 		INIT_LIST_HEAD(&s->failed_paths);
++		spin_lock_init(&s->lock);
+ 	}
+ 
+ 	return s;
+@@ -111,6 +113,7 @@ static int st_add_path(struct path_selector *ps, struct dm_path *path,
+ 	unsigned repeat_count = ST_MIN_IO;
+ 	unsigned relative_throughput = 1;
+ 	char dummy;
++	unsigned long flags;
+ 
+ 	/*
+ 	 * Arguments: [<repeat_count> [<relative_throughput>]]
+@@ -160,7 +163,9 @@ static int st_add_path(struct path_selector *ps, struct dm_path *path,
+ 
+ 	path->pscontext = pi;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	list_add_tail(&pi->list, &s->valid_paths);
++	spin_unlock_irqrestore(&s->lock, flags);
+ 
+ 	return 0;
+ }
+@@ -169,16 +174,22 @@ static void st_fail_path(struct path_selector *ps, struct dm_path *path)
+ {
+ 	struct selector *s = ps->context;
+ 	struct path_info *pi = path->pscontext;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	list_move(&pi->list, &s->failed_paths);
++	spin_unlock_irqrestore(&s->lock, flags);
+ }
+ 
+ static int st_reinstate_path(struct path_selector *ps, struct dm_path *path)
+ {
+ 	struct selector *s = ps->context;
+ 	struct path_info *pi = path->pscontext;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	list_move_tail(&pi->list, &s->valid_paths);
++	spin_unlock_irqrestore(&s->lock, flags);
+ 
+ 	return 0;
+ }
+@@ -265,9 +276,12 @@ static struct dm_path *st_select_path(struct path_selector *ps,
+ {
+ 	struct selector *s = ps->context;
+ 	struct path_info *pi = NULL, *best = NULL;
++	struct dm_path *ret = NULL;
++	unsigned long flags;
+ 
++	spin_lock_irqsave(&s->lock, flags);
+ 	if (list_empty(&s->valid_paths))
+-		return NULL;
++		goto out;
+ 
+ 	/* Change preferred (first in list) path to evenly balance. */
+ 	list_move_tail(s->valid_paths.next, &s->valid_paths);
+@@ -277,11 +291,14 @@ static struct dm_path *st_select_path(struct path_selector *ps,
+ 			best = pi;
+ 
+ 	if (!best)
+-		return NULL;
++		goto out;
+ 
+ 	*repeat_count = best->repeat_count;
+ 
+-	return best->path;
++	ret = best->path;
++out:
++	spin_unlock_irqrestore(&s->lock, flags);
++	return ret;
+ }
+ 
+ static int st_start_io(struct path_selector *ps, struct dm_path *path,
+-- 
+1.8.5.6
+

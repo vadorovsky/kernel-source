@@ -1,0 +1,152 @@
+From: Joe Thornber <ejt@redhat.com>
+Date: Mon, 7 Dec 2015 14:48:04 +0000
+Subject: dm thin metadata: make dm_thin_find_mapped_range() atomic
+References: bnc#974525,FATE#320741
+Patch-Mainline: v4.6-rc1
+Git-commit: 086fbbbda9b743b149b0294e0feec257e2c311d5
+
+Refactor dm_thin_find_mapped_range() so that it takes the read lock on
+the metadata's lock; rather than relying on finer grained locking that
+is pushed down inside dm_thin_find_next_mapped_block() and
+dm_thin_find_block().
+
+Signed-off-by: Joe Thornber <ejt@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Acked-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/md/dm-thin-metadata.c | 64 +++++++++++++++++++++++++++++--------------
+ 1 file changed, 43 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/md/dm-thin-metadata.c b/drivers/md/dm-thin-metadata.c
+index 7547315..f962d64 100644
+--- a/drivers/md/dm-thin-metadata.c
++++ b/drivers/md/dm-thin-metadata.c
+@@ -1408,8 +1408,8 @@ static void unpack_lookup_result(struct dm_thin_device *td, __le64 value,
+ 	result->shared = __snapshotted_since(td, exception_time);
+ }
+ 
+-int dm_thin_find_block(struct dm_thin_device *td, dm_block_t block,
+-		       int can_issue_io, struct dm_thin_lookup_result *result)
++static int __find_block(struct dm_thin_device *td, dm_block_t block,
++			int can_issue_io, struct dm_thin_lookup_result *result)
+ {
+ 	int r;
+ 	__le64 value;
+@@ -1417,12 +1417,6 @@ int dm_thin_find_block(struct dm_thin_device *td, dm_block_t block,
+ 	dm_block_t keys[2] = { td->id, block };
+ 	struct dm_btree_info *info;
+ 
+-	down_read(&pmd->root_lock);
+-	if (pmd->fail_io) {
+-		up_read(&pmd->root_lock);
+-		return -EINVAL;
+-	}
+-
+ 	if (can_issue_io) {
+ 		info = &pmd->info;
+ 	} else
+@@ -1432,18 +1426,14 @@ int dm_thin_find_block(struct dm_thin_device *td, dm_block_t block,
+ 	if (!r)
+ 		unpack_lookup_result(td, value, result);
+ 
+-	up_read(&pmd->root_lock);
+ 	return r;
+ }
+ 
+-static int dm_thin_find_next_mapped_block(struct dm_thin_device *td, dm_block_t block,
+-					  dm_block_t *vblock,
+-					  struct dm_thin_lookup_result *result)
++int dm_thin_find_block(struct dm_thin_device *td, dm_block_t block,
++		       int can_issue_io, struct dm_thin_lookup_result *result)
+ {
+ 	int r;
+-	__le64 value;
+ 	struct dm_pool_metadata *pmd = td->pmd;
+-	dm_block_t keys[2] = { td->id, block };
+ 
+ 	down_read(&pmd->root_lock);
+ 	if (pmd->fail_io) {
+@@ -1451,18 +1441,32 @@ static int dm_thin_find_next_mapped_block(struct dm_thin_device *td, dm_block_t
+ 		return -EINVAL;
+ 	}
+ 
++	r = __find_block(td, block, can_issue_io, result);
++
++	up_read(&pmd->root_lock);
++	return r;
++}
++
++static int __find_next_mapped_block(struct dm_thin_device *td, dm_block_t block,
++					  dm_block_t *vblock,
++					  struct dm_thin_lookup_result *result)
++{
++	int r;
++	__le64 value;
++	struct dm_pool_metadata *pmd = td->pmd;
++	dm_block_t keys[2] = { td->id, block };
++
+ 	r = dm_btree_lookup_next(&pmd->info, pmd->root, keys, vblock, &value);
+ 	if (!r)
+ 		unpack_lookup_result(td, value, result);
+ 
+-	up_read(&pmd->root_lock);
+ 	return r;
+ }
+ 
+-int dm_thin_find_mapped_range(struct dm_thin_device *td,
+-			      dm_block_t begin, dm_block_t end,
+-			      dm_block_t *thin_begin, dm_block_t *thin_end,
+-			      dm_block_t *pool_begin, bool *maybe_shared)
++static int __find_mapped_range(struct dm_thin_device *td,
++			       dm_block_t begin, dm_block_t end,
++			       dm_block_t *thin_begin, dm_block_t *thin_end,
++			       dm_block_t *pool_begin, bool *maybe_shared)
+ {
+ 	int r;
+ 	dm_block_t pool_end;
+@@ -1471,7 +1475,7 @@ int dm_thin_find_mapped_range(struct dm_thin_device *td,
+ 	if (end < begin)
+ 		return -ENODATA;
+ 
+-	r = dm_thin_find_next_mapped_block(td, begin, &begin, &lookup);
++	r = __find_next_mapped_block(td, begin, &begin, &lookup);
+ 	if (r)
+ 		return r;
+ 
+@@ -1485,7 +1489,7 @@ int dm_thin_find_mapped_range(struct dm_thin_device *td,
+ 	begin++;
+ 	pool_end = *pool_begin + 1;
+ 	while (begin != end) {
+-		r = dm_thin_find_block(td, begin, true, &lookup);
++		r = __find_block(td, begin, true, &lookup);
+ 		if (r) {
+ 			if (r == -ENODATA)
+ 				break;
+@@ -1505,6 +1509,24 @@ int dm_thin_find_mapped_range(struct dm_thin_device *td,
+ 	return 0;
+ }
+ 
++int dm_thin_find_mapped_range(struct dm_thin_device *td,
++			      dm_block_t begin, dm_block_t end,
++			      dm_block_t *thin_begin, dm_block_t *thin_end,
++			      dm_block_t *pool_begin, bool *maybe_shared)
++{
++	int r = -EINVAL;
++	struct dm_pool_metadata *pmd = td->pmd;
++
++	down_read(&pmd->root_lock);
++	if (!pmd->fail_io) {
++		r = __find_mapped_range(td, begin, end, thin_begin, thin_end,
++					pool_begin, maybe_shared);
++	}
++	up_read(&pmd->root_lock);
++
++	return r;
++}
++
+ static int __insert(struct dm_thin_device *td, dm_block_t block,
+ 		    dm_block_t data_block)
+ {
+-- 
+1.8.5.6
+

@@ -1,0 +1,169 @@
+From: Mikulas Patocka <mpatocka@redhat.com>
+Date: Mon, 23 Nov 2015 19:20:06 -0500
+Subject: dm bufio: store stacktrace in buffers to help find buffer leaks
+References: bnc#974525,FATE#320741
+Patch-Mainline: v4.6-rc1
+Git-commit: 86bad0c7071c24efee0a395d8b622764bdd24320
+
+The option DM_DEBUG_BLOCK_STACK_TRACING is moved from persistent-data
+directory to device mapper directory because it will now be used by
+persistent-data and bufio.  When the option is enabled, each bufio buffer
+stores the stacktrace of the last dm_bufio_get(), dm_bufio_read() or
+dm_bufio_new() call that increased the hold count to 1.  The buffer's
+stacktrace is printed if the buffer was not released before the bufio
+client is destroyed.
+
+When DM_DEBUG_BLOCK_STACK_TRACING is enabled, any bufio buffer leaks are
+considered warnings - i.e. the kernel continues afterwards.  If not
+enabled, buffer leaks are considered BUGs and the kernel with crash.
+Reasoning on this disposition is: if we only ever warned on buffer leaks
+users would generally ignore them and the problematic code would never
+get fixed.
+
+Successfully used to find source of bufio leaks fixed with commit
+fce079f63c3 ("dm btree: fix bufio buffer leaks in dm_btree_del() error
+path").
+
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Acked-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/md/Kconfig                 |  9 +++++++++
+ drivers/md/dm-bufio.c              | 39 +++++++++++++++++++++++++++++++++++++-
+ drivers/md/persistent-data/Kconfig |  9 ---------
+ 3 files changed, 47 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/md/Kconfig b/drivers/md/Kconfig
+index 7913fdc..1b69359 100644
+--- a/drivers/md/Kconfig
++++ b/drivers/md/Kconfig
+@@ -240,6 +240,15 @@ config DM_BUFIO
+ 	 as a cache, holding recently-read blocks in memory and performing
+ 	 delayed writes.
+ 
++config DM_DEBUG_BLOCK_STACK_TRACING
++       bool "Keep stack trace of persistent data block lock holders"
++       depends on STACKTRACE_SUPPORT && DM_BUFIO
++       select STACKTRACE
++       ---help---
++	 Enable this for messages that may help debug problems with the
++	 block manager locking used by thin provisioning and caching.
++
++	 If unsure, say N.
+ config DM_BIO_PRISON
+        tristate
+        depends on BLK_DEV_DM
+diff --git a/drivers/md/dm-bufio.c b/drivers/md/dm-bufio.c
+index 7734298..bccc7e6 100644
+--- a/drivers/md/dm-bufio.c
++++ b/drivers/md/dm-bufio.c
+@@ -16,6 +16,7 @@
+ #include <linux/shrinker.h>
+ #include <linux/module.h>
+ #include <linux/rbtree.h>
++#include <linux/stacktrace.h>
+ 
+ #define DM_MSG_PREFIX "bufio"
+ 
+@@ -149,6 +150,11 @@ struct dm_buffer {
+ 	struct list_head write_list;
+ 	struct bio bio;
+ 	struct bio_vec bio_vec[DM_BUFIO_INLINE_VECS];
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++#define MAX_STACK 10
++	struct stack_trace stack_trace;
++	unsigned long stack_entries[MAX_STACK];
++#endif
+ };
+ 
+ /*----------------------------------------------------------------*/
+@@ -253,6 +259,17 @@ static LIST_HEAD(dm_bufio_all_clients);
+  */
+ static DEFINE_MUTEX(dm_bufio_clients_lock);
+ 
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++static void buffer_record_stack(struct dm_buffer *b)
++{
++	b->stack_trace.nr_entries = 0;
++	b->stack_trace.max_entries = MAX_STACK;
++	b->stack_trace.entries = b->stack_entries;
++	b->stack_trace.skip = 2;
++	save_stack_trace(&b->stack_trace);
++}
++#endif
++
+ /*----------------------------------------------------------------
+  * A red/black tree acts as an index for all the buffers.
+  *--------------------------------------------------------------*/
+@@ -454,6 +471,9 @@ static struct dm_buffer *alloc_buffer(struct dm_bufio_client *c, gfp_t gfp_mask)
+ 
+ 	adjust_total_allocated(b->data_mode, (long)c->block_size);
+ 
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++	memset(&b->stack_trace, 0, sizeof(b->stack_trace));
++#endif
+ 	return b;
+ }
+ 
+@@ -1063,6 +1083,10 @@ static void *new_read(struct dm_bufio_client *c, sector_t block,
+ 
+ 	dm_bufio_lock(c);
+ 	b = __bufio_new(c, block, nf, &need_submit, &write_list);
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++	if (b && b->hold_count == 1)
++		buffer_record_stack(b);
++#endif
+ 	dm_bufio_unlock(c);
+ 
+ 	__flush_write_list(&write_list);
+@@ -1462,6 +1486,7 @@ static void drop_buffers(struct dm_bufio_client *c)
+ {
+ 	struct dm_buffer *b;
+ 	int i;
++	bool warned = false;
+ 
+ 	BUG_ON(dm_bufio_in_request());
+ 
+@@ -1476,9 +1501,21 @@ static void drop_buffers(struct dm_bufio_client *c)
+ 		__free_buffer_wake(b);
+ 
+ 	for (i = 0; i < LIST_SIZE; i++)
+-		list_for_each_entry(b, &c->lru[i], lru_list)
++		list_for_each_entry(b, &c->lru[i], lru_list) {
++			WARN_ON(!warned);
++			warned = true;
+ 			DMERR("leaked buffer %llx, hold count %u, list %d",
+ 			      (unsigned long long)b->block, b->hold_count, i);
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++			print_stack_trace(&b->stack_trace, 1);
++			b->hold_count = 0; /* mark unclaimed to avoid BUG_ON below */
++#endif
++		}
++
++#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
++	while ((b = __get_unclaimed_buffer(c)))
++		__free_buffer_wake(b);
++#endif
+ 
+ 	for (i = 0; i < LIST_SIZE; i++)
+ 		BUG_ON(!list_empty(&c->lru[i]));
+diff --git a/drivers/md/persistent-data/Kconfig b/drivers/md/persistent-data/Kconfig
+index 78c74bb..a53cbc9 100644
+--- a/drivers/md/persistent-data/Kconfig
++++ b/drivers/md/persistent-data/Kconfig
+@@ -7,12 +7,3 @@ config DM_PERSISTENT_DATA
+ 	 Library providing immutable on-disk data structure support for
+ 	 device-mapper targets such as the thin provisioning target.
+ 
+-config DM_DEBUG_BLOCK_STACK_TRACING
+-       bool "Keep stack trace of persistent data block lock holders"
+-       depends on STACKTRACE_SUPPORT && DM_PERSISTENT_DATA
+-       select STACKTRACE
+-       ---help---
+-	 Enable this for messages that may help debug problems with the
+-	 block manager locking used by thin provisioning and caching.
+-
+-	 If unsure, say N.
+-- 
+1.8.5.6
+
