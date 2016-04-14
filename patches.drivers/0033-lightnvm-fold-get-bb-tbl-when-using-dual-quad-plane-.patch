@@ -1,0 +1,142 @@
+From d5bdec8ddb9f5fac3b351bed463a7132f6ba907b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Matias=20Bj=C3=B8rling?= <m@bjorling.me>
+Date: Fri, 19 Feb 2016 13:56:58 +0100
+Subject: [PATCH] lightnvm: fold get bb tbl when using dual/quad plane mode
+Patch-mainline: v4.6-rc1
+Git-commit: d5bdec8ddb9f5fac3b351bed463a7132f6ba907b 
+References: FATE#319466
+
+When the media manager runs in dual or quad plane mode, lightnvm
+abstracts away plane specific commands. This poses a problem for
+get bad block table, as it reports bad blocks per plane, making the
+table either two or four times bigger than expected. Fold the bad block
+list before returning.
+
+Signed-off-by: Matias Bjørling <m@bjorling.me>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Signed-off-by: Coly Li <colyli@suse.de>
+---
+ drivers/lightnvm/core.c      |  2 +-
+ drivers/nvme/host/lightnvm.c | 46 +++++++++++++++++++++++++++++++++++++++-----
+ include/linux/lightnvm.h     |  6 +++---
+ 3 files changed, 45 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/lightnvm/core.c b/drivers/lightnvm/core.c
+index 782ac5d..968ba7e 100644
+--- a/drivers/lightnvm/core.c
++++ b/drivers/lightnvm/core.c
+@@ -250,7 +250,7 @@ int nvm_set_rqd_ppalist(struct nvm_dev *dev, struct nvm_rq *rqd,
+ 		return 0;
+ 	}
+ 
+-	plane_cnt = (1 << dev->plane_mode);
++	plane_cnt = dev->plane_mode;
+ 	rqd->nr_pages = plane_cnt * nr_ppas;
+ 
+ 	if (dev->ops->max_phys_sect < rqd->nr_pages)
+diff --git a/drivers/nvme/host/lightnvm.c b/drivers/nvme/host/lightnvm.c
+index 5cd3725..d4f81f0 100644
+--- a/drivers/nvme/host/lightnvm.c
++++ b/drivers/nvme/host/lightnvm.c
+@@ -373,8 +373,31 @@ out:
+ 	return ret;
+ }
+ 
++static void nvme_nvm_bb_tbl_fold(struct nvm_dev *nvmdev,
++						int nr_dst_blks, u8 *dst_blks,
++						int nr_src_blks, u8 *src_blks)
++{
++	int blk, offset, pl, blktype;
++
++	for (blk = 0; blk < nr_dst_blks; blk++) {
++		offset = blk * nvmdev->plane_mode;
++		blktype = src_blks[offset];
++
++		/* Bad blocks on any planes take precedence over other types */
++		for (pl = 0; pl < nvmdev->plane_mode; pl++) {
++			if (src_blks[offset + pl] &
++					(NVM_BLK_T_BAD|NVM_BLK_T_GRWN_BAD)) {
++				blktype = src_blks[offset + pl];
++				break;
++			}
++		}
++
++		dst_blks[blk] = blktype;
++	}
++}
++
+ static int nvme_nvm_get_bb_tbl(struct nvm_dev *nvmdev, struct ppa_addr ppa,
+-				int nr_blocks, nvm_bb_update_fn *update_bbtbl,
++				int nr_dst_blks, nvm_bb_update_fn *update_bbtbl,
+ 				void *priv)
+ {
+ 	struct request_queue *q = nvmdev->q;
+@@ -382,7 +405,9 @@ static int nvme_nvm_get_bb_tbl(struct nvm_dev *nvmdev, struct ppa_addr ppa,
+ 	struct nvme_ctrl *ctrl = ns->ctrl;
+ 	struct nvme_nvm_command c = {};
+ 	struct nvme_nvm_bb_tbl *bb_tbl;
+-	int tblsz = sizeof(struct nvme_nvm_bb_tbl) + nr_blocks;
++	u8 *dst_blks = NULL;
++	int nr_src_blks = nr_dst_blks * nvmdev->plane_mode;
++	int tblsz = sizeof(struct nvme_nvm_bb_tbl) + nr_src_blks;
+ 	int ret = 0;
+ 
+ 	c.get_bb.opcode = nvme_nvm_admin_get_bb_tbl;
+@@ -393,6 +418,12 @@ static int nvme_nvm_get_bb_tbl(struct nvm_dev *nvmdev, struct ppa_addr ppa,
+ 	if (!bb_tbl)
+ 		return -ENOMEM;
+ 
++	dst_blks = kzalloc(nr_dst_blks, GFP_KERNEL);
++	if (!dst_blks) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
+ 	ret = nvme_submit_sync_cmd(ctrl->admin_q, (struct nvme_command *)&c,
+ 								bb_tbl, tblsz);
+ 	if (ret) {
+@@ -414,16 +445,21 @@ static int nvme_nvm_get_bb_tbl(struct nvm_dev *nvmdev, struct ppa_addr ppa,
+ 		goto out;
+ 	}
+ 
+-	if (le32_to_cpu(bb_tbl->tblks) != nr_blocks) {
++	if (le32_to_cpu(bb_tbl->tblks) != nr_src_blks) {
+ 		ret = -EINVAL;
+ 		dev_err(ctrl->dev, "bbt unsuspected blocks returned (%u!=%u)",
+-					le32_to_cpu(bb_tbl->tblks), nr_blocks);
++				le32_to_cpu(bb_tbl->tblks), nr_src_blks);
+ 		goto out;
+ 	}
+ 
++	nvme_nvm_bb_tbl_fold(nvmdev, nr_dst_blks, dst_blks,
++						nr_src_blks, bb_tbl->blk);
++
+ 	ppa = dev_to_generic_addr(nvmdev, ppa);
+-	ret = update_bbtbl(ppa, nr_blocks, bb_tbl->blk, priv);
++	ret = update_bbtbl(ppa, nr_dst_blks, dst_blks, priv);
++
+ out:
++	kfree(dst_blks);
+ 	kfree(bb_tbl);
+ 	return ret;
+ }
+diff --git a/include/linux/lightnvm.h b/include/linux/lightnvm.h
+index d675011..7fa1838 100644
+--- a/include/linux/lightnvm.h
++++ b/include/linux/lightnvm.h
+@@ -92,9 +92,9 @@ enum {
+ 	NVM_ADDRMODE_CHANNEL	= 1,
+ 
+ 	/* Plane programming mode for LUN */
+-	NVM_PLANE_SINGLE	= 0,
+-	NVM_PLANE_DOUBLE	= 1,
+-	NVM_PLANE_QUAD		= 2,
++	NVM_PLANE_SINGLE	= 1,
++	NVM_PLANE_DOUBLE	= 2,
++	NVM_PLANE_QUAD		= 4,
+ 
+ 	/* Status codes */
+ 	NVM_RSP_SUCCESS		= 0x0,
+-- 
+2.6.6
+
