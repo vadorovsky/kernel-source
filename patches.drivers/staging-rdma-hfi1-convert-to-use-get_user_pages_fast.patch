@@ -1,0 +1,196 @@
+From: Mitko Haralanov <mitko.haralanov@intel.com>
+Subject: staging/rdma/hfi1: Convert to use get_user_pages_fast
+Git-commit: def8228452f87d05bd43ac21aeaf894ca081bca4
+Patch-mainline: v4.5
+References: bsc#973818, fate#319242
+Acked-by: Jiri Bohac <jbohac@suse.cz>
+
+Convert hfi1_get_user_pages() to use get_user_pages_fast(),
+which is much fatster. The mm semaphore is still taken to
+update the pinned page count but is for a much shorter
+amount of time.
+
+Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+Signed-off-by: Mitko Haralanov <mitko.haralanov@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/staging/rdma/hfi1/file_ops.c   |    8 +-
+ drivers/staging/rdma/hfi1/hfi.h        |    4 -
+ drivers/staging/rdma/hfi1/user_pages.c |   99 +++++++++------------------------
+ 3 files changed, 33 insertions(+), 78 deletions(-)
+
+--- a/drivers/staging/rdma/hfi1/file_ops.c
++++ b/drivers/staging/rdma/hfi1/file_ops.c
+@@ -1663,8 +1663,8 @@ static int exp_tid_setup(struct file *fp
+ 		 * Now that we know how many free RcvArray entries we have,
+ 		 * we can pin that many user pages.
+ 		 */
+-		ret = hfi1_get_user_pages(vaddr + (mapped * PAGE_SIZE),
+-					  pinned, pages);
++		ret = hfi1_acquire_user_pages(vaddr + (mapped * PAGE_SIZE),
++					      pinned, true, pages);
+ 		if (ret) {
+ 			/*
+ 			 * We can't continue because the pages array won't be
+@@ -1833,7 +1833,7 @@ static int exp_tid_free(struct file *fp,
+ 				}
+ 			}
+ 			flush_wc();
+-			hfi1_release_user_pages(pshadow, pcount);
++			hfi1_release_user_pages(pshadow, pcount, true);
+ 			clear_bit(bitidx, &uctxt->tidusemap[idx]);
+ 			map &= ~(1ULL<<bitidx);
+ 		}
+@@ -1862,7 +1862,7 @@ static void unlock_exp_tids(struct hfi1_
+ 		uctxt->physshadow[tid] = 0;
+ 		uctxt->tid_pg_list[tid] = NULL;
+ 		pci_unmap_page(dd->pcidev, phys, PAGE_SIZE, PCI_DMA_FROMDEVICE);
+-		hfi1_release_user_pages(&p, 1);
++		hfi1_release_user_pages(&p, 1, true);
+ 	}
+ }
+ 
+--- a/drivers/staging/rdma/hfi1/hfi.h
++++ b/drivers/staging/rdma/hfi1/hfi.h
+@@ -1587,8 +1587,8 @@ void hfi1_set_led_override(struct hfi1_p
+  */
+ #define DEFAULT_RCVHDR_ENTSIZE 32
+ 
+-int hfi1_get_user_pages(unsigned long, size_t, struct page **);
+-void hfi1_release_user_pages(struct page **, size_t);
++int hfi1_acquire_user_pages(unsigned long, size_t, bool, struct page **);
++void hfi1_release_user_pages(struct page **, size_t, bool);
+ 
+ static inline void clear_rcvhdrtail(const struct hfi1_ctxtdata *rcd)
+ {
+--- a/drivers/staging/rdma/hfi1/user_pages.c
++++ b/drivers/staging/rdma/hfi1/user_pages.c
+@@ -49,59 +49,11 @@
+  */
+ 
+ #include <linux/mm.h>
++#include <linux/sched.h>
+ #include <linux/device.h>
+ 
+ #include "hfi.h"
+ 
+-static void __hfi1_release_user_pages(struct page **p, size_t num_pages,
+-				      int dirty)
+-{
+-	size_t i;
+-
+-	for (i = 0; i < num_pages; i++) {
+-		if (dirty)
+-			set_page_dirty_lock(p[i]);
+-		put_page(p[i]);
+-	}
+-}
+-
+-/*
+- * Call with current->mm->mmap_sem held.
+- */
+-static int __hfi1_get_user_pages(unsigned long start_page, size_t num_pages,
+-				 struct page **p)
+-{
+-	unsigned long lock_limit;
+-	size_t got;
+-	int ret;
+-
+-	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+-
+-	if (num_pages > lock_limit && !capable(CAP_IPC_LOCK)) {
+-		ret = -ENOMEM;
+-		goto bail;
+-	}
+-
+-	for (got = 0; got < num_pages; got += ret) {
+-		ret = get_user_pages(current, current->mm,
+-				     start_page + got * PAGE_SIZE,
+-				     num_pages - got, 1, 1,
+-				     p + got, NULL);
+-		if (ret < 0)
+-			goto bail_release;
+-	}
+-
+-	current->mm->pinned_vm += num_pages;
+-
+-	ret = 0;
+-	goto bail;
+-
+-bail_release:
+-	__hfi1_release_user_pages(p, got, 0);
+-bail:
+-	return ret;
+-}
+-
+ /**
+  * hfi1_map_page - a safety wrapper around pci_map_page()
+  *
+@@ -116,41 +68,44 @@ dma_addr_t hfi1_map_page(struct pci_dev
+ 	return phys;
+ }
+ 
+-/**
+- * hfi1_get_user_pages - lock user pages into memory
+- * @start_page: the start page
+- * @num_pages: the number of pages
+- * @p: the output page structures
+- *
+- * This function takes a given start page (page aligned user virtual
+- * address) and pins it and the following specified number of pages.  For
+- * now, num_pages is always 1, but that will probably change at some point
+- * (because caller is doing expected sends on a single virtually contiguous
+- * buffer, so we can do all pages at once).
+- */
+-int hfi1_get_user_pages(unsigned long start_page, size_t num_pages,
+-			struct page **p)
++int hfi1_acquire_user_pages(unsigned long vaddr, size_t npages, bool writable,
++			    struct page **pages)
+ {
++	unsigned long pinned, lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
++	bool can_lock = capable(CAP_IPC_LOCK);
+ 	int ret;
+ 
+-	down_write(&current->mm->mmap_sem);
+-
+-	ret = __hfi1_get_user_pages(start_page, num_pages, p);
++	down_read(&current->mm->mmap_sem);
++	pinned = current->mm->pinned_vm;
++	up_read(&current->mm->mmap_sem);
++
++	if (pinned + npages > lock_limit && !can_lock)
++		return -ENOMEM;
++
++	ret = get_user_pages_fast(vaddr, npages, writable, pages);
++	if (ret < 0)
++		return ret;
+ 
++	down_write(&current->mm->mmap_sem);
++	current->mm->pinned_vm += ret;
+ 	up_write(&current->mm->mmap_sem);
+ 
+ 	return ret;
+ }
+ 
+-void hfi1_release_user_pages(struct page **p, size_t num_pages)
++void hfi1_release_user_pages(struct page **p, size_t npages, bool dirty)
+ {
+-	if (current->mm) /* during close after signal, mm can be NULL */
+-		down_write(&current->mm->mmap_sem);
++	size_t i;
+ 
+-	__hfi1_release_user_pages(p, num_pages, 1);
++	for (i = 0; i < npages; i++) {
++		if (dirty)
++			set_page_dirty_lock(p[i]);
++		put_page(p[i]);
++	}
+ 
+-	if (current->mm) {
+-		current->mm->pinned_vm -= num_pages;
++	if (current->mm) { /* during close after signal, mm can be NULL */
++		down_write(&current->mm->mmap_sem);
++		current->mm->pinned_vm -= npages;
+ 		up_write(&current->mm->mmap_sem);
+ 	}
+ }
