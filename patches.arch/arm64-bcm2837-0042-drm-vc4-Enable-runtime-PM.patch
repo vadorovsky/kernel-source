@@ -1,0 +1,185 @@
+From 675c9f6ac545b603b3cebb0c04d07e07b31c69cc Mon Sep 17 00:00:00 2001
+From: Eric Anholt <eric@anholt.net>
+Date: Fri, 5 Feb 2016 17:41:49 -0800
+Subject: [PATCH 042/101] drm/vc4: Enable runtime PM.
+Git-commit: 001bdb55d9eb72a9e2d5b623bacfc52da74ae03e
+Patch-mainline: v4.5-rc5
+References: FATE#319481
+
+This may actually get us a feature that the closed driver didn't have:
+turning off the GPU in between rendering jobs, while the V3D device is
+still opened by the client.
+
+There may be some tuning to be applied here to use autosuspend so that
+we don't bounce the device's power so much, but in steady-state
+GPU-bound rendering we keep the power on (since we keep multiple jobs
+outstanding) and even if we power cycle on every job we can still
+manage at least 680 fps.
+
+More importantly, though, runtime PM will allow us to power off the
+device to do a GPU reset.
+
+V2: Switch #ifdef to CONFIG_PM not CONFIG_PM_SLEEP (caught by kbuild
+    test robot)
+
+Signed-off-by: Eric Anholt <eric@anholt.net>
+Signed-off-by: Alexander Graf <agraf@suse.de>
+
+---
+ drivers/gpu/drm/vc4/vc4_drv.h |  1 +
+ drivers/gpu/drm/vc4/vc4_gem.c | 10 ++++++++++
+ drivers/gpu/drm/vc4/vc4_v3d.c | 36 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 47 insertions(+)
+
+diff --git a/drivers/gpu/drm/vc4/vc4_drv.h b/drivers/gpu/drm/vc4/vc4_drv.h
+index af287a3..20e2f55 100644
+--- a/drivers/gpu/drm/vc4/vc4_drv.h
++++ b/drivers/gpu/drm/vc4/vc4_drv.h
+@@ -141,6 +141,7 @@ struct vc4_seqno_cb {
+ };
+ 
+ struct vc4_v3d {
++	struct vc4_dev *vc4;
+ 	struct platform_device *pdev;
+ 	void __iomem *regs;
+ };
+diff --git a/drivers/gpu/drm/vc4/vc4_gem.c b/drivers/gpu/drm/vc4/vc4_gem.c
+index 1a819dd..4e0391c 100644
+--- a/drivers/gpu/drm/vc4/vc4_gem.c
++++ b/drivers/gpu/drm/vc4/vc4_gem.c
+@@ -23,6 +23,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/device.h>
+ #include <linux/io.h>
+ 
+@@ -621,6 +622,7 @@ fail:
+ static void
+ vc4_complete_exec(struct drm_device *dev, struct vc4_exec_info *exec)
+ {
++	struct vc4_dev *vc4 = to_vc4_dev(dev);
+ 	unsigned i;
+ 
+ 	/* Need the struct lock for drm_gem_object_unreference(). */
+@@ -639,6 +641,8 @@ vc4_complete_exec(struct drm_device *dev, struct vc4_exec_info *exec)
+ 	}
+ 	mutex_unlock(&dev->struct_mutex);
+ 
++	pm_runtime_put(&vc4->v3d->pdev->dev);
++
+ 	kfree(exec);
+ }
+ 
+@@ -792,6 +796,12 @@ vc4_submit_cl_ioctl(struct drm_device *dev, void *data,
+ 		return -ENOMEM;
+ 	}
+ 
++	ret = pm_runtime_get_sync(&vc4->v3d->pdev->dev);
++	if (ret < 0) {
++		kfree(exec);
++		return ret;
++	}
++
+ 	exec->args = args;
+ 	INIT_LIST_HEAD(&exec->unref_list);
+ 
+diff --git a/drivers/gpu/drm/vc4/vc4_v3d.c b/drivers/gpu/drm/vc4/vc4_v3d.c
+index 314ff71..cb38b6b 100644
+--- a/drivers/gpu/drm/vc4/vc4_v3d.c
++++ b/drivers/gpu/drm/vc4/vc4_v3d.c
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "linux/component.h"
++#include "linux/pm_runtime.h"
+ #include "vc4_drv.h"
+ #include "vc4_regs.h"
+ 
+@@ -167,6 +168,29 @@ static void vc4_v3d_init_hw(struct drm_device *dev)
+ 	V3D_WRITE(V3D_VPMBASE, 0);
+ }
+ 
++#ifdef CONFIG_PM
++static int vc4_v3d_runtime_suspend(struct device *dev)
++{
++	struct vc4_v3d *v3d = dev_get_drvdata(dev);
++	struct vc4_dev *vc4 = v3d->vc4;
++
++	vc4_irq_uninstall(vc4->dev);
++
++	return 0;
++}
++
++static int vc4_v3d_runtime_resume(struct device *dev)
++{
++	struct vc4_v3d *v3d = dev_get_drvdata(dev);
++	struct vc4_dev *vc4 = v3d->vc4;
++
++	vc4_v3d_init_hw(vc4->dev);
++	vc4_irq_postinstall(vc4->dev);
++
++	return 0;
++}
++#endif
++
+ static int vc4_v3d_bind(struct device *dev, struct device *master, void *data)
+ {
+ 	struct platform_device *pdev = to_platform_device(dev);
+@@ -179,6 +203,8 @@ static int vc4_v3d_bind(struct device *dev, struct device *master, void *data)
+ 	if (!v3d)
+ 		return -ENOMEM;
+ 
++	dev_set_drvdata(dev, v3d);
++
+ 	v3d->pdev = pdev;
+ 
+ 	v3d->regs = vc4_ioremap_regs(pdev, 0);
+@@ -186,6 +212,7 @@ static int vc4_v3d_bind(struct device *dev, struct device *master, void *data)
+ 		return PTR_ERR(v3d->regs);
+ 
+ 	vc4->v3d = v3d;
++	v3d->vc4 = vc4;
+ 
+ 	if (V3D_READ(V3D_IDENT0) != V3D_EXPECTED_IDENT0) {
+ 		DRM_ERROR("V3D_IDENT0 read 0x%08x instead of 0x%08x\n",
+@@ -207,6 +234,8 @@ static int vc4_v3d_bind(struct device *dev, struct device *master, void *data)
+ 		return ret;
+ 	}
+ 
++	pm_runtime_enable(dev);
++
+ 	return 0;
+ }
+ 
+@@ -216,6 +245,8 @@ static void vc4_v3d_unbind(struct device *dev, struct device *master,
+ 	struct drm_device *drm = dev_get_drvdata(master);
+ 	struct vc4_dev *vc4 = to_vc4_dev(drm);
+ 
++	pm_runtime_disable(dev);
++
+ 	drm_irq_uninstall(drm);
+ 
+ 	/* Disable the binner's overflow memory address, so the next
+@@ -228,6 +259,10 @@ static void vc4_v3d_unbind(struct device *dev, struct device *master,
+ 	vc4->v3d = NULL;
+ }
+ 
++static const struct dev_pm_ops vc4_v3d_pm_ops = {
++	SET_RUNTIME_PM_OPS(vc4_v3d_runtime_suspend, vc4_v3d_runtime_resume, NULL)
++};
++
+ static const struct component_ops vc4_v3d_ops = {
+ 	.bind   = vc4_v3d_bind,
+ 	.unbind = vc4_v3d_unbind,
+@@ -255,5 +290,6 @@ struct platform_driver vc4_v3d_driver = {
+ 	.driver = {
+ 		.name = "vc4_v3d",
+ 		.of_match_table = vc4_v3d_dt_match,
++		.pm = &vc4_v3d_pm_ops,
+ 	},
+ };
+-- 
+1.8.5.6
+
