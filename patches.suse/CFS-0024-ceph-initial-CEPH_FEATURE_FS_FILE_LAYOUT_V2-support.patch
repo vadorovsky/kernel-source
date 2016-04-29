@@ -1,0 +1,188 @@
+From: "Yan, Zheng" <zyan@redhat.com>
+Date: Sun, 14 Feb 2016 18:06:41 +0800
+Subject: [PATCH] ceph: initial CEPH_FEATURE_FS_FILE_LAYOUT_V2 support
+Git-commit: 5ea5c5e0a7f70b256417d3b6e36bd9851504babd
+Patch-mainline: v4.5
+References: Fate#318586
+
+Add support for the format change of MClientReply/MclientCaps.
+Also add code that denies access to inodes with pool_ns layouts.
+
+Signed-off-by: Yan, Zheng <zyan@redhat.com>
+Reviewed-by: Sage Weil <sage@redhat.com>
+Acked-by: NeilBrown <neilb@suse.com>
+
+---
+ fs/ceph/addr.c                     |    4 ++++
+ fs/ceph/caps.c                     |   27 ++++++++++++++++++++++++---
+ fs/ceph/inode.c                    |    2 ++
+ fs/ceph/mds_client.c               |   16 ++++++++++++++++
+ fs/ceph/mds_client.h               |    1 +
+ fs/ceph/super.h                    |    1 +
+ include/linux/ceph/ceph_features.h |    1 +
+ 7 files changed, 49 insertions(+), 3 deletions(-)
+
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -1756,6 +1756,10 @@ int ceph_pool_perm_check(struct ceph_ino
+ 	u32 pool;
+ 	int ret, flags;
+ 
++	/* does not support pool namespace yet */
++	if (ci->i_pool_ns_len)
++		return -EIO;
++
+ 	if (ceph_test_mount_opt(ceph_inode_to_client(&ci->vfs_inode),
+ 				NOPOOLPERM))
+ 		return 0;
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -2753,7 +2753,8 @@ static void handle_cap_grant(struct ceph
+ 			     void *inline_data, int inline_len,
+ 			     struct ceph_buffer *xattr_buf,
+ 			     struct ceph_mds_session *session,
+-			     struct ceph_cap *cap, int issued)
++			     struct ceph_cap *cap, int issued,
++			     u32 pool_ns_len)
+ 	__releases(ci->i_ceph_lock)
+ 	__releases(mdsc->snap_rwsem)
+ {
+@@ -2873,6 +2874,8 @@ static void handle_cap_grant(struct ceph
+ 	if (newcaps & (CEPH_CAP_ANY_FILE_RD | CEPH_CAP_ANY_FILE_WR)) {
+ 		/* file layout may have changed */
+ 		ci->i_layout = grant->layout;
++		ci->i_pool_ns_len = pool_ns_len;
++
+ 		/* size/truncate_seq? */
+ 		queue_trunc = ceph_fill_file_size(inode, issued,
+ 					le32_to_cpu(grant->truncate_seq),
+@@ -3411,6 +3414,7 @@ void ceph_handle_caps(struct ceph_mds_se
+ 	u32  inline_len = 0;
+ 	void *snaptrace;
+ 	size_t snaptrace_len;
++	u32 pool_ns_len = 0;
+ 	void *p, *end;
+ 
+ 	dout("handle_caps from mds%d\n", mds);
+@@ -3463,6 +3467,21 @@ void ceph_handle_caps(struct ceph_mds_se
+ 		p += inline_len;
+ 	}
+ 
++	if (le16_to_cpu(msg->hdr.version) >= 8) {
++		u64 flush_tid;
++		u32 caller_uid, caller_gid;
++		u32 osd_epoch_barrier;
++		/* version >= 5 */
++		ceph_decode_32_safe(&p, end, osd_epoch_barrier, bad);
++		/* version >= 6 */
++		ceph_decode_64_safe(&p, end, flush_tid, bad);
++		/* version >= 7 */
++		ceph_decode_32_safe(&p, end, caller_uid, bad);
++		ceph_decode_32_safe(&p, end, caller_gid, bad);
++		/* version >= 8 */
++		ceph_decode_32_safe(&p, end, pool_ns_len, bad);
++	}
++
+ 	/* lookup ino */
+ 	inode = ceph_find_inode(sb, vino);
+ 	ci = ceph_inode(inode);
+@@ -3518,7 +3537,8 @@ void ceph_handle_caps(struct ceph_mds_se
+ 				  &cap, &issued);
+ 		handle_cap_grant(mdsc, inode, h,
+ 				 inline_version, inline_data, inline_len,
+-				 msg->middle, session, cap, issued);
++				 msg->middle, session, cap, issued,
++				 pool_ns_len);
+ 		if (realm)
+ 			ceph_put_snap_realm(mdsc, realm);
+ 		goto done_unlocked;
+@@ -3542,7 +3562,8 @@ void ceph_handle_caps(struct ceph_mds_se
+ 		issued |= __ceph_caps_dirty(ci);
+ 		handle_cap_grant(mdsc, inode, h,
+ 				 inline_version, inline_data, inline_len,
+-				 msg->middle, session, cap, issued);
++				 msg->middle, session, cap, issued,
++				 pool_ns_len);
+ 		goto done_unlocked;
+ 
+ 	case CEPH_CAP_OP_FLUSH_ACK:
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -396,6 +396,7 @@ struct inode *ceph_alloc_inode(struct su
+ 	ci->i_symlink = NULL;
+ 
+ 	memset(&ci->i_dir_layout, 0, sizeof(ci->i_dir_layout));
++	ci->i_pool_ns_len = 0;
+ 
+ 	ci->i_fragtree = RB_ROOT;
+ 	mutex_init(&ci->i_fragtree_mutex);
+@@ -756,6 +757,7 @@ static int fill_inode(struct inode *inod
+ 		if (ci->i_layout.fl_pg_pool != info->layout.fl_pg_pool)
+ 			ci->i_ceph_flags &= ~CEPH_I_POOL_PERM;
+ 		ci->i_layout = info->layout;
++		ci->i_pool_ns_len = iinfo->pool_ns_len;
+ 
+ 		queue_trunc = ceph_fill_file_size(inode, issued,
+ 					le32_to_cpu(info->truncate_seq),
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -100,6 +100,14 @@ static int parse_reply_info_in(void **p,
+ 	} else
+ 		info->inline_version = CEPH_INLINE_NONE;
+ 
++	if (features & CEPH_FEATURE_FS_FILE_LAYOUT_V2) {
++		ceph_decode_32_safe(p, end, info->pool_ns_len, bad);
++		ceph_decode_need(p, end, info->pool_ns_len, bad);
++		*p += info->pool_ns_len;
++	} else {
++		info->pool_ns_len = 0;
++	}
++
+ 	return 0;
+ bad:
+ 	return err;
+@@ -2298,6 +2306,14 @@ int ceph_mdsc_do_request(struct ceph_mds
+ 		ceph_get_cap_refs(ceph_inode(req->r_old_dentry_dir),
+ 				  CEPH_CAP_PIN);
+ 
++	/* deny access to directories with pool_ns layouts */
++	if (req->r_inode && S_ISDIR(req->r_inode->i_mode) &&
++	    ceph_inode(req->r_inode)->i_pool_ns_len)
++		return -EIO;
++	if (req->r_locked_dir &&
++	    ceph_inode(req->r_locked_dir)->i_pool_ns_len)
++		return -EIO;
++
+ 	/* issue */
+ 	mutex_lock(&mdsc->mutex);
+ 	__register_request(mdsc, req, dir);
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@ -44,6 +44,7 @@ struct ceph_mds_reply_info_in {
+ 	u64 inline_version;
+ 	u32 inline_len;
+ 	char *inline_data;
++	u32 pool_ns_len;
+ };
+ 
+ /*
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -287,6 +287,7 @@ struct ceph_inode_info {
+ 
+ 	struct ceph_dir_layout i_dir_layout;
+ 	struct ceph_file_layout i_layout;
++	size_t i_pool_ns_len;
+ 	char *i_symlink;
+ 
+ 	/* for dirs */
+--- a/include/linux/ceph/ceph_features.h
++++ b/include/linux/ceph/ceph_features.h
+@@ -75,6 +75,7 @@
+ #define CEPH_FEATURE_CRUSH_TUNABLES5	(1ULL<<58) /* chooseleaf stable mode */
+ // duplicated since it was introduced at the same time as CEPH_FEATURE_CRUSH_TUNABLES5
+ #define CEPH_FEATURE_NEW_OSDOPREPLY_ENCODING   (1ULL<<58) /* New, v7 encoding */
++#define CEPH_FEATURE_FS_FILE_LAYOUT_V2       (1ULL<<58) /* file_layout_t */
+ 
+ /*
+  * The introduction of CEPH_FEATURE_OSD_SNAPMAPPER caused the feature
