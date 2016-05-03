@@ -1,0 +1,161 @@
+From: Jamie Pocas <jamie.pocas@emc.com>
+Date: Sun, 29 Nov 2015 14:44:57 -0800
+Subject: target/sbc: Add LBPRZ attribute + control CDB emulation
+Git-commit: e6f41633cb79b55ead84b023c02035322c7827e7
+Patch-mainline: v4.5-rc1
+References: bsc#977860
+
+This change sets the LBPRZ flag in EVPD page b2h and READ CAPACITY (16)
+based on a new unmap_zeroes_data device attribute. This flag is set
+automatically for iblock based on underlying block device queue's
+discard_zeroes_data flag.
+
+Signed-off-by: Jamie Pocas <jamie.pocas@emc.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Acked-by: Lee Duncan <lduncan@suse.com>
+---
+ drivers/target/target_core_configfs.c |   36 ++++++++++++++++++++++++++++++++++
+ drivers/target/target_core_device.c   |    2 +
+ drivers/target/target_core_sbc.c      |   10 ++++++++-
+ drivers/target/target_core_spc.c      |   12 +++++++++++
+ include/target/target_core_base.h     |    3 ++
+ 5 files changed, 62 insertions(+), 1 deletion(-)
+
+--- a/drivers/target/target_core_configfs.c
++++ b/drivers/target/target_core_configfs.c
+@@ -499,6 +499,7 @@ DEF_CONFIGFS_ATTRIB_SHOW(max_unmap_lba_c
+ DEF_CONFIGFS_ATTRIB_SHOW(max_unmap_block_desc_count);
+ DEF_CONFIGFS_ATTRIB_SHOW(unmap_granularity);
+ DEF_CONFIGFS_ATTRIB_SHOW(unmap_granularity_alignment);
++DEF_CONFIGFS_ATTRIB_SHOW(unmap_zeroes_data);
+ DEF_CONFIGFS_ATTRIB_SHOW(max_write_same_len);
+ 
+ #define DEF_CONFIGFS_ATTRIB_STORE_U32(_name)				\
+@@ -866,6 +867,39 @@ static ssize_t emulate_rest_reord_store(
+ 	return count;
+ }
+ 
++static ssize_t unmap_zeroes_data_store(struct config_item *item,
++		const char *page, size_t count)
++{
++	struct se_dev_attrib *da = to_attrib(item);
++	bool flag;
++	int ret;
++
++	ret = strtobool(page, &flag);
++	if (ret < 0)
++		return ret;
++
++	if (da->da_dev->export_count) {
++		pr_err("dev[%p]: Unable to change SE Device"
++		       " unmap_zeroes_data while export_count is %d\n",
++		       da->da_dev, da->da_dev->export_count);
++		return -EINVAL;
++	}
++	/*
++	 * We expect this value to be non-zero when generic Block Layer
++	 * Discard supported is detected iblock_configure_device().
++	 */
++	if (flag && !da->max_unmap_block_desc_count) {
++		pr_err("dev[%p]: Thin Provisioning LBPRZ will not be set"
++		       " because max_unmap_block_desc_count is zero\n",
++		       da->da_dev);
++	       return -ENOSYS;
++	}
++	da->unmap_zeroes_data = flag;
++	pr_debug("dev[%p]: SE Device Thin Provisioning LBPRZ bit: %d\n",
++		 da->da_dev, flag);
++	return 0;
++}
++
+ /*
+  * Note, this can only be called on unexported SE Device Object.
+  */
+@@ -998,6 +1032,7 @@ CONFIGFS_ATTR(, max_unmap_lba_count);
+ CONFIGFS_ATTR(, max_unmap_block_desc_count);
+ CONFIGFS_ATTR(, unmap_granularity);
+ CONFIGFS_ATTR(, unmap_granularity_alignment);
++CONFIGFS_ATTR(, unmap_zeroes_data);
+ CONFIGFS_ATTR(, max_write_same_len);
+ 
+ /*
+@@ -1034,6 +1069,7 @@ struct configfs_attribute *sbc_attrib_at
+ 	&attr_max_unmap_block_desc_count,
+ 	&attr_unmap_granularity,
+ 	&attr_unmap_granularity_alignment,
++	&attr_unmap_zeroes_data,
+ 	&attr_max_write_same_len,
+ 	NULL,
+ };
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@ -813,6 +813,8 @@ struct se_device *target_alloc_device(st
+ 	dev->dev_attrib.unmap_granularity = DA_UNMAP_GRANULARITY_DEFAULT;
+ 	dev->dev_attrib.unmap_granularity_alignment =
+ 				DA_UNMAP_GRANULARITY_ALIGNMENT_DEFAULT;
++	dev->dev_attrib.unmap_zeroes_data =
++				DA_UNMAP_ZEROES_DATA_DEFAULT;
+ 	dev->dev_attrib.max_write_same_len = DA_MAX_WRITE_SAME_LEN;
+ 
+ 	xcopy_lun = &dev->xcopy_lun;
+--- a/drivers/target/target_core_sbc.c
++++ b/drivers/target/target_core_sbc.c
+@@ -141,9 +141,17 @@ sbc_emulate_readcapacity_16(struct se_cm
+ 	 * Set Thin Provisioning Enable bit following sbc3r22 in section
+ 	 * READ CAPACITY (16) byte 14 if emulate_tpu or emulate_tpws is enabled.
+ 	 */
+-	if (dev->dev_attrib.emulate_tpu || dev->dev_attrib.emulate_tpws)
++	if (dev->dev_attrib.emulate_tpu || dev->dev_attrib.emulate_tpws) {
+ 		buf[14] |= 0x80;
+ 
++		/*
++		 * LBPRZ signifies that zeroes will be read back from an LBA after
++		 * an UNMAP or WRITE SAME w/ unmap bit (sbc3r36 5.16.2)
++		 */
++		if (dev->dev_attrib.unmap_zeroes_data)
++			buf[14] |= 0x40;
++	}
++
+ 	rbuf = transport_kmap_data_sg(cmd);
+ 	if (rbuf) {
+ 		memcpy(rbuf, buf, min_t(u32, sizeof(buf), cmd->data_length));
+--- a/drivers/target/target_core_spc.c
++++ b/drivers/target/target_core_spc.c
+@@ -635,6 +635,18 @@ spc_emulate_evpd_b2(struct se_cmd *cmd,
+ 	if (dev->dev_attrib.emulate_tpws != 0)
+ 		buf[5] |= 0x40 | 0x20;
+ 
++	/*
++	 * The unmap_zeroes_data set means that the underlying device supports
++	 * REQ_DISCARD and has the discard_zeroes_data bit set. This satisfies
++	 * the SBC requirements for LBPRZ, meaning that a subsequent read
++	 * will return zeroes after an UNMAP or WRITE SAME (16) to an LBA
++	 * See sbc4r36 6.6.4.
++	 */
++	if (((dev->dev_attrib.emulate_tpu != 0) ||
++	     (dev->dev_attrib.emulate_tpws != 0)) &&
++	     (dev->dev_attrib.unmap_zeroes_data != 0))
++		buf[5] |= 0x04;
++
+ 	return 0;
+ }
+ 
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -63,6 +63,8 @@
+ #define DA_UNMAP_GRANULARITY_DEFAULT		0
+ /* Default unmap_granularity_alignment */
+ #define DA_UNMAP_GRANULARITY_ALIGNMENT_DEFAULT	0
++/* Default unmap_zeroes_data */
++#define DA_UNMAP_ZEROES_DATA_DEFAULT		0
+ /* Default max_write_same_len, disabled by default */
+ #define DA_MAX_WRITE_SAME_LEN			0
+ /* Use a model alias based on the configfs backend device name */
+@@ -678,6 +680,7 @@ struct se_dev_attrib {
+ 	int		force_pr_aptpl;
+ 	int		is_nonrot;
+ 	int		emulate_rest_reord;
++	int		unmap_zeroes_data;
+ 	u32		hw_block_size;
+ 	u32		block_size;
+ 	u32		hw_max_sectors;
