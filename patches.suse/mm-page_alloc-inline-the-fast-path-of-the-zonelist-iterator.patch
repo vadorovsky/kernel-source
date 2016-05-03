@@ -1,0 +1,164 @@
+From 68802562b0361be9a7eeaaac3d7754d304b150a8 Mon Sep 17 00:00:00 2001
+From: Mel Gorman <mgorman@suse.de>
+Date: Tue, 3 May 2016 09:43:22 +0100
+Subject: [PATCH] mm, page_alloc: inline the fast path of the zonelist iterator
+
+References: bnc#971975 VM performance -- page allocator
+Patch-mainline: No, expected 4.7 and queued in linux-mm
+
+The page allocator iterates through a zonelist for zones that match the
+addressing limitations and nodemask of the caller but many allocations
+will not be restricted.  Despite this, there is always functional call
+overhead which builds up.
+
+This patch inlines the optimistic basic case and only calls the iterator
+function for the complex case.  A hindrance was the fact that
+cpuset_current_mems_allowed is used in the fastpath as the allowed
+nodemask even though all nodes are allowed on most systems.  The patch
+handles this by only considering cpuset_current_mems_allowed if a cpuset
+exists.  As well as being faster in the fast-path, this removes some junk
+in the slowpath.
+
+The performance difference on a page allocator microbenchmark is;
+
+                                           4.6.0-rc2                  4.6.0-rc2
+                                    statinline-v1r20              optiter-v1r20
+Min      alloc-odr0-1               412.00 (  0.00%)           382.00 (  7.28%)
+Min      alloc-odr0-2               301.00 (  0.00%)           282.00 (  6.31%)
+Min      alloc-odr0-4               247.00 (  0.00%)           233.00 (  5.67%)
+Min      alloc-odr0-8               215.00 (  0.00%)           203.00 (  5.58%)
+Min      alloc-odr0-16              199.00 (  0.00%)           188.00 (  5.53%)
+Min      alloc-odr0-32              191.00 (  0.00%)           182.00 (  4.71%)
+Min      alloc-odr0-64              187.00 (  0.00%)           177.00 (  5.35%)
+Min      alloc-odr0-128             185.00 (  0.00%)           175.00 (  5.41%)
+Min      alloc-odr0-256             193.00 (  0.00%)           184.00 (  4.66%)
+Min      alloc-odr0-512             207.00 (  0.00%)           197.00 (  4.83%)
+Min      alloc-odr0-1024            213.00 (  0.00%)           203.00 (  4.69%)
+Min      alloc-odr0-2048            220.00 (  0.00%)           209.00 (  5.00%)
+Min      alloc-odr0-4096            226.00 (  0.00%)           214.00 (  5.31%)
+Min      alloc-odr0-8192            229.00 (  0.00%)           218.00 (  4.80%)
+Min      alloc-odr0-16384           229.00 (  0.00%)           219.00 (  4.37%)
+
+perf indicated that next_zones_zonelist disappeared in the profile and
+__next_zones_zonelist did not appear.  This is expected as the
+micro-benchmark would hit the inlined fast-path every time.
+
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ include/linux/mmzone.h | 13 +++++++++++--
+ mm/mmzone.c            |  2 +-
+ mm/page_alloc.c        | 26 +++++++++-----------------
+ 3 files changed, 21 insertions(+), 20 deletions(-)
+
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index 5a2c3d3d824f..b80d1ae5488a 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -913,6 +913,10 @@ static inline int zonelist_node_idx(struct zoneref *zoneref)
+ #endif /* CONFIG_NUMA */
+ }
+ 
++struct zoneref *__next_zones_zonelist(struct zoneref *z,
++					enum zone_type highest_zoneidx,
++					nodemask_t *nodes);
++
+ /**
+  * next_zones_zonelist - Returns the next zone at or below highest_zoneidx within the allowed nodemask using a cursor within a zonelist as a starting point
+  * @z - The cursor used as a starting point for the search
+@@ -925,9 +929,14 @@ static inline int zonelist_node_idx(struct zoneref *zoneref)
+  * being examined. It should be advanced by one before calling
+  * next_zones_zonelist again.
+  */
+-struct zoneref *next_zones_zonelist(struct zoneref *z,
++static __always_inline struct zoneref *next_zones_zonelist(struct zoneref *z,
+ 					enum zone_type highest_zoneidx,
+-					nodemask_t *nodes);
++					nodemask_t *nodes)
++{
++	if (likely(!nodes && zonelist_zone_idx(z) <= highest_zoneidx))
++		return z;
++	return __next_zones_zonelist(z, highest_zoneidx, nodes);
++}
+ 
+ /**
+  * first_zones_zonelist - Returns the first zone at or below highest_zoneidx within the allowed nodemask in a zonelist
+diff --git a/mm/mmzone.c b/mm/mmzone.c
+index 7d87ebb0d632..a3c390f2b747 100644
+--- a/mm/mmzone.c
++++ b/mm/mmzone.c
+@@ -52,7 +52,7 @@ static inline int zref_in_nodemask(struct zoneref *zref, nodemask_t *nodes)
+ }
+ 
+ /* Returns the next zone at or below highest_zoneidx in a zonelist */
+-struct zoneref *next_zones_zonelist(struct zoneref *z,
++struct zoneref *__next_zones_zonelist(struct zoneref *z,
+ 					enum zone_type highest_zoneidx,
+ 					nodemask_t *nodes)
+ {
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 9f9beb1c1777..8820f7dd8ad7 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -3146,17 +3146,6 @@ __alloc_pages_slowpath(gfp_t gfp_mask, unsigned int order,
+ 	 */
+ 	alloc_flags = gfp_to_alloc_flags(gfp_mask);
+ 
+-	/*
+-	 * Find the true preferred zone if the allocation is unconstrained by
+-	 * cpusets.
+-	 */
+-	if (!(alloc_flags & ALLOC_CPUSET) && !ac->nodemask) {
+-		struct zoneref *preferred_zoneref;
+-		preferred_zoneref = first_zones_zonelist(ac->zonelist,
+-				ac->high_zoneidx, NULL, &ac->preferred_zone);
+-		ac->classzone_idx = zonelist_zone_idx(preferred_zoneref);
+-	}
+-
+ 	/* This is the last chance, in general, before the goto nopage. */
+ 	page = get_page_from_freelist(gfp_mask, order,
+ 				alloc_flags & ~ALLOC_NO_WATERMARKS, ac);
+@@ -3304,14 +3293,21 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order,
+ 	struct zoneref *preferred_zoneref;
+ 	struct page *page = NULL;
+ 	unsigned int cpuset_mems_cookie;
+-	int alloc_flags = ALLOC_WMARK_LOW|ALLOC_CPUSET|ALLOC_FAIR;
++	int alloc_flags = ALLOC_WMARK_LOW|ALLOC_FAIR;
+ 	gfp_t alloc_mask; /* The gfp_t that was actually used for allocation */
+ 	struct alloc_context ac = {
+ 		.high_zoneidx = gfp_zone(gfp_mask),
++		.zonelist = zonelist,
+ 		.nodemask = nodemask,
+ 		.migratetype = gfpflags_to_migratetype(gfp_mask),
+ 	};
+ 
++	if (cpusets_enabled()) {
++		alloc_flags |= ALLOC_CPUSET;
++		if (!ac.nodemask)
++			ac.nodemask = &cpuset_current_mems_allowed;
++	}
++
+ 	gfp_mask &= gfp_allowed_mask;
+ 
+ 	lockdep_trace_alloc(gfp_mask);
+@@ -3335,16 +3331,12 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order,
+ retry_cpuset:
+ 	cpuset_mems_cookie = read_mems_allowed_begin();
+ 
+-	/* We set it here, as __alloc_pages_slowpath might have changed it */
+-	ac.zonelist = zonelist;
+-
+ 	/* Dirty zone balancing only done in the fast path */
+ 	ac.spread_dirty_pages = (gfp_mask & __GFP_WRITE);
+ 
+ 	/* The preferred zone is used for statistics later */
+ 	preferred_zoneref = first_zones_zonelist(ac.zonelist, ac.high_zoneidx,
+-				ac.nodemask ? : &cpuset_current_mems_allowed,
+-				&ac.preferred_zone);
++				ac.nodemask, &ac.preferred_zone);
+ 	if (!ac.preferred_zone)
+ 		goto out;
+ 	ac.classzone_idx = zonelist_zone_idx(preferred_zoneref);
