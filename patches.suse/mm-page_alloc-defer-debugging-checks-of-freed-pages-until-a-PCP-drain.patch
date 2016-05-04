@@ -1,0 +1,164 @@
+From b2007e44c33dfa0761e085f6cb975778f415e666 Mon Sep 17 00:00:00 2001
+From: Mel Gorman <mgorman@suse.de>
+Date: Tue, 3 May 2016 09:43:24 +0100
+Subject: [PATCH] mm, page_alloc: defer debugging checks of freed pages until a
+ PCP drain
+
+References: bnc#971975 VM performance -- page allocator
+Patch-mainline: No, expected 4.7 and queued in linux-mm
+
+Every page free checks a number of page fields for validity.  This catches
+premature frees and corruptions but it is also expensive.  This patch
+weakens the debugging check by checking PCP pages at the time they are
+drained from the PCP list.  This will trigger the bug but the site that
+freed the corrupt page will be lost.  To get the full context, a kernel
+rebuild with DEBUG_VM is necessary.
+
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Jesper Dangaard Brouer <brouer@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+---
+ mm/page_alloc.c | 107 +++++++++++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 78 insertions(+), 29 deletions(-)
+
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 195585b455fd..4c3f0e2d3ca8 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -904,6 +904,80 @@ static inline int free_pages_check(struct page *page)
+ 	return 1;
+ }
+ 
++static int free_tail_pages_check(struct page *head_page, struct page *page)
++{
++	int ret = 1;
++
++	/*
++	 * We rely page->lru.next never has bit 0 set, unless the page
++	 * is PageTail(). Let's make sure that's true even for poisoned ->lru.
++	 */
++	BUILD_BUG_ON((unsigned long)LIST_POISON1 & 1);
++
++	if (!IS_ENABLED(CONFIG_DEBUG_VM)) {
++		ret = 0;
++		goto out;
++	}
++	if (unlikely(!PageTail(page))) {
++		bad_page(page, "PageTail not set", 0);
++		goto out;
++	}
++	if (unlikely(compound_head(page) != head_page)) {
++		bad_page(page, "compound_head not consistent", 0);
++		goto out;
++	}
++	ret = 0;
++out:
++	clear_compound_head(page);
++	return ret;
++}
++
++static bool free_pages_prepare(struct page *page, unsigned int order);
++
++#ifdef CONFIG_DEBUG_VM
++static inline bool free_pcp_prepare(struct page *page)
++{
++	return free_pages_prepare(page, 0);
++}
++
++static inline bool bulkfree_pcp_prepare(struct page *page)
++{
++	return false;
++}
++#else
++static bool free_pcp_prepare(struct page *page)
++{
++	VM_BUG_ON_PAGE(PageTail(page), page);
++
++	trace_mm_page_free(page, 0);
++	kmemcheck_free_shadow(page, 0);
++	kasan_free_pages(page, 0);
++
++	if (PageAnon(page))
++		page->mapping = NULL;
++
++	reset_page_owner(page, 0);
++
++	if (!PageHighMem(page)) {
++		debug_check_no_locks_freed(page_address(page),
++					   PAGE_SIZE);
++		debug_check_no_obj_freed(page_address(page),
++					   PAGE_SIZE);
++	}
++	arch_free_page(page, 0);
++	kernel_map_pages(page, 0, 0);
++
++	page_cpupid_reset_last(page);
++	page->flags &= ~PAGE_FLAGS_CHECK_AT_PREP;
++	return true;
++}
++
++static bool bulkfree_pcp_prepare(struct page *page)
++{
++	return free_pages_check(page);
++}
++#endif /* CONFIG_DEBUG_VM */
++
+ /*
+  * Frees a number of pages from the PCP lists
+  * Assumes all pages on list are in same zone, and of same order.
+@@ -965,6 +1039,9 @@ static void free_pcppages_bulk(struct zone *zone, int count,
+ 			if (unlikely(isolated_pageblocks))
+ 				mt = get_pageblock_migratetype(page);
+ 
++			if (bulkfree_pcp_prepare(page))
++				continue;
++
+ 			__free_one_page(page, page_to_pfn(page), zone, 0, mt);
+ 			trace_mm_page_pcpu_drain(page, 0, mt);
+ 		} while (--count && --batch_free && !list_empty(list));
+@@ -991,34 +1068,6 @@ static void free_one_page(struct zone *zone,
+ 	spin_unlock(&zone->lock);
+ }
+ 
+-static int free_tail_pages_check(struct page *head_page, struct page *page)
+-{
+-	int ret = 1;
+-
+-	/*
+-	 * We rely page->lru.next never has bit 0 set, unless the page
+-	 * is PageTail(). Let's make sure that's true even for poisoned ->lru.
+-	 */
+-	BUILD_BUG_ON((unsigned long)LIST_POISON1 & 1);
+-
+-	if (!IS_ENABLED(CONFIG_DEBUG_VM)) {
+-		ret = 0;
+-		goto out;
+-	}
+-	if (unlikely(!PageTail(page))) {
+-		bad_page(page, "PageTail not set", 0);
+-		goto out;
+-	}
+-	if (unlikely(compound_head(page) != head_page)) {
+-		bad_page(page, "compound_head not consistent", 0);
+-		goto out;
+-	}
+-	ret = 0;
+-out:
+-	clear_compound_head(page);
+-	return ret;
+-}
+-
+ static void __meminit __init_single_page(struct page *page, unsigned long pfn,
+ 				unsigned long zone, int nid)
+ {
+@@ -2267,7 +2316,7 @@ void free_hot_cold_page(struct page *page, bool cold)
+ 	unsigned long pfn = page_to_pfn(page);
+ 	int migratetype;
+ 
+-	if (!free_pages_prepare(page, 0))
++	if (!free_pcp_prepare(page))
+ 		return;
+ 
+ 	migratetype = get_pfnblock_migratetype(page, pfn);
