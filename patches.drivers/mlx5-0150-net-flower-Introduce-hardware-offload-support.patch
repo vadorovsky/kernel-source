@@ -1,0 +1,189 @@
+From: Amir Vadai <amir@vadai.me>
+Date: Tue, 8 Mar 2016 12:42:29 +0200
+Subject: net/flower: Introduce hardware offload support
+Patch-mainline: v4.6-rc1
+Git-commit: 5b33f48842fa1e13e9c0ea8cc59c1d0df19042db
+References: bsc#966170 FATE#320225 bsc#966172 FATE#320226
+
+This patch is based on a patch made by John Fastabend.
+It adds support for offloading cls_flower.
+when NETIF_F_HW_TC is on:
+  flags = 0       => Rule will be processed twice - by hardware, and if
+                     still relevant, by software.
+  flags = SKIP_HW => Rull will be processed by software only
+
+If hardware fail/not capabale to apply the rule, operation will NOT
+fail. Filter will be processed by SW only.
+
+Acked-by: Jiri Pirko <jiri@mellanox.com>
+Suggested-by: John Fastabend <john.r.fastabend@intel.com>
+Signed-off-by: Amir Vadai <amir@vadai.me>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: Benjamin Poirier <bpoirier@suse.com>
+---
+ include/linux/netdevice.h    |    2 +
+ include/net/pkt_cls.h        |   14 +++++++++
+ include/uapi/linux/pkt_cls.h |    2 +
+ net/sched/cls_flower.c       |   64 ++++++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 81 insertions(+), 1 deletion(-)
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -787,6 +787,7 @@ typedef u16 (*select_queue_fallback_t)(s
+ enum {
+ 	TC_SETUP_MQPRIO,
+ 	TC_SETUP_CLSU32,
++	TC_SETUP_CLSFLOWER,
+ };
+ 
+ struct tc_cls_u32_offload;
+@@ -796,6 +797,7 @@ struct tc_to_netdev {
+ 	union {
+ 		u8 tc;
+ 		struct tc_cls_u32_offload *cls_u32;
++		struct tc_cls_flower_offload *cls_flower;
+ 	};
+ };
+ 
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -409,4 +409,18 @@ static inline bool tc_should_offload(str
+ 	return true;
+ }
+ 
++enum tc_fl_command {
++	TC_CLSFLOWER_REPLACE,
++	TC_CLSFLOWER_DESTROY,
++};
++
++struct tc_cls_flower_offload {
++	enum tc_fl_command command;
++	u64 cookie;
++	struct flow_dissector *dissector;
++	struct fl_flow_key *mask;
++	struct fl_flow_key *key;
++	struct tcf_exts *exts;
++};
++
+ #endif
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@ -417,6 +417,8 @@ enum {
+ 	TCA_FLOWER_KEY_TCP_DST,		/* be16 */
+ 	TCA_FLOWER_KEY_UDP_SRC,		/* be16 */
+ 	TCA_FLOWER_KEY_UDP_DST,		/* be16 */
++
++	TCA_FLOWER_FLAGS,
+ 	__TCA_FLOWER_MAX,
+ };
+ 
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -165,6 +165,51 @@ static void fl_destroy_filter(struct rcu
+ 	kfree(f);
+ }
+ 
++static void fl_hw_destroy_filter(struct tcf_proto *tp, u64 cookie)
++{
++	struct net_device *dev = tp->q->dev_queue->dev;
++	struct tc_cls_flower_offload offload = {0};
++	struct tc_to_netdev tc;
++
++	if (!tc_should_offload(dev, 0))
++		return;
++
++	offload.command = TC_CLSFLOWER_DESTROY;
++	offload.cookie = cookie;
++
++	tc.type = TC_SETUP_CLSFLOWER;
++	tc.cls_flower = &offload;
++
++	dev->netdev_ops->ndo_setup_tc(dev, tp->q->handle, tp->protocol, &tc);
++}
++
++static void fl_hw_replace_filter(struct tcf_proto *tp,
++				 struct flow_dissector *dissector,
++				 struct fl_flow_key *mask,
++				 struct fl_flow_key *key,
++				 struct tcf_exts *actions,
++				 u64 cookie, u32 flags)
++{
++	struct net_device *dev = tp->q->dev_queue->dev;
++	struct tc_cls_flower_offload offload = {0};
++	struct tc_to_netdev tc;
++
++	if (!tc_should_offload(dev, flags))
++		return;
++
++	offload.command = TC_CLSFLOWER_REPLACE;
++	offload.cookie = cookie;
++	offload.dissector = dissector;
++	offload.mask = mask;
++	offload.key = key;
++	offload.exts = actions;
++
++	tc.type = TC_SETUP_CLSFLOWER;
++	tc.cls_flower = &offload;
++
++	dev->netdev_ops->ndo_setup_tc(dev, tp->q->handle, tp->protocol, &tc);
++}
++
+ static bool fl_destroy(struct tcf_proto *tp, bool force)
+ {
+ 	struct cls_fl_head *head = rtnl_dereference(tp->root);
+@@ -174,6 +219,7 @@ static bool fl_destroy(struct tcf_proto
+ 		return false;
+ 
+ 	list_for_each_entry_safe(f, next, &head->filters, list) {
++		fl_hw_destroy_filter(tp, (u64)f);
+ 		list_del_rcu(&f->list);
+ 		call_rcu(&f->rcu, fl_destroy_filter);
+ 	}
+@@ -459,6 +505,7 @@ static int fl_change(struct net *net, st
+ 	struct cls_fl_filter *fnew;
+ 	struct nlattr *tb[TCA_FLOWER_MAX + 1];
+ 	struct fl_flow_mask mask = {};
++	u32 flags = 0;
+ 	int err;
+ 
+ 	if (!tca[TCA_OPTIONS])
+@@ -486,6 +533,9 @@ static int fl_change(struct net *net, st
+ 	}
+ 	fnew->handle = handle;
+ 
++	if (tb[TCA_FLOWER_FLAGS])
++		flags = nla_get_u32(tb[TCA_FLOWER_FLAGS]);
++
+ 	err = fl_set_parms(net, tp, fnew, &mask, base, tb, tca[TCA_RATE], ovr);
+ 	if (err)
+ 		goto errout;
+@@ -498,9 +548,20 @@ static int fl_change(struct net *net, st
+ 				     head->ht_params);
+ 	if (err)
+ 		goto errout;
+-	if (fold)
++
++	fl_hw_replace_filter(tp,
++			     &head->dissector,
++			     &mask.key,
++			     &fnew->key,
++			     &fnew->exts,
++			     (u64)fnew,
++			     flags);
++
++	if (fold) {
+ 		rhashtable_remove_fast(&head->ht, &fold->ht_node,
+ 				       head->ht_params);
++		fl_hw_destroy_filter(tp, (u64)fold);
++	}
+ 
+ 	*arg = (unsigned long) fnew;
+ 
+@@ -527,6 +588,7 @@ static int fl_delete(struct tcf_proto *t
+ 	rhashtable_remove_fast(&head->ht, &f->ht_node,
+ 			       head->ht_params);
+ 	list_del_rcu(&f->list);
++	fl_hw_destroy_filter(tp, (u64)f);
+ 	tcf_unbind_filter(tp, &f->res);
+ 	call_rcu(&f->rcu, fl_destroy_filter);
+ 	return 0;
