@@ -1,0 +1,4342 @@
+From: Linux Kernel Mailing List <linux-kernel@vger.kernel.org>
+Subject: xen: Linux: 4.6
+Patch-mainline: Never, SUSE-Xen specific
+
+ This patch contains the differences between 4.5 and 4.6.
+
+Automatically created from "patch-4.6" by xen-port-patches.py
+Acked-by: jbeulich@suse.com
+
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -1248,7 +1248,7 @@ config MICROCODE_OLD_INTERFACE
+ 	depends on MICROCODE
+ 
+ config PERF_EVENTS_AMD_POWER
+-	depends on PERF_EVENTS && CPU_SUP_AMD
++	depends on PERF_EVENTS && CPU_SUP_AMD && !XEN
+ 	tristate "AMD Processor Power Reporting Mechanism"
+ 	---help---
+ 	  Provide power reporting mechanism support for AMD processors.
+@@ -1780,7 +1780,7 @@ config X86_INTEL_MEMORY_PROTECTION_KEYS
+ 	prompt "Intel Memory Protection Keys"
+ 	def_bool y
+ 	# Note: only available in 64-bit mode
+-	depends on CPU_SUP_INTEL && X86_64
++	depends on CPU_SUP_INTEL && X86_64 && !XEN
+ 	---help---
+ 	  Memory Protection Keys provides a mechanism for enforcing
+ 	  page-based protections, but without requiring modification of the
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@ -336,7 +336,9 @@ __visible void do_syscall_64(struct pt_r
+ 	unsigned long nr = regs->orig_ax;
+ 
+ 	enter_from_user_mode();
++#ifndef CONFIG_XEN
+ 	local_irq_enable();
++#endif
+ 
+ 	if (READ_ONCE(ti->flags) & _TIF_WORK_SYSCALL_ENTRY)
+ 		nr = syscall_trace_enter(regs);
+@@ -402,7 +404,9 @@ static __always_inline void do_syscall_3
+ __visible void do_int80_syscall_32(struct pt_regs *regs)
+ {
+ 	enter_from_user_mode();
++#ifndef CONFIG_XEN
+ 	local_irq_enable();
++#endif
+ 	do_syscall_32_irqs_on(regs);
+ }
+ 
+--- a/arch/x86/entry/entry_32-xen.S
++++ b/arch/x86/entry/entry_32-xen.S
+@@ -40,7 +40,7 @@
+ #include <asm/processor-flags.h>
+ #include <asm/ftrace.h>
+ #include <asm/irq_vectors.h>
+-#include <asm/cpufeature.h>
++#include <asm/cpufeatures.h>
+ #include <asm/alternative-asm.h>
+ #include <asm/asm.h>
+ #include <asm/smap.h>
+@@ -291,14 +291,54 @@ need_resched:
+ END(resume_kernel)
+ #endif
+ 
+-	# SYSENTER  call handler stub
++GLOBAL(__begin_SYSENTER_singlestep_region)
++/*
++ * All code from here through __end_SYSENTER_singlestep_region is subject
++ * to being single-stepped if a user program sets TF and executes SYSENTER.
++ * There is absolutely nothing that we can do to prevent this from happening
++ * (thanks Intel!).  To keep our handling of this situation as simple as
++ * possible, we handle TF just like AC and NT, except that our #DB handler
++ * will ignore all of the single-step traps generated in this range.
++ */
++
++/*
++ * 32-bit SYSENTER entry.
++ *
++ * 32-bit system calls through the vDSO's __kernel_vsyscall enter here
++ * if X86_FEATURE_SEP is available.  This is the preferred system call
++ * entry on 32-bit systems.
++ *
++ * The SYSENTER instruction, in principle, should *only* occur in the
++ * vDSO.  In practice, a small number of Android devices were shipped
++ * with a copy of Bionic that inlined a SYSENTER instruction.  This
++ * never happened in any of Google's Bionic versions -- it only happened
++ * in a narrow range of Intel-provided versions.
++ *
++ * SYSENTER loads SS, ESP, CS, and EIP from previously programmed MSRs.
++ * IF and VM in RFLAGS are cleared (IOW: interrupts are off).
++ * SYSENTER does not save anything on the stack,
++ * and does not save old EIP (!!!), ESP, or EFLAGS.
++ *
++ * To avoid losing track of EFLAGS.VM (and thus potentially corrupting
++ * user and/or vm86 state), we explicitly disable the SYSENTER
++ * instruction in vm86 mode by reprogramming the MSRs.
++ *
++ * Arguments:
++ * eax  system call number
++ * ebx  arg1
++ * ecx  arg2
++ * edx  arg3
++ * esi  arg4
++ * edi  arg5
++ * ebp  user stack
++ * 0(%ebp) arg6
++ */
+ ENTRY(entry_SYSENTER_32)
+ 	movl	SYSENTER_stack_sp0(%esp), %esp
+ sysenter_past_esp:
+ 	pushl	$__USER_DS		/* pt_regs->ss */
+ 	pushl	%ebp			/* pt_regs->sp (stashed in bp) */
+ 	pushfl				/* pt_regs->flags (except IF = 0) */
+-	ASM_CLAC			/* Clear AC after saving FLAGS */
+ 	orl	$X86_EFLAGS_IF, (%esp)	/* Fix IF */
+ 	pushl	$__USER_CS		/* pt_regs->cs */
+ 	pushl	$0			/* pt_regs->ip = 0 (placeholder) */
+@@ -306,6 +346,29 @@ sysenter_past_esp:
+ 	SAVE_ALL pt_regs_ax=$-ENOSYS	/* save rest */
+ 
+ 	/*
++	 * SYSENTER doesn't filter flags, so we need to clear NT, AC
++	 * and TF ourselves.  To save a few cycles, we can check whether
++	 * either was set instead of doing an unconditional popfq.
++	 * This needs to happen before enabling interrupts so that
++	 * we don't get preempted with NT set.
++	 *
++	 * If TF is set, we will single-step all the way to here -- do_debug
++	 * will ignore all the traps.  (Yes, this is slow, but so is
++	 * single-stepping in general.  This allows us to avoid having
++	 * a more complicated code to handle the case where a user program
++	 * forces us to single-step through the SYSENTER entry code.)
++	 *
++	 * NB.: .Lsysenter_fix_flags is a label with the code under it moved
++	 * out-of-line as an optimization: NT is unlikely to be set in the
++	 * majority of the cases and instead of polluting the I$ unnecessarily,
++	 * we're keeping that code behind a branch which will predict as
++	 * not-taken and therefore its instructions won't be fetched.
++	 */
++	testl	$X86_EFLAGS_NT|X86_EFLAGS_AC|X86_EFLAGS_TF, PT_EFLAGS(%esp)
++	jnz	.Lsysenter_fix_flags
++.Lsysenter_flags_fixed:
++
++	/*
+ 	 * User mode is traced as though IRQs are on, and SYSENTER
+ 	 * turned them off.
+ 	 */
+@@ -331,6 +394,15 @@ sysenter_past_esp:
+ 	popl	%eax			/* pt_regs->ax */
+ 
+ 	/*
++	 * Restore all flags except IF. (We restore IF separately because
++	 * STI gives a one-instruction window in which we won't be interrupted,
++	 * whereas POPF does not.)
++	 */
++	addl	$PT_EFLAGS-PT_DS, %esp	/* point esp at pt_regs->flags */
++	btr	$X86_EFLAGS_IF_BIT, (%esp)
++	popfl
++
++	/*
+ 	 * Return back to the vDSO, which will pop ecx and edx.
+ 	 * Don't bother with DS and ES (they already contain __USER_DS).
+ 	 */
+@@ -343,6 +415,12 @@ sysenter_past_esp:
+ .popsection
+ 	_ASM_EXTABLE(1b, 2b)
+ 	PTGS_TO_GS_EX
++
++.Lsysenter_fix_flags:
++	pushl	$X86_EFLAGS_FIXED
++	popfl
++	jmp	.Lsysenter_flags_fixed
++GLOBAL(__end_SYSENTER_singlestep_region)
+ ENDPROC(entry_SYSENTER_32)
+ 
+ 	# pv sysenter call handler stub
+@@ -360,26 +438,55 @@ ENTRY(entry_SYSENTER_PV32)
+ 	jmp	.Lsyscall_32_done
+ ENDPROC(entry_SYSENTER_PV32)
+ 
+-	# system call handler stub
++/*
++ * 32-bit legacy system call entry.
++ *
++ * 32-bit x86 Linux system calls traditionally used the INT $0x80
++ * instruction.  INT $0x80 lands here.
++ *
++ * This entry point can be used by any 32-bit perform system calls.
++ * Instances of INT $0x80 can be found inline in various programs and
++ * libraries.  It is also used by the vDSO's __kernel_vsyscall
++ * fallback for hardware that doesn't support a faster entry method.
++ * Restarted 32-bit system calls also fall back to INT $0x80
++ * regardless of what instruction was originally used to do the system
++ * call.  (64-bit programs can use INT $0x80 as well, but they can
++ * only run on 64-bit kernels and therefore land in
++ * entry_INT80_compat.)
++ *
++ * This is considered a slow path.  It is not used by most libc
++ * implementations on modern hardware except during process startup.
++ *
++ * Arguments:
++ * eax  system call number
++ * ebx  arg1
++ * ecx  arg2
++ * edx  arg3
++ * esi  arg4
++ * edi  arg5
++ * ebp  arg6
++ */
+ ENTRY(entry_INT80_32)
+ 	ASM_CLAC
+ 	pushl	%eax			/* pt_regs->orig_ax */
+ 	SAVE_ALL pt_regs_ax=$-ENOSYS	/* save rest */
+ 
+ 	/*
+-	 * User mode is traced as though IRQs are on.  Unlike the 64-bit
+-	 * case, INT80 is a trap gate on 32-bit kernels, so interrupts
+-	 * are already on (unless user code is messing around with iopl).
++	 * User mode is traced as though IRQs are on, and the interrupt gate
++	 * turned them off.
+ 	 */
++	TRACE_IRQS_OFF
+ 
+ 	movl	%esp, %eax
+-	call	do_syscall_32_irqs_on
++	call	do_int80_syscall_32
+ .Lsyscall_32_done:
+ 
+ restore_all:
+ 	TRACE_IRQS_IRET
+ restore_all_notrace:
+ #ifdef CONFIG_X86_ESPFIX32
++	ALTERNATIVE	"jmp restore_nocheck", "", X86_BUG_ESPFIX
++
+ 	movl	PT_EFLAGS(%esp), %eax		# mix EFLAGS, SS and CS
+ 	/*
+ 	 * Warning: PT_OLDSS(%esp) contains the wrong/random values if we
+@@ -416,19 +523,6 @@ ENTRY(iret_exc	)
+ 
+ #ifdef CONFIG_X86_ESPFIX32
+ ldt_ss:
+-#ifdef CONFIG_PARAVIRT
+-	/*
+-	 * The kernel can't run on a non-flat stack if paravirt mode
+-	 * is active.  Rather than try to fixup the high bits of
+-	 * ESP, bypass this code entirely.  This may break DOSemu
+-	 * and/or Wine support in a paravirt VM, although the option
+-	 * is still available to implement the setting of the high
+-	 * 16-bits in the INTERRUPT_RETURN paravirt-op.
+-	 */
+-	cmpl	$0, pv_info+PARAVIRT_enabled
+-	jne	restore_nocheck
+-#endif
+-
+ /*
+  * Setup and switch to ESPFIX stack
+  *
+@@ -1040,55 +1134,52 @@ error_code:
+ 	jmp	ret_from_exception
+ END(page_fault)
+ 
+-#ifndef CONFIG_XEN
+-/*
+- * Debug traps and NMI can happen at the one SYSENTER instruction
+- * that sets up the real kernel stack. Check here, since we can't
+- * allow the wrong stack to be used.
+- *
+- * "TSS_sysenter_sp0+12" is because the NMI/debug handler will have
+- * already pushed 3 words if it hits on the sysenter instruction:
+- * eflags, cs and eip.
+- *
+- * We just load the right stack, and push the three (known) values
+- * by hand onto the new stack - while updating the return eip past
+- * the instruction that would have done it for sysenter.
+- */
+-.macro FIX_STACK offset ok label
+-	cmpw	$__KERNEL_CS, 4(%esp)
+-	jne	\ok
+-\label:
+-	movl	TSS_sysenter_sp0 + \offset(%esp), %esp
+-	pushfl
+-	pushl	$__KERNEL_CS
+-	pushl	$sysenter_past_esp
+-.endm
+-#endif /* CONFIG_XEN */
+-
+ ENTRY(debug)
++	/*
++	 * #DB can happen at the first instruction of
++	 * entry_SYSENTER_32 or in Xen's SYSENTER prologue.  If this
++	 * happens, then we will be running on a very small stack.  We
++	 * need to detect this condition and switch to the thread
++	 * stack before calling any C code at all.
++	 *
++	 * If you edit this code, keep in mind that NMIs can happen in here.
++	 */
+ 	ASM_CLAC
+-#ifndef CONFIG_XEN
+-	cmpl	$entry_SYSENTER_32, (%esp)
+-	jne	debug_stack_correct
+-	FIX_STACK 12, debug_stack_correct, debug_esp_fix_insn
+-debug_stack_correct:
+-#endif /* !CONFIG_XEN */
+ 	pushl	$-1				# mark this as an int
+ 	SAVE_ALL
+-	TRACE_IRQS_OFF
+ 	xorl	%edx, %edx			# error code 0
+ 	movl	%esp, %eax			# pt_regs pointer
++
++#ifndef CONFIG_XEN
++	/* Are we currently on the SYSENTER stack? */
++	PER_CPU(cpu_tss + CPU_TSS_SYSENTER_stack + SIZEOF_SYSENTER_stack, %ecx)
++	subl	%eax, %ecx	/* ecx = (end of SYSENTER_stack) - esp */
++	cmpl	$SIZEOF_SYSENTER_stack, %ecx
++	jb	.Ldebug_from_sysenter_stack
++#endif
++
++	TRACE_IRQS_OFF
++	call	do_debug
++	jmp	ret_from_exception
++
++#ifndef CONFIG_XEN
++.Ldebug_from_sysenter_stack:
++	/* We're on the SYSENTER stack.  Switch off. */
++	movl	%esp, %ebp
++	movl	PER_CPU_VAR(cpu_current_top_of_stack), %esp
++	TRACE_IRQS_OFF
+ 	call	do_debug
++	movl	%ebp, %esp
+ 	jmp	ret_from_exception
++#endif
+ END(debug)
+ 
+ /*
+- * NMI is doubly nasty. It can happen _while_ we're handling
+- * a debug fault, and the debug fault hasn't yet been able to
+- * clear up the stack. So we first check whether we got  an
+- * NMI on the sysenter entry path, but after that we need to
+- * check whether we got an NMI on the debug path where the debug
+- * fault happened on the sysenter path.
++ * NMI is doubly nasty.  It can happen on the first instruction of
++ * entry_SYSENTER_32 (just like #DB), but it can also interrupt the beginning
++ * of the #DB handler even if that #DB in turn hit before entry_SYSENTER_32
++ * switched stacks.  We handle both conditions by simply checking whether we
++ * interrupted kernel code running on the SYSENTER stack.
+  */
+ ENTRY(nmi)
+ 	ASM_CLAC
+@@ -1100,41 +1191,32 @@ ENTRY(nmi)
+ 	je	nmi_espfix_stack
+ #endif
+ #ifndef CONFIG_XEN
+-	cmpl	$entry_SYSENTER_32, (%esp)
+-	je	nmi_stack_fixup
+-	pushl	%eax
+-	movl	%esp, %eax
+-	/*
+-	 * Do not access memory above the end of our stack page,
+-	 * it might not exist.
+-	 */
+-	andl	$(THREAD_SIZE-1), %eax
+-	cmpl	$(THREAD_SIZE-20), %eax
+-	popl	%eax
+-	jae	nmi_stack_correct
+-	cmpl	$entry_SYSENTER_32, 12(%esp)
+-	je	nmi_debug_stack_check
+-nmi_stack_correct:
+-	pushl	%eax
++
++	pushl	%eax				# pt_regs->orig_ax
+ 	SAVE_ALL
+ 	xorl	%edx, %edx			# zero error code
+ 	movl	%esp, %eax			# pt_regs pointer
++
++	/* Are we currently on the SYSENTER stack? */
++	PER_CPU(cpu_tss + CPU_TSS_SYSENTER_stack + SIZEOF_SYSENTER_stack, %ecx)
++	subl	%eax, %ecx	/* ecx = (end of SYSENTER_stack) - esp */
++	cmpl	$SIZEOF_SYSENTER_stack, %ecx
++	jb	.Lnmi_from_sysenter_stack
++
++	/* Not on SYSENTER stack. */
+ 	call	do_nmi
+ 	jmp	restore_all_notrace
+ 
+-nmi_stack_fixup:
+-	FIX_STACK 12, nmi_stack_correct, 1
+-	jmp	nmi_stack_correct
+-
+-nmi_debug_stack_check:
+-	cmpw	$__KERNEL_CS, 16(%esp)
+-	jne	nmi_stack_correct
+-	cmpl	$debug, (%esp)
+-	jb	nmi_stack_correct
+-	cmpl	$debug_esp_fix_insn, (%esp)
+-	ja	nmi_stack_correct
+-	FIX_STACK 24, nmi_stack_correct, 1
+-	jmp	nmi_stack_correct
++.Lnmi_from_sysenter_stack:
++	/*
++	 * We're on the SYSENTER stack.  Switch off.  No one (not even debug)
++	 * is using the thread stack right now, so it's safe for us to use it.
++	 */
++	movl	%esp, %ebp
++	movl	PER_CPU_VAR(cpu_current_top_of_stack), %esp
++	call	do_nmi
++	movl	%ebp, %esp
++	jmp	restore_all_notrace
+ 
+ #ifdef CONFIG_X86_ESPFIX32
+ nmi_espfix_stack:
+--- a/arch/x86/entry/entry_32.S
++++ b/arch/x86/entry/entry_32.S
+@@ -768,7 +768,7 @@ ENTRY(spurious_interrupt_bug)
+ 	jmp	error_code
+ END(spurious_interrupt_bug)
+ 
+-#ifdef CONFIG_XEN
++#ifdef CONFIG_PARAVIRT_XEN
+ ENTRY(xen_hypervisor_callback)
+ 	pushl	$-1				/* orig_ax = -1 => not a system call */
+ 	SAVE_ALL
+--- a/arch/x86/entry/entry_64-xen.S
++++ b/arch/x86/entry/entry_64-xen.S
+@@ -132,6 +132,16 @@ NMI_MASK = 0x80000000
+ /*
+  * 64-bit SYSCALL instruction entry. Up to 6 arguments in registers.
+  *
++ * This is the only entry point used for 64-bit system calls.  The
++ * hardware interface is reasonably well designed and the register to
++ * argument mapping Linux uses fits well with the registers that are
++ * available when SYSCALL is used.
++ *
++ * SYSCALL instructions can be found inlined in libc implementations as
++ * well as some other programs and libraries.  There are also a handful
++ * of SYSCALL instructions in the vDSO used, for example, as a
++ * clock_gettimeofday fallback.
++ *
+  * 64-bit SYSCALL saves rip to rcx, clears rflags.RF, then saves rflags to r11,
+  * then loads new ss, cs, and rip from previously programmed MSRs.
+  * rflags gets masked by a value from another MSR (so CLD and CLAC
+@@ -176,9 +186,19 @@ ENTRY(entry_SYSCALL_64)
+ 	pushq	%r11				/* pt_regs->r11 */
+ 	sub	$(6*8), %rsp			/* pt_regs->bp, bx, r12-15 not saved */
+ 
+-	testl	$_TIF_WORK_SYSCALL_ENTRY, ASM_THREAD_INFO(TI_flags, %rsp, SIZEOF_PTREGS)
+-	jnz	tracesys
++	/*
++	 * If we need to do entry work or if we guess we'll need to do
++	 * exit work, go straight to the slow path.
++	 */
++	testl	$_TIF_WORK_SYSCALL_ENTRY|_TIF_ALLWORK_MASK, ASM_THREAD_INFO(TI_flags, %rsp, SIZEOF_PTREGS)
++	jnz	entry_SYSCALL64_slow_path
++
+ entry_SYSCALL_64_fastpath:
++	/*
++	 * Easy case: issue the syscall.  If the syscall
++	 * needs pt_regs, we'll call a stub that disables interrupts again
++	 * and jumps to the slow path.
++	 */
+ #if __SYSCALL_MASK == ~0
+ 	cmpq	$__NR_syscall_max, %rax
+ #else
+@@ -187,168 +207,95 @@ entry_SYSCALL_64_fastpath:
+ #endif
+ 	ja	1f				/* return -ENOSYS (already in pt_regs->ax) */
+ 	movq	%r10, %rcx
++
++	/*
++	 * This call instruction is handled specially in stub_ptregs_64.
++	 * It might end up jumping to the slow path.  If it jumps, RAX
++	 * and all argument registers are clobbered.
++	 */
+ 	call	*sys_call_table(, %rax, 8)
++.Lentry_SYSCALL_64_after_fastpath_call:
++
+ 	movq	%rax, RAX(%rsp)
+ 1:
+-/*
+- * Syscall return path ending with SYSRET (fast path).
+- * Has incompletely filled pt_regs.
+- */
+-	LOCKDEP_SYS_EXIT
+-	/*
+-	 * We do not frame this tiny irq-off block with TRACE_IRQS_OFF/ON,
+-	 * it is too small to ever cause noticeable irq latency.
+-	 */
+-	DISABLE_INTERRUPTS(CLBR_ANY)
+ 
+ 	/*
+-	 * We must check ti flags with interrupts (or at least preemption)
+-	 * off because we must *never* return to userspace without
+-	 * processing exit work that is enqueued if we're preempted here.
+-	 * In particular, returning to userspace with any of the one-shot
+-	 * flags (TIF_NOTIFY_RESUME, TIF_USER_RETURN_NOTIFY, etc) set is
+-	 * very bad.
++	 * If we get here, then we know that pt_regs is clean for SYSRET64.
++	 * If we see that no exit work is required (which we are required
++	 * to check with IRQs off), then we can go straight to SYSRET64.
+ 	 */
++	DISABLE_INTERRUPTS(CLBR_ANY)
++	TRACE_IRQS_OFF
+ 	testl	$_TIF_ALLWORK_MASK, ASM_THREAD_INFO(TI_flags, %rsp, SIZEOF_PTREGS)
+-	jnz	int_ret_from_sys_call_irqs_off	/* Go to the slow path */
++	jnz	1f
+ 
++	LOCKDEP_SYS_EXIT
++	TRACE_IRQS_ON		/* user mode is traced as IRQs on */
+ 	RESTORE_C_REGS_EXCEPT_RCX_R11
+ 	REMOVE_PT_GPREGS_FROM_STACK 8
+ 	xor	%ecx, %ecx
+ 	xor	%r11, %r11
+ 	HYPERVISOR_IRET VGCF_IN_SYSCALL
+ 
+-GLOBAL(int_ret_from_sys_call_irqs_off)
++1:
++	/*
++	 * The fast path looked good when we started, but something changed
++	 * along the way and we need to switch to the slow path.  Calling
++	 * raise(3) will trigger this, for example.  IRQs are off.
++	 */
+ 	TRACE_IRQS_ON
+ 	ENABLE_INTERRUPTS(CLBR_ANY)
+-	jmp int_ret_from_sys_call
+-
+-	/* Do syscall entry tracing */
+-tracesys:
+-	movq	%rsp, %rdi
+-	movl	$AUDIT_ARCH_X86_64, %esi
+-	call	syscall_trace_enter_phase1
+-	test	%rax, %rax
+-	jnz	tracesys_phase2			/* if needed, run the slow path */
+-	RESTORE_C_REGS_EXCEPT_RAX		/* else restore clobbered regs */
+-	movq	ORIG_RAX(%rsp), %rax
+-	jmp	entry_SYSCALL_64_fastpath	/* and return to the fast path */
+-
+-tracesys_phase2:
+ 	SAVE_EXTRA_REGS
+ 	movq	%rsp, %rdi
+-	movl	$AUDIT_ARCH_X86_64, %esi
+-	movq	%rax, %rdx
+-	call	syscall_trace_enter_phase2
+-
+-	/*
+-	 * Reload registers from stack in case ptrace changed them.
+-	 * We don't reload %rax because syscall_trace_entry_phase2() returned
+-	 * the value it wants us to use in the table lookup.
+-	 */
+-	RESTORE_C_REGS_EXCEPT_RAX
+-	RESTORE_EXTRA_REGS
+-#if __SYSCALL_MASK == ~0
+-	cmpq	$__NR_syscall_max, %rax
+-#else
+-	andl	$__SYSCALL_MASK, %eax
+-	cmpl	$__NR_syscall_max, %eax
+-#endif
+-	ja	1f				/* return -ENOSYS (already in pt_regs->ax) */
+-	movq	%r10, %rcx			/* fixup for C */
+-	call	*sys_call_table(, %rax, 8)
+-	movq	%rax, RAX(%rsp)
+-1:
+-	/* Use IRET because user could have changed pt_regs->foo */
++	call	syscall_return_slowpath	/* returns with IRQs disabled */
++	jmp	return_from_SYSCALL_64
+ 
+-/*
+- * Syscall return path ending with IRET.
+- * Has correct iret frame.
+- */
+-GLOBAL(int_ret_from_sys_call)
++entry_SYSCALL64_slow_path:
++	/* IRQs are on. */
+ 	SAVE_EXTRA_REGS
+ 	movq	%rsp, %rdi
+-	call	syscall_return_slowpath	/* returns with IRQs disabled */
++	call	do_syscall_64		/* returns with IRQs disabled */
++
++return_from_SYSCALL_64:
+ 	jmp	restore_regs_and_iret
+ END(entry_SYSCALL_64)
+ 
++ENTRY(stub_ptregs_64)
++	/*
++	 * Syscalls marked as needing ptregs land here.
++	 * If we are on the fast path, we need to save the extra regs,
++	 * which we achieve by trying again on the slow path.  If we are on
++	 * the slow path, the extra regs are already saved.
++	 *
++	 * RAX stores a pointer to the C function implementing the syscall.
++	 * IRQs are on.
++	 */
++	cmpq	$.Lentry_SYSCALL_64_after_fastpath_call, (%rsp)
++	jne	1f
+ 
+-	.macro FORK_LIKE func
+-ENTRY(stub_\func)
+-	SAVE_EXTRA_REGS 8
+-	jmp	sys_\func
+-END(stub_\func)
+-	.endm
+-
+-	FORK_LIKE  clone
+-	FORK_LIKE  fork
+-	FORK_LIKE  vfork
+-
+-ENTRY(stub_execve)
+-	call	sys_execve
+-return_from_execve:
+-	testl	%eax, %eax
+-	jz	1f
+-	/* exec failed, can use fast SYSRET code path in this case */
+-	ret
+-1:
+-	/* must use IRET code path (pt_regs->cs may have changed) */
+-	addq	$8, %rsp
+-	ZERO_EXTRA_REGS
+-	movq	%rax, RAX(%rsp)
+-	jmp	int_ret_from_sys_call
+-END(stub_execve)
+-/*
+- * Remaining execve stubs are only 7 bytes long.
+- * ENTRY() often aligns to 16 bytes, which in this case has no benefits.
+- */
+-	.align	8
+-GLOBAL(stub_execveat)
+-	call	sys_execveat
+-	jmp	return_from_execve
+-END(stub_execveat)
+-
+-#if defined(CONFIG_X86_X32_ABI)
+-	.align	8
+-GLOBAL(stub_x32_execve)
+-	call	compat_sys_execve
+-	jmp	return_from_execve
+-END(stub_x32_execve)
+-	.align	8
+-GLOBAL(stub_x32_execveat)
+-	call	compat_sys_execveat
+-	jmp	return_from_execve
+-END(stub_x32_execveat)
+-#endif
+-
+-/*
+- * sigreturn is special because it needs to restore all registers on return.
+- * This cannot be done with SYSRET, so use the IRET return path instead.
+- */
+-ENTRY(stub_rt_sigreturn)
+ 	/*
+-	 * SAVE_EXTRA_REGS result is not normally needed:
+-	 * sigreturn overwrites all pt_regs->GPREGS.
+-	 * But sigreturn can fail (!), and there is no easy way to detect that.
+-	 * To make sure RESTORE_EXTRA_REGS doesn't restore garbage on error,
+-	 * we SAVE_EXTRA_REGS here.
++	 * Called from fast path -- pop return address and jump to slow path
+ 	 */
+-	SAVE_EXTRA_REGS 8
+-	call	sys_rt_sigreturn
+-return_from_stub:
+-	addq	$8, %rsp
+-	RESTORE_EXTRA_REGS
+-	movq	%rax, RAX(%rsp)
+-	jmp	int_ret_from_sys_call
+-END(stub_rt_sigreturn)
++	popq	%rax
++	jmp	entry_SYSCALL64_slow_path
+ 
+-#ifdef CONFIG_X86_X32_ABI
+-ENTRY(stub_x32_rt_sigreturn)
+-	SAVE_EXTRA_REGS 8
+-	call	sys32_x32_rt_sigreturn
+-	jmp	return_from_stub
+-END(stub_x32_rt_sigreturn)
+-#endif
++1:
++	/* Called from C */
++	jmp	*%rax				/* called from C */
++END(stub_ptregs_64)
++
++.macro ptregs_stub func
++ENTRY(ptregs_\func)
++	leaq	\func(%rip), %rax
++	jmp	stub_ptregs_64
++END(ptregs_\func)
++.endm
++
++/* Instantiate ptregs_stub for each ptregs-using syscall */
++#define __SYSCALL_64_QUAL_(sym)
++#define __SYSCALL_64_QUAL_ptregs(sym) ptregs_stub sym
++#define __SYSCALL_64(nr, sym, qual) __SYSCALL_64_QUAL_##qual(sym)
++#include <asm/syscalls_64.h>
+ 
+ /*
+  * A newly forked process directly context switches into this address.
+@@ -356,7 +303,6 @@ END(stub_x32_rt_sigreturn)
+  * rdi: prev task we switched from
+  */
+ ENTRY(ret_from_fork)
+-
+ 	LOCK ; btr $TIF_FORK, TI_flags(%r8)
+ 
+ 	pushq	$0x0002
+@@ -364,30 +310,32 @@ ENTRY(ret_from_fork)
+ 
+ 	call	schedule_tail			/* rdi: 'prev' task parameter */
+ 
+-	RESTORE_EXTRA_REGS
+-
+ 	testb	$3, CS(%rsp)			/* from kernel_thread? */
++	jnz	1f
+ 
+ 	/*
+-	 * By the time we get here, we have no idea whether our pt_regs,
+-	 * ti flags, and ti status came from the 64-bit SYSCALL fast path,
+-	 * the slow path, or one of the 32-bit compat paths.
+-	 * Use IRET code path to return, since it can safely handle
+-	 * all of the above.
++	 * We came from kernel_thread.  This code path is quite twisted, and
++	 * someone should clean it up.
++	 *
++	 * copy_thread_tls stashes the function pointer in RBX and the
++	 * parameter to be passed in RBP.  The called function is permitted
++	 * to call do_execve and thereby jump to user mode.
+ 	 */
+-	jnz	int_ret_from_sys_call
++	movq	RBP(%rsp), %rdi
++	call	*RBX(%rsp)
++	movl	$0, RAX(%rsp)
+ 
+ 	/*
+-	 * We came from kernel_thread
++	 * Fall through as though we're exiting a syscall.  This makes a
++	 * twisted sort of sense if we just called do_execve.
+ 	 * Need to set the proper %ss (not NULL) for ring 3 iretq
+ 	 */
+ 	movl	$__KERNEL_DS, SS(%rsp)
+-	/* nb: we depend on RESTORE_EXTRA_REGS above */
+-	movq	%rbp, %rdi
+-	call	*%rbx
+-	movl	$0, RAX(%rsp)
+-	RESTORE_EXTRA_REGS
+-	jmp	int_ret_from_sys_call
++
++1:
++	movq	%rsp, %rdi
++	call	syscall_return_slowpath	/* returns with IRQs disabled */
++	jmp	restore_regs_and_iret
+ END(ret_from_fork)
+ 
+ /*
+--- a/arch/x86/entry/entry_64_compat-xen.S
++++ b/arch/x86/entry/entry_64_compat-xen.S
+@@ -19,12 +19,21 @@
+ 	.section .entry.text, "ax"
+ 
+ /*
+- * 32-bit SYSENTER instruction entry.
++ * 32-bit SYSENTER entry.
+  *
+- * SYSENTER loads ss, rsp, cs, and rip from previously programmed MSRs.
+- * IF and VM in rflags are cleared (IOW: interrupts are off).
++ * 32-bit system calls through the vDSO's __kernel_vsyscall enter here
++ * on 64-bit kernels running on Intel CPUs.
++ *
++ * The SYSENTER instruction, in principle, should *only* occur in the
++ * vDSO.  In practice, a small number of Android devices were shipped
++ * with a copy of Bionic that inlined a SYSENTER instruction.  This
++ * never happened in any of Google's Bionic versions -- it only happened
++ * in a narrow range of Intel-provided versions.
++ *
++ * SYSENTER loads SS, RSP, CS, and RIP from previously programmed MSRs.
++ * IF and VM in RFLAGS are cleared (IOW: interrupts are off).
+  * SYSENTER does not save anything on the stack,
+- * and does not save old rip (!!!) and rflags.
++ * and does not save old RIP (!!!), RSP, or RFLAGS.
+  *
+  * Arguments:
+  * eax  system call number
+@@ -35,10 +44,6 @@
+  * edi  arg5
+  * ebp  user stack
+  * 0(%ebp) arg6
+- *
+- * This is purely a fast path. For anything complicated we use the int 0x80
+- * path below. We set up a complete hardware stack frame to share code
+- * with the int 0x80 path.
+  */
+ ENTRY(entry_SYSENTER_compat)
+ 	/* Interrupts are on upon entry. */
+@@ -50,17 +55,38 @@ ENTRY(entry_SYSENTER_compat)
+ ENDPROC(entry_SYSENTER_compat)
+ 
+ /*
+- * 32-bit SYSCALL instruction entry.
++ * 32-bit SYSCALL entry.
+  *
+- * 32-bit SYSCALL saves rip to rcx, clears rflags.RF, then saves rflags to r11,
+- * then loads new ss, cs, and rip from previously programmed MSRs.
+- * rflags gets masked by a value from another MSR (so CLD and CLAC
+- * are not needed). SYSCALL does not save anything on the stack
+- * and does not change rsp.
++ * 32-bit system calls through the vDSO's __kernel_vsyscall enter here
++ * on 64-bit kernels running on AMD CPUs.
+  *
+- * Note: rflags saving+masking-with-MSR happens only in Long mode
++ * The SYSCALL instruction, in principle, should *only* occur in the
++ * vDSO.  In practice, it appears that this really is the case.
++ * As evidence:
++ *
++ *  - The calling convention for SYSCALL has changed several times without
++ *    anyone noticing.
++ *
++ *  - Prior to the in-kernel X86_BUG_SYSRET_SS_ATTRS fixup, anything
++ *    user task that did SYSCALL without immediately reloading SS
++ *    would randomly crash.
++ *
++ *  - Most programmers do not directly target AMD CPUs, and the 32-bit
++ *    SYSCALL instruction does not exist on Intel CPUs.  Even on AMD
++ *    CPUs, Linux disables the SYSCALL instruction on 32-bit kernels
++ *    because the SYSCALL instruction in legacy/native 32-bit mode (as
++ *    opposed to compat mode) is sufficiently poorly designed as to be
++ *    essentially unusable.
++ *
++ * 32-bit SYSCALL saves RIP to RCX, clears RFLAGS.RF, then saves
++ * RFLAGS to R11, then loads new SS, CS, and RIP from previously
++ * programmed MSRs.  RFLAGS gets masked by a value from another MSR
++ * (so CLD and CLAC are not needed).  SYSCALL does not save anything on
++ * the stack and does not change RSP.
++ *
++ * Note: RFLAGS saving+masking-with-MSR happens only in Long mode
+  * (in legacy 32-bit mode, IF, RF and VM bits are cleared and that's it).
+- * Don't get confused: rflags saving+masking depends on Long Mode Active bit
++ * Don't get confused: RFLAGS saving+masking depends on Long Mode Active bit
+  * (EFER.LMA=1), NOT on bitness of userspace where SYSCALL executes
+  * or target CS descriptor's L bit (SYSCALL does not read segment descriptors).
+  *
+@@ -108,7 +134,21 @@ ENTRY(entry_SYSCALL_compat)
+ END(entry_SYSCALL_compat)
+ 
+ /*
+- * Emulated IA32 system calls via int 0x80.
++ * 32-bit legacy system call entry.
++ *
++ * 32-bit x86 Linux system calls traditionally used the INT $0x80
++ * instruction.  INT $0x80 lands here.
++ *
++ * This entry point can be used by 32-bit and 64-bit programs to perform
++ * 32-bit system calls.  Instances of INT $0x80 can be found inline in
++ * various programs and libraries.  It is also used by the vDSO's
++ * __kernel_vsyscall fallback for hardware that doesn't support a faster
++ * entry method.  Restarted 32-bit system calls also fall back to INT
++ * $0x80 regardless of what instruction was originally used to do the
++ * system call.
++ *
++ * This is considered a slow path.  It is not used by most libc
++ * implementations on modern hardware except during process startup.
+  *
+  * Arguments:
+  * eax  system call number
+@@ -117,18 +157,10 @@ END(entry_SYSCALL_compat)
+  * edx  arg3
+  * esi  arg4
+  * edi  arg5
+- * ebp  arg6	(note: not saved in the stack frame, should not be touched)
+- *
+- * Notes:
+- * Uses the same stack frame as the x86-64 version.
+- * All registers except eax must be saved (but ptrace may violate that).
+- * Arguments are zero extended. For system calls that want sign extension and
+- * take long arguments a wrapper is needed. Most calls can just be called
+- * directly.
+- * Assumes it is only called from user space and entered with interrupts on.
++ * ebp  arg6
+  */
+-
+ ENTRY(entry_INT80_compat)
++	/* Interrupts are on upon entry. */
+ 	movq	8(%rsp),%r11
+ 	popq	%rcx
+ 
+@@ -162,7 +194,7 @@ ENTRY(entry_INT80_compat)
+ 	cld
+ 
+ 	movq	%rsp, %rdi
+-	call	do_syscall_32_irqs_on
++	call	do_int80_syscall_32
+ .Lsyscall_32_done:
+ 
+ 	/* Go back to user mode. */
+--- a/arch/x86/entry/vdso/vdso32-setup-xen.c
++++ b/arch/x86/entry/vdso/vdso32-setup-xen.c
+@@ -11,7 +11,6 @@
+ #include <linux/kernel.h>
+ #include <linux/mm_types.h>
+ 
+-#include <asm/cpufeature.h>
+ #include <asm/processor.h>
+ #include <asm/vdso.h>
+ 
+--- a/arch/x86/events/Makefile
++++ b/arch/x86/events/Makefile
+@@ -12,3 +12,5 @@ obj-$(CONFIG_CPU_SUP_INTEL)		+= intel/lb
+ obj-$(CONFIG_CPU_SUP_INTEL)		+= intel/rapl.o msr.o
+ obj-$(CONFIG_PERF_EVENTS_INTEL_UNCORE)	+= intel/uncore.o intel/uncore_nhmex.o
+ obj-$(CONFIG_PERF_EVENTS_INTEL_UNCORE)	+= intel/uncore_snb.o intel/uncore_snbep.o
++
++obj-$(CONFIG_XEN)	:=
+--- a/arch/x86/include/asm/hypervisor.h
++++ b/arch/x86/include/asm/hypervisor.h
+@@ -20,6 +20,8 @@
+ #ifndef _ASM_X86_HYPERVISOR_H
+ #define _ASM_X86_HYPERVISOR_H
+ 
++struct cpuinfo_x86;
++
+ #ifdef CONFIG_HYPERVISOR_GUEST
+ 
+ #include <asm/kvm_para.h>
+--- a/arch/x86/include/mach-xen/asm/desc.h
++++ b/arch/x86/include/mach-xen/asm/desc.h
+@@ -104,17 +104,23 @@ static inline int desc_empty(const void
+ #define write_ldt_entry(dt, entry, desc)	native_write_ldt_entry(dt, entry, desc)
+ #define write_gdt_entry(dt, entry, desc, type)	native_write_gdt_entry(dt, entry, desc, type)
+ #define write_idt_entry(dt, entry, g)		native_write_idt_entry(dt, entry, g)
++#endif
+ 
+ static inline void paravirt_alloc_ldt(struct desc_struct *ldt, unsigned entries)
+ {
++	make_pages_readonly(ldt, PFN_UP(entries * LDT_ENTRY_SIZE),
++			    XENFEAT_writable_descriptor_tables);
+ }
+ 
+ static inline void paravirt_free_ldt(struct desc_struct *ldt, unsigned entries)
+ {
++	make_pages_writable(ldt, PFN_UP(entries * LDT_ENTRY_SIZE),
++			    XENFEAT_writable_descriptor_tables);
+ }
+ 
+ #define store_ldt(ldt) asm("sldt %0" : "=m"(ldt))
+ 
++#ifndef CONFIG_XEN
+ static inline void native_write_idt_entry(gate_desc *idt, int entry, const gate_desc *gate)
+ {
+ 	memcpy(&idt[entry], gate, sizeof(*gate));
+--- a/arch/x86/include/mach-xen/asm/fixmap.h
++++ b/arch/x86/include/mach-xen/asm/fixmap.h
+@@ -147,7 +147,7 @@ extern void reserve_top_address(unsigned
+ extern int fixmaps_set;
+ 
+ extern pte_t *kmap_pte;
+-extern pgprot_t kmap_prot;
++#define kmap_prot PAGE_KERNEL
+ extern pte_t *pkmap_page_table;
+ 
+ void xen_set_fixmap(enum fixed_addresses, phys_addr_t, pgprot_t);
+--- a/arch/x86/include/mach-xen/asm/fpu/internal.h
++++ b/arch/x86/include/mach-xen/asm/fpu/internal.h
+@@ -37,7 +37,8 @@ static inline fpu_switch_t xen_switch_fp
+ 	 * If the task has used the math, pre-load the FPU on xsave processors
+ 	 * or if the past 5 consecutive context-switches used math.
+ 	 */
+-	fpu.preload = new_fpu->fpstate_active &&
++	fpu.preload = static_cpu_has(X86_FEATURE_FPU) &&
++		      new_fpu->fpstate_active &&
+ 		      (use_eager_fpu() || new_fpu->counter > 5);
+ 
+ 	if (old_fpu->fpregs_active) {
+--- a/arch/x86/include/mach-xen/asm/mmu_context.h
++++ b/arch/x86/include/mach-xen/asm/mmu_context.h
+@@ -59,15 +59,15 @@ struct ldt_struct {
+ /*
+  * Used for LDT copy/destruction.
+  */
+-int init_new_context(struct task_struct *tsk, struct mm_struct *mm);
+-void destroy_context(struct mm_struct *mm);
++int init_new_context_ldt(struct task_struct *tsk, struct mm_struct *mm);
++void destroy_context_ldt(struct mm_struct *mm);
+ #else	/* CONFIG_MODIFY_LDT_SYSCALL */
+-static inline int init_new_context(struct task_struct *tsk,
+-				   struct mm_struct *mm)
++static inline int init_new_context_ldt(struct task_struct *tsk,
++				       struct mm_struct *mm)
+ {
+ 	return 0;
+ }
+-static inline void destroy_context(struct mm_struct *mm) {}
++static inline void destroy_context_ldt(struct mm_struct *mm) {}
+ #endif
+ 
+ static inline void load_mm_ldt(struct mm_struct *mm)
+@@ -153,6 +153,18 @@ static inline void __prepare_arch_switch
+ #endif
+ }
+ 
++static inline int init_new_context(struct task_struct *tsk,
++				   struct mm_struct *mm)
++{
++	mm->context.has_foreign_mappings = false;
++	init_new_context_ldt(tsk, mm);
++	return 0;
++}
++static inline void destroy_context(struct mm_struct *mm)
++{
++	destroy_context_ldt(mm);
++}
++
+ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 			     struct task_struct *tsk)
+ {
+@@ -356,4 +368,68 @@ static inline void arch_unmap(struct mm_
+ 		mpx_notify_unmap(mm, vma, start, end);
+ }
+ 
++static inline int vma_pkey(struct vm_area_struct *vma)
++{
++	u16 pkey = 0;
++#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++	unsigned long vma_pkey_mask = VM_PKEY_BIT0 | VM_PKEY_BIT1 |
++				      VM_PKEY_BIT2 | VM_PKEY_BIT3;
++	pkey = (vma->vm_flags & vma_pkey_mask) >> VM_PKEY_SHIFT;
++#endif
++	return pkey;
++}
++
++static inline bool __pkru_allows_pkey(u16 pkey, bool write)
++{
++	u32 pkru = read_pkru();
++
++	if (!__pkru_allows_read(pkru, pkey))
++		return false;
++	if (write && !__pkru_allows_write(pkru, pkey))
++		return false;
++
++	return true;
++}
++
++/*
++ * We only want to enforce protection keys on the current process
++ * because we effectively have no access to PKRU for other
++ * processes or any way to tell *which * PKRU in a threaded
++ * process we could use.
++ *
++ * So do not enforce things if the VMA is not from the current
++ * mm, or if we are in a kernel thread.
++ */
++static inline bool vma_is_foreign(struct vm_area_struct *vma)
++{
++	if (!current->mm)
++		return true;
++	/*
++	 * Should PKRU be enforced on the access to this VMA?  If
++	 * the VMA is from another process, then PKRU has no
++	 * relevance and should not be enforced.
++	 */
++	if (current->mm != vma->vm_mm)
++		return true;
++
++	return false;
++}
++
++static inline bool arch_vma_access_permitted(struct vm_area_struct *vma,
++		bool write, bool execute, bool foreign)
++{
++	/* pkeys never affect instruction fetches */
++	if (execute)
++		return true;
++	/* allow access if the VMA is not one from this process */
++	if (foreign || vma_is_foreign(vma))
++		return true;
++	return __pkru_allows_pkey(vma_pkey(vma), write);
++}
++
++static inline bool arch_pte_access_permitted(pte_t pte, bool write)
++{
++	return __pkru_allows_pkey(pte_flags_pkey(pte_flags(pte)), write);
++}
++
+ #endif /* _ASM_X86_MMU_CONTEXT_H */
+--- a/arch/x86/include/mach-xen/asm/pci.h
++++ b/arch/x86/include/mach-xen/asm/pci.h
+@@ -20,6 +20,9 @@ struct pci_sysdata {
+ #if defined(CONFIG_X86_64) && !defined(CONFIG_XEN)
+ 	void		*iommu;		/* IOMMU private data */
+ #endif
++#ifdef CONFIG_PCI_MSI_IRQ_DOMAIN
++	void		*fwnode;	/* IRQ domain for MSI assignment */
++#endif
+ #ifdef CONFIG_XEN_PCIDEV_FRONTEND
+ 	struct pcifront_device *pdev;
+ #endif
+@@ -35,6 +38,7 @@ extern int noioapicreroute;
+ static inline int pci_domain_nr(struct pci_bus *bus)
+ {
+ 	struct pci_sysdata *sd = bus->sysdata;
++
+ 	return sd->domain;
+ }
+ 
+@@ -44,6 +48,17 @@ static inline int pci_proc_domain(struct
+ }
+ #endif
+ 
++#ifdef CONFIG_PCI_MSI_IRQ_DOMAIN
++static inline void *_pci_root_bus_fwnode(struct pci_bus *bus)
++{
++	struct pci_sysdata *sd = bus->sysdata;
++
++	return sd->fwnode;
++}
++
++#define pci_root_bus_fwnode	_pci_root_bus_fwnode
++#endif
++
+ /* Can be used to override the logic in pci_scan_bus for skipping
+    already-configured bus numbers - to be used for buggy BIOSes
+    or architectures with incomplete PCI setup by the loader */
+@@ -111,9 +126,6 @@ void native_restore_msi_irqs(struct pci_
+ #include <asm/pci_64.h>
+ #endif
+ 
+-/* implement the pci_ DMA API in terms of the generic device dma_ one */
+-#include <asm-generic/pci-dma-compat.h>
+-
+ /* generic pci stuff */
+ #include <asm-generic/pci.h>
+ 
+--- a/arch/x86/include/mach-xen/asm/pgtable.h
++++ b/arch/x86/include/mach-xen/asm/pgtable.h
+@@ -91,6 +91,20 @@ static inline int pte_dirty(pte_t pte)
+ 	return pte_flags(pte) & _PAGE_DIRTY;
+ }
+ 
++
++static inline u32 read_pkru(void)
++{
++	if (boot_cpu_has(X86_FEATURE_OSPKE))
++		return __read_pkru();
++	return 0;
++}
++
++static inline void write_pkru(u32 pkru)
++{
++	if (boot_cpu_has(X86_FEATURE_OSPKE))
++		__write_pkru(pkru);
++}
++
+ static inline int pte_young(pte_t pte)
+ {
+ 	return pte_flags(pte) & _PAGE_ACCESSED;
+@@ -1011,6 +1025,36 @@ static inline pte_t pte_swp_clear_soft_d
+ }
+ #endif
+ 
++#define PKRU_AD_BIT 0x1
++#define PKRU_WD_BIT 0x2
++#define PKRU_BITS_PER_PKEY 2
++
++static inline bool __pkru_allows_read(u32 pkru, u16 pkey)
++{
++	int pkru_pkey_bits = pkey * PKRU_BITS_PER_PKEY;
++	return !(pkru & (PKRU_AD_BIT << pkru_pkey_bits));
++}
++
++static inline bool __pkru_allows_write(u32 pkru, u16 pkey)
++{
++	int pkru_pkey_bits = pkey * PKRU_BITS_PER_PKEY;
++	/*
++	 * Access-disable disables writes too so we need to check
++	 * both bits here.
++	 */
++	return !(pkru & ((PKRU_AD_BIT|PKRU_WD_BIT) << pkru_pkey_bits));
++}
++
++static inline u16 pte_flags_pkey(unsigned long pte_flags)
++{
++#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++	/* ifdef to avoid doing 59-bit shift on 32-bit values */
++	return (pte_flags & _PAGE_PKEY_MASK) >> _PAGE_BIT_PKEY_BIT0;
++#else
++	return 0;
++#endif
++}
++
+ #include <asm-generic/pgtable.h>
+ 
+ struct vm_area_struct;
+--- a/arch/x86/include/mach-xen/asm/pgtable_types.h
++++ b/arch/x86/include/mach-xen/asm/pgtable_types.h
+@@ -20,14 +20,19 @@
+ #define _PAGE_BIT_SOFTW2	10	/* " */
+ #define _PAGE_BIT_SOFTW3	11	/* " */
+ #define _PAGE_BIT_PAT_LARGE	12	/* On 2MB or 1GB pages */
++#define _PAGE_BIT_SOFTW4	58	/* available for programmer */
++#define _PAGE_BIT_PKEY_BIT0	59	/* Protection Keys, bit 1/4 */
++#define _PAGE_BIT_PKEY_BIT1	60	/* Protection Keys, bit 2/4 */
++#define _PAGE_BIT_PKEY_BIT2	61	/* Protection Keys, bit 3/4 */
++#define _PAGE_BIT_PKEY_BIT3	62	/* Protection Keys, bit 4/4 */
++#define _PAGE_BIT_NX		63	/* No execute: only valid after cpuid check */
++
+ #define _PAGE_BIT_SPECIAL	_PAGE_BIT_SOFTW1
+ #define _PAGE_BIT_CPA_TEST	_PAGE_BIT_SOFTW1
+ #define _PAGE_BIT_IOMAP		_PAGE_BIT_SOFTW2 /* flag used to indicate IO mapping */
+ #define _PAGE_BIT_HIDDEN	_PAGE_BIT_SOFTW3 /* hidden by kmemcheck */
+ #define _PAGE_BIT_SOFT_DIRTY	_PAGE_BIT_SOFTW3 /* software dirty tracking */
+-#define _PAGE_BIT_SOFTW4	58	/* available for programmer */
+-#define _PAGE_BIT_DEVMAP		_PAGE_BIT_SOFTW4
+-#define _PAGE_BIT_NX		63	/* No execute: only valid after cpuid check */
++#define _PAGE_BIT_DEVMAP	_PAGE_BIT_SOFTW4
+ 
+ /* If _PAGE_BIT_PRESENT is clear, we use these: */
+ /* - if the user mapped it with PROT_NONE; pte_present gives true */
+@@ -48,8 +53,24 @@
+ #define _PAGE_PAT_LARGE (_AT(pteval_t, 1) << _PAGE_BIT_PAT_LARGE)
+ #define _PAGE_SPECIAL	(_AT(pteval_t, 1) << _PAGE_BIT_SPECIAL)
+ #define _PAGE_CPA_TEST	(_AT(pteval_t, 1) << _PAGE_BIT_CPA_TEST)
++#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++#define _PAGE_PKEY_BIT0	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT0)
++#define _PAGE_PKEY_BIT1	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT1)
++#define _PAGE_PKEY_BIT2	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT2)
++#define _PAGE_PKEY_BIT3	(_AT(pteval_t, 1) << _PAGE_BIT_PKEY_BIT3)
++#else
++#define _PAGE_PKEY_BIT0	(_AT(pteval_t, 0))
++#define _PAGE_PKEY_BIT1	(_AT(pteval_t, 0))
++#define _PAGE_PKEY_BIT2	(_AT(pteval_t, 0))
++#define _PAGE_PKEY_BIT3	(_AT(pteval_t, 0))
++#endif
+ #define __HAVE_ARCH_PTE_SPECIAL
+ 
++#define _PAGE_PKEY_MASK (_PAGE_PKEY_BIT0 | \
++			 _PAGE_PKEY_BIT1 | \
++			 _PAGE_PKEY_BIT2 | \
++			 _PAGE_PKEY_BIT3)
++
+ #ifdef CONFIG_KMEMCHECK
+ #define _PAGE_HIDDEN	(_AT(pteval_t, 1) << _PAGE_BIT_HIDDEN)
+ #else
+@@ -108,7 +129,12 @@ extern unsigned int __kernel_page_user;
+ #define _KERNPG_TABLE	(_PAGE_PRESENT | _PAGE_RW | _PAGE_ACCESSED |	\
+ 			 _PAGE_DIRTY | __kernel_page_user)
+ 
+-/* Set of bits not changed in pte_modify */
++/*
++ * Set of bits not changed in pte_modify.  The pte's
++ * protection key is treated like _PAGE_RW, for
++ * instance, and is *not* included in this mask since
++ * pte_modify() does modify it.
++ */
+ #define _PAGE_CHG_MASK	(PTE_PFN_MASK | _PAGE_CACHE_MASK | _PAGE_IOMAP | \
+ 			 _PAGE_SPECIAL | _PAGE_ACCESSED | _PAGE_DIRTY |	\
+ 			 _PAGE_SOFT_DIRTY)
+@@ -224,7 +250,10 @@ enum page_cache_mode {
+ /* Extracts the PFN from a (pte|pmd|pud|pgd)val_t of a 4KB page */
+ #define PTE_PFN_MASK		((pteval_t)PHYSICAL_PAGE_MASK)
+ 
+-/* Extracts the flags from a (pte|pmd|pud|pgd)val_t of a 4KB page */
++/*
++ *  Extracts the flags from a (pte|pmd|pud|pgd)val_t
++ *  This includes the protection key value.
++ */
+ #define PTE_FLAGS_MASK		(~PTE_PFN_MASK)
+ 
+ typedef struct pgprot { pgprotval_t pgprot; } pgprot_t;
+--- a/arch/x86/include/mach-xen/asm/processor.h
++++ b/arch/x86/include/mach-xen/asm/processor.h
+@@ -13,7 +13,7 @@ struct vm86;
+ #include <asm/types.h>
+ #include <uapi/asm/sigcontext.h>
+ #include <asm/current.h>
+-#include <asm/cpufeature.h>
++#include <asm/cpufeatures.h>
+ #include <asm/page.h>
+ #include <asm/pgtable_types.h>
+ #include <asm/percpu.h>
+@@ -24,7 +24,6 @@ struct vm86;
+ #include <asm/fpu/types.h>
+ 
+ #include <linux/personality.h>
+-#include <linux/cpumask.h>
+ #include <linux/cache.h>
+ #include <linux/threads.h>
+ #include <linux/math64.h>
+@@ -138,10 +137,10 @@ struct cpuinfo_x86 {
+ 	u16			booted_cores;
+ 	/* Physical processor id: */
+ 	u16			phys_proc_id;
++	/* Logical processor id: */
++	u16			logical_proc_id;
+ 	/* Core id: */
+ 	u16			cpu_core_id;
+-	/* Compute unit id */
+-	u8			compute_unit_id;
+ #endif
+ 	/* Index into per_cpu list: */
+ 	u16			cpu_index;
+@@ -313,10 +312,13 @@ struct tss_struct {
+ 	 */
+ 	unsigned long		io_bitmap[IO_BITMAP_LONGS + 1];
+ 
++#ifdef CONFIG_X86_32
+ 	/*
+-	 * Space for the temporary SYSENTER stack:
++	 * Space for the temporary SYSENTER stack.
+ 	 */
++	unsigned long		SYSENTER_stack_canary;
+ 	unsigned long		SYSENTER_stack[64];
++#endif
+ 
+ } ____cacheline_aligned;
+ 
+--- a/arch/x86/include/mach-xen/asm/smp.h
++++ b/arch/x86/include/mach-xen/asm/smp.h
+@@ -16,7 +16,6 @@
+ #endif
+ #include <asm/thread_info.h>
+ #include <asm/cpumask.h>
+-#include <asm/cpufeature.h>
+ 
+ extern unsigned int num_processors;
+ 
+@@ -179,6 +178,7 @@ static inline int wbinvd_on_all_cpus(voi
+ 	wbinvd();
+ 	return 0;
+ }
++#define smp_num_siblings	1
+ #endif /* CONFIG_SMP */
+ 
+ #ifdef CONFIG_XEN
+--- a/arch/x86/include/mach-xen/asm/special_insns.h
++++ b/arch/x86/include/mach-xen/asm/special_insns.h
+@@ -148,6 +148,44 @@ static inline void xen_write_cr8(unsigne
+ }
+ #endif
+ 
++#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++static inline u32 __read_pkru(void)
++{
++	u32 ecx = 0;
++	u32 edx, pkru;
++
++	/*
++	 * "rdpkru" instruction.  Places PKRU contents in to EAX,
++	 * clears EDX and requires that ecx=0.
++	 */
++	asm volatile(".byte 0x0f,0x01,0xee\n\t"
++		     : "=a" (pkru), "=d" (edx)
++		     : "c" (ecx));
++	return pkru;
++}
++
++static inline void __write_pkru(u32 pkru)
++{
++	u32 ecx = 0, edx = 0;
++
++	/*
++	 * "wrpkru" instruction.  Loads contents in EAX to PKRU,
++	 * requires that ecx = edx = 0.
++	 */
++	asm volatile(".byte 0x0f,0x01,0xef\n\t"
++		     : : "a" (pkru), "c"(ecx), "d"(edx));
++}
++#else
++static inline u32 __read_pkru(void)
++{
++	return 0;
++}
++
++static inline void __write_pkru(u32 pkru)
++{
++}
++#endif
++
+ static inline void native_wbinvd(void)
+ {
+ 	asm volatile("wbinvd": : :"memory");
+--- a/arch/x86/include/mach-xen/asm/tlbflush.h
++++ b/arch/x86/include/mach-xen/asm/tlbflush.h
+@@ -195,6 +195,10 @@ extern void flush_tlb_kernel_range(unsig
+ 
+ #define flush_tlb()	flush_tlb_current_task()
+ 
++extern void flush_tlb_others(const struct cpumask *cpumask,
++			     struct mm_struct *mm,
++			     unsigned long start, unsigned long end);
++
+ #ifndef CONFIG_XEN
+ #define TLBSTATE_OK	1
+ #define TLBSTATE_LAZY	2
+@@ -208,7 +212,4 @@ static inline void reset_lazy_tlbstate(v
+ 
+ #endif	/* SMP */
+ 
+-/* Simple as there is no TLB accounting on Xen. */
+-#define flush_tlb_local local_flush_tlb
+-
+ #endif /* _ASM_X86_TLBFLUSH_H */
+--- a/arch/x86/kernel/apic/vector-xen.c
++++ b/arch/x86/kernel/apic/vector-xen.c
+@@ -220,6 +220,7 @@ update:
+ 	 */
+ 	cpumask_and(d->old_domain, d->old_domain, cpu_online_mask);
+ 	d->move_in_progress = !cpumask_empty(d->old_domain);
++	d->cfg.old_vector = d->move_in_progress ? d->cfg.vector : 0;
+ 	d->cfg.vector = vector;
+ 	cpumask_copy(d->domain, vector_cpumask);
+ success:
+@@ -262,7 +263,8 @@ static void clear_irq_vector(int irq, st
+ 	struct irq_desc *desc;
+ 	int cpu, vector;
+ 
+-	BUG_ON(!data->cfg.vector);
++	if (!data->cfg.vector)
++		return;
+ 
+ 	vector = data->cfg.vector;
+ 	for_each_cpu_and(cpu, data->domain, cpu_online_mask)
+@@ -664,46 +666,97 @@ void irq_complete_move(struct irq_cfg *c
+ }
+ 
+ /*
+- * Called with @desc->lock held and interrupts disabled.
++ * Called from fixup_irqs() with @desc->lock held and interrupts disabled.
+  */
+ void irq_force_complete_move(struct irq_desc *desc)
+ {
+ 	struct irq_data *irqdata = irq_desc_get_irq_data(desc);
+ 	struct apic_chip_data *data = apic_chip_data(irqdata);
+ 	struct irq_cfg *cfg = data ? &data->cfg : NULL;
++	unsigned int cpu;
+ 
+ 	if (!cfg)
+ 		return;
+ 
+-	__irq_complete_move(cfg, cfg->vector);
+-
+ 	/*
+ 	 * This is tricky. If the cleanup of @data->old_domain has not been
+ 	 * done yet, then the following setaffinity call will fail with
+ 	 * -EBUSY. This can leave the interrupt in a stale state.
+ 	 *
+-	 * The cleanup cannot make progress because we hold @desc->lock. So in
+-	 * case @data->old_domain is not yet cleaned up, we need to drop the
+-	 * lock and acquire it again. @desc cannot go away, because the
+-	 * hotplug code holds the sparse irq lock.
++	 * All CPUs are stuck in stop machine with interrupts disabled so
++	 * calling __irq_complete_move() would be completely pointless.
+ 	 */
+ 	raw_spin_lock(&vector_lock);
+-	/* Clean out all offline cpus (including ourself) first. */
++	/*
++	 * Clean out all offline cpus (including the outgoing one) from the
++	 * old_domain mask.
++	 */
+ 	cpumask_and(data->old_domain, data->old_domain, cpu_online_mask);
+-	while (!cpumask_empty(data->old_domain)) {
++
++	/*
++	 * If move_in_progress is cleared and the old_domain mask is empty,
++	 * then there is nothing to cleanup. fixup_irqs() will take care of
++	 * the stale vectors on the outgoing cpu.
++	 */
++	if (!data->move_in_progress && cpumask_empty(data->old_domain)) {
+ 		raw_spin_unlock(&vector_lock);
+-		raw_spin_unlock(&desc->lock);
+-		cpu_relax();
+-		raw_spin_lock(&desc->lock);
++		return;
++	}
++
++	/*
++	 * 1) The interrupt is in move_in_progress state. That means that we
++	 *    have not seen an interrupt since the io_apic was reprogrammed to
++	 *    the new vector.
++	 *
++	 * 2) The interrupt has fired on the new vector, but the cleanup IPIs
++	 *    have not been processed yet.
++	 */
++	if (data->move_in_progress) {
+ 		/*
+-		 * Reevaluate apic_chip_data. It might have been cleared after
+-		 * we dropped @desc->lock.
++		 * In theory there is a race:
++		 *
++		 * set_ioapic(new_vector) <-- Interrupt is raised before update
++		 *			      is effective, i.e. it's raised on
++		 *			      the old vector.
++		 *
++		 * So if the target cpu cannot handle that interrupt before
++		 * the old vector is cleaned up, we get a spurious interrupt
++		 * and in the worst case the ioapic irq line becomes stale.
++		 *
++		 * But in case of cpu hotplug this should be a non issue
++		 * because if the affinity update happens right before all
++		 * cpus rendevouz in stop machine, there is no way that the
++		 * interrupt can be blocked on the target cpu because all cpus
++		 * loops first with interrupts enabled in stop machine, so the
++		 * old vector is not yet cleaned up when the interrupt fires.
++		 *
++		 * So the only way to run into this issue is if the delivery
++		 * of the interrupt on the apic/system bus would be delayed
++		 * beyond the point where the target cpu disables interrupts
++		 * in stop machine. I doubt that it can happen, but at least
++		 * there is a theroretical chance. Virtualization might be
++		 * able to expose this, but AFAICT the IOAPIC emulation is not
++		 * as stupid as the real hardware.
++		 *
++		 * Anyway, there is nothing we can do about that at this point
++		 * w/o refactoring the whole fixup_irq() business completely.
++		 * We print at least the irq number and the old vector number,
++		 * so we have the necessary information when a problem in that
++		 * area arises.
+ 		 */
+-		data = apic_chip_data(irqdata);
+-		if (!data)
+-			return;
+-		raw_spin_lock(&vector_lock);
++		pr_warn("IRQ fixup: irq %d move in progress, old vector %d\n",
++			irqdata->irq, cfg->old_vector);
+ 	}
++	/*
++	 * If old_domain is not empty, then other cpus still have the irq
++	 * descriptor set in their vector array. Clean it up.
++	 */
++	for_each_cpu(cpu, data->old_domain)
++		per_cpu(vector_irq, cpu)[cfg->old_vector] = VECTOR_UNUSED;
++
++	/* Cleanup the left overs of the (half finished) move */
++	cpumask_clear(data->old_domain);
++	data->move_in_progress = 0;
+ 	raw_spin_unlock(&vector_lock);
+ }
+ #endif
+--- a/arch/x86/kernel/cpu/Makefile
++++ b/arch/x86/kernel/cpu/Makefile
+@@ -42,7 +42,7 @@ obj-$(CONFIG_X86_LOCAL_APIC)		+= perfctr
+ 
+ obj-$(CONFIG_HYPERVISOR_GUEST)		+= vmware.o hypervisor.o mshyperv.o
+ 
+-disabled-obj-$(CONFIG_XEN) := perfctr-watchdog.o perf_event.o perf_event_%.o
++disabled-obj-$(CONFIG_XEN) := perfctr-watchdog.o
+ 
+ ifdef CONFIG_X86_FEATURE_NAMES
+ quiet_cmd_mkcapflags = MKCAP   $@
+--- a/arch/x86/kernel/cpu/common-xen.c
++++ b/arch/x86/kernel/cpu/common-xen.c
+@@ -179,6 +179,22 @@ static int __init x86_mpx_setup(char *s)
+ }
+ __setup("nompx", x86_mpx_setup);
+ 
++static int __init x86_noinvpcid_setup(char *s)
++{
++	/* noinvpcid doesn't accept parameters */
++	if (s)
++		return -EINVAL;
++
++	/* do not emit a message if the feature is not present */
++	if (!boot_cpu_has(X86_FEATURE_INVPCID))
++		return 0;
++
++	setup_clear_cpu_cap(X86_FEATURE_INVPCID);
++	pr_info("noinvpcid: INVPCID feature disabled\n");
++	return 0;
++}
++early_param("noinvpcid", x86_noinvpcid_setup);
++
+ #ifdef CONFIG_X86_32
+ static int cachesize_override = -1;
+ 
+@@ -248,7 +264,7 @@ static void squash_the_stupid_serial_num
+ 	lo |= 0x200000;
+ 	wrmsr(MSR_IA32_BBL_CR_CTL, lo, hi);
+ 
+-	printk(KERN_NOTICE "CPU serial number disabled.\n");
++	pr_notice("CPU serial number disabled.\n");
+ 	clear_cpu_cap(c, X86_FEATURE_PN);
+ 
+ 	/* Disabling the serial number may affect the cpuid level */
+@@ -310,6 +326,48 @@ static __always_inline void setup_smap(s
+ }
+ 
+ /*
++ * Protection Keys are not available in 32-bit mode.
++ */
++static bool pku_disabled;
++
++static __always_inline void setup_pku(struct cpuinfo_x86 *c)
++{
++	if (!cpu_has(c, X86_FEATURE_PKU))
++		return;
++	if (pku_disabled)
++		return;
++
++	cr4_set_bits(X86_CR4_PKE);
++	/*
++	 * Seting X86_CR4_PKE will cause the X86_FEATURE_OSPKE
++	 * cpuid bit to be set.  We need to ensure that we
++	 * update that bit in this CPU's "cpu_info".
++	 */
++	get_cpu_cap(c);
++}
++
++#ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
++static __init int setup_disable_pku(char *arg)
++{
++	/*
++	 * Do not clear the X86_FEATURE_PKU bit.  All of the
++	 * runtime checks are against OSPKE so clearing the
++	 * bit does nothing.
++	 *
++	 * This way, we will see "pku" in cpuinfo, but not
++	 * "ospke", which is exactly what we want.  It shows
++	 * that the CPU has PKU, but the OS has not enabled it.
++	 * This happens to be exactly how a system would look
++	 * if we disabled the config option.
++	 */
++	pr_info("x86: 'nopku' specified, disabling Memory Protection Keys\n");
++	pku_disabled = true;
++	return 1;
++}
++__setup("nopku", setup_disable_pku);
++#endif /* CONFIG_X86_64 */
++
++/*
+  * Some CPU features depend on higher CPUID levels, which may not always
+  * be available due to CPUID level capping or broken virtualization
+  * software.  Add those features to this table to auto-disable them.
+@@ -351,9 +409,8 @@ static void filter_cpuid_features(struct
+ 		if (!warn)
+ 			continue;
+ 
+-		printk(KERN_WARNING
+-		       "CPU: CPU feature " X86_CAP_FMT " disabled, no CPUID level 0x%x\n",
+-				x86_cap_flag(df->feature), df->level);
++		pr_warn("CPU: CPU feature " X86_CAP_FMT " disabled, no CPUID level 0x%x\n",
++			x86_cap_flag(df->feature), df->level);
+ 	}
+ }
+ 
+@@ -554,7 +611,7 @@ void detect_ht(struct cpuinfo_x86 *c)
+ 	smp_num_siblings = (ebx & 0xff0000) >> 16;
+ 
+ 	if (smp_num_siblings == 1) {
+-		printk_once(KERN_INFO "CPU0: Hyper-Threading is disabled\n");
++		pr_info_once("CPU0: Hyper-Threading is disabled\n");
+ 		goto out;
+ 	}
+ 
+@@ -575,10 +632,10 @@ void detect_ht(struct cpuinfo_x86 *c)
+ 
+ out:
+ 	if (!printed && (c->x86_max_cores * smp_num_siblings) > 1) {
+-		printk(KERN_INFO  "CPU: Physical Processor ID: %d\n",
+-		       c->phys_proc_id);
+-		printk(KERN_INFO  "CPU: Processor Core ID: %d\n",
+-		       c->cpu_core_id);
++		pr_info("CPU: Physical Processor ID: %d\n",
++			c->phys_proc_id);
++		pr_info("CPU: Processor Core ID: %d\n",
++			c->cpu_core_id);
+ 		printed = 1;
+ 	}
+ #endif
+@@ -603,9 +660,8 @@ static void get_cpu_vendor(struct cpuinf
+ 		}
+ 	}
+ 
+-	printk_once(KERN_ERR
+-			"CPU: vendor_id '%s' unknown, using generic init.\n" \
+-			"CPU: Your system may be unstable.\n", v);
++	pr_err_once("CPU: vendor_id '%s' unknown, using generic init.\n" \
++		    "CPU: Your system may be unstable.\n", v);
+ 
+ 	c->x86_vendor = X86_VENDOR_UNKNOWN;
+ 	this_cpu = &default_cpu;
+@@ -655,6 +711,7 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
+ 		c->x86_capability[CPUID_7_0_EBX] = ebx;
+ 
+ 		c->x86_capability[CPUID_6_EAX] = cpuid_eax(0x00000006);
++		c->x86_capability[CPUID_7_ECX] = ecx;
+ 	}
+ 
+ 	/* Extended state features: level 0x0000000d */
+@@ -679,7 +736,9 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
+ 			cpuid_count(0x0000000F, 1, &eax, &ebx, &ecx, &edx);
+ 			c->x86_capability[CPUID_F_1_EDX] = edx;
+ 
+-			if (cpu_has(c, X86_FEATURE_CQM_OCCUP_LLC)) {
++			if ((cpu_has(c, X86_FEATURE_CQM_OCCUP_LLC)) ||
++			      ((cpu_has(c, X86_FEATURE_CQM_MBM_TOTAL)) ||
++			       (cpu_has(c, X86_FEATURE_CQM_MBM_LOCAL)))) {
+ 				c->x86_cache_max_rmid = ecx;
+ 				c->x86_cache_occ_scale = ebx;
+ 			}
+@@ -809,7 +868,7 @@ void __init early_cpu_init(void)
+ 	int count = 0;
+ 
+ #ifdef CONFIG_PROCESSOR_SELECT
+-	printk(KERN_INFO "KERNEL supported cpus:\n");
++	pr_info("KERNEL supported cpus:\n");
+ #endif
+ 
+ 	for (cdev = __x86_cpu_dev_start; cdev < __x86_cpu_dev_end; cdev++) {
+@@ -827,7 +886,7 @@ void __init early_cpu_init(void)
+ 			for (j = 0; j < 2; j++) {
+ 				if (!cpudev->c_ident[j])
+ 					continue;
+-				printk(KERN_INFO "  %s %s\n", cpudev->c_vendor,
++				pr_info("  %s %s\n", cpudev->c_vendor,
+ 					cpudev->c_ident[j]);
+ 			}
+ 		}
+@@ -852,6 +911,31 @@ static void detect_nopl(struct cpuinfo_x
+ #else
+ 	set_cpu_cap(c, X86_FEATURE_NOPL);
+ #endif
++
++	/*
++	 * ESPFIX is a strange bug.  All real CPUs have it.  Paravirt
++	 * systems that run Linux at CPL > 0 may or may not have the
++	 * issue, but, even if they have the issue, there's absolutely
++	 * nothing we can do about it because we can't use the real IRET
++	 * instruction.
++	 *
++	 * NB: For the time being, only 32-bit kernels support
++	 * X86_BUG_ESPFIX as such.  64-bit kernels directly choose
++	 * whether to apply espfix using paravirt hooks.  If any
++	 * non-paravirt system ever shows up that does *not* have the
++	 * ESPFIX issue, we can change this.
++	 */
++#ifdef CONFIG_X86_32
++#ifdef CONFIG_PARAVIRT
++	do {
++		extern void native_iret(void);
++		if (pv_cpu_ops.iret == native_iret)
++			set_cpu_bug(c, X86_BUG_ESPFIX);
++	} while (0);
++#else
++	set_cpu_bug(c, X86_BUG_ESPFIX);
++#endif
++#endif
+ }
+ 
+ static void generic_identify(struct cpuinfo_x86 *c)
+@@ -941,7 +1025,7 @@ static void identify_cpu(struct cpuinfo_
+ 	if (this_cpu->c_identify)
+ 		this_cpu->c_identify(c);
+ 
+-	/* Clear/Set all flags overriden by options, after probe */
++	/* Clear/Set all flags overridden by options, after probe */
+ 	for (i = 0; i < NCAPINTS; i++) {
+ 		c->x86_capability[i] &= ~cpu_caps_cleared[i];
+ 		c->x86_capability[i] |= cpu_caps_set[i];
+@@ -998,9 +1082,10 @@ static void identify_cpu(struct cpuinfo_
+ 	init_hypervisor(c);
+ 	x86_init_rdrand(c);
+ 	x86_init_cache_qos(c);
++	setup_pku(c);
+ 
+ 	/*
+-	 * Clear/Set all flags overriden by options, need do it
++	 * Clear/Set all flags overridden by options, need do it
+ 	 * before following smp all cpus cap AND.
+ 	 */
+ 	for (i = 0; i < NCAPINTS; i++) {
+@@ -1032,6 +1117,10 @@ static void identify_cpu(struct cpuinfo_
+ #ifdef CONFIG_NUMA
+ 	numa_add_cpu(smp_processor_id());
+ #endif
++#ifndef CONFIG_XEN
++	/* The boot/hotplug time assigment got cleared, restore it */
++	c->logical_proc_id = topology_phys_to_logical_pkg(c->phys_proc_id);
++#endif
+ }
+ 
+ /*
+@@ -1135,7 +1224,7 @@ static void __print_cpu_msr(void)
+ 		for (index = index_min; index < index_max; index++) {
+ 			if (rdmsrl_safe(index, &val))
+ 				continue;
+-			printk(KERN_INFO " MSR%08x: %016llx\n", index, val);
++			pr_info(" MSR%08x: %016llx\n", index, val);
+ 		}
+ 	}
+ }
+@@ -1174,19 +1263,19 @@ void print_cpu_info(struct cpuinfo_x86 *
+ 	}
+ 
+ 	if (vendor && !strstr(c->x86_model_id, vendor))
+-		printk(KERN_CONT "%s ", vendor);
++		pr_cont("%s ", vendor);
+ 
+ 	if (c->x86_model_id[0])
+-		printk(KERN_CONT "%s", c->x86_model_id);
++		pr_cont("%s", c->x86_model_id);
+ 	else
+-		printk(KERN_CONT "%d86", c->x86);
++		pr_cont("%d86", c->x86);
+ 
+-	printk(KERN_CONT " (family: 0x%x, model: 0x%x", c->x86, c->x86_model);
++	pr_cont(" (family: 0x%x, model: 0x%x", c->x86, c->x86_model);
+ 
+ 	if (c->x86_mask || c->cpuid_level >= 0)
+-		printk(KERN_CONT ", stepping: 0x%x)\n", c->x86_mask);
++		pr_cont(", stepping: 0x%x)\n", c->x86_mask);
+ 	else
+-		printk(KERN_CONT ")\n");
++		pr_cont(")\n");
+ 
+ 	print_cpu_msr(c);
+ }
+@@ -1579,7 +1668,7 @@ void cpu_init(void)
+ 
+ 	show_ucode_info_early();
+ 
+-	printk(KERN_INFO "Initializing CPU#%d\n", cpu);
++	pr_info("Initializing CPU#%d\n", cpu);
+ 
+ 	if (cpu_feature_enabled(X86_FEATURE_VME) ||
+ 	    boot_cpu_has(X86_FEATURE_DE))
+@@ -1615,20 +1704,6 @@ void cpu_init(void)
+ }
+ #endif
+ 
+-#ifdef CONFIG_X86_DEBUG_STATIC_CPU_HAS
+-void warn_pre_alternatives(void)
+-{
+-	WARN(1, "You're using static_cpu_has before alternatives have run!\n");
+-}
+-EXPORT_SYMBOL_GPL(warn_pre_alternatives);
+-#endif
+-
+-inline bool __static_cpu_has_safe(u16 bit)
+-{
+-	return boot_cpu_has(bit);
+-}
+-EXPORT_SYMBOL_GPL(__static_cpu_has_safe);
+-
+ static void bsp_resume(void)
+ {
+ 	if (this_cpu->c_bsp_resume)
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@ -163,6 +163,7 @@ static void early_init_intel(struct cpui
+ 		setup_clear_cpu_cap(X86_FEATURE_PGE);
+ 	}
+ 
++#ifndef CONFIG_XEN
+ 	if (c->cpuid_level >= 0x00000001) {
+ 		u32 eax, ebx, ecx, edx;
+ 
+@@ -175,6 +176,7 @@ static void early_init_intel(struct cpui
+ 		if (edx & (1U << 28))
+ 			c->x86_coreid_bits = get_count_order((ebx >> 16) & 0xff);
+ 	}
++#endif
+ }
+ 
+ #ifdef CONFIG_X86_32
+--- a/arch/x86/kernel/cpu/mtrr/main-xen.c
++++ b/arch/x86/kernel/cpu/mtrr/main-xen.c
+@@ -101,7 +101,7 @@ int mtrr_add_page(unsigned long base, un
+ static int mtrr_check(unsigned long base, unsigned long size)
+ {
+ 	if ((base & (PAGE_SIZE - 1)) || (size & (PAGE_SIZE - 1))) {
+-		pr_warning("mtrr: size and base must be multiples of 4 kiB\n");
++		pr_warn("mtrr: size and base must be multiples of 4 kiB\n");
+ 		pr_debug("mtrr: size: 0x%lx  base: 0x%lx\n", size, base);
+ 		dump_stack();
+ 		return -1;
+@@ -149,7 +149,7 @@ int mtrr_del_page(int reg, unsigned long
+ 		}
+ 	}
+ 	if (mtrr_usage_table[reg] < 1) {
+-		pr_warning("mtrr: reg: %d has count=0\n", reg);
++		pr_warn("mtrr: reg: %d has count=0\n", reg);
+ 		goto out;
+ 	}
+ 	if (--mtrr_usage_table[reg] < 1) {
+--- a/arch/x86/kernel/e820-xen.c
++++ b/arch/x86/kernel/e820-xen.c
+@@ -24,6 +24,7 @@
+ #include <asm/e820.h>
+ #include <asm/proto.h>
+ #include <asm/setup.h>
++#include <asm/cpufeature.h>
+ #include <xen/interface/memory.h>
+ 
+ /*
+@@ -1037,6 +1038,41 @@ static const char *e820_type_to_string(i
+ 	}
+ }
+ 
++static unsigned long e820_type_to_iomem_type(int e820_type)
++{
++	switch (e820_type) {
++	case E820_RESERVED_KERN:
++	case E820_RAM:
++		return IORESOURCE_SYSTEM_RAM;
++	case E820_ACPI:
++	case E820_NVS:
++	case E820_UNUSABLE:
++	case E820_PRAM:
++	case E820_PMEM:
++	default:
++		return IORESOURCE_MEM;
++	}
++}
++
++static unsigned long e820_type_to_iores_desc(int e820_type)
++{
++	switch (e820_type) {
++	case E820_ACPI:
++		return IORES_DESC_ACPI_TABLES;
++	case E820_NVS:
++		return IORES_DESC_ACPI_NV_STORAGE;
++	case E820_PMEM:
++		return IORES_DESC_PERSISTENT_MEMORY;
++	case E820_PRAM:
++		return IORES_DESC_PERSISTENT_MEMORY_LEGACY;
++	case E820_RESERVED_KERN:
++	case E820_RAM:
++	case E820_UNUSABLE:
++	default:
++		return IORES_DESC_NONE;
++	}
++}
++
+ static bool do_mark_busy(u32 type, struct resource *res)
+ {
+ 	/* this is the legacy bios/dos rom-shadow + mmio region */
+@@ -1083,7 +1119,8 @@ void __init e820_reserve_resources(void)
+ 		res->start = e820.map[i].addr;
+ 		res->end = end;
+ 
+-		res->flags = IORESOURCE_MEM;
++		res->flags = e820_type_to_iomem_type(e820.map[i].type);
++		res->desc = e820_type_to_iores_desc(e820.map[i].type);
+ 
+ 		/*
+ 		 * don't register the region that could be conflicted with
+--- a/arch/x86/kernel/early_printk-xen.c
++++ b/arch/x86/kernel/early_printk-xen.c
+@@ -286,7 +286,7 @@ static __init void early_pci_serial_init
+ 	}
+ 
+ 	/*
+-	 * Lastly, initalize the hardware
++	 * Lastly, initialize the hardware
+ 	 */
+ 	if (*s) {
+ 		if (strcmp(s, "nocfg") == 0)
+--- a/arch/x86/kernel/head64-xen.c
++++ b/arch/x86/kernel/head64-xen.c
+@@ -41,13 +41,8 @@ pmdval_t early_pmd_flags = __PAGE_KERNEL
+ /* Wipe all early page tables except for the kernel symbol map */
+ static void __init reset_early_page_tables(void)
+ {
+-	unsigned long i;
+-
+-	for (i = 0; i < PTRS_PER_PGD-1; i++)
+-		early_level4_pgt[i].pgd = 0;
+-
++	memset(early_level4_pgt, 0, sizeof(pgd_t)*(PTRS_PER_PGD-1));
+ 	next_early_pgt = 0;
+-
+ 	write_cr3(__pa_nodebug(early_level4_pgt));
+ }
+ 
+@@ -55,7 +50,6 @@ static void __init reset_early_page_tabl
+ int __init early_make_pgtable(unsigned long address)
+ {
+ 	unsigned long physaddr = address - __PAGE_OFFSET;
+-	unsigned long i;
+ 	pgdval_t pgd, *pgd_p;
+ 	pudval_t pud, *pud_p;
+ 	pmdval_t pmd, *pmd_p;
+@@ -82,8 +76,7 @@ again:
+ 		}
+ 
+ 		pud_p = (pudval_t *)early_dynamic_pgts[next_early_pgt++];
+-		for (i = 0; i < PTRS_PER_PUD; i++)
+-			pud_p[i] = 0;
++		memset(pud_p, 0, sizeof(*pud_p) * PTRS_PER_PUD);
+ 		*pgd_p = (pgdval_t)pud_p - __START_KERNEL_map + phys_base + _KERNPG_TABLE;
+ 	}
+ 	pud_p += pud_index(address);
+@@ -98,8 +91,7 @@ again:
+ 		}
+ 
+ 		pmd_p = (pmdval_t *)early_dynamic_pgts[next_early_pgt++];
+-		for (i = 0; i < PTRS_PER_PMD; i++)
+-			pmd_p[i] = 0;
++		memset(pmd_p, 0, sizeof(*pmd_p) * PTRS_PER_PMD);
+ 		*pud_p = (pudval_t)pmd_p - __START_KERNEL_map + phys_base + _KERNPG_TABLE;
+ 	}
+ 	pmd = (physaddr & PMD_MASK) + early_pmd_flags;
+--- a/arch/x86/kernel/ioport-xen.c
++++ b/arch/x86/kernel/ioport-xen.c
+@@ -68,7 +68,7 @@ asmlinkage long sys_ioperm(unsigned long
+ SYSCALL_DEFINE1(iopl, unsigned int, level)
+ {
+ 	struct thread_struct *t = &current->thread;
+-	unsigned int old = t->iopl >> 12;
++	unsigned int old = t->iopl >> X86_EFLAGS_IOPL_BIT;
+ 
+ 	if (level > 3)
+ 		return -EINVAL;
+@@ -77,7 +77,7 @@ SYSCALL_DEFINE1(iopl, unsigned int, leve
+ 		if (!capable(CAP_SYS_RAWIO))
+ 			return -EPERM;
+ 	}
+-	t->iopl = level << 12;
++	t->iopl = level << X86_EFLAGS_IOPL_BIT;
+ 	set_iopl_mask(t->iopl);
+ 
+ 	return 0;
+--- a/arch/x86/kernel/mpparse-xen.c
++++ b/arch/x86/kernel/mpparse-xen.c
+@@ -426,7 +426,7 @@ static inline void __init construct_defa
+ 	processor.cpuflag = CPU_ENABLED;
+ 	processor.cpufeature = (boot_cpu_data.x86 << 8) |
+ 	    (boot_cpu_data.x86_model << 4) | boot_cpu_data.x86_mask;
+-	processor.featureflag = boot_cpu_data.x86_capability[0];
++	processor.featureflag = boot_cpu_data.x86_capability[CPUID_1_EDX];
+ 	processor.reserved[0] = 0;
+ 	processor.reserved[1] = 0;
+ 	for (i = 0; i < 2; i++) {
+--- a/arch/x86/kernel/process-xen.c
++++ b/arch/x86/kernel/process-xen.c
+@@ -59,6 +59,9 @@ __visible DEFINE_PER_CPU_SHARED_ALIGNED(
+ 	  */
+ 	.io_bitmap		= { [0 ... IO_BITMAP_LONGS] = ~0 },
+ #endif
++#ifdef CONFIG_X86_32
++	.SYSENTER_stack_canary	= STACK_END_MAGIC,
++#endif
+ };
+ EXPORT_PER_CPU_SYMBOL(cpu_tss);
+ #elif defined(CONFIG_X86_64_XEN)
+@@ -413,9 +416,9 @@ static void mwait_idle(void)
+ 	if (!current_set_polling_and_test()) {
+ 		trace_cpu_idle_rcuidle(1, smp_processor_id());
+ 		if (this_cpu_has(X86_BUG_CLFLUSH_MONITOR)) {
+-			smp_mb(); /* quirk */
++			mb(); /* quirk */
+ 			clflush((void *)&current_thread_info()->flags);
+-			smp_mb(); /* quirk */
++			mb(); /* quirk */
+ 		}
+ 
+ 		__monitor((void *)&current_thread_info()->flags, 0, 0);
+--- a/arch/x86/kernel/process_64-xen.c
++++ b/arch/x86/kernel/process_64-xen.c
+@@ -53,6 +53,7 @@
+ #include <asm/syscalls.h>
+ #include <asm/debugreg.h>
+ #include <asm/switch_to.h>
++#include <asm/xen/hypervisor.h>
+ 
+ asmlinkage extern void ret_from_fork(void);
+ 
+@@ -119,6 +120,8 @@ void __show_regs(struct pt_regs *regs, i
+ 	printk(KERN_DEFAULT "DR0: %016lx DR1: %016lx DR2: %016lx\n", d0, d1, d2);
+ 	printk(KERN_DEFAULT "DR3: %016lx DR6: %016lx DR7: %016lx\n", d3, d6, d7);
+ 
++	if (boot_cpu_has(X86_FEATURE_OSPKE))
++		printk(KERN_DEFAULT "PKRU: %08x\n", read_pkru());
+ }
+ 
+ void xen_load_gs_index(unsigned gs)
+@@ -539,7 +542,7 @@ void set_personality_ia32(bool x32)
+ 		if (current->mm)
+ 			current->mm->context.ia32_compat = TIF_X32;
+ 		current->personality &= ~READ_IMPLIES_EXEC;
+-		/* is_compat_task() uses the presence of the x32
++		/* in_compat_syscall() uses the presence of the x32
+ 		   syscall bit flag to determine compat status */
+ 		current_thread_info()->status &= ~TS_COMPAT;
+ 	} else {
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -414,7 +414,7 @@ __switch_to(struct task_struct *prev_p,
+ 		     task_thread_info(prev_p)->flags & _TIF_WORK_CTXSW_PREV))
+ 		__switch_to_xtra(prev_p, next_p, tss);
+ 
+-#ifdef CONFIG_XEN
++#ifdef CONFIG_PARAVIRT_XEN
+ 	/*
+ 	 * On Xen PV, IOPL bits in pt_regs->flags have no effect, and
+ 	 * current_pt_regs()->flags may not match the current task's
+--- a/arch/x86/kernel/setup-xen.c
++++ b/arch/x86/kernel/setup-xen.c
+@@ -183,21 +183,21 @@ static struct resource data_resource = {
+ 	.name	= "Kernel data",
+ 	.start	= 0,
+ 	.end	= 0,
+-	.flags	= IORESOURCE_BUSY | IORESOURCE_MEM
++	.flags	= IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM
+ };
+ 
+ static struct resource code_resource = {
+ 	.name	= "Kernel code",
+ 	.start	= 0,
+ 	.end	= 0,
+-	.flags	= IORESOURCE_BUSY | IORESOURCE_MEM
++	.flags	= IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM
+ };
+ 
+ static struct resource bss_resource = {
+ 	.name	= "Kernel bss",
+ 	.start	= 0,
+ 	.end	= 0,
+-	.flags	= IORESOURCE_BUSY | IORESOURCE_MEM
++	.flags	= IORESOURCE_BUSY | IORESOURCE_SYSTEM_RAM
+ };
+ 
+ 
+@@ -1541,6 +1541,14 @@ static int __init register_kernel_offset
+ }
+ __initcall(register_kernel_offset_dumper);
+ 
++void arch_show_smap(struct seq_file *m, struct vm_area_struct *vma)
++{
++	if (!boot_cpu_has(X86_FEATURE_OSPKE))
++		return;
++
++	seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
++}
++
+ #ifdef CONFIG_XEN
+ static int
+ xen_panic_event(struct notifier_block *this, unsigned long event, void *ptr)
+--- a/arch/x86/kernel/traps-xen.c
++++ b/arch/x86/kernel/traps-xen.c
+@@ -89,30 +89,16 @@ DECLARE_BITMAP(used_vectors, NR_VECTORS)
+ EXPORT_SYMBOL_GPL(used_vectors);
+ #endif
+ 
+-static inline void conditional_sti(struct pt_regs *regs)
++static inline void cond_local_irq_enable(struct pt_regs *regs)
+ {
+ 	if (regs->flags & X86_EFLAGS_IF)
+ 		local_irq_enable();
+ }
+ 
+-static inline void preempt_conditional_sti(struct pt_regs *regs)
+-{
+-	preempt_count_inc();
+-	if (regs->flags & X86_EFLAGS_IF)
+-		local_irq_enable();
+-}
+-
+-static inline void conditional_cli(struct pt_regs *regs)
+-{
+-	if (regs->flags & X86_EFLAGS_IF)
+-		local_irq_disable();
+-}
+-
+-static inline void preempt_conditional_cli(struct pt_regs *regs)
++static inline void cond_local_irq_disable(struct pt_regs *regs)
+ {
+ 	if (regs->flags & X86_EFLAGS_IF)
+ 		local_irq_disable();
+-	preempt_count_dec();
+ }
+ 
+ void ist_enter(struct pt_regs *regs)
+@@ -205,7 +191,7 @@ do_trap_no_signal(struct task_struct *ts
+ 	}
+ 
+ 	if (!user_mode(regs)) {
+-		if (!fixup_exception(regs)) {
++		if (!fixup_exception(regs, trapnr)) {
+ 			tsk->thread.error_code = error_code;
+ 			tsk->thread.trap_nr = trapnr;
+ 			die(str, regs, error_code);
+@@ -268,7 +254,6 @@ do_trap(int trapnr, int signr, char *str
+ 	tsk->thread.error_code = error_code;
+ 	tsk->thread.trap_nr = trapnr;
+ 
+-#ifdef CONFIG_X86_64
+ 	if (show_unhandled_signals && unhandled_signal(tsk, signr) &&
+ 	    printk_ratelimit()) {
+ 		pr_info("%s[%d] trap %s ip:%lx sp:%lx error:%lx",
+@@ -277,7 +262,6 @@ do_trap(int trapnr, int signr, char *str
+ 		print_vma_addr(" in ", regs->ip);
+ 		pr_cont("\n");
+ 	}
+-#endif
+ 
+ 	force_sig_info(signr, info ?: SEND_SIG_PRIV, tsk);
+ }
+@@ -292,7 +276,7 @@ static void do_error_trap(struct pt_regs
+ 
+ 	if (notify_die(DIE_TRAP, str, regs, error_code, trapnr, signr) !=
+ 			NOTIFY_STOP) {
+-		conditional_sti(regs);
++		cond_local_irq_enable(regs);
+ 		do_trap(trapnr, signr, str, regs, error_code,
+ 			fill_trap_info(regs, signr, trapnr, &info));
+ 	}
+@@ -374,7 +358,7 @@ dotraplinkage void do_bounds(struct pt_r
+ 	if (notify_die(DIE_TRAP, "bounds", regs, error_code,
+ 			X86_TRAP_BR, SIGSEGV) == NOTIFY_STOP)
+ 		return;
+-	conditional_sti(regs);
++	cond_local_irq_enable(regs);
+ 
+ 	if (!user_mode(regs))
+ 		die("bounds", regs, error_code);
+@@ -449,7 +433,7 @@ do_general_protection(struct pt_regs *re
+ 	struct task_struct *tsk;
+ 
+ 	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+-	conditional_sti(regs);
++	cond_local_irq_enable(regs);
+ 
+ 	if (v8086_mode(regs)) {
+ 		local_irq_enable();
+@@ -459,7 +443,7 @@ do_general_protection(struct pt_regs *re
+ 
+ 	tsk = current;
+ 	if (!user_mode(regs)) {
+-		if (fixup_exception(regs))
++		if (fixup_exception(regs, X86_TRAP_GP))
+ 			return;
+ 
+ 		tsk->thread.error_code = error_code;
+@@ -523,9 +507,11 @@ dotraplinkage void notrace do_int3(struc
+ 	 * as we may switch to the interrupt stack.
+ 	 */
+ 	debug_stack_usage_inc();
+-	preempt_conditional_sti(regs);
++	preempt_disable();
++	cond_local_irq_enable(regs);
+ 	do_trap(X86_TRAP_BP, SIGTRAP, "int3", regs, error_code, NULL);
+-	preempt_conditional_cli(regs);
++	cond_local_irq_disable(regs);
++	preempt_enable_no_resched();
+ 	debug_stack_usage_dec();
+ exit:
+ 	ist_exit(regs);
+@@ -577,6 +563,29 @@ struct bad_iret_stack *fixup_bad_iret(st
+ NOKPROBE_SYMBOL(fixup_bad_iret);
+ #endif
+ 
++static bool is_sysenter_singlestep(struct pt_regs *regs)
++{
++	/*
++	 * We don't try for precision here.  If we're anywhere in the region of
++	 * code that can be single-stepped in the SYSENTER entry path, then
++	 * assume that this is a useless single-step trap due to SYSENTER
++	 * being invoked with TF set.  (We don't know in advance exactly
++	 * which instructions will be hit because BTF could plausibly
++	 * be set.)
++	 */
++#ifdef CONFIG_X86_32
++	return (regs->ip - (unsigned long)__begin_SYSENTER_singlestep_region) <
++		(unsigned long)__end_SYSENTER_singlestep_region -
++		(unsigned long)__begin_SYSENTER_singlestep_region;
++#elif defined(CONFIG_IA32_EMULATION) && !defined(CONFIG_XEN)
++	return (regs->ip - (unsigned long)entry_SYSENTER_compat) <
++		(unsigned long)__end_entry_SYSENTER_compat -
++		(unsigned long)entry_SYSENTER_compat;
++#else
++	return false;
++#endif
++}
++
+ /*
+  * Our handling of the processor debug registers is non-trivial.
+  * We do not clear them on entry and exit from the kernel. Therefore
+@@ -611,11 +620,42 @@ dotraplinkage void do_debug(struct pt_re
+ 	ist_enter(regs);
+ 
+ 	get_debugreg(dr6, 6);
++	/*
++	 * The Intel SDM says:
++	 *
++	 *   Certain debug exceptions may clear bits 0-3. The remaining
++	 *   contents of the DR6 register are never cleared by the
++	 *   processor. To avoid confusion in identifying debug
++	 *   exceptions, debug handlers should clear the register before
++	 *   returning to the interrupted task.
++	 *
++	 * Keep it simple: clear DR6 immediately.
++	 */
++	set_debugreg(0, 6);
+ 
+ 	/* Filter out all the reserved bits which are preset to 1 */
+ 	dr6 &= ~DR6_RESERVED;
+ 
+ 	/*
++	 * The SDM says "The processor clears the BTF flag when it
++	 * generates a debug exception."  Clear TIF_BLOCKSTEP to keep
++	 * TIF_BLOCKSTEP in sync with the hardware BTF flag.
++	 */
++	clear_tsk_thread_flag(tsk, TIF_BLOCKSTEP);
++
++	if (unlikely(!user_mode(regs) && (dr6 & DR_STEP) &&
++		     is_sysenter_singlestep(regs))) {
++		dr6 &= ~DR_STEP;
++		if (!dr6)
++			goto exit;
++		/*
++		 * else we might have gotten a single-step trap and hit a
++		 * watchpoint at the same time, in which case we should fall
++		 * through and handle the watchpoint.
++		 */
++	}
++
++	/*
+ 	 * If dr6 has no reason to give us about the origin of this trap,
+ 	 * then it's very likely the result of an icebp/int01 trap.
+ 	 * User wants a sigtrap for that.
+@@ -623,18 +663,10 @@ dotraplinkage void do_debug(struct pt_re
+ 	if (!dr6 && user_mode(regs))
+ 		user_icebp = 1;
+ 
+-	/* Catch kmemcheck conditions first of all! */
++	/* Catch kmemcheck conditions! */
+ 	if ((dr6 & DR_STEP) && kmemcheck_trap(regs))
+ 		goto exit;
+ 
+-	/* DR6 may or may not be cleared by the CPU */
+-	set_debugreg(0, 6);
+-
+-	/*
+-	 * The processor cleared BTF, so don't mark that we need it set.
+-	 */
+-	clear_tsk_thread_flag(tsk, TIF_BLOCKSTEP);
+-
+ 	/* Store the virtualized DR6 value */
+ 	tsk->thread.debugreg6 = dr6;
+ 
+@@ -654,24 +686,25 @@ dotraplinkage void do_debug(struct pt_re
+ 	debug_stack_usage_inc();
+ 
+ 	/* It's safe to allow irq's after DR6 has been saved */
+-	preempt_conditional_sti(regs);
++	preempt_disable();
++	cond_local_irq_enable(regs);
+ 
+ 	if (v8086_mode(regs)) {
+ 		handle_vm86_trap((struct kernel_vm86_regs *) regs, error_code,
+ 					X86_TRAP_DB);
+-		preempt_conditional_cli(regs);
++		cond_local_irq_disable(regs);
++		preempt_enable_no_resched();
+ 		debug_stack_usage_dec();
+ 		goto exit;
+ 	}
+ 
+-	/*
+-	 * Single-stepping through system calls: ignore any exceptions in
+-	 * kernel space, but re-enable TF when returning to user mode.
+-	 *
+-	 * We already checked v86 mode above, so we can check for kernel mode
+-	 * by just checking the CPL of CS.
+-	 */
+-	if ((dr6 & DR_STEP) && !user_mode(regs)) {
++	if (WARN_ON_ONCE((dr6 & DR_STEP) && !user_mode(regs))) {
++		/*
++		 * Historical junk that used to handle SYSENTER single-stepping.
++		 * This should be unreachable now.  If we survive for a while
++		 * without anyone hitting this warning, we'll turn this into
++		 * an oops.
++		 */
+ 		tsk->thread.debugreg6 &= ~DR_STEP;
+ 		set_tsk_thread_flag(tsk, TIF_SINGLESTEP);
+ 		regs->flags &= ~X86_EFLAGS_TF;
+@@ -679,10 +712,19 @@ dotraplinkage void do_debug(struct pt_re
+ 	si_code = get_si_code(tsk->thread.debugreg6);
+ 	if (tsk->thread.debugreg6 & (DR_STEP | DR_TRAP_BITS) || user_icebp)
+ 		send_sigtrap(tsk, regs, error_code, si_code);
+-	preempt_conditional_cli(regs);
++	cond_local_irq_disable(regs);
++	preempt_enable_no_resched();
+ 	debug_stack_usage_dec();
+ 
+ exit:
++#if defined(CONFIG_X86_32) && !defined(CONFIG_X86_NO_TSS)
++	/*
++	 * This is the most likely code path that involves non-trivial use
++	 * of the SYSENTER stack.  Check that we haven't overrun it.
++	 */
++	WARN(this_cpu_read(cpu_tss.SYSENTER_stack_canary) != STACK_END_MAGIC,
++	     "Overran or corrupted SYSENTER stack\n");
++#endif
+ 	ist_exit(regs);
+ }
+ NOKPROBE_SYMBOL(do_debug);
+@@ -702,10 +744,10 @@ static void math_error(struct pt_regs *r
+ 
+ 	if (notify_die(DIE_TRAP, str, regs, error_code, trapnr, SIGFPE) == NOTIFY_STOP)
+ 		return;
+-	conditional_sti(regs);
++	cond_local_irq_enable(regs);
+ 
+ 	if (!user_mode(regs)) {
+-		if (!fixup_exception(regs)) {
++		if (!fixup_exception(regs, trapnr)) {
+ 			task->thread.error_code = error_code;
+ 			task->thread.trap_nr = trapnr;
+ 			die(str, regs, error_code);
+@@ -750,7 +792,7 @@ do_simd_coprocessor_error(struct pt_regs
+ dotraplinkage void
+ do_spurious_interrupt_bug(struct pt_regs *regs, long error_code)
+ {
+-	conditional_sti(regs);
++	cond_local_irq_enable(regs);
+ }
+ #endif /* CONFIG_XEN */
+ 
+@@ -758,13 +800,12 @@ dotraplinkage void
+ do_device_not_available(struct pt_regs *regs, long error_code)
+ {
+ 	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+-	BUG_ON(use_eager_fpu());
+ 
+ #ifdef CONFIG_MATH_EMULATION
+-	if (read_cr0() & X86_CR0_EM) {
++	if (!boot_cpu_has(X86_FEATURE_FPU) && (read_cr0() & X86_CR0_EM)) {
+ 		struct math_emu_info info = { };
+ 
+-		conditional_sti(regs);
++		cond_local_irq_enable(regs);
+ 
+ 		info.regs = regs;
+ 		math_emulate(&info);
+@@ -775,7 +816,7 @@ do_device_not_available(struct pt_regs *
+ 	__this_cpu_and(xen_x86_cr0, ~X86_CR0_TS);
+ 	fpu__restore(&current->thread.fpu); /* interrupts still off */
+ #ifdef CONFIG_X86_32
+-	conditional_sti(regs);
++	cond_local_irq_enable(regs);
+ #endif
+ }
+ NOKPROBE_SYMBOL(do_device_not_available);
+--- a/arch/x86/lib/insn.c
++++ b/arch/x86/lib/insn.c
+@@ -184,6 +184,15 @@ found:
+ vex_end:
+ 	insn->vex_prefix.got = 1;
+ 
++	/* Check for Xen #UD escape prefix */
++	if (peek_next(insn_byte_t, insn) == 0x0f &&
++	    peek_nbyte_next(insn_byte_t, insn, 1) == 0x0b &&
++	    peek_nbyte_next(insn_byte_t, insn, 2) == 'x' &&
++	    peek_nbyte_next(insn_byte_t, insn, 3) == 'e' &&
++	    peek_nbyte_next(insn_byte_t, insn, 4) == 'n') {
++		insn->next_byte += 5;
++	}
++
+ 	prefixes->got = 1;
+ 
+ err_out:
+--- a/arch/x86/mm/dump_pagetables-xen.c
++++ b/arch/x86/mm/dump_pagetables-xen.c
+@@ -374,20 +374,19 @@ static void walk_pud_level(struct seq_fi
+ #define pgd_none(a)  pud_none(__pud_ma(__pgd_val(a)))
+ #endif
+ 
+-#ifdef CONFIG_X86_64
+ static inline bool is_hypervisor_range(int idx)
+ {
++#ifdef CONFIG_X86_64
+ 	/*
+ 	 * ffff800000000000 - ffff87ffffffffff is reserved for
+ 	 * the hypervisor.
+ 	 */
+-	return paravirt_enabled() &&
+-		(idx >= pgd_index(__PAGE_OFFSET) - 16) &&
+-		(idx < pgd_index(__PAGE_OFFSET));
+-}
++	return	(idx >= pgd_index(__PAGE_OFFSET) - 16) &&
++		(idx <  pgd_index(__PAGE_OFFSET));
+ #else
+-static inline bool is_hypervisor_range(int idx) { return false; }
++	return false;
+ #endif
++}
+ 
+ static void ptdump_walk_pgd_level_core(struct seq_file *m, pgd_t *pgd,
+ 				       bool checkwx)
+--- a/arch/x86/mm/fault-xen.c
++++ b/arch/x86/mm/fault-xen.c
+@@ -15,12 +15,14 @@
+ #include <linux/context_tracking.h>	/* exception_enter(), ...	*/
+ #include <linux/uaccess.h>		/* faulthandler_disabled()	*/
+ 
++#include <asm/cpufeature.h>		/* boot_cpu_has, ...		*/
+ #include <asm/traps.h>			/* dotraplinkage, ...		*/
+ #include <asm/pgalloc.h>		/* pgd_*(), ...			*/
+ #include <asm/kmemcheck.h>		/* kmemcheck_*(), ...		*/
+ #include <asm/fixmap.h>			/* VSYSCALL_ADDR		*/
+ #include <asm/vsyscall.h>		/* emulate_vsyscall		*/
+ #include <asm/vm86.h>			/* struct vm86			*/
++#include <asm/mmu_context.h>		/* vma_pkey()			*/
+ 
+ #define CREATE_TRACE_POINTS
+ #include <asm/trace/exceptions.h>
+@@ -33,6 +35,7 @@
+  *   bit 2 ==	 0: kernel-mode access	1: user-mode access
+  *   bit 3 ==				1: use of reserved bit detected
+  *   bit 4 ==				1: fault was an instruction fetch
++ *   bit 5 ==				1: protection keys block access
+  */
+ enum x86_pf_error_code {
+ 
+@@ -41,6 +44,7 @@ enum x86_pf_error_code {
+ 	PF_USER		=		1 << 2,
+ 	PF_RSVD		=		1 << 3,
+ 	PF_INSTR	=		1 << 4,
++	PF_PK		=		1 << 5,
+ };
+ 
+ /*
+@@ -167,9 +171,60 @@ is_prefetch(struct pt_regs *regs, unsign
+ 	return prefetch;
+ }
+ 
++/*
++ * A protection key fault means that the PKRU value did not allow
++ * access to some PTE.  Userspace can figure out what PKRU was
++ * from the XSAVE state, and this function fills out a field in
++ * siginfo so userspace can discover which protection key was set
++ * on the PTE.
++ *
++ * If we get here, we know that the hardware signaled a PF_PK
++ * fault and that there was a VMA once we got in the fault
++ * handler.  It does *not* guarantee that the VMA we find here
++ * was the one that we faulted on.
++ *
++ * 1. T1   : mprotect_key(foo, PAGE_SIZE, pkey=4);
++ * 2. T1   : set PKRU to deny access to pkey=4, touches page
++ * 3. T1   : faults...
++ * 4.    T2: mprotect_key(foo, PAGE_SIZE, pkey=5);
++ * 5. T1   : enters fault handler, takes mmap_sem, etc...
++ * 6. T1   : reaches here, sees vma_pkey(vma)=5, when we really
++ *	     faulted on a pte with its pkey=4.
++ */
++static void fill_sig_info_pkey(int si_code, siginfo_t *info,
++		struct vm_area_struct *vma)
++{
++	/* This is effectively an #ifdef */
++	if (!boot_cpu_has(X86_FEATURE_OSPKE))
++		return;
++
++	/* Fault not from Protection Keys: nothing to do */
++	if (si_code != SEGV_PKUERR)
++		return;
++	/*
++	 * force_sig_info_fault() is called from a number of
++	 * contexts, some of which have a VMA and some of which
++	 * do not.  The PF_PK handing happens after we have a
++	 * valid VMA, so we should never reach this without a
++	 * valid VMA.
++	 */
++	if (!vma) {
++		WARN_ONCE(1, "PKU fault with no VMA passed in");
++		info->si_pkey = 0;
++		return;
++	}
++	/*
++	 * si_pkey should be thought of as a strong hint, but not
++	 * absolutely guranteed to be 100% accurate because of
++	 * the race explained above.
++	 */
++	info->si_pkey = vma_pkey(vma);
++}
++
+ static void
+ force_sig_info_fault(int si_signo, int si_code, unsigned long address,
+-		     struct task_struct *tsk, int fault)
++		     struct task_struct *tsk, struct vm_area_struct *vma,
++		     int fault)
+ {
+ 	unsigned lsb = 0;
+ 	siginfo_t info;
+@@ -184,6 +239,8 @@ force_sig_info_fault(int si_signo, int s
+ 		lsb = PAGE_SHIFT;
+ 	info.si_addr_lsb = lsb;
+ 
++	fill_sig_info_pkey(si_code, &info, vma);
++
+ 	force_sig_info(si_signo, &info, tsk);
+ }
+ 
+@@ -670,9 +727,11 @@ no_context(struct pt_regs *regs, unsigne
+ 	struct task_struct *tsk = current;
+ 	unsigned long flags;
+ 	int sig;
++	/* No context means no VMA to pass down */
++	struct vm_area_struct *vma = NULL;
+ 
+ 	/* Are we prepared to handle this kernel fault? */
+-	if (fixup_exception(regs)) {
++	if (fixup_exception(regs, X86_TRAP_PF)) {
+ 		/*
+ 		 * Any interrupt that takes a fault gets the fixup. This makes
+ 		 * the below recursive fault logic only apply to a faults from
+@@ -693,7 +752,8 @@ no_context(struct pt_regs *regs, unsigne
+ 			tsk->thread.cr2 = address;
+ 
+ 			/* XXX: hwpoison faults will set the wrong code. */
+-			force_sig_info_fault(signal, si_code, address, tsk, 0);
++			force_sig_info_fault(signal, si_code, address,
++					     tsk, vma, 0);
+ 		}
+ 
+ 		/*
+@@ -770,7 +830,8 @@ show_signal_msg(struct pt_regs *regs, un
+ 
+ static void
+ __bad_area_nosemaphore(struct pt_regs *regs, unsigned long error_code,
+-		       unsigned long address, int si_code)
++		       unsigned long address, struct vm_area_struct *vma,
++		       int si_code)
+ {
+ 	struct task_struct *tsk = current;
+ 
+@@ -813,7 +874,7 @@ __bad_area_nosemaphore(struct pt_regs *r
+ 		tsk->thread.error_code	= error_code;
+ 		tsk->thread.trap_nr	= X86_TRAP_PF;
+ 
+-		force_sig_info_fault(SIGSEGV, si_code, address, tsk, 0);
++		force_sig_info_fault(SIGSEGV, si_code, address, tsk, vma, 0);
+ 
+ 		return;
+ 	}
+@@ -826,14 +887,14 @@ __bad_area_nosemaphore(struct pt_regs *r
+ 
+ static noinline void
+ bad_area_nosemaphore(struct pt_regs *regs, unsigned long error_code,
+-		     unsigned long address)
++		     unsigned long address, struct vm_area_struct *vma)
+ {
+-	__bad_area_nosemaphore(regs, error_code, address, SEGV_MAPERR);
++	__bad_area_nosemaphore(regs, error_code, address, vma, SEGV_MAPERR);
+ }
+ 
+ static void
+ __bad_area(struct pt_regs *regs, unsigned long error_code,
+-	   unsigned long address, int si_code)
++	   unsigned long address,  struct vm_area_struct *vma, int si_code)
+ {
+ 	struct mm_struct *mm = current->mm;
+ 
+@@ -843,25 +904,50 @@ __bad_area(struct pt_regs *regs, unsigne
+ 	 */
+ 	up_read(&mm->mmap_sem);
+ 
+-	__bad_area_nosemaphore(regs, error_code, address, si_code);
++	__bad_area_nosemaphore(regs, error_code, address, vma, si_code);
+ }
+ 
+ static noinline void
+ bad_area(struct pt_regs *regs, unsigned long error_code, unsigned long address)
+ {
+-	__bad_area(regs, error_code, address, SEGV_MAPERR);
++	__bad_area(regs, error_code, address, NULL, SEGV_MAPERR);
++}
++
++static inline bool bad_area_access_from_pkeys(unsigned long error_code,
++		struct vm_area_struct *vma)
++{
++	/* This code is always called on the current mm */
++	bool foreign = false;
++
++	if (!boot_cpu_has(X86_FEATURE_OSPKE))
++		return false;
++	if (error_code & PF_PK)
++		return true;
++	/* this checks permission keys on the VMA: */
++	if (!arch_vma_access_permitted(vma, (error_code & PF_WRITE),
++				(error_code & PF_INSTR), foreign))
++		return true;
++	return false;
+ }
+ 
+ static noinline void
+ bad_area_access_error(struct pt_regs *regs, unsigned long error_code,
+-		      unsigned long address)
++		      unsigned long address, struct vm_area_struct *vma)
+ {
+-	__bad_area(regs, error_code, address, SEGV_ACCERR);
++	/*
++	 * This OSPKE check is not strictly necessary at runtime.
++	 * But, doing it this way allows compiler optimizations
++	 * if pkeys are compiled out.
++	 */
++	if (bad_area_access_from_pkeys(error_code, vma))
++		__bad_area(regs, error_code, address, vma, SEGV_PKUERR);
++	else
++		__bad_area(regs, error_code, address, vma, SEGV_ACCERR);
+ }
+ 
+ static void
+ do_sigbus(struct pt_regs *regs, unsigned long error_code, unsigned long address,
+-	  unsigned int fault)
++	  struct vm_area_struct *vma, unsigned int fault)
+ {
+ 	struct task_struct *tsk = current;
+ 	int code = BUS_ADRERR;
+@@ -888,12 +974,13 @@ do_sigbus(struct pt_regs *regs, unsigned
+ 		code = BUS_MCEERR_AR;
+ 	}
+ #endif
+-	force_sig_info_fault(SIGBUS, code, address, tsk, fault);
++	force_sig_info_fault(SIGBUS, code, address, tsk, vma, fault);
+ }
+ 
+ static noinline void
+ mm_fault_error(struct pt_regs *regs, unsigned long error_code,
+-	       unsigned long address, unsigned int fault)
++	       unsigned long address, struct vm_area_struct *vma,
++	       unsigned int fault)
+ {
+ 	if (fatal_signal_pending(current) && !(error_code & PF_USER)) {
+ 		no_context(regs, error_code, address, 0, 0);
+@@ -917,9 +1004,9 @@ mm_fault_error(struct pt_regs *regs, uns
+ 	} else {
+ 		if (fault & (VM_FAULT_SIGBUS|VM_FAULT_HWPOISON|
+ 			     VM_FAULT_HWPOISON_LARGE))
+-			do_sigbus(regs, error_code, address, fault);
++			do_sigbus(regs, error_code, address, vma, fault);
+ 		else if (fault & VM_FAULT_SIGSEGV)
+-			bad_area_nosemaphore(regs, error_code, address);
++			bad_area_nosemaphore(regs, error_code, address, vma);
+ 		else
+ 			BUG();
+ 	}
+@@ -932,6 +1019,12 @@ static int spurious_fault_check(unsigned
+ 
+ 	if ((error_code & PF_INSTR) && !pte_exec(*pte))
+ 		return 0;
++	/*
++	 * Note: We do not do lazy flushing on protection key
++	 * changes, so no spurious fault will ever set PF_PK.
++	 */
++	if ((error_code & PF_PK))
++		return 1;
+ 
+ 	return 1;
+ }
+@@ -1021,6 +1114,17 @@ int show_unhandled_signals = 1;
+ static inline int
+ access_error(unsigned long error_code, struct vm_area_struct *vma)
+ {
++	/* This is only called for the current mm, so: */
++	bool foreign = false;
++	/*
++	 * Make sure to check the VMA so that we do not perform
++	 * faults just to hit a PF_PK as soon as we fill in a
++	 * page.
++	 */
++	if (!arch_vma_access_permitted(vma, (error_code & PF_WRITE),
++				(error_code & PF_INSTR), foreign))
++		return 1;
++
+ 	if (error_code & PF_WRITE) {
+ 		/* write, present and write, not present: */
+ 		if (unlikely(!(vma->vm_flags & VM_WRITE)))
+@@ -1121,7 +1225,7 @@ __do_page_fault(struct pt_regs *regs, un
+ 		if (address >= HYPERVISOR_VIRT_START
+ 		    && address < HYPERVISOR_VIRT_END) {
+ #endif
+-			bad_area_nosemaphore(regs, error_code, address);
++			bad_area_nosemaphore(regs, error_code, address, NULL);
+ 			return;
+ 		}
+ 
+@@ -1147,7 +1251,7 @@ __do_page_fault(struct pt_regs *regs, un
+ 		 * Don't take the mm semaphore here. If we fixup a prefetch
+ 		 * fault we could otherwise deadlock:
+ 		 */
+-		bad_area_nosemaphore(regs, error_code, address);
++		bad_area_nosemaphore(regs, error_code, address, NULL);
+ 
+ 		return;
+ 	}
+@@ -1160,7 +1264,7 @@ __do_page_fault(struct pt_regs *regs, un
+ 		pgtable_bad(regs, error_code, address);
+ 
+ 	if (unlikely(smap_violation(error_code, regs))) {
+-		bad_area_nosemaphore(regs, error_code, address);
++		bad_area_nosemaphore(regs, error_code, address, NULL);
+ 		return;
+ 	}
+ 
+@@ -1169,7 +1273,7 @@ __do_page_fault(struct pt_regs *regs, un
+ 	 * in a region with pagefaults disabled then we must not take the fault
+ 	 */
+ 	if (unlikely(faulthandler_disabled() || !mm)) {
+-		bad_area_nosemaphore(regs, error_code, address);
++		bad_area_nosemaphore(regs, error_code, address, NULL);
+ 		return;
+ 	}
+ 
+@@ -1193,6 +1297,8 @@ __do_page_fault(struct pt_regs *regs, un
+ 
+ 	if (error_code & PF_WRITE)
+ 		flags |= FAULT_FLAG_WRITE;
++	if (error_code & PF_INSTR)
++		flags |= FAULT_FLAG_INSTRUCTION;
+ 
+ 	/*
+ 	 * When running in the kernel we expect faults to occur only to
+@@ -1213,7 +1319,7 @@ __do_page_fault(struct pt_regs *regs, un
+ 	if (unlikely(!down_read_trylock(&mm->mmap_sem))) {
+ 		if ((error_code & PF_USER) == 0 &&
+ 		    !search_exception_tables(regs->ip)) {
+-			bad_area_nosemaphore(regs, error_code, address);
++			bad_area_nosemaphore(regs, error_code, address, NULL);
+ 			return;
+ 		}
+ retry:
+@@ -1261,7 +1367,7 @@ retry:
+ 	 */
+ good_area:
+ 	if (unlikely(access_error(error_code, vma))) {
+-		bad_area_access_error(regs, error_code, address);
++		bad_area_access_error(regs, error_code, address, vma);
+ 		return;
+ 	}
+ 
+@@ -1299,7 +1405,7 @@ good_area:
+ 
+ 	up_read(&mm->mmap_sem);
+ 	if (unlikely(fault & VM_FAULT_ERROR)) {
+-		mm_fault_error(regs, error_code, address, fault);
++		mm_fault_error(regs, error_code, address, vma, fault);
+ 		return;
+ 	}
+ 
+--- a/arch/x86/mm/init-xen.c
++++ b/arch/x86/mm/init-xen.c
+@@ -169,13 +169,14 @@ static int page_size_mask;
+ 
+ static void __init probe_page_size_mask(void)
+ {
+-#if !defined(CONFIG_DEBUG_PAGEALLOC) && !defined(CONFIG_KMEMCHECK)
++#if !defined(CONFIG_KMEMCHECK)
+ 	/*
+-	 * For CONFIG_DEBUG_PAGEALLOC, identity mapping will use small pages.
++	 * For CONFIG_KMEMCHECK or pagealloc debugging, identity mapping will
++	 * use small pages.
+ 	 * This will simplify cpa(), which otherwise needs to support splitting
+ 	 * large pages into small in interrupt context, etc.
+ 	 */
+-	if (cpu_has_pse)
++	if (cpu_has_pse && !debug_pagealloc_enabled())
+ 		page_size_mask |= 1 << PG_LEVEL_2M;
+ #endif
+ 
+@@ -685,33 +686,34 @@ void free_init_pages(char *what, unsigne
+ 	 * mark them not present - any buggy init-section access will
+ 	 * create a kernel page fault:
+ 	 */
+-#ifdef CONFIG_DEBUG_PAGEALLOC
+-	printk(KERN_INFO "debug: unmapping init [mem %#010lx-%#010lx]\n",
+-		begin, end - 1);
+-	set_memory_np(begin, (end - begin) >> PAGE_SHIFT);
+-#else
+-	/*
+-	 * We just marked the kernel text read only above, now that
+-	 * we are going to free part of that, we need to make that
+-	 * writeable and non-executable first.
+-	 */
+-	set_memory_nx(begin, (end - begin) >> PAGE_SHIFT);
+-	set_memory_rw(begin, (end - begin) >> PAGE_SHIFT);
++	if (debug_pagealloc_enabled()) {
++		pr_info("debug: unmapping init [mem %#010lx-%#010lx]\n",
++			begin, end - 1);
++		set_memory_np(begin, (end - begin) >> PAGE_SHIFT);
++	} else {
++		/*
++		 * We just marked the kernel text read only above, now that
++		 * we are going to free part of that, we need to make that
++		 * writeable and non-executable first.
++		 */
++		set_memory_nx(begin, (end - begin) >> PAGE_SHIFT);
++		set_memory_rw(begin, (end - begin) >> PAGE_SHIFT);
+ 
+ #ifdef CONFIG_X86_64
+-	if (begin >= __START_KERNEL_map) {
+-		unsigned long addr;
++		if (begin >= __START_KERNEL_map) {
++			unsigned long addr;
+ 
+-		for (addr = begin; addr < end; addr += PAGE_SIZE)
+-			if (HYPERVISOR_update_va_mapping(addr, __pte(0), 0))
+-				BUG();
++			for (addr = begin; addr < end; addr += PAGE_SIZE)
++				if (HYPERVISOR_update_va_mapping(addr, __pte(0), 0))
++					BUG();
+ 
+-		begin = (unsigned long)__va(__pa_symbol(begin));
+-		end = (unsigned long)__va(__pa_symbol(end));
+-	}
+-#endif
+-	free_reserved_area((void *)begin, (void *)end, POISON_FREE_INITMEM, what);
++			begin = (unsigned long)__va(__pa_symbol(begin));
++			end = (unsigned long)__va(__pa_symbol(end));
++		}
+ #endif
++		free_reserved_area((void *)begin, (void *)end,
++				   POISON_FREE_INITMEM, what);
++	}
+ }
+ 
+ void free_initmem(void)
+--- a/arch/x86/mm/init_32-xen.c
++++ b/arch/x86/mm/init_32-xen.c
+@@ -432,7 +432,6 @@ repeat:
+ }
+ 
+ pte_t *kmap_pte;
+-pgprot_t kmap_prot;
+ 
+ static inline pte_t *kmap_get_fixmap_pte(unsigned long vaddr)
+ {
+@@ -449,8 +448,6 @@ static void __init kmap_init(void)
+ 	 */
+ 	kmap_vstart = __fix_to_virt(FIX_KMAP_BEGIN);
+ 	kmap_pte = kmap_get_fixmap_pte(kmap_vstart);
+-
+-	kmap_prot = PAGE_KERNEL;
+ }
+ 
+ #ifdef CONFIG_HIGHMEM
+@@ -879,7 +876,6 @@ static noinline int do_test_wp_bit(void)
+ 	return flag;
+ }
+ 
+-#ifdef CONFIG_DEBUG_RODATA
+ const int rodata_test_data = 0xC3;
+ EXPORT_SYMBOL_GPL(rodata_test_data);
+ 
+@@ -968,5 +964,3 @@ void mark_rodata_ro(void)
+ 	if (__supported_pte_mask & _PAGE_NX)
+ 		debug_checkwx();
+ }
+-#endif
+-
+--- a/arch/x86/mm/init_64-xen.c
++++ b/arch/x86/mm/init_64-xen.c
+@@ -1401,7 +1401,6 @@ void __init mem_init(void)
+ 	mem_init_print_info(NULL);
+ }
+ 
+-#ifdef CONFIG_DEBUG_RODATA
+ const int rodata_test_data = 0xC3;
+ EXPORT_SYMBOL_GPL(rodata_test_data);
+ 
+@@ -1508,8 +1507,6 @@ void mark_rodata_ro(void)
+ 	debug_checkwx();
+ }
+ 
+-#endif
+-
+ int kern_addr_valid(unsigned long addr)
+ {
+ 	unsigned long above = ((long)addr) >> __VIRTUAL_MASK_SHIFT;
+@@ -1562,26 +1559,13 @@ int kern_addr_valid(unsigned long addr)
+ #ifdef CONFIG_MEMORY_HOTPLUG_SPARSE
+ static unsigned long probe_memory_block_size(void)
+ {
+-	/* start from 2g */
+-	unsigned long bz = 1UL<<31;
++	unsigned long bz = MIN_MEMORY_BLOCK_SIZE;
+ 
+-	if (totalram_pages >= (64ULL << (30 - PAGE_SHIFT))) {
+-		pr_info("Using 2GB memory block size for large-memory system\n");
+-		return 2UL * 1024 * 1024 * 1024;
+-	}
+-
+-	/* less than 64g installed */
+-	if ((max_pfn << PAGE_SHIFT) < (16UL << 32))
+-		return MIN_MEMORY_BLOCK_SIZE;
+-
+-	/* get the tail size */
+-	while (bz > MIN_MEMORY_BLOCK_SIZE) {
+-		if (!((max_pfn << PAGE_SHIFT) & (bz - 1)))
+-			break;
+-		bz >>= 1;
+-	}
++	/* if system is UV or has 64GB of RAM or more, use large blocks */
++	if (is_uv_system() || ((max_pfn << PAGE_SHIFT) >= (64UL << 30)))
++		bz = 2UL << 30; /* 2GB */
+ 
+-	printk(KERN_DEBUG "memory block size : %ldMB\n", bz >> 20);
++	pr_info("x86/mm: Memory block size: %ldMB\n", bz >> 20);
+ 
+ 	return bz;
+ }
+--- a/arch/x86/mm/pageattr-xen.c
++++ b/arch/x86/mm/pageattr-xen.c
+@@ -106,12 +106,6 @@ static inline unsigned long highmap_end_
+ 
+ #endif
+ 
+-#ifdef CONFIG_DEBUG_PAGEALLOC
+-# define debug_pagealloc 1
+-#else
+-# define debug_pagealloc 0
+-#endif
+-
+ static inline int
+ within(unsigned long addr, unsigned long start, unsigned long end)
+ {
+@@ -283,7 +277,7 @@ static inline pgprot_t static_protection
+ 		   __pa_symbol(__end_rodata) >> PAGE_SHIFT))
+ 		pgprot_val(forbidden) |= _PAGE_RW;
+ 
+-#if defined(CONFIG_X86_64) && defined(CONFIG_DEBUG_RODATA) && !defined(CONFIG_XEN)
++#if defined(CONFIG_X86_64) && !defined(CONFIG_XEN)
+ 	/*
+ 	 * Once the kernel maps the text as RO (kernel_set_to_readonly is set),
+ 	 * kernel text mappings for the large page aligned text, rodata sections
+@@ -731,10 +725,10 @@ static int split_large_page(struct cpa_d
+ {
+ 	struct page *base;
+ 
+-	if (!debug_pagealloc)
++	if (!debug_pagealloc_enabled())
+ 		spin_unlock(&cpa_lock);
+ 	base = alloc_pages(GFP_KERNEL | __GFP_NOTRACK, 0);
+-	if (!debug_pagealloc)
++	if (!debug_pagealloc_enabled())
+ 		spin_lock(&cpa_lock);
+ 	if (!base)
+ 		return -ENOMEM;
+@@ -933,16 +927,25 @@ static void populate_pte(struct cpa_data
+ 
+ 	pte = pte_offset_kernel(pmd, start);
+ 
+-	while (num_pages-- && start < end) {
++	/*
++	 * Set the GLOBAL flags only if the PRESENT flag is
++	 * set otherwise pte_present will return true even on
++	 * a non present pte. The canon_pgprot will clear
++	 * _PAGE_GLOBAL for the ancient hardware that doesn't
++	 * support it.
++	 */
++	if (pgprot_val(pgprot) & _PAGE_PRESENT)
++		pgprot_val(pgprot) |= _PAGE_GLOBAL;
++	else
++		pgprot_val(pgprot) &= ~_PAGE_GLOBAL;
+ 
+-		/* deal with the NX bit */
+-		if (!(pgprot_val(pgprot) & _PAGE_NX))
+-			cpa->pfn &= ~_PAGE_NX;
++	pgprot = canon_pgprot(pgprot);
+ 
+-		set_pte(pte, pfn_pte(cpa->pfn >> PAGE_SHIFT, pgprot));
++	while (num_pages-- && start < end) {
++		set_pte(pte, pfn_pte(cpa->pfn, pgprot));
+ 
+ 		start	 += PAGE_SIZE;
+-		cpa->pfn += PAGE_SIZE;
++		cpa->pfn++;
+ 		pte++;
+ 	}
+ }
+@@ -998,11 +1001,11 @@ static int populate_pmd(struct cpa_data
+ 
+ 		pmd = pmd_offset(pud, start);
+ 
+-		set_pmd(pmd, __pmd(cpa->pfn | _PAGE_PSE |
++		set_pmd(pmd, __pmd(cpa->pfn << PAGE_SHIFT | _PAGE_PSE |
+ 				   massage_pgprot(pmd_pgprot)));
+ 
+ 		start	  += PMD_SIZE;
+-		cpa->pfn  += PMD_SIZE;
++		cpa->pfn  += PMD_SIZE >> PAGE_SHIFT;
+ 		cur_pages += PMD_SIZE >> PAGE_SHIFT;
+ 	}
+ 
+@@ -1070,12 +1073,12 @@ static int populate_pud(struct cpa_data
+ 	/*
+ 	 * Map everything starting from the Gb boundary, possibly with 1G pages
+ 	 */
+-	while (end - start >= PUD_SIZE) {
+-		set_pud(pud, __pud(cpa->pfn | _PAGE_PSE |
++	while (cpu_has_gbpages && end - start >= PUD_SIZE) {
++		set_pud(pud, __pud(cpa->pfn << PAGE_SHIFT | _PAGE_PSE |
+ 				   massage_pgprot(pud_pgprot)));
+ 
+ 		start	  += PUD_SIZE;
+-		cpa->pfn  += PUD_SIZE;
++		cpa->pfn  += PUD_SIZE >> PAGE_SHIFT;
+ 		cur_pages += PUD_SIZE >> PAGE_SHIFT;
+ 		pud++;
+ 	}
+@@ -1151,8 +1154,10 @@ static int __cpa_process_fault(struct cp
+ 	/*
+ 	 * Ignore all non primary paths.
+ 	 */
+-	if (!primary)
++	if (!primary) {
++		cpa->numpages = 1;
+ 		return 0;
++	}
+ 
+ 	/*
+ 	 * Ignore the NULL PTE for kernel identity mapping, as it is expected
+@@ -1383,10 +1388,10 @@ static int __change_page_attr_set_clr(st
+ 		if (cpa->flags & (CPA_ARRAY | CPA_PAGES_ARRAY))
+ 			cpa->numpages = 1;
+ 
+-		if (!debug_pagealloc)
++		if (!debug_pagealloc_enabled())
+ 			spin_lock(&cpa_lock);
+ 		ret = __change_page_attr(cpa, checkalias);
+-		if (!debug_pagealloc)
++		if (!debug_pagealloc_enabled())
+ 			spin_unlock(&cpa_lock);
+ 		if (ret)
+ 			return ret;
+@@ -2060,6 +2065,9 @@ int kernel_map_pages_in_pgd(pgd_t *pgd,
+ 	if (!(page_flags & _PAGE_NX))
+ 		cpa.mask_clr = __pgprot(_PAGE_NX);
+ 
++	if (!(page_flags & _PAGE_RW))
++		cpa.mask_clr = __pgprot(_PAGE_RW);
++
+ 	cpa.mask_set = __pgprot(_PAGE_PRESENT | page_flags);
+ 
+ 	retval = __change_page_attr_set_clr(&cpa, 0);
+--- a/arch/x86/mm/pat-xen.c
++++ b/arch/x86/mm/pat-xen.c
+@@ -149,7 +149,7 @@ enum {
+ 	PAT_WT = 4,		/* Write Through */
+ 	PAT_WP = 5,		/* Write Protected */
+ 	PAT_WB = 6,		/* Write Back (default) */
+-	PAT_UC_MINUS = 7,	/* UC, but can be overriden by MTRR */
++	PAT_UC_MINUS = 7,	/* UC, but can be overridden by MTRR */
+ };
+ 
+ #define CM(c) (_PAGE_CACHE_MODE_ ## c)
+@@ -937,7 +937,7 @@ int track_pfn_remap(struct vm_area_struc
+ 			return -EINVAL;
+ 	}
+ 
+-	*prot = __pgprot((pgprot_val(vma->vm_page_prot) & (~_PAGE_CACHE_MASK)) |
++	*prot = __pgprot((pgprot_val(*prot) & (~_PAGE_CACHE_MASK)) |
+ 			 cachemode2protval(pcm));
+ 
+ 	return 0;
+@@ -953,7 +953,7 @@ int track_pfn_insert(struct vm_area_stru
+ 
+ 	/* Set prot based on lookup */
+ 	pcm = lookup_memtype(pfn_t_to_phys(pfn));
+-	*prot = __pgprot((pgprot_val(vma->vm_page_prot) & (~_PAGE_CACHE_MASK)) |
++	*prot = __pgprot((pgprot_val(*prot) & (~_PAGE_CACHE_MASK)) |
+ 			 cachemode2protval(pcm));
+ 
+ 	return 0;
+--- a/arch/x86/mm/tlb-xen.c
++++ b/arch/x86/mm/tlb-xen.c
+@@ -9,6 +9,23 @@
+ #include <asm/cache.h>
+ #include <linux/debugfs.h>
+ 
++void flush_tlb_others(const struct cpumask *cpumask, struct mm_struct *mm,
++		      unsigned long start, unsigned long end)
++{
++	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH);
++	if (end == TLB_FLUSH_ALL) {
++		xen_tlb_flush_mask(cpumask);
++		trace_tlb_flush(TLB_REMOTE_SHOOTDOWN, TLB_FLUSH_ALL);
++	} else {
++		/* flush range by one by one 'invlpg' */
++		unsigned long addr;
++
++		for (addr = start; addr < end; addr += PAGE_SIZE)
++			xen_invlpg_mask(cpumask, addr);
++		trace_tlb_flush(TLB_REMOTE_SHOOTDOWN, PFN_DOWN(end - start));
++	}
++}
++
+ /*
+  * See Documentation/x86/tlb.txt for details.  We choose 33
+  * because it is large enough to cover the vast majority (at
+--- a/drivers/edac/Kconfig
++++ b/drivers/edac/Kconfig
+@@ -51,7 +51,7 @@ config EDAC_DEBUG
+ 
+ config EDAC_DECODE_MCE
+ 	tristate "Decode MCEs in human-readable form (only on AMD for now)"
+-	depends on CPU_SUP_AMD && (X86_MCE_AMD || X86_XEN_MCE)
++	depends on CPU_SUP_AMD && (X86_MCE_AMD || (X86_XEN_MCE && BROKEN))
+ 	default y
+ 	---help---
+ 	  Enable this option if you want to decode Machine Check Exceptions
+--- a/drivers/net/ethernet/intel/Kconfig
++++ b/drivers/net/ethernet/intel/Kconfig
+@@ -86,7 +86,7 @@ config E1000E
+ config E1000E_HWTS
+ 	bool "Support HW cross-timestamp on PCH devices"
+ 	default y
+-	depends on E1000E && X86
++	depends on E1000E && X86 && !XEN
+ 	---help---
+ 	 Say Y to enable hardware supported cross-timestamping on PCH
+ 	 devices. The cross-timestamp is available through the PTP clock
+--- a/drivers/platform/goldfish/Kconfig
++++ b/drivers/platform/goldfish/Kconfig
+@@ -1,7 +1,7 @@
+ menuconfig GOLDFISH
+ 	bool "Platform support for Goldfish virtual devices"
+ 	depends on X86_32 || X86_64 || ARM || ARM64 || MIPS
+-	depends on HAS_IOMEM
++	depends on HAS_IOMEM && !XEN
+ 	---help---
+ 	  Say Y here to get to see options for the Goldfish virtual platform.
+ 	  This option alone does not add any kernel code.
+--- a/drivers/xen/blktap2-new/device.c
++++ b/drivers/xen/blktap2-new/device.c
+@@ -2,7 +2,6 @@
+ #include <linux/blkdev.h>
+ #include <linux/cdrom.h>
+ #include <linux/hdreg.h>
+-#include <linux/module.h>
+ #include <scsi/scsi.h>
+ #include <scsi/scsi_ioctl.h>
+ 
+--- a/drivers/xen/blktap2-new/ring.c
++++ b/drivers/xen/blktap2-new/ring.c
+@@ -1,4 +1,3 @@
+-#include <linux/module.h>
+ #include <linux/device.h>
+ #include <linux/signal.h>
+ #include <linux/sched.h>
+--- a/drivers/xen/blktap2-new/sysfs.c
++++ b/drivers/xen/blktap2-new/sysfs.c
+@@ -1,6 +1,5 @@
+ #include <linux/types.h>
+ #include <linux/device.h>
+-#include <linux/module.h>
+ #include <linux/sched.h>
+ #include <linux/genhd.h>
+ #include <linux/blkdev.h>
+--- a/drivers/xen/blktap2/device.c
++++ b/drivers/xen/blktap2/device.c
+@@ -2,7 +2,6 @@
+ #include <linux/blkdev.h>
+ #include <linux/cdrom.h>
+ #include <linux/hdreg.h>
+-#include <linux/module.h>
+ #include <scsi/scsi.h>
+ #include <asm/tlbflush.h>
+ 
+--- a/drivers/xen/blktap2/ring.c
++++ b/drivers/xen/blktap2/ring.c
+@@ -1,4 +1,3 @@
+-#include <linux/module.h>
+ #include <linux/signal.h>
+ 
+ #include "blktap.h"
+--- a/drivers/xen/blktap2/sysfs.c
++++ b/drivers/xen/blktap2/sysfs.c
+@@ -1,6 +1,5 @@
+ #include <linux/types.h>
+ #include <linux/device.h>
+-#include <linux/module.h>
+ 
+ #include "blktap.h"
+ 
+--- a/drivers/xen/char/mem.c
++++ b/drivers/xen/char/mem.c
+@@ -199,7 +199,7 @@ static loff_t memory_lseek(struct file *
+ 		offset += file->f_pos;
+ 	case SEEK_SET:
+ 		/* to avoid userland mistaking f_pos=-9 as -EBADF=-9 */
+-		if (IS_ERR_VALUE((unsigned long long)offset)) {
++		if ((unsigned long long)offset >= -MAX_ERRNO) {
+ 			ret = -EOVERFLOW;
+ 			break;
+ 		}
+--- a/drivers/xen/console/console.c
++++ b/drivers/xen/console/console.c
+@@ -30,7 +30,6 @@
+  * IN THE SOFTWARE.
+  */
+ 
+-#include <linux/module.h>
+ #include <linux/errno.h>
+ #include <linux/signal.h>
+ #include <linux/sched.h>
+@@ -648,7 +647,7 @@ static void xencons_close(struct tty_str
+ 	tty->closing = 1;
+ 	tty_wait_until_sent(tty, 0);
+ 	tty_driver_flush_buffer(tty);
+-	if (tty->ldisc->ops->flush_buffer)
++	if (tty->ldisc && tty->ldisc->ops->flush_buffer)
+ 		tty->ldisc->ops->flush_buffer(tty);
+ 	tty->closing = 0;
+ 	spin_lock_irqsave(&xencons_lock, flags);
+@@ -763,7 +762,4 @@ static int __init xencons_init(void)
+ 
+ 	return 0;
+ }
+-
+-module_init(xencons_init);
+-
+-MODULE_LICENSE("Dual BSD/GPL");
++__initcall(xencons_init);
+--- a/drivers/xen/core/evtchn.c
++++ b/drivers/xen/core/evtchn.c
+@@ -30,7 +30,7 @@
+  * IN THE SOFTWARE.
+  */
+ 
+-#include <linux/module.h>
++#include <linux/export.h>
+ #include <linux/slab.h>
+ #include <linux/irq.h>
+ #include <linux/interrupt.h>
+--- a/drivers/xen/core/smpboot.c
++++ b/drivers/xen/core/smpboot.c
+@@ -200,7 +200,7 @@ static void cpu_bringup(void)
+ static void cpu_bringup_and_idle(void)
+ {
+ 	cpu_bringup();
+-	cpu_startup_entry(CPUHP_ONLINE);
++	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
+ }
+ 
+ static void cpu_initialize_context(unsigned int cpu, unsigned long sp0)
+@@ -437,6 +437,7 @@ void __ref play_dead(void)
+ 	VOID(HYPERVISOR_vcpu_op(VCPUOP_down, smp_processor_id(), NULL));
+ 	cpu_bringup();
+ 	tick_nohz_idle_enter();
++	cpu_startup_entry(CPUHP_AP_ONLINE_IDLE);
+ #else
+ 	BUG();
+ #endif
+--- a/drivers/xen/fbfront/xenfb.c
++++ b/drivers/xen/fbfront/xenfb.c
+@@ -417,7 +417,7 @@ static int xenfb_vm_fault(struct vm_area
+ 
+ 	vmf->page = page;
+ 
+-	return VM_FAULT_MINOR;
++	return 0;
+ }
+ 
+ static const struct vm_operations_struct xenfb_vm_ops = {
+--- a/drivers/xen/netback/xenbus.c
++++ b/drivers/xen/netback/xenbus.c
+@@ -255,11 +255,8 @@ static void frontend_changed(struct xenb
+ 
+ 	switch (frontend_state) {
+ 	case XenbusStateInitialising:
+-		if (dev->state == XenbusStateClosed) {
+-			pr_info("%s: %s: prepare for reconnect\n",
+-				__func__, dev->nodename);
++		if (dev->state == XenbusStateClosed)
+ 			xenbus_switch_state(dev, XenbusStateInitWait);
+-		}
+ 		break;
+ 
+ 	case XenbusStateInitialised:
+--- a/drivers/xen/pcifront/pci_op.c
++++ b/drivers/xen/pcifront/pci_op.c
+@@ -3,9 +3,9 @@
+  *
+  *   Author: Ryan Wilson <hap9@epoch.ncsc.mil>
+  */
+-#include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/ktime.h>
++#include <linux/moduleparam.h>
+ #include <linux/pci.h>
+ #include <linux/spinlock.h>
+ #include <asm/bitops.h>
+--- a/drivers/xen/pcifront/xenbus.c
++++ b/drivers/xen/pcifront/xenbus.c
+@@ -3,7 +3,6 @@
+  *
+  *   Author: Ryan Wilson <hap9@epoch.ncsc.mil>
+  */
+-#include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/mm.h>
+ #include <xen/xenbus.h>
+@@ -457,7 +456,6 @@ static const struct xenbus_device_id pci
+ 	{"pci"},
+ 	{{0}},
+ };
+-MODULE_ALIAS("xen:pci");
+ 
+ static DEFINE_XENBUS_DRIVER(pcifront, "pcifront",
+ 	.probe 			= pcifront_xenbus_probe,
+--- a/drivers/xen/sys-hypervisor.c
++++ b/drivers/xen/sys-hypervisor.c
+@@ -526,10 +526,10 @@ static int __init hyper_sysfs_init(void)
+ 		goto out;
+ 
+ #ifdef CONFIG_XEN_HAVE_VPMU
+-	xen_pmu_destroy();
++	sysfs_remove_group(hypervisor_kobj, &xen_pmu_group);
+ vpmu_out:
+ #endif
+-	xen_properties_destroy();
++	sysfs_remove_group(hypervisor_kobj, &xen_properties_group);
+ prop_out:
+ 	sysfs_remove_file(hypervisor_kobj, &uuid_attr.attr);
+ uuid_out:
+--- a/drivers/xen/util.c
++++ b/drivers/xen/util.c
+@@ -1,5 +1,5 @@
+ #include <linux/err.h>
+-#include <linux/module.h>
++#include <linux/export.h>
+ #include <linux/mutex.h>
+ #include <linux/slab.h>
+ #include <xen/driver_util.h>
+--- a/drivers/xen/xenbus/xenbus_dev_backend.c
++++ b/drivers/xen/xenbus/xenbus_dev_backend.c
+@@ -20,6 +20,11 @@
+ 
+ #include "xenbus_comms.h"
+ 
++#ifdef MODULE
++#include <linux/module.h>
++MODULE_LICENSE("GPL");
++#endif
++
+ static int xenbus_backend_open(struct inode *inode, struct file *filp)
+ {
+ 	if (!capable(CAP_SYS_ADMIN))
+@@ -136,4 +141,14 @@ static int __init xenbus_backend_init(vo
+ 		pr_err("Could not register xenbus backend device\n");
+ 	return err;
+ }
++#ifdef MODULE
++module_init(xenbus_backend_init);
++
++static void __exit xenbus_backend_exit(void)
++{
++	misc_deregister(&xenbus_backend_dev);
++}
++module_exit(xenbus_backend_exit);
++#else
+ device_initcall(xenbus_backend_init);
++#endif
+--- a/drivers/xen/xenbus/xenbus_xs.c
++++ b/drivers/xen/xenbus/xenbus_xs.c
+@@ -44,7 +44,6 @@
+ #include <linux/fcntl.h>
+ #include <linux/kthread.h>
+ #include <linux/rwsem.h>
+-#include <linux/module.h>
+ #include <linux/mutex.h>
+ #ifndef CONFIG_XEN
+ #include <asm/xen/hypervisor.h>
+--- a/include/trace/events/mmflags.h
++++ b/include/trace/events/mmflags.h
+@@ -78,6 +78,12 @@
+ #define IF_HAVE_PG_IDLE(flag,string)
+ #endif
+ 
++#ifdef CONFIG_XEN
++#define IF_HAVE_PG_XEN(flag) ,{1UL << PG_##flag, #flag}
++#else
++#define IF_HAVE_PG_XEN(flag)
++#endif
++
+ #define __def_pageflag_names						\
+ 	{1UL << PG_locked,		"locked"	},		\
+ 	{1UL << PG_error,		"error"		},		\
+@@ -103,7 +109,8 @@ IF_HAVE_PG_MLOCK(PG_mlocked,		"mlocked"
+ IF_HAVE_PG_UNCACHED(PG_uncached,	"uncached"	)		\
+ IF_HAVE_PG_HWPOISON(PG_hwpoison,	"hwpoison"	)		\
+ IF_HAVE_PG_IDLE(PG_young,		"young"		)		\
+-IF_HAVE_PG_IDLE(PG_idle,		"idle"		)
++IF_HAVE_PG_IDLE(PG_idle,		"idle"		)		\
++IF_HAVE_PG_XEN(foreign) /* IF_HAVE_PG_XEN(netback) */ IF_HAVE_PG_XEN(blkback)
+ 
+ #define show_page_flags(flags)						\
+ 	(flags) ? __print_flags(flags, "|",				\
+--- a/include/xen/interface/io/netif.h
++++ b/include/xen/interface/io/netif.h
+@@ -136,35 +136,511 @@
+  */
+ 
+ /*
+- * "feature-multicast-control" advertises the capability to filter ethernet
+- * multicast packets in the backend. To enable use of this capability the
+- * frontend must set "request-multicast-control" before moving into the
+- * connected state.
+- *
+- * If "request-multicast-control" is set then the backend transmit side should
+- * no longer flood multicast packets to the frontend, it should instead drop any
+- * multicast packet that does not match in a filter list. The list is
+- * amended by the frontend by sending dummy transmit requests containing
+- * XEN_NETIF_EXTRA_TYPE_MCAST_{ADD,DEL} extra-info fragments as specified below.
+- * Once enabled by the frontend, the feature cannot be disabled except by
+- * closing and re-connecting to the backend.
++ * "feature-multicast-control" and "feature-dynamic-multicast-control"
++ * advertise the capability to filter ethernet multicast packets in the
++ * backend. If the frontend wishes to take advantage of this feature then
++ * it may set "request-multicast-control". If the backend only advertises
++ * "feature-multicast-control" then "request-multicast-control" must be set
++ * before the frontend moves into the connected state. The backend will
++ * sample the value on this state transition and any subsequent change in
++ * value will have no effect. However, if the backend also advertises
++ * "feature-dynamic-multicast-control" then "request-multicast-control"
++ * may be set by the frontend at any time. In this case, the backend will
++ * watch the value and re-sample on watch events.
++ *
++ * If the sampled value of "request-multicast-control" is set then the
++ * backend transmit side should no longer flood multicast packets to the
++ * frontend, it should instead drop any multicast packet that does not
++ * match in a filter list.
++ * The list is amended by the frontend by sending dummy transmit requests
++ * containing XEN_NETIF_EXTRA_TYPE_MCAST_{ADD,DEL} extra-info fragments as
++ * specified below.
++ * Note that the filter list may be amended even if the sampled value of
++ * "request-multicast-control" is not set, however the filter should only
++ * be applied if it is set.
+  */
+ 
+ /*
+- * This is the 'wire' format for packets:
+- *  Request 1: xen_netif_tx_request  -- XEN_NETTXF_* (any flags)
+- * [Request 2: xen_netif_extra_info]    (only if request 1 has XEN_NETTXF_extra_info)
+- * [Request 3: xen_netif_extra_info]    (only if request 2 has XEN_NETIF_EXTRA_MORE)
+- *  Request 4: xen_netif_tx_request  -- XEN_NETTXF_more_data
+- *  Request 5: xen_netif_tx_request  -- XEN_NETTXF_more_data
+- *  ...
+- *  Request N: xen_netif_tx_request_t -- 0
++ * Control ring
++ * ============
++ *
++ * Some features, such as hashing (detailed below), require a
++ * significant amount of out-of-band data to be passed from frontend to
++ * backend. Use of xenstore is not suitable for large quantities of data
++ * because of quota limitations and so a dedicated 'control ring' is used.
++ * The ability of the backend to use a control ring is advertised by
++ * setting:
++ *
++ * /local/domain/X/backend/<domid>/<vif>/feature-ctrl-ring = "1"
++ *
++ * The frontend provides a control ring to the backend by setting:
++ *
++ * /local/domain/<domid>/device/vif/<vif>/ctrl-ring-ref = <gref>
++ * /local/domain/<domid>/device/vif/<vif>/event-channel-ctrl = <port>
++ *
++ * where <gref> is the grant reference of the shared page used to
++ * implement the control ring and <port> is an event channel to be used
++ * as a mailbox interrupt. These keys must be set before the frontend
++ * moves into the connected state.
++ *
++ * The control ring uses a fixed request/response message size and is
++ * balanced (i.e. one request to one response), so operationally it is much
++ * the same as a transmit or receive ring.
++ * Note that there is no requirement that responses are issued in the same
++ * order as requests.
++ */
++
++/*
++ * Hash types
++ * ==========
++ *
++ * For the purposes of the definitions below, 'Packet[]' is an array of
++ * octets containing an IP packet without options, 'Array[X..Y]' means a
++ * sub-array of 'Array' containing bytes X thru Y inclusive, and '+' is
++ * used to indicate concatenation of arrays.
++ */
++
++/*
++ * A hash calculated over an IP version 4 header as follows:
++ *
++ * Buffer[0..8] = Packet[12..15] (source address) +
++ *                Packet[16..19] (destination address)
++ *
++ * Result = Hash(Buffer, 8)
++ */
++#define _XEN_NETIF_CTRL_HASH_TYPE_IPV4 0
++#define XEN_NETIF_CTRL_HASH_TYPE_IPV4 \
++	(1 << _XEN_NETIF_CTRL_HASH_TYPE_IPV4)
++
++/*
++ * A hash calculated over an IP version 4 header and TCP header as
++ * follows:
++ *
++ * Buffer[0..12] = Packet[12..15] (source address) +
++ *                 Packet[16..19] (destination address) +
++ *                 Packet[20..21] (source port) +
++ *                 Packet[22..23] (destination port)
++ *
++ * Result = Hash(Buffer, 12)
++ */
++#define _XEN_NETIF_CTRL_HASH_TYPE_IPV4_TCP 1
++#define XEN_NETIF_CTRL_HASH_TYPE_IPV4_TCP \
++	(1 << _XEN_NETIF_CTRL_HASH_TYPE_IPV4_TCP)
++
++/*
++ * A hash calculated over an IP version 6 header as follows:
++ *
++ * Buffer[0..32] = Packet[8..23]  (source address ) +
++ *                 Packet[24..39] (destination address)
++ *
++ * Result = Hash(Buffer, 32)
++ */
++#define _XEN_NETIF_CTRL_HASH_TYPE_IPV6 2
++#define XEN_NETIF_CTRL_HASH_TYPE_IPV6 \
++	(1 << _XEN_NETIF_CTRL_HASH_TYPE_IPV6)
++
++/*
++ * A hash calculated over an IP version 6 header and TCP header as
++ * follows:
++ *
++ * Buffer[0..36] = Packet[8..23]  (source address) +
++ *                 Packet[24..39] (destination address) +
++ *                 Packet[40..41] (source port) +
++ *                 Packet[42..43] (destination port)
++ *
++ * Result = Hash(Buffer, 36)
++ */
++#define _XEN_NETIF_CTRL_HASH_TYPE_IPV6_TCP 3
++#define XEN_NETIF_CTRL_HASH_TYPE_IPV6_TCP \
++	(1 << _XEN_NETIF_CTRL_HASH_TYPE_IPV6_TCP)
++
++/*
++ * Hash algorithms
++ * ===============
++ */
++
++#define XEN_NETIF_CTRL_HASH_ALGORITHM_NONE 0
++
++/*
++ * Toeplitz hash:
++ */
++
++#define XEN_NETIF_CTRL_HASH_ALGORITHM_TOEPLITZ 1
++
++/*
++ * This algorithm uses a 'key' as well as the data buffer itself.
++ * (Buffer[] and Key[] are treated as shift-registers where the MSB of
++ * Buffer/Key[0] is considered 'left-most' and the LSB of Buffer/Key[N-1]
++ * is the 'right-most').
++ *
++ * Value = 0
++ * For number of bits in Buffer[]
++ *    If (left-most bit of Buffer[] is 1)
++ *        Value ^= left-most 32 bits of Key[]
++ *    Key[] << 1
++ *    Buffer[] << 1
++ *
++ * The code below is provided for convenience where an operating system
++ * does not already provide an implementation.
+  */
++#ifdef XEN_NETIF_DEFINE_TOEPLITZ
++static uint32_t xen_netif_toeplitz_hash(const uint8_t *key,
++					unsigned int keylen,
++					const uint8_t *buf, unsigned int buflen)
++{
++	unsigned int keyi, bufi;
++	uint64_t prefix = 0;
++	uint64_t hash = 0;
++
++	/* Pre-load prefix with the first 8 bytes of the key */
++	for (keyi = 0; keyi < 8; keyi++) {
++		prefix <<= 8;
++		prefix |= (keyi < keylen) ? key[keyi] : 0;
++	}
++
++	for (bufi = 0; bufi < buflen; bufi++) {
++		uint8_t byte = buf[bufi];
++		unsigned int bit;
++
++		for (bit = 0; bit < 8; bit++) {
++			if (byte & 0x80)
++				hash ^= prefix;
++			prefix <<= 1;
++			byte <<= 1;
++		}
++
++		/*
++		 * 'prefix' has now been left-shifted by 8, so
++		 * OR in the next byte.
++		 */
++		prefix |= (keyi < keylen) ? key[keyi] : 0;
++		keyi++;
++	}
++
++	/* The valid part of the hash is in the upper 32 bits. */
++	return hash >> 32;
++}
++#endif				/* XEN_NETIF_DEFINE_TOEPLITZ */
++
++/*
++ * Control requests (struct xen_netif_ctrl_request)
++ * ================================================
++ *
++ * All requests have the following format:
++ *
++ *    0     1     2     3     4     5     6     7  octet
++ * +-----+-----+-----+-----+-----+-----+-----+-----+
++ * |    id     |   type    |         data[0]       |
++ * +-----+-----+-----+-----+-----+-----+-----+-----+
++ * |         data[1]       |         data[2]       |
++ * +-----+-----+-----+-----+-----------------------+
++ *
++ * id: the request identifier, echoed in response.
++ * type: the type of request (see below)
++ * data[]: any data associated with the request (determined by type)
++ */
++
++struct xen_netif_ctrl_request {
++	uint16_t id;
++	uint16_t type;
++
++#define XEN_NETIF_CTRL_TYPE_INVALID               0
++#define XEN_NETIF_CTRL_TYPE_GET_HASH_FLAGS        1
++#define XEN_NETIF_CTRL_TYPE_SET_HASH_FLAGS        2
++#define XEN_NETIF_CTRL_TYPE_SET_HASH_KEY          3
++#define XEN_NETIF_CTRL_TYPE_GET_HASH_MAPPING_SIZE 4
++#define XEN_NETIF_CTRL_TYPE_SET_HASH_MAPPING_SIZE 5
++#define XEN_NETIF_CTRL_TYPE_SET_HASH_MAPPING      6
++#define XEN_NETIF_CTRL_TYPE_SET_HASH_ALGORITHM    7
++
++	uint32_t data[3];
++};
++
++/*
++ * Control responses (struct xen_netif_ctrl_response)
++ * ==================================================
++ *
++ * All responses have the following format:
++ *
++ *    0     1     2     3     4     5     6     7  octet
++ * +-----+-----+-----+-----+-----+-----+-----+-----+
++ * |    id     |   type    |         status        |
++ * +-----+-----+-----+-----+-----+-----+-----+-----+
++ * |         data          |
++ * +-----+-----+-----+-----+
++ *
++ * id: the corresponding request identifier
++ * type: the type of the corresponding request
++ * status: the status of request processing
++ * data: any data associated with the response (determined by type and
++ *       status)
++ */
++
++struct xen_netif_ctrl_response {
++	uint16_t id;
++	uint16_t type;
++	uint32_t status;
++
++#define XEN_NETIF_CTRL_STATUS_SUCCESS           0
++#define XEN_NETIF_CTRL_STATUS_NOT_SUPPORTED     1
++#define XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER 2
++#define XEN_NETIF_CTRL_STATUS_BUFFER_OVERFLOW   3
++
++	uint32_t data;
++};
++
++/*
++ * Control messages
++ * ================
++ *
++ * XEN_NETIF_CTRL_TYPE_SET_HASH_ALGORITHM
++ * --------------------------------------
++ *
++ * This is sent by the frontend to set the desired hash algorithm.
++ *
++ * Request:
++ *
++ *  type    = XEN_NETIF_CTRL_TYPE_SET_HASH_ALGORITHM
++ *  data[0] = a XEN_NETIF_CTRL_HASH_ALGORITHM_* value
++ *  data[1] = 0
++ *  data[2] = 0
++ *
++ * Response:
++ *
++ *  status = XEN_NETIF_CTRL_STATUS_NOT_SUPPORTED     - Operation not
++ *                                                     supported
++ *           XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER - The algorithm is not
++ *                                                     supported
++ *           XEN_NETIF_CTRL_STATUS_SUCCESS           - Operation successful
++ *
++ * NOTE: Setting data[0] to XEN_NETIF_CTRL_HASH_ALGORITHM_NONE disables
++ *       hashing and the backend is free to choose how it steers packets
++ *       to queues (which is the default behaviour).
++ *
++ * XEN_NETIF_CTRL_TYPE_GET_HASH_FLAGS
++ * ----------------------------------
++ *
++ * This is sent by the frontend to query the types of hash supported by
++ * the backend.
++ *
++ * Request:
++ *
++ *  type    = XEN_NETIF_CTRL_TYPE_GET_HASH_FLAGS
++ *  data[0] = 0
++ *  data[1] = 0
++ *  data[2] = 0
++ *
++ * Response:
++ *
++ *  status = XEN_NETIF_CTRL_STATUS_NOT_SUPPORTED - Operation not supported
++ *           XEN_NETIF_CTRL_STATUS_SUCCESS       - Operation successful
++ *  data   = supported hash types (if operation was successful)
++ *
++ * NOTE: A valid hash algorithm must be selected before this operation can
++ *       succeed.
++ *
++ * XEN_NETIF_CTRL_TYPE_SET_HASH_FLAGS
++ * ----------------------------------
++ *
++ * This is sent by the frontend to set the types of hash that the backend
++ * should calculate. (See above for hash type definitions).
++ * Note that the 'maximal' type of hash should always be chosen. For
++ * example, if the frontend sets both IPV4 and IPV4_TCP hash types then
++ * the latter hash type should be calculated for any TCP packet and the
++ * former only calculated for non-TCP packets.
++ *
++ * Request:
++ *
++ *  type    = XEN_NETIF_CTRL_TYPE_SET_HASH_FLAGS
++ *  data[0] = bitwise OR of XEN_NETIF_CTRL_HASH_TYPE_* values
++ *  data[1] = 0
++ *  data[2] = 0
++ *
++ * Response:
++ *
++ *  status = XEN_NETIF_CTRL_STATUS_NOT_SUPPORTED     - Operation not
++ *                                                     supported
++ *           XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER - One or more flag
++ *                                                     value is invalid or
++ *                                                     unsupported
++ *           XEN_NETIF_CTRL_STATUS_SUCCESS           - Operation successful
++ *  data   = 0
++ *
++ * NOTE: A valid hash algorithm must be selected before this operation can
++ *       succeed.
++ *       Also, setting data[0] to zero disables hashing and the backend
++ *       is free to choose how it steers packets to queues.
++ *
++ * XEN_NETIF_CTRL_TYPE_SET_HASH_KEY
++ * --------------------------------
++ *
++ * This is sent by the frontend to set the key of the hash if the algorithm
++ * requires it. (See hash algorithms above).
++ *
++ * Request:
++ *
++ *  type    = XEN_NETIF_CTRL_TYPE_SET_HASH_KEY
++ *  data[0] = grant reference of page containing the key (assumed to
++ *            start at beginning of grant)
++ *  data[1] = size of key in octets
++ *  data[2] = 0
++ *
++ * Response:
++ *
++ *  status = XEN_NETIF_CTRL_STATUS_NOT_SUPPORTED     - Operation not
++ *                                                     supported
++ *           XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER - Key size is invalid
++ *           XEN_NETIF_CTRL_STATUS_BUFFER_OVERFLOW   - Key size is larger
++ *                                                     than the backend
++ *                                                     supports
++ *           XEN_NETIF_CTRL_STATUS_SUCCESS           - Operation successful
++ *  data   = 0
++ *
++ * NOTE: Any key octets not specified are assumed to be zero (the key
++ *       is assumed to be empty by default) and specifying a new key
++ *       invalidates any previous key, hence specifying a key size of
++ *       zero will clear the key (which ensures that the calculated hash
++ *       will always be zero).
++ *       The maximum size of key is algorithm and backend specific, but
++ *       is also limited by the single grant reference.
++ *       The grant reference may be read-only and must remain valid until
++ *       the response has been processed.
++ *
++ * XEN_NETIF_CTRL_TYPE_GET_HASH_MAPPING_SIZE
++ * -----------------------------------------
++ *
++ * This is sent by the frontend to query the maximum size of mapping
++ * table supported by the backend. The size is specified in terms of
++ * table entries.
++ *
++ * Request:
++ *
++ *  type    = XEN_NETIF_CTRL_TYPE_GET_HASH_MAPPING_SIZE
++ *  data[0] = 0
++ *  data[1] = 0
++ *  data[2] = 0
++ *
++ * Response:
++ *
++ *  status = XEN_NETIF_CTRL_STATUS_NOT_SUPPORTED - Operation not supported
++ *           XEN_NETIF_CTRL_STATUS_SUCCESS       - Operation successful
++ *  data   = maximum number of entries allowed in the mapping table
++ *           (if operation was successful) or zero if a mapping table is
++ *           not supported (i.e. hash mapping is done only by modular
++ *           arithmetic).
++ *
++ * XEN_NETIF_CTRL_TYPE_SET_HASH_MAPPING_SIZE
++ * -------------------------------------
++ *
++ * This is sent by the frontend to set the actual size of the mapping
++ * table to be used by the backend. The size is specified in terms of
++ * table entries.
++ * Any previous table is invalidated by this message and any new table
++ * is assumed to be zero filled.
++ *
++ * Request:
++ *
++ *  type    = XEN_NETIF_CTRL_TYPE_SET_HASH_MAPPING_SIZE
++ *  data[0] = number of entries in mapping table
++ *  data[1] = 0
++ *  data[2] = 0
++ *
++ * Response:
++ *
++ *  status = XEN_NETIF_CTRL_STATUS_NOT_SUPPORTED     - Operation not
++ *                                                     supported
++ *           XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER - Table size is invalid
++ *           XEN_NETIF_CTRL_STATUS_SUCCESS           - Operation successful
++ *  data   = 0
++ *
++ * NOTE: Setting data[0] to 0 means that hash mapping should be done
++ *       using modular arithmetic.
++ *
++ * XEN_NETIF_CTRL_TYPE_SET_HASH_MAPPING
++ * ------------------------------------
++ *
++ * This is sent by the frontend to set the content of the table mapping
++ * hash value to queue number. The backend should calculate the hash from
++ * the packet header, use it as an index into the table (modulo the size
++ * of the table) and then steer the packet to the queue number found at
++ * that index.
++ *
++ * Request:
++ *
++ *  type    = XEN_NETIF_CTRL_TYPE_SET_HASH_MAPPING
++ *  data[0] = grant reference of page containing the mapping (sub-)table
++ *            (assumed to start at beginning of grant)
++ *  data[1] = size of (sub-)table in entries
++ *  data[2] = offset, in entries, of sub-table within overall table
++ *
++ * Response:
++ *
++ *  status = XEN_NETIF_CTRL_STATUS_NOT_SUPPORTED     - Operation not
++ *                                                     supported
++ *           XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER - Table size or content
++ *                                                     is invalid
++ *           XEN_NETIF_CTRL_STATUS_BUFFER_OVERFLOW   - Table size is larger
++ *                                                     than the backend
++ *                                                     supports
++ *           XEN_NETIF_CTRL_STATUS_SUCCESS           - Operation successful
++ *  data   = 0
++ *
++ * NOTE: The overall table has the following format:
++ *
++ *          0     1     2     3     4     5     6     7  octet
++ *       +-----+-----+-----+-----+-----+-----+-----+-----+
++ *       |       mapping[0]      |       mapping[1]      |
++ *       +-----+-----+-----+-----+-----+-----+-----+-----+
++ *       |                       .                       |
++ *       |                       .                       |
++ *       |                       .                       |
++ *       +-----+-----+-----+-----+-----+-----+-----+-----+
++ *       |      mapping[N-2]     |      mapping[N-1]     |
++ *       +-----+-----+-----+-----+-----+-----+-----+-----+
++ *
++ *       where N is specified by a XEN_NETIF_CTRL_TYPE_SET_HASH_MAPPING_SIZE
++ *       message and each  mapping must specifies a queue between 0 and
++ *       "multi-queue-num-queues" (see above).
++ *       The backend may support a mapping table larger than can be
++ *       mapped by a single grant reference. Thus sub-tables within a
++ *       larger table can be individually set by sending multiple messages
++ *       with differing offset values. Specifying a new sub-table does not
++ *       invalidate any table data outside that range.
++ *       The grant reference may be read-only and must remain valid until
++ *       the response has been processed.
++ */
++
++DEFINE_RING_TYPES(xen_netif_ctrl,
++		  struct xen_netif_ctrl_request,
++		  struct xen_netif_ctrl_response);
+ 
+ /*
+  * Guest transmit
+  * ==============
+  *
++ * This is the 'wire' format for transmit (frontend -> backend) packets:
++ *
++ *  Fragment 1: xen_netif_tx_request_t  - flags = XEN_NETTXF_*
++ *                                    size = total packet size
++ * [Extra 1: xen_netif_extra_info_t]    - (only if fragment 1 flags include
++ *                                     XEN_NETTXF_extra_info)
++ *  ...
++ * [Extra N: xen_netif_extra_info_t]    - (only if extra N-1 flags include
++ *                                     XEN_NETIF_EXTRA_MORE)
++ *  ...
++ *  Fragment N: xen_netif_tx_request_t  - (only if fragment N-1 flags include
++ *                                     XEN_NETTXF_more_data - flags on preceding
++ *                                     extras are not relevant here)
++ *                                    flags = 0
++ *                                    size = fragment size
++ *
++ * NOTE:
++ *
++ * This format slightly is different from that used for receive
++ * (backend -> frontend) packets. Specifically, in a multi-fragment
++ * packet the actual size of fragment 1 can only be determined by
++ * subtracting the sizes of fragments 2..N from the total packet size.
++ *
+  * Ring slot size is 12 octets, however not all request/response
+  * structs use the full size.
+  *
+@@ -184,7 +660,7 @@
+  * id: request identifier, echoed in response.
+  * size: packet size in bytes.
+  *
+- * tx response (netif_tx_response_t)
++ * tx response (xen_netif_tx_response_t)
+  * ---------------------------------
+  *
+  *    0     1     2     3     4     5     6     7  octet
+@@ -195,14 +671,37 @@
+  * +-----+-----+-----+-----+
+  *
+  * id: reflects id in transmit request
+- * status: NETIF_RSP_*
++ * status: XEN_NETIF_RSP_*
+  *
+  * Guest receive
+  * =============
+  *
++ * This is the 'wire' format for receive (backend -> frontend) packets:
++ *
++ *  Fragment 1: xen_netif_rx_request_t  - flags = XEN_NETRXF_*
++ *                                    size = fragment size
++ * [Extra 1: xen_netif_extra_info_t]    - (only if fragment 1 flags include
++ *                                     XEN_NETRXF_extra_info)
++ *  ...
++ * [Extra N: xen_netif_extra_info_t]    - (only if extra N-1 flags include
++ *                                     XEN_NETIF_EXTRA_MORE)
++ *  ...
++ *  Fragment N: xen_netif_rx_request_t  - (only if fragment N-1 flags include
++ *                                     XEN_NETRXF_more_data - flags on preceding
++ *                                     extras are not relevant here)
++ *                                    flags = 0
++ *                                    size = fragment size
++ *
++ * NOTE:
++ *
++ * This format slightly is different from that used for transmit
++ * (frontend -> backend) packets. Specifically, in a multi-fragment
++ * packet the size of the packet can only be determined by summing the
++ * sizes of fragments 1..N.
++ *
+  * Ring slot size is 8 octets.
+  *
+- * rx request (netif_rx_request_t)
++ * rx request (xen_netif_rx_request_t)
+  * -------------------------------
+  *
+  *    0     1     2     3     4     5     6     7  octet
+@@ -213,7 +712,7 @@
+  * id: request identifier, echoed in response.
+  * gref: reference to incoming granted frame.
+  *
+- * rx response (netif_rx_response_t)
++ * rx response (xen_netif_rx_response_t)
+  * ---------------------------------
+  *
+  *    0     1     2     3     4     5     6     7  octet
+@@ -223,18 +722,32 @@
+  *
+  * id: reflects id in receive request
+  * offset: offset in page of start of received packet
+- * flags: NETRXF_*
+- * status: -ve: NETIF_RSP_*; +ve: Rx'ed pkt size.
++ * flags: XEN_NETRXF_*
++ * status: -ve: XEN_NETIF_RSP_*; +ve: Rx'ed pkt size.
++ *
++ * NOTE: Historically, to support GSO on the frontend receive side, Linux
++ *       netfront does not make use of the rx response id (because, as
++ *       described below, extra info structures overlay the id field).
++ *       Instead it assumes that responses always appear in the same ring
++ *       slot as their corresponding request. Thus, to maintain
++ *       compatibility, backends must make sure this is the case.
+  *
+  * Extra Info
+  * ==========
+  *
+- * Can be present if initial request has NET{T,R}XF_extra_info, or
+- * previous extra request has XEN_NETIF_EXTRA_MORE.
++ * Can be present if initial request or response has NET{T,R}XF_extra_info,
++ * or previous extra request has XEN_NETIF_EXTRA_MORE.
+  *
+  * The struct therefore needs to fit into either a tx or rx slot and
+  * is therefore limited to 8 octets.
+  *
++ * NOTE: Because extra info data overlays the usual request/response
++ *       structures, there is no id information in the opposite direction.
++ *       So, if an extra info overlays an rx response the frontend can
++ *       assume that it is in the same ring slot as the request that was
++ *       consumed to make the slot available, and the backend must ensure
++ *       this assumption is true.
++ *
+  * extra info (xen_netif_extra_info_t)
+  * -------------------------------
+  *
+@@ -242,7 +755,7 @@
+  *
+  *    0     1     2     3     4     5     6     7  octet
+  * +-----+-----+-----+-----+-----+-----+-----+-----+
+- * |type |flags| type specfic data                 |
++ * |type |flags| type specific data                |
+  * +-----+-----+-----+-----+-----+-----+-----+-----+
+  * | padding for tx        |
+  * +-----+-----+-----+-----+
+@@ -250,7 +763,8 @@
+  * type: XEN_NETIF_EXTRA_TYPE_*
+  * flags: XEN_NETIF_EXTRA_FLAG_*
+  * padding for tx: present only in the tx case due to 8 octet limit
+- *     from rx case. Not shown in type specific entries below.
++ *                 from rx case. Not shown in type specific entries
++ *                 below.
+  *
+  * XEN_NETIF_EXTRA_TYPE_GSO:
+  *
+@@ -261,9 +775,14 @@
+  *
+  * type: Must be XEN_NETIF_EXTRA_TYPE_GSO
+  * flags: XEN_NETIF_EXTRA_FLAG_*
+- * size: Maximum payload size of each segment.
+- * type: XEN_NETIF_GSO_TYPE_*
+- * features: EN_NETIF_GSO_FEAT_*
++ * size: Maximum payload size of each segment. For example,
++ *       for TCP this is just the path MSS.
++ * type: XEN_NETIF_GSO_TYPE_*: This determines the protocol of
++ *       the packet and any extra features required to segment the
++ *       packet properly.
++ * features: EN_XEN_NETIF_GSO_FEAT_*: This specifies any extra GSO
++ *           features required to process this packet, such as ECN
++ *           support for TCPv4.
+  *
+  * XEN_NETIF_EXTRA_TYPE_MCAST_{ADD,DEL}:
+  *
+@@ -275,23 +794,42 @@
+  * type: Must be XEN_NETIF_EXTRA_TYPE_MCAST_{ADD,DEL}
+  * flags: XEN_NETIF_EXTRA_FLAG_*
+  * addr: address to add/remove
++ *
++ * XEN_NETIF_EXTRA_TYPE_HASH:
++ *
++ * A backend that supports teoplitz hashing is assumed to accept
++ * this type of extra info in transmit packets.
++ * A frontend that enables hashing is assumed to accept
++ * this type of extra info in receive packets.
++ *
++ *    0     1     2     3     4     5     6     7  octet
++ * +-----+-----+-----+-----+-----+-----+-----+-----+
++ * |type |flags|htype| alg |LSB ---- value ---- MSB|
++ * +-----+-----+-----+-----+-----+-----+-----+-----+
++ *
++ * type: Must be XEN_NETIF_EXTRA_TYPE_HASH
++ * flags: XEN_NETIF_EXTRA_FLAG_*
++ * htype: Hash type (one of _XEN_NETIF_CTRL_HASH_TYPE_* - see above)
++ * alg: The algorithm used to calculate the hash (one of
++ *      XEN_NETIF_CTRL_HASH_TYPE_ALGORITHM_* - see above)
++ * value: Hash value
+  */
+ 
+ /* Protocol checksum field is blank in the packet (hardware offload)? */
+-#define _XEN_NETTXF_csum_blank		(0)
+-#define  XEN_NETTXF_csum_blank		(1U<<_XEN_NETTXF_csum_blank)
++#define _XEN_NETTXF_csum_blank     (0)
++#define  XEN_NETTXF_csum_blank     (1U<<_XEN_NETTXF_csum_blank)
+ 
+ /* Packet data has been validated against protocol checksum. */
+-#define _XEN_NETTXF_data_validated	(1)
+-#define  XEN_NETTXF_data_validated	(1U<<_XEN_NETTXF_data_validated)
++#define _XEN_NETTXF_data_validated (1)
++#define  XEN_NETTXF_data_validated (1U<<_XEN_NETTXF_data_validated)
+ 
+ /* Packet continues in the next request descriptor. */
+-#define _XEN_NETTXF_more_data		(2)
+-#define  XEN_NETTXF_more_data		(1U<<_XEN_NETTXF_more_data)
++#define _XEN_NETTXF_more_data      (2)
++#define  XEN_NETTXF_more_data      (1U<<_XEN_NETTXF_more_data)
+ 
+ /* Packet to be followed by extra descriptor(s). */
+-#define _XEN_NETTXF_extra_info		(3)
+-#define  XEN_NETTXF_extra_info		(1U<<_XEN_NETTXF_extra_info)
++#define _XEN_NETTXF_extra_info     (3)
++#define  XEN_NETTXF_extra_info     (1U<<_XEN_NETTXF_extra_info)
+ 
+ #define XEN_NETIF_MAX_TX_SIZE 0xFFFF
+ struct netif_tx_request {
+@@ -304,24 +842,25 @@ struct netif_tx_request {
+ typedef struct netif_tx_request netif_tx_request_t;
+ 
+ /* Types of netif_extra_info descriptors. */
+-#define XEN_NETIF_EXTRA_TYPE_NONE	(0)  /* Never used - invalid */
+-#define XEN_NETIF_EXTRA_TYPE_GSO	(1)  /* u.gso */
+-#define XEN_NETIF_EXTRA_TYPE_MCAST_ADD	(2)  /* u.mcast */
+-#define XEN_NETIF_EXTRA_TYPE_MCAST_DEL	(3)  /* u.mcast */
+-#define XEN_NETIF_EXTRA_TYPE_MAX	(4)
++#define XEN_NETIF_EXTRA_TYPE_NONE      (0)	/* Never used - invalid */
++#define XEN_NETIF_EXTRA_TYPE_GSO       (1)	/* u.gso */
++#define XEN_NETIF_EXTRA_TYPE_MCAST_ADD (2)	/* u.mcast */
++#define XEN_NETIF_EXTRA_TYPE_MCAST_DEL (3)	/* u.mcast */
++#define XEN_NETIF_EXTRA_TYPE_HASH      (4)	/* u.hash */
++#define XEN_NETIF_EXTRA_TYPE_MAX       (5)
+ 
+ /* xen_netif_extra_info_t flags. */
+-#define _XEN_NETIF_EXTRA_FLAG_MORE	(0)
+-#define  XEN_NETIF_EXTRA_FLAG_MORE	(1U<<_XEN_NETIF_EXTRA_FLAG_MORE)
++#define _XEN_NETIF_EXTRA_FLAG_MORE (0)
++#define XEN_NETIF_EXTRA_FLAG_MORE  (1U<<_XEN_NETIF_EXTRA_FLAG_MORE)
+ 
+ /* GSO types */
+-#define XEN_NETIF_GSO_TYPE_NONE		(0)
+-#define XEN_NETIF_GSO_TYPE_TCPV4	(1)
+-#define XEN_NETIF_GSO_TYPE_TCPV6	(2)
++#define XEN_NETIF_GSO_TYPE_NONE         (0)
++#define XEN_NETIF_GSO_TYPE_TCPV4        (1)
++#define XEN_NETIF_GSO_TYPE_TCPV6        (2)
+ 
+ /*
+- * This structure needs to fit within both netif_tx_request_t and
+- * netif_rx_response_t for compatibility.
++ * This structure needs to fit within both xen_netif_tx_request_t and
++ * xen_netif_rx_response_t for compatibility.
+  */
+ struct netif_extra_info {
+ 	uint8_t type;  /* XEN_NETIF_EXTRA_TYPE_* */
+@@ -363,6 +902,12 @@ struct netif_extra_info {
+ 			uint8_t addr[6]; /* Address to add/remove. */
+ 		} mcast;
+ 
++		struct {
++			uint8_t type;
++			uint8_t algorithm;
++			uint8_t value[4];
++		} hash;
++
+ 		uint16_t pad[3];
+ 	} u;
+ };
+@@ -382,24 +927,24 @@ struct netif_rx_request {
+ typedef struct netif_rx_request netif_rx_request_t;
+ 
+ /* Packet data has been validated against protocol checksum. */
+-#define _XEN_NETRXF_data_validated	(0)
+-#define  XEN_NETRXF_data_validated	(1U<<_XEN_NETRXF_data_validated)
++#define _XEN_NETRXF_data_validated (0)
++#define  XEN_NETRXF_data_validated (1U<<_XEN_NETRXF_data_validated)
+ 
+ /* Protocol checksum field is blank in the packet (hardware offload)? */
+-#define _XEN_NETRXF_csum_blank		(1)
+-#define  XEN_NETRXF_csum_blank		(1U<<_XEN_NETRXF_csum_blank)
++#define _XEN_NETRXF_csum_blank     (1)
++#define  XEN_NETRXF_csum_blank     (1U<<_XEN_NETRXF_csum_blank)
+ 
+ /* Packet continues in the next request descriptor. */
+-#define _XEN_NETRXF_more_data		(2)
+-#define  XEN_NETRXF_more_data		(1U<<_XEN_NETRXF_more_data)
++#define _XEN_NETRXF_more_data      (2)
++#define  XEN_NETRXF_more_data      (1U<<_XEN_NETRXF_more_data)
+ 
+ /* Packet to be followed by extra descriptor(s). */
+-#define _XEN_NETRXF_extra_info		(3)
+-#define  XEN_NETRXF_extra_info		(1U<<_XEN_NETRXF_extra_info)
++#define _XEN_NETRXF_extra_info     (3)
++#define  XEN_NETRXF_extra_info     (1U<<_XEN_NETRXF_extra_info)
+ 
+-/* GSO Prefix descriptor. */
+-#define _XEN_NETRXF_gso_prefix		(4)
+-#define  XEN_NETRXF_gso_prefix		(1U<<_XEN_NETRXF_gso_prefix)
++/* Packet has GSO prefix. Deprecated but included for compatibility */
++#define _XEN_NETRXF_gso_prefix     (4)
++#define  XEN_NETRXF_gso_prefix     (1U<<_XEN_NETRXF_gso_prefix)
+ 
+ struct netif_rx_response {
+ 	uint16_t id;
+@@ -410,7 +955,7 @@ struct netif_rx_response {
+ typedef struct netif_rx_response netif_rx_response_t;
+ 
+ /*
+- * Generate netif ring structures and types.
++ * Generate xen_netif ring structures and types.
+  */
+ 
+ #if defined(CONFIG_XEN) || defined(HAVE_XEN_PLATFORM_COMPAT_H)
+@@ -421,19 +966,17 @@ DEFINE_RING_TYPES(netif_rx, struct netif
+ #define xen_netif_rx_request netif_rx_request
+ #define xen_netif_tx_response netif_tx_response
+ #define xen_netif_rx_response netif_rx_response
+-DEFINE_RING_TYPES(xen_netif_tx,
+-		  struct xen_netif_tx_request,
++DEFINE_RING_TYPES(xen_netif_tx, struct xen_netif_tx_request,
+ 		  struct xen_netif_tx_response);
+-DEFINE_RING_TYPES(xen_netif_rx,
+-		  struct xen_netif_rx_request,
++DEFINE_RING_TYPES(xen_netif_rx, struct xen_netif_rx_request,
+ 		  struct xen_netif_rx_response);
+ #define xen_netif_extra_info netif_extra_info
+ #endif
+ 
+-#define XEN_NETIF_RSP_DROPPED	-2
+-#define XEN_NETIF_RSP_ERROR	-1
+-#define XEN_NETIF_RSP_OKAY	 0
+-/* No response: used for auxiliary requests (e.g., netif_extra_info_t). */
+-#define XEN_NETIF_RSP_NULL	 1
++#define XEN_NETIF_RSP_DROPPED         -2
++#define XEN_NETIF_RSP_ERROR           -1
++#define XEN_NETIF_RSP_OKAY             0
++/* No response: used for auxiliary requests (e.g., xen_netif_extra_info_t). */
++#define XEN_NETIF_RSP_NULL             1
+ 
+ #endif
+--- a/tools/objtool/arch/x86/insn/insn.c
++++ b/tools/objtool/arch/x86/insn/insn.c
+@@ -184,6 +184,15 @@ found:
+ vex_end:
+ 	insn->vex_prefix.got = 1;
+ 
++	/* Check for Xen #UD escape prefix */
++	if (peek_next(insn_byte_t, insn) == 0x0f &&
++	    peek_nbyte_next(insn_byte_t, insn, 1) == 0x0b &&
++	    peek_nbyte_next(insn_byte_t, insn, 2) == 'x' &&
++	    peek_nbyte_next(insn_byte_t, insn, 3) == 'e' &&
++	    peek_nbyte_next(insn_byte_t, insn, 4) == 'n') {
++		insn->next_byte += 5;
++	}
++
+ 	prefixes->got = 1;
+ 
+ err_out:
