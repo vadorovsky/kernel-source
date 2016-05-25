@@ -1,0 +1,278 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: s390/3270: avoid endless I/O loop with disconnected 3270 terminals
+Patch-mainline: v4.7-rc1
+Git-commit: 8340ab60b3624386eaa24fa21bdb4e6775066ccf
+References: bnc#980892, LTC#141736
+
+Description:  kernel: fix disconnect/reconnect of 3270 terminals
+Symptom:      The disconnect and reconnect of a 3270 terminal is not
+              working as expected, the terminal session is not hung
+              up and the new size of the reconnected terminal is not
+              detected.
+Problem:      The 3270 driver does not have support for disconnected
+              terminals.
+Solution:     Add support for disconnected 3270 terminals.
+Reproduction: Open a 3270 terminal, login on the tty, disconnected the
+              terminal and reconnect with a terminal of different size.
+
+Upstream-Description:
+
+              s390/3270: avoid endless I/O loop with disconnected 3270 terminals
+
+              If a 3270 terminal is disconnected while the tty view is active
+              the 3270 driver goes into an endless loop of failed I/O requests
+              until the terminal is connected again.
+
+              Add code to the raw3270 interrupt handler to check for unit checks
+              due to failed I/O requests and put the device to sleep with the
+              RAW3270_FLAGS_BUSY flag until a unsolicited device end interrupt
+              indicates that the device can be used again. while we are at it
+              simplify the 3270 irq handling and remove unnecessary code.
+
+              Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/char/con3270.c |    3 -
+ drivers/s390/char/fs3270.c  |    3 -
+ drivers/s390/char/raw3270.c |  101 ++++++++------------------------------------
+ drivers/s390/char/raw3270.h |    8 ---
+ drivers/s390/char/tty3270.c |    3 -
+ 5 files changed, 23 insertions(+), 95 deletions(-)
+
+--- a/drivers/s390/char/con3270.c
++++ b/drivers/s390/char/con3270.c
+@@ -400,7 +400,7 @@ con3270_deactivate(struct raw3270_view *
+ 	del_timer(&cp->timer);
+ }
+ 
+-static int
++static void
+ con3270_irq(struct con3270 *cp, struct raw3270_request *rq, struct irb *irb)
+ {
+ 	/* Handle ATTN. Schedule tasklet to read aid. */
+@@ -418,7 +418,6 @@ con3270_irq(struct con3270 *cp, struct r
+ 		cp->update_flags = CON_UPDATE_ALL;
+ 		con3270_set_timer(cp, 1);
+ 	}
+-	return RAW3270_IO_DONE;
+ }
+ 
+ /* Console view to a 3270 device. */
+--- a/drivers/s390/char/fs3270.c
++++ b/drivers/s390/char/fs3270.c
+@@ -217,7 +217,7 @@ fs3270_deactivate(struct raw3270_view *v
+ 		fp->init->callback(fp->init, NULL);
+ }
+ 
+-static int
++static void
+ fs3270_irq(struct fs3270 *fp, struct raw3270_request *rq, struct irb *irb)
+ {
+ 	/* Handle ATTN. Set indication and wake waiters for attention. */
+@@ -233,7 +233,6 @@ fs3270_irq(struct fs3270 *fp, struct raw
+ 			/* Normal end. Copy residual count. */
+ 			rq->rescnt = irb->scsw.cmd.count;
+ 	}
+-	return RAW3270_IO_DONE;
+ }
+ 
+ /*
+--- a/drivers/s390/char/raw3270.c
++++ b/drivers/s390/char/raw3270.c
+@@ -229,29 +229,6 @@ raw3270_request_set_idal(struct raw3270_
+ }
+ 
+ /*
+- * Stop running ccw.
+- */
+-static int
+-__raw3270_halt_io(struct raw3270 *rp, struct raw3270_request *rq)
+-{
+-	int retries;
+-	int rc;
+-
+-	if (raw3270_request_final(rq))
+-		return 0;
+-	/* Check if interrupt has already been processed */
+-	for (retries = 0; retries < 5; retries++) {
+-		if (retries < 2)
+-			rc = ccw_device_halt(rp->cdev, (long) rq);
+-		else
+-			rc = ccw_device_clear(rp->cdev, (long) rq);
+-		if (rc == 0)
+-			break;		/* termination successful */
+-	}
+-	return rc;
+-}
+-
+-/*
+  * Add the request to the request queue, try to start it if the
+  * 3270 device is idle. Return without waiting for end of i/o.
+  */
+@@ -342,7 +319,6 @@ raw3270_irq (struct ccw_device *cdev, un
+ 	struct raw3270 *rp;
+ 	struct raw3270_view *view;
+ 	struct raw3270_request *rq;
+-	int rc;
+ 
+ 	rp = dev_get_drvdata(&cdev->dev);
+ 	if (!rp)
+@@ -350,55 +326,27 @@ raw3270_irq (struct ccw_device *cdev, un
+ 	rq = (struct raw3270_request *) intparm;
+ 	view = rq ? rq->view : rp->view;
+ 
+-	if (IS_ERR(irb))
+-		rc = RAW3270_IO_RETRY;
+-	else if (irb->scsw.cmd.fctl & SCSW_FCTL_HALT_FUNC) {
+-		rq->rc = -EIO;
+-		rc = RAW3270_IO_DONE;
+-	} else if (irb->scsw.cmd.dstat == (DEV_STAT_CHN_END | DEV_STAT_DEV_END |
+-					   DEV_STAT_UNIT_EXCEP)) {
++	if (!IS_ERR(irb)) {
+ 		/* Handle CE-DE-UE and subsequent UDE */
+-		set_bit(RAW3270_FLAGS_BUSY, &rp->flags);
+-		rc = RAW3270_IO_BUSY;
+-	} else if (test_bit(RAW3270_FLAGS_BUSY, &rp->flags)) {
+-		/* Wait for UDE if busy flag is set. */
+-		if (irb->scsw.cmd.dstat & DEV_STAT_DEV_END) {
++		if (irb->scsw.cmd.dstat & DEV_STAT_DEV_END)
+ 			clear_bit(RAW3270_FLAGS_BUSY, &rp->flags);
+-			/* Got it, now retry. */
+-			rc = RAW3270_IO_RETRY;
+-		} else
+-			rc = RAW3270_IO_BUSY;
+-	} else if (view)
+-		rc = view->fn->intv(view, rq, irb);
+-	else
+-		rc = RAW3270_IO_DONE;
++		if (irb->scsw.cmd.dstat == (DEV_STAT_CHN_END |
++					    DEV_STAT_DEV_END |
++					    DEV_STAT_UNIT_EXCEP))
++			set_bit(RAW3270_FLAGS_BUSY, &rp->flags);
++		/* Handle disconnected devices */
++		if ((irb->scsw.cmd.dstat & DEV_STAT_UNIT_CHECK) &&
++		    (irb->ecw[0] & SNS0_INTERVENTION_REQ))
++			set_bit(RAW3270_FLAGS_BUSY, &rp->flags);
++		/* Call interrupt handler of the view */
++		if (view)
++			view->fn->intv(view, rq, irb);
++	}
+ 
+-	switch (rc) {
+-	case RAW3270_IO_DONE:
+-		break;
+-	case RAW3270_IO_BUSY:
+-		/* 
+-		 * Intervention required by the operator. We have to wait
+-		 * for unsolicited device end.
+-		 */
++	if (test_bit(RAW3270_FLAGS_BUSY, &rp->flags))
++		/* Device busy, do not start I/O */
+ 		return;
+-	case RAW3270_IO_RETRY:
+-		if (!rq)
+-			break;
+-		rq->rc = ccw_device_start(rp->cdev, &rq->ccw,
+-					  (unsigned long) rq, 0, 0);
+-		if (rq->rc == 0)
+-			return;	/* Successfully restarted. */
+-		break;
+-	case RAW3270_IO_STOP:
+-		if (!rq)
+-			break;
+-		__raw3270_halt_io(rp, rq);
+-		rq->rc = -EIO;
+-		break;
+-	default:
+-		BUG();
+-	}
++
+ 	if (rq) {
+ 		BUG_ON(list_empty(&rq->list));
+ 		/* The request completed, remove from queue and do callback. */
+@@ -408,6 +356,7 @@ raw3270_irq (struct ccw_device *cdev, un
+ 		/* Do put_device for get_device in raw3270_start. */
+ 		raw3270_put_view(view);
+ 	}
++
+ 	/*
+ 	 * Try to start each request on request queue until one is
+ 	 * started successful.
+@@ -685,23 +634,12 @@ raw3270_reset(struct raw3270_view *view)
+ 	return rc;
+ }
+ 
+-static int
++static void
+ raw3270_init_irq(struct raw3270_view *view, struct raw3270_request *rq,
+ 		 struct irb *irb)
+ {
+ 	struct raw3270 *rp;
+ 
+-	/*
+-	 * Unit-Check Processing:
+-	 * Expect Command Reject or Intervention Required.
+-	 */
+-	if (irb->scsw.cmd.dstat & DEV_STAT_UNIT_CHECK) {
+-		/* Request finished abnormally. */
+-		if (irb->ecw[0] & SNS0_INTERVENTION_REQ) {
+-			set_bit(RAW3270_FLAGS_BUSY, &view->dev->flags);
+-			return RAW3270_IO_BUSY;
+-		}
+-	}
+ 	if (rq) {
+ 		if (irb->scsw.cmd.dstat & DEV_STAT_UNIT_CHECK) {
+ 			if (irb->ecw[0] & SNS0_CMD_REJECT)
+@@ -715,7 +653,6 @@ raw3270_init_irq(struct raw3270_view *vi
+ 		rp = view->dev;
+ 		raw3270_read_modified(rp);
+ 	}
+-	return RAW3270_IO_DONE;
+ }
+ 
+ static struct raw3270_fn raw3270_init_fn = {
+--- a/drivers/s390/char/raw3270.h
++++ b/drivers/s390/char/raw3270.h
+@@ -125,19 +125,13 @@ raw3270_request_final(struct raw3270_req
+ 
+ void raw3270_buffer_address(struct raw3270 *, char *, unsigned short);
+ 
+-/* Return value of *intv (see raw3270_fn below) can be one of the following: */
+-#define RAW3270_IO_DONE		0	/* request finished */
+-#define RAW3270_IO_BUSY		1	/* request still active */
+-#define RAW3270_IO_RETRY	2	/* retry current request */
+-#define RAW3270_IO_STOP		3	/* kill current request */
+-
+ /*
+  * Functions of a 3270 view.
+  */
+ struct raw3270_fn {
+ 	int  (*activate)(struct raw3270_view *);
+ 	void (*deactivate)(struct raw3270_view *);
+-	int  (*intv)(struct raw3270_view *,
++	void (*intv)(struct raw3270_view *,
+ 		     struct raw3270_request *, struct irb *);
+ 	void (*release)(struct raw3270_view *);
+ 	void (*free)(struct raw3270_view *);
+--- a/drivers/s390/char/tty3270.c
++++ b/drivers/s390/char/tty3270.c
+@@ -645,7 +645,7 @@ tty3270_deactivate(struct raw3270_view *
+ 	del_timer(&tp->timer);
+ }
+ 
+-static int
++static void
+ tty3270_irq(struct tty3270 *tp, struct raw3270_request *rq, struct irb *irb)
+ {
+ 	/* Handle ATTN. Schedule tasklet to read aid. */
+@@ -667,7 +667,6 @@ tty3270_irq(struct tty3270 *tp, struct r
+ 		tp->update_flags = TTY_UPDATE_ALL;
+ 		tty3270_set_timer(tp, 1);
+ 	}
+-	return RAW3270_IO_DONE;
+ }
+ 
+ /*
