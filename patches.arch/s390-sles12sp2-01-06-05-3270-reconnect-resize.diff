@@ -1,0 +1,157 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: s390/3270: handle reconnect of a tty with a different size
+Patch-mainline: v4.7-rc1
+Git-commit: 7e36eff1eece29eaa37501806ded0e0fb88e61ee
+References: bnc#980892, LTC#141736
+
+Description:  kernel: fix disconnect/reconnect of 3270 terminals
+Symptom:      The disconnect and reconnect of a 3270 terminal is not
+              working as expected, the terminal session is not hung
+              up and the new size of the reconnected terminal is not
+              detected.
+Problem:      The 3270 driver does not have support for disconnected
+              terminals.
+Solution:     Add support for disconnected 3270 terminals.
+Reproduction: Open a 3270 terminal, login on the tty, disconnected the
+              terminal and reconnect with a terminal of different size.
+
+Upstream-Description:
+
+              s390/3270: handle reconnect of a tty with a different size
+
+              If an existing 3270 terminal disconnects and reconnects with a
+              different size, the 3270 driver still works with the old size.
+              If the new dimensions are larger the output merely looks funny,
+              if the new dimensions are smaller the terminal is unusable.
+
+              To fix this restart the size detection after a unit check has
+              been received.
+
+              Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.de>
+---
+ drivers/s390/char/raw3270.c |   32 +++++++++++++++++++++++++++++---
+ drivers/s390/char/tty3270.c |   25 ++++++++++++++++++++++++-
+ 2 files changed, 53 insertions(+), 4 deletions(-)
+
+--- a/drivers/s390/char/raw3270.c
++++ b/drivers/s390/char/raw3270.c
+@@ -90,6 +90,8 @@ module_param(tubxcorrect, bool, 0);
+  */
+ DECLARE_WAIT_QUEUE_HEAD(raw3270_wait_queue);
+ 
++static void __raw3270_disconnect(struct raw3270 *rp);
++
+ /*
+  * Encode array for 12 bit 3270 addresses.
+  */
+@@ -336,8 +338,11 @@ raw3270_irq (struct ccw_device *cdev, un
+ 			set_bit(RAW3270_FLAGS_BUSY, &rp->flags);
+ 		/* Handle disconnected devices */
+ 		if ((irb->scsw.cmd.dstat & DEV_STAT_UNIT_CHECK) &&
+-		    (irb->ecw[0] & SNS0_INTERVENTION_REQ))
++		    (irb->ecw[0] & SNS0_INTERVENTION_REQ)) {
+ 			set_bit(RAW3270_FLAGS_BUSY, &rp->flags);
++			if (rp->state > RAW3270_STATE_RESET)
++				__raw3270_disconnect(rp);
++		}
+ 		/* Call interrupt handler of the view */
+ 		if (view)
+ 			view->fn->intv(view, rq, irb);
+@@ -347,8 +352,7 @@ raw3270_irq (struct ccw_device *cdev, un
+ 		/* Device busy, do not start I/O */
+ 		return;
+ 
+-	if (rq) {
+-		BUG_ON(list_empty(&rq->list));
++	if (rq && !list_empty(&rq->list)) {
+ 		/* The request completed, remove from queue and do callback. */
+ 		list_del_init(&rq->list);
+ 		if (rq->callback)
+@@ -635,6 +639,28 @@ raw3270_reset(struct raw3270_view *view)
+ }
+ 
+ static void
++__raw3270_disconnect(struct raw3270 *rp)
++{
++	struct raw3270_request *rq;
++	struct raw3270_view *view;
++
++	rp->state = RAW3270_STATE_INIT;
++	rp->view = &rp->init_view;
++	/* Cancel all queued requests */
++	while (!list_empty(&rp->req_queue)) {
++		rq = list_entry(rp->req_queue.next,struct raw3270_request,list);
++		view = rq->view;
++		rq->rc = -EACCES;
++		list_del_init(&rq->list);
++		if (rq->callback)
++			rq->callback(rq, rq->callback_data);
++		raw3270_put_view(view);
++	}
++	/* Start from scratch */
++	__raw3270_reset_device(rp);
++}
++
++static void
+ raw3270_init_irq(struct raw3270_view *view, struct raw3270_request *rq,
+ 		 struct irb *irb)
+ {
+--- a/drivers/s390/char/tty3270.c
++++ b/drivers/s390/char/tty3270.c
+@@ -319,6 +319,27 @@ tty3270_blank_line(struct tty3270 *tp)
+ }
+ 
+ /*
++ * Create a blank screen and remove all lines from the history.
++ */
++static void
++tty3270_blank_screen(struct tty3270 *tp)
++{
++	struct string *s, *n;
++	int i;
++
++	for (i = 0; i < tp->view.rows - 2; i++)
++		tp->screen[i].len = 0;
++	tp->nr_up = 0;
++	list_for_each_entry_safe(s, n, &tp->lines, list) {
++		list_del(&s->list);
++		if (!list_empty(&s->update))
++			list_del(&s->update);
++		tp->nr_lines--;
++		free_string(&tp->freemem, s);
++	}
++}
++
++/*
+  * Write request completion callback.
+  */
+ static void
+@@ -816,6 +837,7 @@ static void tty3270_resize_work(struct w
+ 		return;
+ 	/* Switch to new output size */
+ 	spin_lock_bh(&tp->view.lock);
++	tty3270_blank_screen(tp);
+ 	oscreen = tp->screen;
+ 	orows = tp->view.rows;
+ 	tp->view.model = tp->n_model;
+@@ -826,7 +848,6 @@ static void tty3270_resize_work(struct w
+ 	free_string(&tp->freemem, tp->status);
+ 	tty3270_create_prompt(tp);
+ 	tty3270_create_status(tp);
+-	tp->nr_up = 0;
+ 	while (tp->nr_lines < tp->view.rows - 2)
+ 		tty3270_blank_line(tp);
+ 	tp->update_flags = TTY_UPDATE_ALL;
+@@ -848,6 +869,8 @@ tty3270_resize(struct raw3270_view *view
+ {
+ 	struct tty3270 *tp = container_of(view, struct tty3270, view);
+ 
++	if (tp->n_model == model && tp->n_rows == rows && tp->n_cols == cols)
++		return;
+ 	tp->n_model = model;
+ 	tp->n_rows = rows;
+ 	tp->n_cols = cols;
