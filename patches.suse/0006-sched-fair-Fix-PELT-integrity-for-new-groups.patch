@@ -1,0 +1,166 @@
+From 152ea59d799f53be407c5e37fd0796655a23188a Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Fri, 17 Jun 2016 11:20:46 +0200
+Subject: [PATCH 6/9] sched/fair: Fix PELT integrity for new groups
+Patch-mainline: Queued in subsystem maintainer repository
+Git-repo: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+Git-commit: 010114739d294c474764c94196d32fb92e233657
+References: bsc#981825
+
+Vincent reported that when a new task is moved into a new cgroup it
+gets attached twice to the load tracking:
+
+  sched_move_task()
+    task_move_group_fair()
+      detach_task_cfs_rq()
+      set_task_rq()
+      attach_task_cfs_rq()
+        attach_entity_load_avg()
+          se->avg.last_load_update = cfs_rq->avg.last_load_update // == 0
+
+  enqueue_entity()
+    enqueue_entity_load_avg()
+      update_cfs_rq_load_avg()
+        now = clock()
+        __update_load_avg(&cfs_rq->avg)
+          cfs_rq->avg.last_load_update = now
+          // ages load/util for: now - 0, load/util -> 0
+      if (migrated)
+        attach_entity_load_avg()
+          se->avg.last_load_update = cfs_rq->avg.last_load_update; // now != 0
+
+The problem is that we don't update cfs_rq load_avg before all
+entity attach/detach operations. Only enqueue_task() and migrate_task()
+do this.
+
+By fixing this, the above will not happen, because the
+sched_move_task() attach will have updated cfs_rq's last_load_update
+time before attach, and in turn the attach will have set the entity's
+last_load_update stamp.
+
+Note that there is a further problem with sched_move_task() calling
+detach on a task that hasn't yet been attached; this will be taken
+care of in a subsequent patch.
+
+Reported-by: Vincent Guittot <vincent.guittot@linaro.org>
+Tested-by:  Vincent Guittot <vincent.guittot@linaro.org>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Yuyang Du <yuyang.du@intel.com>
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Matt Fleming <mfleming@suse.de>
+---
+ kernel/sched/fair.c | 37 ++++++++++++++++---------------------
+ 1 file changed, 16 insertions(+), 21 deletions(-)
+
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index c53cce8..5140b8e 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -3057,6 +3057,12 @@ static int idle_balance(struct rq *this_rq);
+ 
+ #else /* CONFIG_SMP */
+ 
++static inline int
++update_cfs_rq_load_avg(u64 now, struct cfs_rq *cfs_rq)
++{
++	return 0;
++}
++
+ static inline void update_load_avg(struct sched_entity *se, int update_tg) {}
+ static inline void
+ enqueue_entity_load_avg(struct cfs_rq *cfs_rq, struct sched_entity *se) {}
+@@ -4356,7 +4362,7 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
+ 		 *
+ 		 * note: in the case of encountering a throttled cfs_rq we will
+ 		 * post the final h_nr_running increment below.
+-		*/
++		 */
+ 		if (cfs_rq_throttled(cfs_rq))
+ 			break;
+ 		cfs_rq->h_nr_running++;
+@@ -8158,31 +8164,17 @@ static void task_fork_fair(struct task_struct *p)
+ {
+ 	struct cfs_rq *cfs_rq;
+ 	struct sched_entity *se = &p->se, *curr;
+-	int this_cpu = smp_processor_id();
+ 	struct rq *rq = this_rq();
+-	unsigned long flags;
+-
+-	raw_spin_lock_irqsave(&rq->lock, flags);
+ 
++	raw_spin_lock(&rq->lock);
+ 	update_rq_clock(rq);
+ 
+ 	cfs_rq = task_cfs_rq(current);
+ 	curr = cfs_rq->curr;
+-
+-	/*
+-	 * Not only the cpu but also the task_group of the parent might have
+-	 * been changed after parent->se.parent,cfs_rq were copied to
+-	 * child->se.parent,cfs_rq. So call __set_task_cpu() to make those
+-	 * of child point to valid ones.
+-	 */
+-	rcu_read_lock();
+-	__set_task_cpu(p, this_cpu);
+-	rcu_read_unlock();
+-
+-	update_curr(cfs_rq);
+-
+-	if (curr)
++	if (curr) {
++		update_curr(cfs_rq);
+ 		se->vruntime = curr->vruntime;
++	}
+ 	place_entity(cfs_rq, se, 1);
+ 
+ 	if (sysctl_sched_child_runs_first && curr && entity_before(curr, se)) {
+@@ -8195,8 +8187,7 @@ static void task_fork_fair(struct task_struct *p)
+ 	}
+ 
+ 	se->vruntime -= cfs_rq->min_vruntime;
+-
+-	raw_spin_unlock_irqrestore(&rq->lock, flags);
++	raw_spin_unlock(&rq->lock);
+ }
+ 
+ /*
+@@ -8252,6 +8243,7 @@ static void detach_task_cfs_rq(struct task_struct *p)
+ {
+ 	struct sched_entity *se = &p->se;
+ 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
++	u64 now = cfs_rq_clock_task(cfs_rq);
+ 
+ 	if (!vruntime_normalized(p)) {
+ 		/*
+@@ -8263,6 +8255,7 @@ static void detach_task_cfs_rq(struct task_struct *p)
+ 	}
+ 
+ 	/* Catch up with the cfs_rq and remove our load when we leave */
++	update_cfs_rq_load_avg(now, cfs_rq);
+ 	detach_entity_load_avg(cfs_rq, se);
+ }
+ 
+@@ -8270,6 +8263,7 @@ static void attach_task_cfs_rq(struct task_struct *p)
+ {
+ 	struct sched_entity *se = &p->se;
+ 	struct cfs_rq *cfs_rq = cfs_rq_of(se);
++	u64 now = cfs_rq_clock_task(cfs_rq);
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 	/*
+@@ -8280,6 +8274,7 @@ static void attach_task_cfs_rq(struct task_struct *p)
+ #endif
+ 
+ 	/* Synchronize task with its cfs_rq */
++	update_cfs_rq_load_avg(now, cfs_rq);
+ 	attach_entity_load_avg(cfs_rq, se);
+ 
+ 	if (!vruntime_normalized(p))
+-- 
+2.7.3
+
