@@ -1,0 +1,108 @@
+From c56bdcac153e60d96a619a59c7981f2a78cba598 Mon Sep 17 00:00:00 2001
+From: Will Deacon <will.deacon@arm.com>
+Date: Thu, 2 Jun 2016 18:40:07 +0100
+Subject: [PATCH 4/4] arm64: spinlock: Ensure forward-progress in spin_unlock_wait
+Git-commit: c56bdcac153e60d96a619a59c7981f2a78cba598
+Patch-mainline: v4.7
+References: bsc#969756
+
+Rather than wait until we observe the lock being free (which might never
+happen), we can also return from spin_unlock_wait if we observe that the
+lock is now held by somebody else, which implies that it was unlocked
+but we just missed seeing it in that state.
+
+Furthermore, in such a scenario there is no longer a need to write back
+the value that we loaded, since we know that there has been a lock
+hand-off, which is sufficient to publish any stores prior to the
+unlock_wait because the ARm architecture ensures that a Store-Release
+instruction is multi-copy atomic when observed by a Load-Acquire
+instruction.
+
+The litmus test is something like:
+
+AArch64
+{
+0:X1=x; 0:X3=y;
+1:X1=y;
+2:X1=y; 2:X3=x;
+}
+ P0          | P1           | P2           ;
+ MOV W0,#1   | MOV W0,#1    | LDAR W0,[X1] ;
+ STR W0,[X1] | STLR W0,[X1] | LDR W2,[X3]  ;
+ DMB SY      |              |              ;
+ LDR W2,[X3] |              |              ;
+exists
+(0:X2=0 /\ 2:X0=1 /\ 2:X2=0)
+
+where P0 is doing spin_unlock_wait, P1 is doing spin_unlock and P2 is
+doing spin_lock.
+
+Signed-off-by: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+
+---
+ arch/arm64/include/asm/spinlock.h | 27 ++++++++++++++++++++++++---
+ 1 file changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/include/asm/spinlock.h b/arch/arm64/include/asm/spinlock.h
+index d5c894253e73..e875a5a551d7 100644
+--- a/arch/arm64/include/asm/spinlock.h
++++ b/arch/arm64/include/asm/spinlock.h
+@@ -30,20 +30,39 @@ static inline void arch_spin_unlock_wait(arch_spinlock_t *lock)
+ {
+ 	unsigned int tmp;
+ 	arch_spinlock_t lockval;
++	u32 owner;
+ 
+ 	/*
+ 	 * Ensure prior spin_lock operations to other locks have completed
+ 	 * on this CPU before we test whether "lock" is locked.
+ 	 */
+ 	smp_mb();
++	owner = READ_ONCE(lock->owner) << 16;
+ 
+ 	asm volatile(
+ "	sevl\n"
+ "1:	wfe\n"
+ "2:	ldaxr	%w0, %2\n"
++	/* Is the lock free? */
+ "	eor	%w1, %w0, %w0, ror #16\n"
+-"	cbnz	%w1, 1b\n"
+-	/* Serialise against any concurrent lockers */
++"	cbz	%w1, 3f\n"
++	/* Lock taken -- has there been a subsequent unlock->lock transition? */
++"	eor	%w1, %w3, %w0, lsl #16\n"
++"	cbz	%w1, 1b\n"
++	/*
++	 * The owner has been updated, so there was an unlock->lock
++	 * transition that we missed. That means we can rely on the
++	 * store-release of the unlock operation paired with the
++	 * load-acquire of the lock operation to publish any of our
++	 * previous stores to the new lock owner and therefore don't
++	 * need to bother with the writeback below.
++	 */
++"	b	4f\n"
++"3:\n"
++	/*
++	 * Serialise against any concurrent lockers by writing back the
++	 * unlocked lock value
++	 */
+ 	ARM64_LSE_ATOMIC_INSN(
+ 	/* LL/SC */
+ "	stxr	%w1, %w0, %2\n"
+@@ -53,9 +72,11 @@ static inline void arch_spin_unlock_wait(arch_spinlock_t *lock)
+ "	mov	%w1, %w0\n"
+ "	cas	%w0, %w0, %2\n"
+ "	eor	%w1, %w1, %w0\n")
++	/* Somebody else wrote to the lock, GOTO 10 and reload the value */
+ "	cbnz	%w1, 2b\n"
++"4:"
+ 	: "=&r" (lockval), "=&r" (tmp), "+Q" (*lock)
+-	:
++	: "r" (owner)
+ 	: "memory");
+ }
+ 
+-- 
+2.6.6
+
