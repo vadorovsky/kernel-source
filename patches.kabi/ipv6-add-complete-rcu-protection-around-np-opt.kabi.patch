@@ -1,0 +1,223 @@
+From: Jiri Bohac <jbohac@suse.cz>
+Subject: KABI workaround for ipv6: add complete rcu protection around np->opt
+Patch-mainline: never, KABI
+References: bsc#992566, CVE-2016-3841
+
+Commit 71781d1f85bc02bcdb29b18e9e76f1d49118ddc8 adds RCU protection to np->opt.
+Prevent breaking the KABI by wrapping struct ipv6_txoptions into
+ipv6_txoptions_rcu.
+
+This assumes that potential external modules only read the np->opt pointer, so
+they need not care about the wrapper.
+
+Signed-off-by: Jiri Bohac <jbohac@suse.cz>
+diff --git a/include/linux/ipv6.h b/include/linux/ipv6.h
+index 00ef00d..7795ee3 100644
+--- a/include/linux/ipv6.h
++++ b/include/linux/ipv6.h
+@@ -369,7 +369,7 @@ struct ipv6_pinfo {
+ 	struct ipv6_ac_socklist	*ipv6_ac_list;
+ 	struct ipv6_fl_socklist *ipv6_fl_list;
+ 
+-	struct ipv6_txoptions __rcu	*opt;
++	struct ipv6_txoptions __rcu	*opt;	/* KABI hack: points to a member of ipv6_txoptions_rcu */
+ 	struct sk_buff		*pktoptions;
+ 	struct sk_buff		*rxpmtu;
+ 	struct {
+diff --git a/include/net/ipv6.h b/include/net/ipv6.h
+index eebe91c..b6b7ad5 100644
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -191,7 +191,6 @@ extern rwlock_t ip6_ra_lock;
+  */
+ 
+ struct ipv6_txoptions {
+-	atomic_t		refcnt;
+ 	/* Length of this structure */
+ 	int			tot_len;
+ 
+@@ -204,10 +203,16 @@ struct ipv6_txoptions {
+ 	struct ipv6_opt_hdr	*dst0opt;
+ 	struct ipv6_rt_hdr	*srcrt;	/* Routing Header */
+ 	struct ipv6_opt_hdr	*dst1opt;
+-	struct rcu_head		rcu;
+ 	/* Option buffer, as read by IPV6_PKTOPTIONS, starts here. */
+ };
+ 
++struct ipv6_txoptions_rcu {
++	atomic_t		refcnt;
++	struct rcu_head		rcu;
++	struct ipv6_txoptions	txoptions;
++};
++#define IPV6_TXOPT_RCU_LEN (sizeof(struct ipv6_txoptions_rcu) - sizeof(struct ipv6_txoptions))
++
+ struct ip6_flowlabel {
+ 	struct ip6_flowlabel	*next;
+ 	__be32			label;
+@@ -233,10 +238,12 @@ struct ipv6_fl_socklist {
+ static inline struct ipv6_txoptions *txopt_get(const struct ipv6_pinfo *np)
+ {
+ 	struct ipv6_txoptions *opt;
++	struct ipv6_txoptions_rcu *opt_rcu;
+ 
+ 	rcu_read_lock();
+ 	opt = rcu_dereference(np->opt);
+-	if (opt && !atomic_inc_not_zero(&opt->refcnt))
++	opt_rcu = container_of(opt, struct ipv6_txoptions_rcu, txoptions);
++	if (opt && !atomic_inc_not_zero(&opt_rcu->refcnt))
+ 		opt = NULL;
+ 	rcu_read_unlock();
+ 	return opt;
+@@ -244,8 +251,9 @@ static inline struct ipv6_txoptions *txopt_get(const struct ipv6_pinfo *np)
+ 
+ static inline void txopt_put(struct ipv6_txoptions *opt)
+ {
+-	if (opt && atomic_dec_and_test(&opt->refcnt))
+-		kfree_rcu(opt, rcu);
++	struct ipv6_txoptions_rcu *opt_rcu = container_of(opt, struct ipv6_txoptions_rcu, txoptions);
++	if (opt && atomic_dec_and_test(&opt_rcu->refcnt))
++		kfree_rcu(opt_rcu, rcu);
+ }
+ 
+ extern struct ip6_flowlabel	*fl6_sock_lookup(struct sock *sk, __be32 label);
+diff --git a/net/ipv6/af_inet6.c b/net/ipv6/af_inet6.c
+index a884413..d54003f 100644
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -431,7 +431,7 @@ void inet6_destroy_sock(struct sock *sk)
+ 
+ 	opt = xchg((__force struct ipv6_txoptions **)&np->opt, NULL);
+ 	if (opt) {
+-		atomic_sub(opt->tot_len, &sk->sk_omem_alloc);
++		atomic_sub(opt->tot_len + IPV6_TXOPT_RCU_LEN, &sk->sk_omem_alloc);
+ 		txopt_put(opt);
+ 	}
+ }
+diff --git a/net/ipv6/exthdrs.c b/net/ipv6/exthdrs.c
+index 88052ba..9b0e47b 100644
+--- a/net/ipv6/exthdrs.c
++++ b/net/ipv6/exthdrs.c
+@@ -737,11 +737,13 @@ void ipv6_push_frag_opts(struct sk_buff *skb, struct ipv6_txoptions *opt, u8 *pr
+ struct ipv6_txoptions *
+ ipv6_dup_options(struct sock *sk, struct ipv6_txoptions *opt)
+ {
+-	struct ipv6_txoptions *opt2;
++	struct ipv6_txoptions_rcu *opt2_rcu;
+ 
+-	opt2 = sock_kmalloc(sk, opt->tot_len, GFP_ATOMIC);
+-	if (opt2) {
++	opt2_rcu = sock_kmalloc(sk, opt->tot_len + IPV6_TXOPT_RCU_LEN, GFP_ATOMIC);
++	if (opt2_rcu) {
++		struct ipv6_txoptions *opt2 = &opt2_rcu->txoptions;
+ 		long dif = (char*)opt2 - (char*)opt;
++		memset(opt2_rcu, 0, IPV6_TXOPT_RCU_LEN);
+ 		memcpy(opt2, opt, opt->tot_len);
+ 		if (opt2->hopopt)
+ 			*((char**)&opt2->hopopt) += dif;
+@@ -751,9 +753,11 @@ ipv6_dup_options(struct sock *sk, struct ipv6_txoptions *opt)
+ 			*((char**)&opt2->dst1opt) += dif;
+ 		if (opt2->srcrt)
+ 			*((char**)&opt2->srcrt) += dif;
+-		atomic_set(&opt2->refcnt, 1);
++		atomic_set(&opt2_rcu->refcnt, 1);
++		return opt2;
+ 	}
+-	return opt2;
++	else
++		return NULL;
+ }
+ 
+ EXPORT_SYMBOL_GPL(ipv6_dup_options);
+@@ -791,6 +795,7 @@ ipv6_renew_options(struct sock *sk, struct ipv6_txoptions *opt,
+ 	int tot_len = 0;
+ 	char *p;
+ 	struct ipv6_txoptions *opt2;
++	struct ipv6_txoptions_rcu *opt2_rcu;
+ 	int err;
+ 
+ 	if (opt) {
+@@ -811,12 +816,13 @@ ipv6_renew_options(struct sock *sk, struct ipv6_txoptions *opt,
+ 		return NULL;
+ 
+ 	tot_len += sizeof(*opt2);
+-	opt2 = sock_kmalloc(sk, tot_len, GFP_ATOMIC);
+-	if (!opt2)
++	opt2_rcu = sock_kmalloc(sk, tot_len + IPV6_TXOPT_RCU_LEN, GFP_ATOMIC);
++	if (!opt2_rcu)
+ 		return ERR_PTR(-ENOBUFS);
+ 
+-	memset(opt2, 0, tot_len);
+-	atomic_set(&opt2->refcnt, 1);
++	memset(opt2_rcu, 0, tot_len + IPV6_TXOPT_RCU_LEN);
++	atomic_set(&opt2_rcu->refcnt, 1);
++	opt2 = &opt2_rcu->txoptions;
+ 	opt2->tot_len = tot_len;
+ 	p = (char *)(opt2 + 1);
+ 
+@@ -851,7 +857,7 @@ ipv6_renew_options(struct sock *sk, struct ipv6_txoptions *opt,
+ 
+ 	return opt2;
+ out:
+-	sock_kfree_s(sk, opt2, opt2->tot_len);
++	sock_kfree_s(sk, opt2_rcu, opt2->tot_len + IPV6_TXOPT_RCU_LEN);
+ 	return ERR_PTR(err);
+ }
+ 
+diff --git a/net/ipv6/ipv6_sockglue.c b/net/ipv6/ipv6_sockglue.c
+index 62a1b7c..9b04511 100644
+--- a/net/ipv6/ipv6_sockglue.c
++++ b/net/ipv6/ipv6_sockglue.c
+@@ -219,7 +219,7 @@ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
+ 			opt = xchg((__force struct ipv6_txoptions **)&np->opt,
+ 				   NULL);
+ 			if (opt) {
+-				atomic_sub(opt->tot_len, &sk->sk_omem_alloc);
++				atomic_sub(opt->tot_len + IPV6_TXOPT_RCU_LEN, &sk->sk_omem_alloc);
+ 				txopt_put(opt);
+ 			}
+ 			pktopt = xchg(&np->pktoptions, NULL);
+@@ -421,7 +421,7 @@ static int do_ipv6_setsockopt(struct sock *sk, int level, int optname,
+ 		opt = ipv6_update_options(sk, opt);
+ sticky_done:
+ 		if (opt) {
+-			atomic_sub(opt->tot_len, &sk->sk_omem_alloc);
++			atomic_sub(opt->tot_len + IPV6_TXOPT_RCU_LEN, &sk->sk_omem_alloc);
+ 			txopt_put(opt);
+ 		}
+ 		break;
+@@ -452,6 +452,7 @@ sticky_done:
+ 	case IPV6_2292PKTOPTIONS:
+ 	{
+ 		struct ipv6_txoptions *opt = NULL;
++		struct ipv6_txoptions_rcu *opt_rcu = NULL;
+ 		struct msghdr msg;
+ 		struct flowi6 fl6;
+ 		int junk;
+@@ -470,13 +471,14 @@ sticky_done:
+ 		if (optlen > 64*1024)
+ 			break;
+ 
+-		opt = sock_kmalloc(sk, sizeof(*opt) + optlen, GFP_KERNEL);
++		opt_rcu = sock_kmalloc(sk, sizeof(*opt_rcu) + optlen, GFP_KERNEL);
+ 		retv = -ENOBUFS;
+-		if (opt == NULL)
++		if (opt_rcu == NULL)
+ 			break;
+ 
+-		memset(opt, 0, sizeof(*opt));
+-		atomic_set(&opt->refcnt, 1);
++		memset(opt_rcu, 0, sizeof(*opt_rcu));
++		atomic_set(&opt_rcu->refcnt, 1);
++		opt = &opt_rcu->txoptions;
+ 		opt->tot_len = sizeof(*opt) + optlen;
+ 		retv = -EFAULT;
+ 		if (copy_from_user(opt+1, optval, optlen))
+@@ -494,7 +496,7 @@ update:
+ 		opt = ipv6_update_options(sk, opt);
+ done:
+ 		if (opt) {
+-			atomic_sub(opt->tot_len, &sk->sk_omem_alloc);
++			atomic_sub(opt->tot_len + IPV6_TXOPT_RCU_LEN, &sk->sk_omem_alloc);
+ 			txopt_put(opt);
+ 		}
+ 		break;
