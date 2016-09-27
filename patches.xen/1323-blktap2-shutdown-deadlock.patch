@@ -1,0 +1,105 @@
+From http://xenbits.xen.org/hg/linux-2.6.18-xen.hg/rev/d8c979f0e04c
+From: xen-devel@lists.xenproject.org
+Patch-mainline: Never, SUSE-Xen specific
+Subject: blktap2: eliminate deadlock potential from shutdown path
+References: bsc#909994
+
+blktap_device_fail_pending_requests(), being called from
+blktap_ring_vm_close() (and hence with vm_munmap() up the call chain),
+already holds current->mm->mmap_sem and hence blktap_unmap() mustn't
+try to acquire it when called in this context. Correcting this the
+straightforward way (moving the acquire out of that function into its
+only other caller) is not possible though, as that would yield an ABBA
+deadlock situation on tap_sem and mmap_sem between the two paths using
+blktap_unmap(); see the code comment in blktap_read_ring() for why the
+two semaphores there need to be acquired in this order.
+
+Note that for the blktap_read_ring() -> blktap_device_finish_request()
+-> blktap_unmap() call chain we don't really need mmap_sem held for
+writing.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+
+--- a/drivers/xen/blktap2/device.c
++++ b/drivers/xen/blktap2/device.c
+@@ -292,7 +292,7 @@ blktap_device_fast_flush(struct blktap *
+ }
+ 
+ /*
+- * tap->tap_sem held on entry
++ * tap->tap_sem and tap->ring.vma->vm_mm->mmap_sem held on entry
+  */
+ static void
+ blktap_unmap(struct blktap *tap, struct blktap_request *request)
+@@ -301,7 +301,6 @@ blktap_unmap(struct blktap *tap, struct
+ 	unsigned long kvaddr;
+ 
+ 	usr_idx = request->usr_idx;
+-	down_write(&tap->ring.vma->vm_mm->mmap_sem);
+ 
+ 	for (i = 0; i < request->nr_pages; i++) {
+ 		kvaddr = request_to_kaddr(request, i);
+@@ -321,7 +320,6 @@ blktap_unmap(struct blktap *tap, struct
+ 	}
+ 
+ 	blktap_device_fast_flush(tap, request);
+-	up_write(&tap->ring.vma->vm_mm->mmap_sem);
+ }
+ 
+ /*
+@@ -339,6 +337,12 @@ blktap_device_fail_pending_requests(stru
+ 	if (!test_bit(BLKTAP_DEVICE, &tap->dev_inuse))
+ 		return;
+ 
++	/*
++	 * Being called via vm_munmap(), which acquires current->mm->mmap_sem,
++	 * assure that's the semaphore blktap_unmap() wants held.
++	 */
++	WARN_ON(current->mm != tap->ring.vma->vm_mm);
++
+ 	down_write(&tap->tap_sem);
+ 
+ 	dev = &tap->device;
+--- a/drivers/xen/blktap2/ring.c
++++ b/drivers/xen/blktap2/ring.c
+@@ -26,15 +26,27 @@ blktap_read_ring(struct blktap *tap)
+ 	int usr_idx;
+ 	RING_IDX rc, rp;
+ 	blkif_response_t res;
+-	struct blktap_ring *ring;
++	struct blktap_ring *ring = &tap->ring;
+ 	struct blktap_request *request;
+ 
+-	down_read(&tap->tap_sem);
++	/*
++	 * We can't acquire ring->vma->vm_mm->mmap_sem before tap->tap_sem
++	 * here (as would be needed to match the vm_munmap() ->
++	 * blktap_device_fail_pending_requests() call tree) since ring->vma
++	 * may become NULL while not holding tap->tap_sem. To acquire them
++	 * in the wrong order we need to use a retry loop.
++	 */
++	for (;;) {
++		down_read(&tap->tap_sem);
++		if (!ring->vma) {
++			up_read(&tap->tap_sem);
++			return 0;
++		}
+ 
+-	ring = &tap->ring;
+-	if (!ring->vma) {
++		if (down_read_trylock(&ring->vma->vm_mm->mmap_sem))
++			break;
+ 		up_read(&tap->tap_sem);
+-		return 0;
++		cpu_relax();
+ 	}
+ 
+ 	/* for each outstanding message on the ring  */
+@@ -59,6 +71,7 @@ blktap_read_ring(struct blktap *tap)
+ 		blktap_device_finish_request(tap, &res, request);
+ 	}
+ 
++	up_read(&ring->vma->vm_mm->mmap_sem);
+ 	up_read(&tap->tap_sem);
+ 
+ 	blktap_run_deferred();
