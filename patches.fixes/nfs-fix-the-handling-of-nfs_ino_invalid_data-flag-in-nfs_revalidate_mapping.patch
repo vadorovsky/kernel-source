@@ -1,0 +1,165 @@
+From: Jeff Layton <jlayton@redhat.com>
+Date: Mon, 27 Jan 2014 13:46:15 -0500
+Subject: NFS: fix the handling of NFS_INO_INVALID_DATA flag in
+ nfs_revalidate_mapping
+Git-commit: d529ef83c355f97027ff85298a9709fe06216a66
+Patch-mainline: v3.14-rc1
+References: bsc#999584
+
+There is a possible race in how the nfs_invalidate_mapping function is
+handled.  Currently, we go and invalidate the pages in the file and then
+clear NFS_INO_INVALID_DATA.
+
+The problem is that it's possible for a stale page to creep into the
+mapping after the page was invalidated (i.e., via readahead). If another
+writer comes along and sets the flag after that happens but before
+invalidate_inode_pages2 returns then we could clear the flag
+without the cache having been properly invalidated.
+
+So, we must clear the flag first and then invalidate the pages. Doing
+this however, opens another race:
+
+It's possible to have two concurrent read() calls that end up in
+nfs_revalidate_mapping at the same time. The first one clears the
+NFS_INO_INVALID_DATA flag and then goes to call nfs_invalidate_mapping.
+
+Just before calling that though, the other task races in, checks the
+flag and finds it cleared. At that point, it trusts that the mapping is
+good and gets the lock on the page, allowing the read() to be satisfied
+from the cache even though the data is no longer valid.
+
+These effects are easily manifested by running diotest3 from the LTP
+test suite on NFS. That program does a series of DIO writes and buffered
+reads. The operations are serialized and page-aligned but the existing
+code fails the test since it occasionally allows a read to come out of
+the cache incorrectly. While mixing direct and buffered I/O isn't
+recommended, I believe it's possible to hit this in other ways that just
+use buffered I/O, though that situation is much harder to reproduce.
+
+The problem is that the checking/clearing of that flag and the
+invalidation of the mapping really need to be atomic. Fix this by
+serializing concurrent invalidations with a bitlock.
+
+At the same time, we also need to allow other places that check
+NFS_INO_INVALID_DATA to check whether we might be in the middle of
+invalidating the file, so fix up a couple of places that do that
+to look for the new NFS_INO_INVALIDATING flag.
+
+Doing this requires us to be careful not to set the bitlock
+unnecessarily, so this code only does that if it believes it will
+be doing an invalidation.
+
+Signed-off-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+ fs/nfs/dir.c           |    3 ++-
+ fs/nfs/inode.c         |   46 +++++++++++++++++++++++++++++++++++++++++-----
+ fs/nfs/write.c         |    2 +-
+ include/linux/nfs_fs.h |    1 +
+ 4 files changed, 45 insertions(+), 7 deletions(-)
+
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -356,7 +356,8 @@ int nfs_readdir_search_for_cookie(struct
+ 
+ 			new_pos = desc->current_index + i;
+ 			if (ctx->attr_gencount != nfsi->attr_gencount
+-			    || (nfsi->cache_validity & (NFS_INO_INVALID_ATTR|NFS_INO_INVALID_DATA))) {
++			    || (nfsi->cache_validity & (NFS_INO_INVALID_ATTR|NFS_INO_INVALID_DATA))
++			    || test_bit(NFS_INO_INVALIDATING, &nfsi->flags)) {
+ 				ctx->duped = 0;
+ 				ctx->attr_gencount = nfsi->attr_gencount;
+ 			} else if (new_pos < desc->file->f_pos) {
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@ -863,11 +863,11 @@ static int nfs_invalidate_mapping(struct
+ 		if (ret < 0)
+ 			return ret;
+ 	}
+-	spin_lock(&inode->i_lock);
+-	nfsi->cache_validity &= ~NFS_INO_INVALID_DATA;
+-	if (S_ISDIR(inode->i_mode))
++	if (S_ISDIR(inode->i_mode)) {
++		spin_lock(&inode->i_lock);
+ 		memset(nfsi->cookieverf, 0, sizeof(nfsi->cookieverf));
+-	spin_unlock(&inode->i_lock);
++		spin_unlock(&inode->i_lock);
++	}
+ 	nfs_inc_stats(inode, NFSIOS_DATAINVALIDATE);
+ 	nfs_fscache_wait_on_invalidate(inode);
+ 	dfprintk(PAGECACHE, "NFS: (%s/%Ld) data cache invalidated\n",
+@@ -883,6 +883,7 @@ static int nfs_invalidate_mapping(struct
+ int nfs_revalidate_mapping(struct inode *inode, struct address_space *mapping)
+ {
+ 	struct nfs_inode *nfsi = NFS_I(inode);
++	unsigned long *bitlock = &nfsi->flags;
+ 	int ret = 0;
+ 
+ 	/* swapfiles are not supposed to be shared. */
+@@ -896,8 +897,43 @@ int nfs_revalidate_mapping(struct inode
+ 		if (ret < 0)
+ 			goto out;
+ 	}
+-	if (nfsi->cache_validity & NFS_INO_INVALID_DATA)
++
++	/*
++	 * We must clear NFS_INO_INVALID_DATA first to ensure that
++	 * invalidations that come in while we're shooting down the mappings
++	 * are respected. But, that leaves a race window where one revalidator
++	 * can clear the flag, and then another checks it before the mapping
++	 * gets invalidated. Fix that by serializing access to this part of
++	 * the function.
++	 *
++	 * At the same time, we need to allow other tasks to see whether we
++	 * might be in the middle of invalidating the pages, so we only set
++	 * the bit lock here if it looks like we're going to be doing that.
++	 */
++	for (;;) {
++		ret = wait_on_bit(bitlock, NFS_INO_INVALIDATING,
++				  nfs_wait_bit_killable, TASK_KILLABLE);
++		if (ret)
++			goto out;
++		if (!(nfsi->cache_validity & NFS_INO_INVALID_DATA))
++			goto out;
++		if (!test_and_set_bit_lock(NFS_INO_INVALIDATING, bitlock))
++			break;
++	}
++
++	spin_lock(&inode->i_lock);
++	if (nfsi->cache_validity & NFS_INO_INVALID_DATA) {
++		nfsi->cache_validity &= ~NFS_INO_INVALID_DATA;
++		spin_unlock(&inode->i_lock);
+ 		ret = nfs_invalidate_mapping(inode, mapping);
++	} else {
++		/* something raced in and cleared the flag */
++		spin_unlock(&inode->i_lock);
++	}
++
++	clear_bit_unlock(NFS_INO_INVALIDATING, bitlock);
++	smp_mb__after_clear_bit();
++	wake_up_bit(bitlock, NFS_INO_INVALIDATING);
+ out:
+ 	return ret;
+ }
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -773,7 +773,7 @@ int nfs_flush_incompatible(struct file *
+ static int nfs_write_pageuptodate(struct page *page, struct inode *inode)
+ {
+ 	return PageUptodate(page) &&
+-		!(NFS_I(inode)->cache_validity & (NFS_INO_REVAL_PAGECACHE|NFS_INO_INVALID_DATA));
++		!(NFS_I(inode)->cache_validity & (NFS_INO_REVAL_PAGECACHE|NFS_INO_INVALID_DATA)) && !test_bit(NFS_INO_INVALIDATING, &NFS_I(inode)->flags);
+ }
+ 
+ /*
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -235,6 +235,7 @@ struct nfs_inode {
+ #define NFS_INO_ADVISE_RDPLUS	(0)		/* advise readdirplus */
+ #define NFS_INO_STALE		(1)		/* possible stale inode */
+ #define NFS_INO_ACL_LRU_SET	(2)		/* Inode is on the LRU list */
++#define NFS_INO_INVALIDATING	(3)		/* inode is being invalidated */
+ #define NFS_INO_FLUSHING	(4)		/* inode is flushing out data */
+ #define NFS_INO_FSCACHE		(5)		/* inode can be cached by FS-Cache */
+ #define NFS_INO_FSCACHE_LOCK	(6)		/* FS-Cache cookie management lock */
