@@ -141,6 +141,7 @@ tag_map = {
     },
     'From' : {
         'multi' : True,
+        'required' : True,
         'accepted' : [
             {
                 'name' : 'SUSE',
@@ -151,15 +152,30 @@ tag_map = {
             }
         ],
     },
-#    'References' : {
-#        'required' : True,
-#        'accepted' : [
-#            {
-#                'match' : '(([a-z]+)#\d+),*\s*)+',
-#            },
-#        ],
-#        'error' : "must contain list of references",
-#    }
+    'Subject' : {
+        'required' : True,
+        'accepted' :  [
+            {
+                'match' : '\S+',
+            },
+        ],
+    },
+    'References' : {
+        'required' : True,
+        'multi' : True,
+        'accepted' : [
+            {
+                'name' : 'SUSE',
+                'match' : '(bsc|boo|bnc|fate)#\d+',
+            },
+            {
+                'match' : '\S+',
+            },
+        ],
+        'error' : "must contain list of references",
+     # Enable to require real References tags
+     #   'requires' : ['References:SUSE'],
+    }
 }
 
 class ValidationError(patch.ValidationError):
