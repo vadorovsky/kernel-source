@@ -73,7 +73,7 @@ set_var()
 		CONFIG_*) ;;
 		*) name="CONFIG_$name" ;;
 	esac
-	config_files=$(${prefix}scripts/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
+	config_files=$(${scripts}/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
 	if [ -n "$set_flavor" ] ; then
 		info "appending $name=$val to all -$set_flavor config files listed in config.conf"
 		config_files=$(printf "%s\n" $config_files | grep "/$set_flavor\$")
@@ -82,6 +82,11 @@ set_var()
 	fi
 	for config in $config_files; do
 		if test -L "${prefix}config/$config"; then
+			continue
+		fi
+		# do not change trimmed configs unless requested
+		if test -z "$set_flavor" && ! \
+			grep -q '^CONFIG_MMU=' "${prefix}config/$config"; then
 			continue
 		fi
 		sed -i "/\\<$name[ =]/d" "${prefix}config/$config"
@@ -114,7 +119,7 @@ check=false
 current=false
 until [ "$#" = "0" ] ; do
 	case "$1" in
-	y|-y|--yes)
+	y|-y|--yes|o|-o|--olddefconfig)
 		mode=yes
 		shift
 		;;
@@ -179,7 +184,9 @@ run it with no options in your SCRATCH_AREA $SCRATCH_AREA, like
 	patches/scripts/${0##*/}
 possible options in this mode:
 	called with no option will run just make oldconfig interactive
-	y|-y|--yes         to run 'yes "" | make oldconfig'
+	y|-y|--yes         to run 'yes "" | make oldconfig' - equivalent to
+                           'make olddefconfig' on newer kernels
+	o|-o|--olddefconfig  same as '--yes'
 	--mod              to set all new options to 'm' (booleans to 'y')
 	a|-a|--arch        to run make oldconfig only for the given arch
 	m|-m|--menuconfig  to run make menuconfig instead of oldconfig
@@ -220,6 +227,13 @@ else
 	exit 1
 fi
 
+if $current; then
+	prefix=../../$prefix
+	cd tmp/current
+fi
+
+scripts="${prefix}scripts"
+
 if test -e "${prefix}rpm/config.sh"; then
 	source "$_"
 fi
@@ -229,12 +243,12 @@ fi
 
 if [ -z "$cpu_arch" ]; then
     CONFIG_SYMBOLS=$(
-        for arch in $(${prefix}scripts/arch-symbols --list); do
-            ${prefix}scripts/arch-symbols $arch
+        for arch in $(${scripts}/arch-symbols --list); do
+            ${scripts}/arch-symbols $arch
         done
     )
 else
-    CONFIG_SYMBOLS=$(${prefix}scripts/arch-symbols $cpu_arch)
+    CONFIG_SYMBOLS=$(${scripts}/arch-symbols $cpu_arch)
 fi
 
 case "$mode" in
@@ -245,6 +259,17 @@ single)
 menuconfig)
 	;;
 *)
+	if test "$set_flavor" = "vanilla" -a -z "$VANILLA_ONLY" -a \
+			! -e .is_vanilla; then
+		echo "run_oldconfig.sh --vanilla only works in a tree created with" >&2
+		echo -n "sequence-patch.sh --vanilla. Do you really want to continue? [yN] " >&2
+		read
+		case "$REPLY" in
+		"" | [Nn]*)
+			exit 1
+		esac
+	fi
+
 	case "$TERM" in
 	linux* | xterm* | screen*)
 		if tty -s && ! $silent; then
@@ -254,7 +279,7 @@ menuconfig)
 	esac
 esac
 
-config_files=$(${prefix}scripts/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
+config_files=$(${scripts}/guards $CONFIG_SYMBOLS < ${prefix}config.conf)
 
 if [ -z "$set_flavor" ] ; then
     config_files=$(printf "%s\n" $config_files | grep -v vanilla)
@@ -269,7 +294,7 @@ if [ -s extra-symbols ]; then
     EXTRA_SYMBOLS="$(cat extra-symbols)"
 fi
 
-${prefix}scripts/guards $EXTRA_SYMBOLS < ${prefix}series.conf \
+${scripts}/guards $EXTRA_SYMBOLS < ${prefix}series.conf \
     > $TMPDIR/applied-patches
 
 EXTRA_SYMBOLS="$(echo $EXTRA_SYMBOLS | sed -e 's# *[Rr][Tt] *##g')"
@@ -334,11 +359,10 @@ filter_config()
     sed -e '/^# .* is not set$/p' -e '/^$\|^#/d' "$@" | sort
 }
 
-if $current; then
-	prefix=../../$prefix
-	cd tmp/current
-fi
-
+# Keep these in the -vanilla fragment even if -default has the same values.
+# This allows the spec file to read them from the fragment without calling
+# kconfig
+precious_options=($(sed -n 's/^%define config_vars //p' "${prefix}rpm/kernel-binary.spec.in"))
 err=0
 for config in $config_files; do
     cpu_arch=${config%/*}
@@ -348,7 +372,7 @@ for config in $config_files; do
         continue
     fi
     set -- kernel-$flavor $flavor $(case $flavor in (rt|rt_*) echo RT ;; esac)
-    ${prefix}scripts/guards $* $EXTRA_SYMBOLS \
+    ${scripts}/guards $* $EXTRA_SYMBOLS \
 	< ${prefix}series.conf > $TMPDIR/patches
 
     if ! diff -q $TMPDIR/applied-patches $TMPDIR/patches > /dev/null; then
@@ -359,11 +383,7 @@ for config in $config_files; do
 
     case $config in
     ppc*/*)
-        if test -e arch/powerpc/Makefile; then
-            MAKE_ARGS="ARCH=powerpc"
-        else
-            MAKE_ARGS="ARCH=$cpu_arch"
-        fi
+	MAKE_ARGS="ARCH=powerpc"
         ;;
     s390x/*)
         MAKE_ARGS="ARCH=s390"
@@ -385,9 +405,24 @@ for config in $config_files; do
 	    MAKE_ARGS="$MAKE_ARGS -s"
     fi
     config="${prefix}config/$config"
+    config_orig="config-orig"
 
-    cp "$config" .config
-    for cfg in "CONFIG_LOCALVERSION=\"-$flavor\"" "CONFIG_SUSE_KERNEL=y"; do
+    config_base=
+    if ! grep -q CONFIG_MMU= "$config"; then
+	if [ "$cpu_arch" = "i386" ]; then
+	    config_base="$(dirname "$config")/pae"
+	else
+	    config_base="$(dirname "$config")/default"
+	fi
+	${scripts}/config-merge "$config_base" "$config" >$config_orig
+    else
+	cp "$config" $config_orig
+    fi
+
+    cp $config_orig .config
+
+    for cfg in "CONFIG_LOCALVERSION=\"-$flavor\"" "CONFIG_SUSE_KERNEL=y" \
+		    "CONFIG_DEBUG_INFO=y"; do
 	    if ! grep -q "^$cfg\$" .config; then
 		    echo "$cfg" >>.config
 	    fi
@@ -421,6 +456,7 @@ for config in $config_files; do
             if ! make $MAKE_ARGS silentoldconfig </dev/null; then
                 echo "${config#$prefix} is out of date"
                 err=1
+                rm $config_orig
                 continue
             fi
         else
@@ -428,15 +464,35 @@ for config in $config_files; do
         fi
     esac
     if ! $check; then
-        ask_reuse_config $config .config
-        if ! $silent; then
-            diff -U0 $config .config
-        fi
-        cp .config $config
+        ask_reuse_config $config_orig .config
+	if [ -n "$config_base" ]; then
+	    # We need to diff and re-merge to compare to the original,
+	    # otherwise we'll see the differences between default
+	    # and vanilla in addition to the changes made during this run.
+	    ${scripts}/config-diff "$config_base" .config > config-new.diff
+	    for opt in "${precious_options[@]}"; do
+		    if ! grep -q -w "$opt" config-new.diff; then
+			    grep -w "$opt" .config >>config-new.diff
+		    fi
+	    done
+	    ${scripts}/config-merge "$config_base" config-new.diff > config-new
+	    if ! $silent; then
+		diff -U0 $config_orig config-new|grep -v ^@@
+	    fi
+	    mv config-new.diff "$config"
+	    rm -f config-new
+
+	else
+	    if ! $silent; then
+		diff -U0 $config_orig .config|grep -v ^@@
+	    fi
+	    cp .config "$config"
+	fi
+	rm -f $config_orig
         continue
     fi
     differences="$(
-        diff -bU0 <(filter_config "$config") <(filter_config .config) | \
+        diff -bU0 <(filter_config $config_orig) <(filter_config .config) | \
         grep '^[-+][^-+]'
     )"
     if echo "$differences" | grep -q '^+' ; then
@@ -444,6 +500,7 @@ for config in $config_files; do
         echo "$differences"
         err=1
     fi
+    rm $config_orig
 done
 
 exit $err
