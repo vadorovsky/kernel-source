@@ -1,4 +1,4 @@
-From http://xenbits.xen.org/linux-2.6.18-xen.hg (tip 1321:7cb172c46867)
+From http://xenbits.xen.org/linux-2.6.18-xen.hg (tip 1324:7ba8deb4c1be)
 Subject: xen3 xen-drivers
 From: xen-devel@lists.xen.org
 Patch-mainline: Never, SUSE-Xen specific
@@ -7743,7 +7743,7 @@ and in case upstream wants to take the forward porting patches:
 +MODULE_LICENSE("Dual BSD/GPL");
 --- /dev/null
 +++ b/drivers/xen/blktap2/device.c
-@@ -0,0 +1,1178 @@
+@@ -0,0 +1,1182 @@
 +#include <linux/fs.h>
 +#include <linux/blkdev.h>
 +#include <linux/cdrom.h>
@@ -8038,7 +8038,7 @@ and in case upstream wants to take the forward porting patches:
 +}
 +
 +/*
-+ * tap->tap_sem held on entry
++ * tap->tap_sem and tap->ring.vma->vm_mm->mmap_sem held on entry
 + */
 +static void
 +blktap_unmap(struct blktap *tap, struct blktap_request *request)
@@ -8047,7 +8047,6 @@ and in case upstream wants to take the forward porting patches:
 +	unsigned long kvaddr;
 +
 +	usr_idx = request->usr_idx;
-+	down_write(&tap->ring.vma->vm_mm->mmap_sem);
 +
 +	for (i = 0; i < request->nr_pages; i++) {
 +		kvaddr = request_to_kaddr(request, i);
@@ -8067,7 +8066,6 @@ and in case upstream wants to take the forward porting patches:
 +	}
 +
 +	blktap_device_fast_flush(tap, request);
-+	up_write(&tap->ring.vma->vm_mm->mmap_sem);
 +}
 +
 +/*
@@ -8084,6 +8082,12 @@ and in case upstream wants to take the forward porting patches:
 +
 +	if (!test_bit(BLKTAP_DEVICE, &tap->dev_inuse))
 +		return;
++
++	/*
++	 * Being called via vm_munmap(), which acquires current->mm->mmap_sem,
++	 * assure that's the semaphore blktap_unmap() wants held.
++	 */
++	WARN_ON(current->mm != tap->ring.vma->vm_mm);
 +
 +	down_write(&tap->tap_sem);
 +
@@ -9223,7 +9227,7 @@ and in case upstream wants to take the forward porting patches:
 +}
 --- /dev/null
 +++ b/drivers/xen/blktap2/ring.c
-@@ -0,0 +1,610 @@
+@@ -0,0 +1,623 @@
 +#include <linux/module.h>
 +#include <linux/signal.h>
 +
@@ -9252,15 +9256,27 @@ and in case upstream wants to take the forward porting patches:
 +	int usr_idx;
 +	RING_IDX rc, rp;
 +	blkif_response_t res;
-+	struct blktap_ring *ring;
++	struct blktap_ring *ring = &tap->ring;
 +	struct blktap_request *request;
 +
-+	down_read(&tap->tap_sem);
++	/*
++	 * We can't acquire ring->vma->vm_mm->mmap_sem before tap->tap_sem
++	 * here (as would be needed to match the vm_munmap() ->
++	 * blktap_device_fail_pending_requests() call tree) since ring->vma
++	 * may become NULL while not holding tap->tap_sem. To acquire them
++	 * in the wrong order we need to use a retry loop.
++	 */
++	for (;;) {
++		down_read(&tap->tap_sem);
++		if (!ring->vma) {
++			up_read(&tap->tap_sem);
++			return 0;
++		}
 +
-+	ring = &tap->ring;
-+	if (!ring->vma) {
++		if (down_read_trylock(&ring->vma->vm_mm->mmap_sem))
++			break;
 +		up_read(&tap->tap_sem);
-+		return 0;
++		cpu_relax();
 +	}
 +
 +	/* for each outstanding message on the ring  */
@@ -9285,6 +9301,7 @@ and in case upstream wants to take the forward porting patches:
 +		blktap_device_finish_request(tap, &res, request);
 +	}
 +
++	up_read(&ring->vma->vm_mm->mmap_sem);
 +	up_read(&tap->tap_sem);
 +
 +	blktap_run_deferred();
@@ -10264,7 +10281,7 @@ and in case upstream wants to take the forward porting patches:
 +}
 --- /dev/null
 +++ b/drivers/xen/blktap2/wait_queue.c
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,39 @@
 +#include <linux/list.h>
 +#include <linux/spinlock.h>
 +
@@ -10282,13 +10299,14 @@ and in case upstream wants to take the forward porting patches:
 +
 +	spin_lock_irqsave(&deferred_work_lock, flags);
 +	list_splice_init(&deferred_work_queue, &queue);
-+	list_for_each_entry(tap, &queue, deferred_queue)
-+		clear_bit(BLKTAP_DEFERRED, &tap->dev_inuse);
 +	spin_unlock_irqrestore(&deferred_work_lock, flags);
 +
 +	while (!list_empty(&queue)) {
 +		tap = list_entry(queue.next, struct blktap, deferred_queue);
++		spin_lock_irqsave(&deferred_work_lock, flags);
++		clear_bit(BLKTAP_DEFERRED, &tap->dev_inuse);
 +		list_del_init(&tap->deferred_queue);
++		spin_unlock_irqrestore(&deferred_work_lock, flags);
 +		blktap_device_restart(tap);
 +	}
 +}
@@ -10299,10 +10317,8 @@ and in case upstream wants to take the forward porting patches:
 +	unsigned long flags;
 +
 +	spin_lock_irqsave(&deferred_work_lock, flags);
-+	if (!test_bit(BLKTAP_DEFERRED, &tap->dev_inuse)) {
-+		set_bit(BLKTAP_DEFERRED, &tap->dev_inuse);
++	if (!test_and_set_bit(BLKTAP_DEFERRED, &tap->dev_inuse))
 +		list_add_tail(&tap->deferred_queue, &deferred_work_queue);
-+	}
 +	spin_unlock_irqrestore(&deferred_work_lock, flags);
 +}
 --- /dev/null
