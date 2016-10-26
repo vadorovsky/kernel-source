@@ -1,0 +1,146 @@
+From 9360bf99809fda193b5ea9d19e3f8acf15326848 Mon Sep 17 00:00:00 2001
+From: James Bottomley <jbottomley@parallels.com>
+Date: Mon, 11 Nov 2013 13:44:53 +0100
+Subject: [SCSI] Fix erratic device offline during EH
+References: bsc#993832
+Patch-Mainline: v3.14
+Git-commit: 2451079bc2ae1334058be8babd44be03ecfa7041
+
+Commit 18a4d0a22ed6c54b67af7718c305cd010f09ddf8
+(Handle disk devices which can not process medium access commands)
+was introduced to offline any device which cannot process medium
+access commands.
+However, commit 3eef6257de48ff84a5d98ca533685df8a3beaeb8
+(Reduce error recovery time by reducing use of TURs) reduced
+the number of TURs by sending it only on the first failing
+command, which might or might not be a medium access command.
+So in combination this results in an erratic device offlining
+during EH; if the command where the TUR was sent upon happens
+to be a medium access command the device will be set offline,
+if not everything proceeds as normal.
+
+This patch moves the check to the final test, eliminating
+this problem.
+
+[hare: ported to SLES11 to avoid kABI breakage]
+
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+Signed-off-by: James Bottomley <JBottomley@Parallels.com>
+---
+ drivers/scsi/scsi_error.c | 27 ++++++++++++++++++---------
+ drivers/scsi/sd.c         | 19 ++++++++++---------
+ 2 files changed, 28 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/scsi/scsi_error.c b/drivers/scsi/scsi_error.c
+index 4fe4c4b..11745ef 100644
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@ -1008,12 +1008,6 @@ retry:
+ 
+ 	scsi_eh_restore_cmnd(scmd, &ses);
+ 
+-	if (scmd->request->cmd_type != REQ_TYPE_BLOCK_PC) {
+-		struct scsi_driver *sdrv = scsi_cmd_to_driver(scmd);
+-		if (sdrv->eh_action)
+-			rtn = sdrv->eh_action(scmd, cmnd, cmnd_size, rtn);
+-	}
+-
+ 	return rtn;
+ }
+ 
+@@ -1031,6 +1025,17 @@ static int scsi_request_sense(struct scsi_cmnd *scmd)
+ 	return scsi_send_eh_cmnd(scmd, NULL, 0, scmd->device->eh_timeout, ~0);
+ }
+ 
++static int scsi_eh_action(struct scsi_cmnd *scmd, int rtn)
++{
++	if (scmd->request->cmd_type != REQ_TYPE_BLOCK_PC) {
++		struct scsi_driver *sdrv = scsi_cmd_to_driver(scmd);
++		if (sdrv->eh_action)
++			rtn = sdrv->eh_action(scmd, scmd->cmnd,
++					      scmd->cmd_len, rtn);
++	}
++	return rtn;
++}
++
+ /**
+  * scsi_eh_finish_cmd - Handle a cmd that eh is finished with.
+  * @scmd:	Original SCSI cmd that eh has finished.
+@@ -1209,7 +1214,9 @@ static int scsi_eh_test_devices(struct list_head *cmd_list,
+ 
+ 		list_for_each_entry_safe(scmd, next, cmd_list, eh_entry)
+ 			if (scmd->device == sdev) {
+-				if (finish_cmds)
++				if (finish_cmds &&
++				    (try_stu ||
++				     scsi_eh_action(scmd, SUCCESS) == SUCCESS))
+ 					scsi_eh_finish_cmd(scmd, done_q);
+ 				else
+ 					list_move_tail(&scmd->eh_entry, work_q);
+@@ -1348,7 +1355,8 @@ static int scsi_eh_stu(struct Scsi_Host *shost,
+ 			    !scsi_eh_tur(stu_scmd)) {
+ 				list_for_each_entry_safe(scmd, next,
+ 							  work_q, eh_entry) {
+-					if (scmd->device == sdev)
++					if (scmd->device == sdev &&
++					    scsi_eh_action(scmd, SUCCESS) == SUCCESS)
+ 						scsi_eh_finish_cmd(scmd, done_q);
+ 				}
+ 			}
+@@ -1415,7 +1423,8 @@ static int scsi_eh_bus_device_reset(struct Scsi_Host *shost,
+ 			    !scsi_eh_tur(bdr_scmd)) {
+ 				list_for_each_entry_safe(scmd, next,
+ 							 work_q, eh_entry) {
+-					if (scmd->device == sdev)
++					if (scmd->device == sdev &&
++					    scsi_eh_action(scmd, rtn) != FAILED)
+ 						scsi_eh_finish_cmd(scmd,
+ 								   done_q);
+ 				}
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index 5d01e55..b7f120be 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -1431,11 +1431,12 @@ static const struct block_device_operations sd_fops = {
+  *	@eh_cmnd_len:	Length of eh_cmnd in bytes
+  *	@eh_disp:	The recovery disposition suggested by the midlayer
+  *
+- *	This function is called by the SCSI midlayer upon completion of
+- *	an error handling command (TEST UNIT READY, START STOP UNIT,
+- *	etc.) The command sent to the device by the error handler is
+- *	stored in eh_cmnd. The result of sending the eh command is
+- *	passed in eh_disp.
++ *	This function is called by the SCSI midlayer upon completion of an
++ *	error test command (currently TEST UNIT READY). The result of sending
++ *	the eh command is passed in eh_disp.  We're looking for devices that
++ *	fail medium access commands but are OK with non access commands like
++ *	test unit ready (so wrongly see the device as having a successful
++ *	recovery)
+  **/
+ static int sd_eh_action(struct scsi_cmnd *scmd, unsigned char *eh_cmnd,
+ 			int eh_cmnd_len, int eh_disp)
+@@ -1443,7 +1444,9 @@ static int sd_eh_action(struct scsi_cmnd *scmd, unsigned char *eh_cmnd,
+ 	struct scsi_disk *sdkp = scsi_disk(scmd->request->rq_disk);
+ 
+ 	if (!scsi_device_online(scmd->device) ||
+-	    !scsi_medium_access_command(scmd))
++	    !scsi_medium_access_command(scmd) ||
++	    host_byte(scmd->result) != DID_TIME_OUT ||
++	    eh_disp != SUCCESS)
+ 		return eh_disp;
+ 
+ 	/*
+@@ -1453,9 +1456,7 @@ static int sd_eh_action(struct scsi_cmnd *scmd, unsigned char *eh_cmnd,
+ 	 * process of recovering or has it suffered an internal failure
+ 	 * that prevents access to the storage medium.
+ 	 */
+-	if (host_byte(scmd->result) == DID_TIME_OUT && eh_disp == SUCCESS &&
+-	    eh_cmnd_len && eh_cmnd[0] == TEST_UNIT_READY)
+-		sdkp->medium_access_timed_out++;
++	sdkp->medium_access_timed_out++;
+ 
+ 	/*
+ 	 * If the device keeps failing read/write commands but TEST UNIT
+-- 
+1.8.5.6
+
