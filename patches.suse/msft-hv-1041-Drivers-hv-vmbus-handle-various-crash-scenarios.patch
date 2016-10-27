@@ -1,0 +1,175 @@
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Sat, 30 Apr 2016 19:21:34 -0700
+Patch-mainline: v4.7-rc1
+Subject: Drivers: hv: vmbus: handle various crash scenarios
+Git-commit: cd95aad5579371ac332507fc946008217fc37e6c
+References: bnc#986337
+
+Kdump keeps biting. Turns out CHANNELMSG_UNLOAD_RESPONSE is always
+delivered to the CPU which was used for initial contact or to CPU0
+depending on host version. vmbus_wait_for_unload() doesn't account for
+the fact that in case we're crashing on some other CPU we won't get the
+CHANNELMSG_UNLOAD_RESPONSE message and our wait on the current CPU will
+never end.
+
+Do the following:
+1) Check for completion_done() in the loop. In case interrupt handler is
+   still alive we'll get the confirmation we need.
+
+2) Read message pages for all CPUs message page as we're unsure where
+   CHANNELMSG_UNLOAD_RESPONSE is going to be delivered to. We can race with
+   still-alive interrupt handler doing the same, add cmpxchg() to
+   vmbus_signal_eom() to not lose CHANNELMSG_UNLOAD_RESPONSE message.
+
+3) Cleanup message pages on all CPUs. This is required (at least for the
+   current CPU as we're clearing CPU0 messages now but we may want to bring
+   up additional CPUs on crash) as new messages won't be delivered till we
+   consume what's pending. On boot we'll place message pages somewhere else
+   and we won't be able to read stale messages.
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Acked-by: <ohering@suse.de>
+---
+ drivers/hv/channel_mgmt.c | 58 +++++++++++++++++++++++++++++++++++------------
+ drivers/hv/hyperv_vmbus.h | 16 +++++++++++--
+ drivers/hv/vmbus_drv.c    |  7 +++---
+ 3 files changed, 61 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/hv/channel_mgmt.c b/drivers/hv/channel_mgmt.c
+index 38b682ba..b6c1211 100644
+--- a/drivers/hv/channel_mgmt.c
++++ b/drivers/hv/channel_mgmt.c
+@@ -597,27 +597,55 @@ static void init_vp_index(struct vmbus_channel *channel, u16 dev_type)
+ 
+ static void vmbus_wait_for_unload(void)
+ {
+-	int cpu = smp_processor_id();
+-	void *page_addr = hv_context.synic_message_page[cpu];
+-	struct hv_message *msg = (struct hv_message *)page_addr +
+-				  VMBUS_MESSAGE_SINT;
++	int cpu;
++	void *page_addr;
++	struct hv_message *msg;
+ 	struct vmbus_channel_message_header *hdr;
+-	bool unloaded = false;
++	u32 message_type;
+ 
++	/*
++	 * CHANNELMSG_UNLOAD_RESPONSE is always delivered to the CPU which was
++	 * used for initial contact or to CPU0 depending on host version. When
++	 * we're crashing on a different CPU let's hope that IRQ handler on
++	 * the cpu which receives CHANNELMSG_UNLOAD_RESPONSE is still
++	 * functional and vmbus_unload_response() will complete
++	 * vmbus_connection.unload_event. If not, the last thing we can do is
++	 * read message pages for all CPUs directly.
++	 */
+ 	while (1) {
+-		if (msg->header.message_type == HVMSG_NONE) {
+-			mdelay(10);
+-			continue;
+-		}
++		if (completion_done(&vmbus_connection.unload_event))
++			break;
+ 
+-		hdr = (struct vmbus_channel_message_header *)msg->u.payload;
+-		if (hdr->msgtype == CHANNELMSG_UNLOAD_RESPONSE)
+-			unloaded = true;
++		for_each_online_cpu(cpu) {
++			page_addr = hv_context.synic_message_page[cpu];
++			msg = (struct hv_message *)page_addr +
++				VMBUS_MESSAGE_SINT;
+ 
+-		vmbus_signal_eom(msg);
++			message_type = msg->header.message_type;
++			if (message_type == HVMSG_NONE)
++				continue;
+ 
+-		if (unloaded)
+-			break;
++			hdr = (struct vmbus_channel_message_header *)
++				msg->u.payload;
++
++			if (hdr->msgtype == CHANNELMSG_UNLOAD_RESPONSE)
++				complete(&vmbus_connection.unload_event);
++
++			vmbus_signal_eom(msg, message_type);
++		}
++
++		mdelay(10);
++	}
++
++	/*
++	 * We're crashing and already got the UNLOAD_RESPONSE, cleanup all
++	 * maybe-pending messages on all CPUs to be able to receive new
++	 * messages after we reconnect.
++	 */
++	for_each_online_cpu(cpu) {
++		page_addr = hv_context.synic_message_page[cpu];
++		msg = (struct hv_message *)page_addr + VMBUS_MESSAGE_SINT;
++		msg->header.message_type = HVMSG_NONE;
+ 	}
+ }
+ 
+diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
+index e5203e4..718b5c7 100644
+--- a/drivers/hv/hyperv_vmbus.h
++++ b/drivers/hv/hyperv_vmbus.h
+@@ -625,9 +625,21 @@ extern struct vmbus_channel_message_table_entry
+ 	channel_message_table[CHANNELMSG_COUNT];
+ 
+ /* Free the message slot and signal end-of-message if required */
+-static inline void vmbus_signal_eom(struct hv_message *msg)
++static inline void vmbus_signal_eom(struct hv_message *msg, u32 old_msg_type)
+ {
+-	msg->header.message_type = HVMSG_NONE;
++	/*
++	 * On crash we're reading some other CPU's message page and we need
++	 * to be careful: this other CPU may already had cleared the header
++	 * and the host may already had delivered some other message there.
++	 * In case we blindly write msg->header.message_type we're going
++	 * to lose it. We can still lose a message of the same type but
++	 * we count on the fact that there can only be one
++	 * CHANNELMSG_UNLOAD_RESPONSE and we don't care about other messages
++	 * on crash.
++	 */
++	if (cmpxchg(&msg->header.message_type, old_msg_type,
++		    HVMSG_NONE) != old_msg_type)
++		return;
+ 
+ 	/*
+ 	 * Make sure the write to MessageType (ie set to
+diff --git a/drivers/hv/vmbus_drv.c b/drivers/hv/vmbus_drv.c
+index a29a6c0..952f20f 100644
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -712,7 +712,7 @@ static void hv_process_timer_expiration(struct hv_message *msg, int cpu)
+ 	if (dev->event_handler)
+ 		dev->event_handler(dev);
+ 
+-	vmbus_signal_eom(msg);
++	vmbus_signal_eom(msg, HVMSG_TIMER_EXPIRED);
+ }
+ 
+ static void vmbus_on_msg_dpc(unsigned long data)
+@@ -724,8 +724,9 @@ void vmbus_on_msg_dpc(unsigned long data)
+ 	struct vmbus_channel_message_header *hdr;
+ 	struct vmbus_channel_message_table_entry *entry;
+ 	struct onmessage_work_context *ctx;
++	u32 message_type = msg->header.message_type;
+ 
+-	if (msg->header.message_type == HVMSG_NONE)
++	if (message_type == HVMSG_NONE)
+ 		/* no msg */
+ 		return;
+ 
+@@ -750,7 +751,7 @@ void vmbus_on_msg_dpc(unsigned long data)
+ 		entry->message_handler(hdr);
+ 
+ msg_handled:
+-	vmbus_signal_eom(msg);
++	vmbus_signal_eom(msg, message_type);
+ }
+ 
+ static irqreturn_t vmbus_isr(int irq, void *dev_id)
