@@ -1,0 +1,178 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: s390/time: LPAR offset handling
+Patch-mainline: v4.8-rc1
+Git-commit: 4027789192d149678262ad606b2d7e2a61bed0f2
+References: bnc#1003677, LTC#146920
+
+Description:  kernel: tolerate LPAR clock offsets
+Symptom:      The remote copy of a DASD in an extended-remote-copy setup
+              can get inconsistent due to misorder of I/O requests.
+Problem:      If the activation profile of an LPAR specifies a logical-
+              partition time offset, the time stamps stored by the
+              get_sync_clock function includes this offset. With two
+              LPARs writing to a shared DASD but using different clock
+              offsets the I/O requests may be ordered incorrectly.
+Solution:     Use the PTFF instruction to retrieve the TOD clock offset
+              and subtract it from the TOD clock value to get physical
+              timestamps.
+Reproduction: Write to a shared DASD volume on two LPARs with differing
+              logical-partition time offsets and use XRC to copy the
+              volume to a secondary volume. Compare the two volumes.
+
+Upstream-Description:
+
+              s390/time: LPAR offset handling
+
+              It is possible to specify a user offset for the TOD clock, e.g. +2 hours.
+              The TOD clock will carry this offset even if the clock is synchronized
+              with STP. This makes the time stamps acquired with get_sync_clock()
+              useless as another LPAR migth use a different TOD offset.
+
+              Use the PTFF instrution to get the TOD epoch difference and subtract
+              it from the TOD clock value to get a physical timestamp. As the epoch
+              difference contains the sync check delta as well the LPAR offset value
+              to the physical clock needs to be refreshed after each clock
+              synchronization.
+
+              Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: John Jolly <jjolly@suse.com>
+---
+ arch/s390/include/asm/timex.h |   13 +++++++++++++
+ arch/s390/kernel/early.c      |    1 +
+ arch/s390/kernel/time.c       |   41 +++++++++++++++++++++++++++++++++++------
+ 3 files changed, 49 insertions(+), 6 deletions(-)
+
+--- a/arch/s390/include/asm/timex.h
++++ b/arch/s390/include/asm/timex.h
+@@ -53,6 +53,11 @@ static inline void store_clock_comparato
+ 
+ void clock_comparator_work(void);
+ 
++void __init ptff_init(void);
++
++extern unsigned char ptff_function_mask[16];
++extern unsigned long lpar_offset;
++
+ /* Function codes for the ptff instruction. */
+ #define PTFF_QAF	0x00	/* query available functions */
+ #define PTFF_QTO	0x01	/* query tod offset */
+@@ -70,6 +75,14 @@ struct ptff_qto {
+ 	unsigned long long tod_epoch_difference;
+ } __packed;
+ 
++static inline int ptff_query(unsigned int nr)
++{
++	unsigned char *ptr;
++
++	ptr = ptff_function_mask + (nr >> 3);
++	return (*ptr & (0x80 >> (nr & 7))) != 0;
++}
++
+ static inline int ptff(void *ptff_block, size_t len, unsigned int func)
+ {
+ 	typedef struct { char _[len]; } addrtype;
+--- a/arch/s390/kernel/early.c
++++ b/arch/s390/kernel/early.c
+@@ -445,6 +445,7 @@ void __init startup_init(void)
+ 	ipl_save_parameters();
+ 	rescue_initrd();
+ 	clear_bss_section();
++	ptff_init();
+ 	init_kernel_storage_key();
+ 	lockdep_init();
+ 	lockdep_off();
+--- a/arch/s390/kernel/time.c
++++ b/arch/s390/kernel/time.c
+@@ -66,6 +66,25 @@ unsigned long long notrace __kprobes sch
+ 	return tod_to_ns(get_clock_monotonic());
+ }
+ 
++unsigned char ptff_function_mask[16];
++unsigned long lpar_offset;
++
++/*
++ * Get time offsets with PTFF
++ */
++void __init ptff_init(void)
++{
++	struct ptff_qto qto;
++
++	if (!test_facility(28))
++		return;
++	ptff(&ptff_function_mask, sizeof(ptff_function_mask), PTFF_QAF);
++
++	/* get LPAR offset */
++	if (ptff_query(PTFF_QTO) && ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
++		lpar_offset = qto.tod_epoch_difference;
++}
++
+ /*
+  * Monotonic_clock - returns # of nanoseconds passed since time_init()
+  */
+@@ -318,11 +337,11 @@ static unsigned long clock_sync_flags;
+ #define CLOCK_SYNC_STP		3
+ 
+ /*
+- * The synchronous get_clock function. It will write the current clock
+- * value to the clock pointer and return 0 if the clock is in sync with
+- * the external time source. If the clock mode is local it will return
+- * -ENOSYS and -EAGAIN if the clock is not in sync with the external
+- * reference.
++ * The get_clock function for the physical clock. It will get the current
++ * TOD clock, subtract the LPAR offset and write the result to *clock.
++ * The function returns 0 if the clock is in sync with the external time
++ * source. If the clock mode is local it will return -EOPNOTSUPP and
++ * -EAGAIN if the clock is not in sync with the external reference.
+  */
+ int get_sync_clock(unsigned long long *clock)
+ {
+@@ -331,7 +350,7 @@ int get_sync_clock(unsigned long long *c
+ 
+ 	sw_ptr = &get_cpu_var(clock_sync_word);
+ 	sw0 = atomic_read(sw_ptr);
+-	*clock = get_clock();
++	*clock = get_clock() - lpar_offset;
+ 	sw1 = atomic_read(sw_ptr);
+ 	put_cpu_var(clock_sync_word);
+ 	if (sw0 == sw1 && (sw0 & 0x80000000U))
+@@ -733,6 +752,7 @@ static int etr_sync_clock(void *data)
+ 	unsigned long long clock, old_clock, delay, delta;
+ 	struct clock_sync_data *etr_sync;
+ 	struct etr_aib *sync_port, *aib;
++	struct ptff_qto qto;
+ 	int port;
+ 	int rc;
+ 
+@@ -776,6 +796,10 @@ static int etr_sync_clock(void *data)
+ 			etr_sync->in_sync = -EAGAIN;
+ 			rc = -EAGAIN;
+ 		} else {
++			if (ptff_query(PTFF_QTO) &&
++			    ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
++				/* Update LPAR offset */
++				lpar_offset = qto.tod_epoch_difference;
+ 			etr_sync->in_sync = 1;
+ 			rc = 0;
+ 		}
+@@ -1505,6 +1529,7 @@ static int stp_sync_clock(void *data)
+ 	static int first;
+ 	unsigned long long old_clock, delta;
+ 	struct clock_sync_data *stp_sync;
++	struct ptff_qto qto;
+ 	int rc;
+ 
+ 	stp_sync = data;
+@@ -1529,6 +1554,10 @@ static int stp_sync_clock(void *data)
+ 		rc = chsc_sstpc(stp_page, STP_OP_SYNC, 0);
+ 		if (rc == 0) {
+ 			delta = adjust_time(old_clock, get_clock(), 0);
++			if (ptff_query(PTFF_QTO) &&
++			    ptff(&qto, sizeof(qto), PTFF_QTO) == 0)
++				/* Update LPAR offset */
++				lpar_offset = qto.tod_epoch_difference;
+ 			fixup_clock_comparator(delta);
+ 			rc = chsc_sstpi(stp_page, &stp_info,
+ 					sizeof(struct stp_sstpi));
