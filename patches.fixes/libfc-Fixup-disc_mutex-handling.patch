@@ -1,0 +1,236 @@
+From: Hannes Reinecke <hare@suse.de>
+Date: Thu, 11 Aug 2016 09:08:14 +0200
+Subject: libfc: Fixup disc_mutex handling
+References: bsc#962846
+Patch-Mainline: queued in maintainer repository
+Git-commit: 14bb189f8f6e5b301d959e02b2e4506120e509e6
+Git-repo: git://git.kernel.org/mkp/h/4.10/scsi-queue
+
+The list of attached 'rdata' remote port structures is RCU
+protected, so there is no need to take the 'disc_mutex' when
+traversing it.
+Rather we should be using rcu_read_lock() and kref_get_unless_zero()
+to validate the entries.
+We need, however, take the disc_mutex when deleting an entry;
+otherwise we risk clashes with list_add.
+
+References: bsc#962846
+
+Signed-off-by: Hannes Reinecke <hare@suse.com>
+---
+ drivers/scsi/fcoe/fcoe_ctlr.c | 37 +++++++++++++++++++++++++++++--------
+ drivers/scsi/libfc/fc_disc.c  | 38 +++++++++++++++++++++++++-------------
+ drivers/scsi/libfc/fc_rport.c |  2 ++
+ 3 files changed, 56 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/scsi/fcoe/fcoe_ctlr.c b/drivers/scsi/fcoe/fcoe_ctlr.c
+index 725f5fa..a96b80f 100644
+--- a/drivers/scsi/fcoe/fcoe_ctlr.c
++++ b/drivers/scsi/fcoe/fcoe_ctlr.c
+@@ -2135,9 +2135,15 @@ static void fcoe_ctlr_disc_stop_locked(struct fc_lport *lport)
+ {
+ 	struct fc_rport_priv *rdata;
+ 
++	rcu_read_lock();
++	list_for_each_entry_rcu(rdata, &lport->disc.rports, peers) {
++		if (kref_get_unless_zero(&rdata->kref)) {
++			lport->tt.rport_logoff(rdata);
++			kref_put(&rdata->kref, lport->tt.rport_destroy);
++		}
++	}
++	rcu_read_unlock();
+ 	mutex_lock(&lport->disc.disc_mutex);
+-	list_for_each_entry_rcu(rdata, &lport->disc.rports, peers)
+-		lport->tt.rport_logoff(rdata);
+ 	lport->disc.disc_callback = NULL;
+ 	mutex_unlock(&lport->disc.disc_mutex);
+ }
+@@ -2462,17 +2468,22 @@ static void fcoe_ctlr_vn_add(struct fcoe_ctlr *fip, struct fc_rport_priv *new)
+ 		mutex_unlock(&lport->disc.disc_mutex);
+ 		return;
+ 	}
++	mutex_lock(&rdata->rp_mutex);
++	mutex_unlock(&lport->disc.disc_mutex);
+ 
+ 	rdata->ops = &fcoe_ctlr_vn_rport_ops;
+ 	rdata->disc_id = lport->disc.disc_id;
+ 
+ 	ids = &rdata->ids;
+ 	if ((ids->port_name != -1 && ids->port_name != new->ids.port_name) ||
+-	    (ids->node_name != -1 && ids->node_name != new->ids.node_name))
++	    (ids->node_name != -1 && ids->node_name != new->ids.node_name)) {
++		mutex_unlock(&rdata->rp_mutex);
+ 		lport->tt.rport_logoff(rdata);
++		mutex_lock(&rdata->rp_mutex);
++	}
+ 	ids->port_name = new->ids.port_name;
+ 	ids->node_name = new->ids.node_name;
+-	mutex_unlock(&lport->disc.disc_mutex);
++	mutex_unlock(&rdata->rp_mutex);
+ 
+ 	frport = fcoe_ctlr_rport(rdata);
+ 	LIBFCOE_FIP_DBG(fip, "vn_add rport %6.6x %s\n",
+@@ -2628,11 +2639,15 @@ static unsigned long fcoe_ctlr_vn_age(struct fcoe_ctlr *fip)
+ 	unsigned long deadline;
+ 
+ 	next_time = jiffies + msecs_to_jiffies(FIP_VN_BEACON_INT * 10);
+-	mutex_lock(&lport->disc.disc_mutex);
++	rcu_read_lock();
+ 	list_for_each_entry_rcu(rdata, &lport->disc.rports, peers) {
++		if (!kref_get_unless_zero(&rdata->kref))
++			continue;
+ 		frport = fcoe_ctlr_rport(rdata);
+-		if (!frport->time)
++		if (!frport->time) {
++			kref_put(&rdata->kref, lport->tt.rport_destroy);
+ 			continue;
++		}
+ 		deadline = frport->time +
+ 			   msecs_to_jiffies(FIP_VN_BEACON_INT * 25 / 10);
+ 		if (time_after_eq(jiffies, deadline)) {
+@@ -2643,8 +2658,9 @@ static unsigned long fcoe_ctlr_vn_age(struct fcoe_ctlr *fip)
+ 			lport->tt.rport_logoff(rdata);
+ 		} else if (time_before(deadline, next_time))
+ 			next_time = deadline;
++		kref_put(&rdata->kref, lport->tt.rport_destroy);
+ 	}
+-	mutex_unlock(&lport->disc.disc_mutex);
++	rcu_read_unlock();
+ 	return next_time;
+ }
+ 
+@@ -2767,12 +2783,17 @@ static void fcoe_ctlr_vn_disc(struct fcoe_ctlr *fip)
+ 	mutex_lock(&disc->disc_mutex);
+ 	callback = disc->pending ? disc->disc_callback : NULL;
+ 	disc->pending = 0;
++	mutex_unlock(&disc->disc_mutex);
++	rcu_read_lock();
+ 	list_for_each_entry_rcu(rdata, &disc->rports, peers) {
++		if (!kref_get_unless_zero(&rdata->kref))
++			continue;
+ 		frport = fcoe_ctlr_rport(rdata);
+ 		if (frport->time)
+ 			lport->tt.rport_login(rdata);
++		kref_put(&rdata->kref, lport->tt.rport_destroy);
+ 	}
+-	mutex_unlock(&disc->disc_mutex);
++	rcu_read_unlock();
+ 	if (callback)
+ 		callback(lport, DISC_EV_SUCCESS);
+ }
+diff --git a/drivers/scsi/libfc/fc_disc.c b/drivers/scsi/libfc/fc_disc.c
+index 9a28394..26e2089 100644
+--- a/drivers/scsi/libfc/fc_disc.c
++++ b/drivers/scsi/libfc/fc_disc.c
+@@ -67,10 +67,14 @@ static void fc_disc_stop_rports(struct fc_disc *disc)
+ 
+ 	lport = fc_disc_lport(disc);
+ 
+-	mutex_lock(&disc->disc_mutex);
+-	list_for_each_entry_rcu(rdata, &disc->rports, peers)
+-		lport->tt.rport_logoff(rdata);
+-	mutex_unlock(&disc->disc_mutex);
++	rcu_read_lock();
++	list_for_each_entry_rcu(rdata, &disc->rports, peers) {
++		if (kref_get_unless_zero(&rdata->kref)) {
++			lport->tt.rport_logoff(rdata);
++			kref_put(&rdata->kref, lport->tt.rport_destroy);
++		}
++	}
++	rcu_read_unlock();
+ }
+ 
+ /**
+@@ -288,15 +292,19 @@ static void fc_disc_done(struct fc_disc *disc, enum fc_disc_event event)
+ 	 * Skip ports which were never discovered.  These are the dNS port
+ 	 * and ports which were created by PLOGI.
+ 	 */
++	rcu_read_lock();
+ 	list_for_each_entry_rcu(rdata, &disc->rports, peers) {
+-		if (!rdata->disc_id)
++		if (!kref_get_unless_zero(&rdata->kref))
+ 			continue;
+-		if (rdata->disc_id == disc->disc_id)
+-			lport->tt.rport_login(rdata);
+-		else
+-			lport->tt.rport_logoff(rdata);
++		if (rdata->disc_id) {
++			if (rdata->disc_id == disc->disc_id)
++				lport->tt.rport_login(rdata);
++			else
++				lport->tt.rport_logoff(rdata);
++		}
++		kref_put(&rdata->kref, lport->tt.rport_destroy);
+ 	}
+-
++	rcu_read_unlock();
+ 	mutex_unlock(&disc->disc_mutex);
+ 	disc->disc_callback(lport, event);
+ 	mutex_lock(&disc->disc_mutex);
+@@ -591,7 +599,6 @@ static void fc_disc_gpn_id_resp(struct fc_seq *sp, struct fc_frame *fp,
+ 	lport = rdata->local_port;
+ 	disc = &lport->disc;
+ 
+-	mutex_lock(&disc->disc_mutex);
+ 	if (PTR_ERR(fp) == -FC_EX_CLOSED)
+ 		goto out;
+ 	if (IS_ERR(fp))
+@@ -606,16 +613,19 @@ static void fc_disc_gpn_id_resp(struct fc_seq *sp, struct fc_frame *fp,
+ 			goto redisc;
+ 		pn = (struct fc_ns_gid_pn *)(cp + 1);
+ 		port_name = get_unaligned_be64(&pn->fn_wwpn);
++		mutex_lock(&rdata->rp_mutex);
+ 		if (rdata->ids.port_name == -1)
+ 			rdata->ids.port_name = port_name;
+ 		else if (rdata->ids.port_name != port_name) {
+ 			FC_DISC_DBG(disc, "GPN_ID accepted.  WWPN changed. "
+ 				    "Port-id %6.6x wwpn %16.16llx\n",
+ 				    rdata->ids.port_id, port_name);
++			mutex_unlock(&rdata->rp_mutex);
+ 			lport->tt.rport_logoff(rdata);
+-
++			mutex_lock(&lport->disc.disc_mutex);
+ 			new_rdata = lport->tt.rport_create(lport,
+ 							   rdata->ids.port_id);
++			mutex_unlock(&lport->disc.disc_mutex);
+ 			if (new_rdata) {
+ 				new_rdata->disc_id = disc->disc_id;
+ 				lport->tt.rport_login(new_rdata);
+@@ -623,6 +633,7 @@ static void fc_disc_gpn_id_resp(struct fc_seq *sp, struct fc_frame *fp,
+ 			goto out;
+ 		}
+ 		rdata->disc_id = disc->disc_id;
++		mutex_unlock(&rdata->rp_mutex);
+ 		lport->tt.rport_login(rdata);
+ 	} else if (ntohs(cp->ct_cmd) == FC_FS_RJT) {
+ 		FC_DISC_DBG(disc, "GPN_ID rejected reason %x exp %x\n",
+@@ -632,10 +643,11 @@ static void fc_disc_gpn_id_resp(struct fc_seq *sp, struct fc_frame *fp,
+ 		FC_DISC_DBG(disc, "GPN_ID unexpected response code %x\n",
+ 			    ntohs(cp->ct_cmd));
+ redisc:
++		mutex_lock(&disc->disc_mutex);
+ 		fc_disc_restart(disc);
++		mutex_unlock(&disc->disc_mutex);
+ 	}
+ out:
+-	mutex_unlock(&disc->disc_mutex);
+ 	kref_put(&rdata->kref, lport->tt.rport_destroy);
+ }
+ 
+diff --git a/drivers/scsi/libfc/fc_rport.c b/drivers/scsi/libfc/fc_rport.c
+index 92542f0..8eb49db 100644
+--- a/drivers/scsi/libfc/fc_rport.c
++++ b/drivers/scsi/libfc/fc_rport.c
+@@ -377,7 +377,9 @@ static void fc_rport_work(struct work_struct *work)
+ 				mutex_unlock(&rdata->rp_mutex);
+ 			} else {
+ 				FC_RPORT_DBG(rdata, "work delete\n");
++				mutex_lock(&lport->disc.disc_mutex);
+ 				list_del_rcu(&rdata->peers);
++				mutex_unlock(&lport->disc.disc_mutex);
+ 				mutex_unlock(&rdata->rp_mutex);
+ 				kref_put(&rdata->kref, lport->tt.rport_destroy);
+ 			}
+-- 
+2.10.0.297.gf6727b0
+
