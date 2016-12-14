@@ -1,0 +1,198 @@
+From d3a22af448c079f9e54775e6e67f36c28dc47d8b Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Mon, 9 May 2016 10:37:59 +0200
+Subject: [PATCH 07/11] sched/core: Introduce 'struct sched_domain_shared'
+Git-commit: 24fc7edb92eea05946119cc0258c891c26b3b469
+Patch-mainline: v4.9-rc1
+References: bsc#981825
+
+Since struct sched_domain is strictly per cpu; introduce a structure
+that is shared between all 'identical' sched_domains.
+
+Limit to SD_SHARE_PKG_RESOURCES domains for now, as we'll only use it
+for shared cache state; if another use comes up later we can easily
+relax this.
+
+While the sched_group's are normally shared between CPUs, these are
+not natural to use when we need some shared state on a domain level --
+since that would require the domain to have a parent, which is not a
+given.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: linux-kernel@vger.kernel.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Matt Fleming <mfleming@suse.de>
+---
+ include/linux/sched.h |  6 ++++++
+ kernel/sched/core.c   | 46 ++++++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 7d16aba..da0c35d 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1041,6 +1041,10 @@ extern int sched_domain_level_max;
+ 
+ struct sched_group;
+ 
++struct sched_domain_shared {
++	atomic_t	ref;
++};
++
+ struct sched_domain {
+ 	/* These fields must be setup */
+ 	struct sched_domain *parent;	/* top domain must be null terminated */
+@@ -1109,6 +1113,7 @@ struct sched_domain {
+ 		void *private;		/* used during construction */
+ 		struct rcu_head rcu;	/* used during destruction */
+ 	};
++	struct sched_domain_shared *shared;
+ 
+ 	unsigned int span_weight;
+ 	/*
+@@ -1142,6 +1147,7 @@ typedef int (*sched_domain_flags_f)(void);
+ 
+ struct sd_data {
+ 	struct sched_domain **__percpu sd;
++	struct sched_domain_shared **__percpu sds;
+ 	struct sched_group **__percpu sg;
+ 	struct sched_group_capacity **__percpu sgc;
+ };
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 4668dbf..70082c5 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -6293,6 +6293,8 @@ static void destroy_sched_domain(struct sched_domain *sd)
+ 		kfree(sd->groups->sgc);
+ 		kfree(sd->groups);
+ 	}
++	if (sd->shared && atomic_dec_and_test(&sd->shared->ref))
++		kfree(sd->shared);
+ 	kfree(sd);
+ }
+ 
+@@ -6726,6 +6728,9 @@ static void claim_allocations(int cpu, struct sched_domain *sd)
+ 	WARN_ON_ONCE(*per_cpu_ptr(sdd->sd, cpu) != sd);
+ 	*per_cpu_ptr(sdd->sd, cpu) = NULL;
+ 
++	if (atomic_read(&(*per_cpu_ptr(sdd->sds, cpu))->ref))
++		*per_cpu_ptr(sdd->sds, cpu) = NULL;
++
+ 	if (atomic_read(&(*per_cpu_ptr(sdd->sg, cpu))->ref))
+ 		*per_cpu_ptr(sdd->sg, cpu) = NULL;
+ 
+@@ -6761,10 +6766,12 @@ static int sched_domains_curr_level;
+ 	 SD_SHARE_POWERDOMAIN)
+ 
+ static struct sched_domain *
+-sd_init(struct sched_domain_topology_level *tl, int cpu)
++sd_init(struct sched_domain_topology_level *tl,
++	const struct cpumask *cpu_map, int cpu)
+ {
+-	struct sched_domain *sd = *per_cpu_ptr(tl->data.sd, cpu);
+-	int sd_weight, sd_flags = 0;
++	struct sd_data *sdd = &tl->data;
++	struct sched_domain *sd = *per_cpu_ptr(sdd->sd, cpu);
++	int sd_id, sd_weight, sd_flags = 0;
+ 
+ #ifdef CONFIG_NUMA
+ 	/*
+@@ -6818,6 +6825,9 @@ sd_init(struct sched_domain_topology_level *tl, int cpu)
+ #endif
+ 	};
+ 
++	cpumask_and(sched_domain_span(sd), cpu_map, tl->mask(cpu));
++	sd_id = cpumask_first(sched_domain_span(sd));
++
+ 	/*
+ 	 * Convert topological properties into behaviour.
+ 	 */
+@@ -6853,7 +6863,16 @@ sd_init(struct sched_domain_topology_level *tl, int cpu)
+ 		sd->idle_idx = 1;
+ 	}
+ 
+-	sd->private = &tl->data;
++	/*
++	 * For all levels sharing cache; connect a sched_domain_shared
++	 * instance.
++	 */
++	if (sd->flags & SD_SHARE_PKG_RESOURCES) {
++		sd->shared = *per_cpu_ptr(sdd->sds, sd_id);
++		atomic_inc(&sd->shared->ref);
++	}
++
++	sd->private = sdd;
+ 
+ 	return sd;
+ }
+@@ -7191,6 +7210,10 @@ static int __sdt_alloc(const struct cpumask *cpu_map)
+ 		if (!sdd->sd)
+ 			return -ENOMEM;
+ 
++		sdd->sds = alloc_percpu(struct sched_domain_shared *);
++		if (!sdd->sds)
++			return -ENOMEM;
++
+ 		sdd->sg = alloc_percpu(struct sched_group *);
+ 		if (!sdd->sg)
+ 			return -ENOMEM;
+@@ -7201,6 +7224,7 @@ static int __sdt_alloc(const struct cpumask *cpu_map)
+ 
+ 		for_each_cpu(j, cpu_map) {
+ 			struct sched_domain *sd;
++			struct sched_domain_shared *sds;
+ 			struct sched_group *sg;
+ 			struct sched_group_capacity *sgc;
+ 
+@@ -7211,6 +7235,13 @@ static int __sdt_alloc(const struct cpumask *cpu_map)
+ 
+ 			*per_cpu_ptr(sdd->sd, j) = sd;
+ 
++			sds = kzalloc_node(sizeof(struct sched_domain_shared),
++					GFP_KERNEL, cpu_to_node(j));
++			if (!sds)
++				return -ENOMEM;
++
++			*per_cpu_ptr(sdd->sds, j) = sds;
++
+ 			sg = kzalloc_node(sizeof(struct sched_group) + cpumask_size(),
+ 					GFP_KERNEL, cpu_to_node(j));
+ 			if (!sg)
+@@ -7250,6 +7281,8 @@ static void __sdt_free(const struct cpumask *cpu_map)
+ 				kfree(*per_cpu_ptr(sdd->sd, j));
+ 			}
+ 
++			if (sdd->sds)
++				kfree(*per_cpu_ptr(sdd->sds, j));
+ 			if (sdd->sg)
+ 				kfree(*per_cpu_ptr(sdd->sg, j));
+ 			if (sdd->sgc)
+@@ -7257,6 +7290,8 @@ static void __sdt_free(const struct cpumask *cpu_map)
+ 		}
+ 		free_percpu(sdd->sd);
+ 		sdd->sd = NULL;
++		free_percpu(sdd->sds);
++		sdd->sds = NULL;
+ 		free_percpu(sdd->sg);
+ 		sdd->sg = NULL;
+ 		free_percpu(sdd->sgc);
+@@ -7268,11 +7303,10 @@ struct sched_domain *build_sched_domain(struct sched_domain_topology_level *tl,
+ 		const struct cpumask *cpu_map, struct sched_domain_attr *attr,
+ 		struct sched_domain *child, int cpu)
+ {
+-	struct sched_domain *sd = sd_init(tl, cpu);
++	struct sched_domain *sd = sd_init(tl, cpu_map, cpu);
+ 	if (!sd)
+ 		return child;
+ 
+-	cpumask_and(sched_domain_span(sd), cpu_map, tl->mask(cpu));
+ 	if (child) {
+ 		sd->level = child->level + 1;
+ 		sched_domain_level_max = max(sched_domain_level_max, sd->level);
+-- 
+2.10.0
+
