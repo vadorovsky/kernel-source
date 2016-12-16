@@ -1,0 +1,235 @@
+From: Huaitong Han <huaitong.han@intel.com>
+Date: Tue, 22 Mar 2016 16:51:20 +0800
+Subject: KVM, pkeys: add pkeys support for permission_fault
+Git-commit: be94f6b71067df47d623fc6c6983a8dee504fb4d
+Patch-mainline: v4.6-rc1
+References: fate#321300
+
+Protection keys define a new 4-bit protection key field (PKEY) in bits
+62:59 of leaf entries of the page tables, the PKEY is an index to PKRU
+register(16 domains), every domain has 2 bits(write disable bit, access
+disable bit).
+
+Static logic has been produced in update_pkru_bitmask, dynamic logic need
+read pkey from page table entries, get pkru value, and deduce the correct
+result.
+
+[ Huaitong: Xiao helps to modify many sections. ]
+
+Signed-off-by: Huaitong Han <huaitong.han@intel.com>
+Signed-off-by: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ arch/x86/include/asm/kvm_host.h |  3 +++
+ arch/x86/kvm/kvm_cache_regs.h   |  5 +++++
+ arch/x86/kvm/mmu.h              | 33 ++++++++++++++++++++++++++++-----
+ arch/x86/kvm/paging_tmpl.h      | 16 ++++++++++++++--
+ arch/x86/kvm/svm.c              |  8 ++++++++
+ arch/x86/kvm/vmx.c              |  8 ++++++++
+ arch/x86/kvm/x86.c              |  7 ++++++-
+ 7 files changed, 72 insertions(+), 8 deletions(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -160,12 +160,14 @@ enum {
+ #define PFERR_USER_BIT 2
+ #define PFERR_RSVD_BIT 3
+ #define PFERR_FETCH_BIT 4
++#define PFERR_PK_BIT 5
+ 
+ #define PFERR_PRESENT_MASK (1U << PFERR_PRESENT_BIT)
+ #define PFERR_WRITE_MASK (1U << PFERR_WRITE_BIT)
+ #define PFERR_USER_MASK (1U << PFERR_USER_BIT)
+ #define PFERR_RSVD_MASK (1U << PFERR_RSVD_BIT)
+ #define PFERR_FETCH_MASK (1U << PFERR_FETCH_BIT)
++#define PFERR_PK_MASK (1U << PFERR_PK_BIT)
+ 
+ /* apic attention bits */
+ #define KVM_APIC_CHECK_VAPIC	0
+@@ -814,6 +816,7 @@ struct kvm_x86_ops {
+ 	void (*cache_reg)(struct kvm_vcpu *vcpu, enum kvm_reg reg);
+ 	unsigned long (*get_rflags)(struct kvm_vcpu *vcpu);
+ 	void (*set_rflags)(struct kvm_vcpu *vcpu, unsigned long rflags);
++	u32 (*get_pkru)(struct kvm_vcpu *vcpu);
+ 	void (*fpu_activate)(struct kvm_vcpu *vcpu);
+ 	void (*fpu_deactivate)(struct kvm_vcpu *vcpu);
+ 
+--- a/arch/x86/kvm/kvm_cache_regs.h
++++ b/arch/x86/kvm/kvm_cache_regs.h
+@@ -84,6 +84,11 @@ static inline u64 kvm_read_edx_eax(struc
+ 		| ((u64)(kvm_register_read(vcpu, VCPU_REGS_RDX) & -1u) << 32);
+ }
+ 
++static inline u32 kvm_read_pkru(struct kvm_vcpu *vcpu)
++{
++	return kvm_x86_ops->get_pkru(vcpu);
++}
++
+ static inline void enter_guest_mode(struct kvm_vcpu *vcpu)
+ {
+ 	vcpu->arch.hflags |= HF_GUEST_MASK;
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -10,10 +10,11 @@
+ #define PT32_ENT_PER_PAGE (1 << PT32_PT_BITS)
+ 
+ #define PT_WRITABLE_SHIFT 1
++#define PT_USER_SHIFT 2
+ 
+ #define PT_PRESENT_MASK (1ULL << 0)
+ #define PT_WRITABLE_MASK (1ULL << PT_WRITABLE_SHIFT)
+-#define PT_USER_MASK (1ULL << 2)
++#define PT_USER_MASK (1ULL << PT_USER_SHIFT)
+ #define PT_PWT_MASK (1ULL << 3)
+ #define PT_PCD_MASK (1ULL << 4)
+ #define PT_ACCESSED_SHIFT 5
+@@ -145,7 +146,8 @@ static inline bool is_write_protection(s
+  * fault with the given access (in ACC_* format)?
+  */
+ static inline bool permission_fault(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+-				    unsigned pte_access, unsigned pfec)
++				    unsigned pte_access, unsigned pte_pkey,
++				    unsigned pfec)
+ {
+ 	int cpl = kvm_x86_ops->get_cpl(vcpu);
+ 	unsigned long rflags = kvm_x86_ops->get_rflags(vcpu);
+@@ -166,10 +168,31 @@ static inline bool permission_fault(stru
+ 	unsigned long smap = (cpl - 3) & (rflags & X86_EFLAGS_AC);
+ 	int index = (pfec >> 1) +
+ 		    (smap >> (X86_EFLAGS_AC_BIT - PFERR_RSVD_BIT + 1));
++	bool fault = (mmu->permissions[index] >> pte_access) & 1;
+ 
+-	WARN_ON(pfec & PFERR_RSVD_MASK);
++	WARN_ON(pfec & (PFERR_PK_MASK | PFERR_RSVD_MASK));
+ 
+-	return (mmu->permissions[index] >> pte_access) & 1;
++	if (unlikely(mmu->pkru_mask)) {
++		u32 pkru_bits, offset;
++
++		/*
++		* PKRU defines 32 bits, there are 16 domains and 2
++		* attribute bits per domain in pkru.  pte_pkey is the
++		* index of the protection domain, so pte_pkey * 2 is
++		* is the index of the first bit for the domain.
++		*/
++		pkru_bits = (kvm_read_pkru(vcpu) >> (pte_pkey * 2)) & 3;
++
++		/* clear present bit, replace PFEC.RSVD with ACC_USER_MASK. */
++		offset = pfec - 1 +
++			((pte_access & PT_USER_MASK) << (PFERR_RSVD_BIT - PT_USER_SHIFT));
++
++		pkru_bits &= mmu->pkru_mask >> offset;
++		pfec |= -pkru_bits & PFERR_PK_MASK;
++		fault |= (pkru_bits != 0);
++	}
++
++	return fault;
+ }
+ 
+ void kvm_mmu_invalidate_zap_all_pages(struct kvm *kvm);
+--- a/arch/x86/kvm/paging_tmpl.h
++++ b/arch/x86/kvm/paging_tmpl.h
+@@ -254,6 +254,17 @@ static int FNAME(update_accessed_dirty_b
+ 	return 0;
+ }
+ 
++static inline unsigned FNAME(gpte_pkeys)(struct kvm_vcpu *vcpu, u64 gpte)
++{
++	unsigned pkeys = 0;
++#if PTTYPE == 64
++	pte_t pte = {.pte = gpte};
++
++	pkeys = pte_flags_pkey(pte_flags(pte));
++#endif
++	return pkeys;
++}
++
+ /*
+  * Fetch a guest pte for a guest virtual address
+  */
+@@ -265,7 +276,7 @@ static int FNAME(walk_addr_generic)(stru
+ 	pt_element_t pte;
+ 	pt_element_t __user *uninitialized_var(ptep_user);
+ 	gfn_t table_gfn;
+-	unsigned index, pt_access, pte_access, accessed_dirty;
++	unsigned index, pt_access, pte_access, accessed_dirty, pte_pkey;
+ 	gpa_t pte_gpa;
+ 	int offset;
+ 	const int write_fault = access & PFERR_WRITE_MASK;
+@@ -356,7 +367,8 @@ retry_walk:
+ 		walker->ptes[walker->level - 1] = pte;
+ 	} while (!is_last_gpte(mmu, walker->level, pte));
+ 
+-	if (unlikely(permission_fault(vcpu, mmu, pte_access, access))) {
++	pte_pkey = FNAME(gpte_pkeys)(vcpu, pte);
++	if (unlikely(permission_fault(vcpu, mmu, pte_access, pte_pkey, access))) {
+ 		errcode |= PFERR_PRESENT_MASK;
+ 		goto error;
+ 	}
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -1275,6 +1275,11 @@ static void svm_set_rflags(struct kvm_vc
+ 	to_svm(vcpu)->vmcb->save.rflags = rflags;
+ }
+ 
++static u32 svm_get_pkru(struct kvm_vcpu *vcpu)
++{
++	return 0;
++}
++
+ static void svm_cache_reg(struct kvm_vcpu *vcpu, enum kvm_reg reg)
+ {
+ 	switch (reg) {
+@@ -4305,6 +4310,9 @@ static struct kvm_x86_ops svm_x86_ops =
+ 	.cache_reg = svm_cache_reg,
+ 	.get_rflags = svm_get_rflags,
+ 	.set_rflags = svm_set_rflags,
++
++	.get_pkru = svm_get_pkru,
++
+ 	.fpu_activate = svm_fpu_activate,
+ 	.fpu_deactivate = svm_fpu_deactivate,
+ 
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -2218,6 +2218,11 @@ static void vmx_set_rflags(struct kvm_vc
+ 	vmcs_writel(GUEST_RFLAGS, rflags);
+ }
+ 
++static u32 vmx_get_pkru(struct kvm_vcpu *vcpu)
++{
++	return to_vmx(vcpu)->guest_pkru;
++}
++
+ static u32 vmx_get_interrupt_shadow(struct kvm_vcpu *vcpu)
+ {
+ 	u32 interruptibility = vmcs_read32(GUEST_INTERRUPTIBILITY_INFO);
+@@ -10872,6 +10877,9 @@ static struct kvm_x86_ops vmx_x86_ops =
+ 	.cache_reg = vmx_cache_reg,
+ 	.get_rflags = vmx_get_rflags,
+ 	.set_rflags = vmx_set_rflags,
++
++	.get_pkru = vmx_get_pkru,
++
+ 	.fpu_activate = vmx_fpu_activate,
+ 	.fpu_deactivate = vmx_fpu_deactivate,
+ 
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4287,9 +4287,14 @@ static int vcpu_mmio_gva_to_gpa(struct k
+ 	u32 access = ((kvm_x86_ops->get_cpl(vcpu) == 3) ? PFERR_USER_MASK : 0)
+ 		| (write ? PFERR_WRITE_MASK : 0);
+ 
++	/*
++	 * currently PKRU is only applied to ept enabled guest so
++	 * there is no pkey in EPT page table for L1 guest or EPT
++	 * shadow page table for L2 guest.
++	 */
+ 	if (vcpu_match_mmio_gva(vcpu, gva)
+ 	    && !permission_fault(vcpu, vcpu->arch.walk_mmu,
+-				 vcpu->arch.access, access)) {
++				 vcpu->arch.access, 0, access)) {
+ 		*gpa = vcpu->arch.mmio_gfn << PAGE_SHIFT |
+ 					(gva & (PAGE_SIZE - 1));
+ 		trace_vcpu_match_mmio(gva, *gpa, write, false);
