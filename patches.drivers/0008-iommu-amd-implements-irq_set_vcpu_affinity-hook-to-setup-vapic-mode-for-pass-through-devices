@@ -1,0 +1,174 @@
+From: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+Date: Tue, 23 Aug 2016 13:52:39 -0500
+Subject: iommu/amd: Implements irq_set_vcpu_affinity() hook to setup vapic
+ mode for pass-through devices
+Git-commit: b9fc6b56f478b487dc8fc400da73d89ac9137201
+Patch-mainline: v4.9-rc1
+References: fate#319478
+
+This patch implements irq_set_vcpu_affinity() function to set up interrupt
+remapping table entry with vapic mode for pass-through devices.
+
+In case requirements for vapic mode are not met, it falls back to set up
+the IRTE in legacy mode.
+
+Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+Signed-off-by: Joerg Roedel <jroedel@suse.de>
+---
+ drivers/iommu/amd_iommu.c       | 68 ++++++++++++++++++++++++++++++++++++++---
+ drivers/iommu/amd_iommu_types.h |  1 +
+ include/linux/amd-iommu.h       | 14 +++++++++
+ 3 files changed, 79 insertions(+), 4 deletions(-)
+
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@ -3720,7 +3720,8 @@ out:
+ 	return index;
+ }
+ 
+-static int modify_irte_ga(u16 devid, int index, struct irte_ga *irte)
++static int modify_irte_ga(u16 devid, int index, struct irte_ga *irte,
++			  struct amd_ir_data *data)
+ {
+ 	struct irq_remap_table *table;
+ 	struct amd_iommu *iommu;
+@@ -3743,6 +3744,8 @@ static int modify_irte_ga(u16 devid, int
+ 	entry->hi.val = irte->hi.val;
+ 	entry->lo.val = irte->lo.val;
+ 	entry->lo.fields_remap.valid = 1;
++	if (data)
++		data->ref = entry;
+ 
+ 	spin_unlock_irqrestore(&table->lock, flags);
+ 
+@@ -3841,7 +3844,7 @@ static void irte_ga_activate(void *entry
+ 	struct irte_ga *irte = (struct irte_ga *) entry;
+ 
+ 	irte->lo.fields_remap.valid = 1;
+-	modify_irte_ga(devid, index, irte);
++	modify_irte_ga(devid, index, irte, NULL);
+ }
+ 
+ static void irte_deactivate(void *entry, u16 devid, u16 index)
+@@ -3857,7 +3860,7 @@ static void irte_ga_deactivate(void *ent
+ 	struct irte_ga *irte = (struct irte_ga *) entry;
+ 
+ 	irte->lo.fields_remap.valid = 0;
+-	modify_irte_ga(devid, index, irte);
++	modify_irte_ga(devid, index, irte, NULL);
+ }
+ 
+ static void irte_set_affinity(void *entry, u16 devid, u16 index,
+@@ -3878,7 +3881,7 @@ static void irte_ga_set_affinity(void *e
+ 	irte->hi.fields.vector = vector;
+ 	irte->lo.fields_remap.destination = dest_apicid;
+ 	irte->lo.fields_remap.guest_mode = 0;
+-	modify_irte_ga(devid, index, irte);
++	modify_irte_ga(devid, index, irte, NULL);
+ }
+ 
+ #define IRTE_ALLOCATED (~1U)
+@@ -4213,6 +4216,62 @@ static struct irq_domain_ops amd_ir_doma
+ 	.deactivate = irq_remapping_deactivate,
+ };
+ 
++static int amd_ir_set_vcpu_affinity(struct irq_data *data, void *vcpu_info)
++{
++	struct amd_iommu *iommu;
++	struct amd_iommu_pi_data *pi_data = vcpu_info;
++	struct vcpu_data *vcpu_pi_info = pi_data->vcpu_data;
++	struct amd_ir_data *ir_data = data->chip_data;
++	struct irte_ga *irte = (struct irte_ga *) ir_data->entry;
++	struct irq_2_irte *irte_info = &ir_data->irq_2_irte;
++
++	pi_data->ir_data = ir_data;
++
++	/* Note:
++	 * SVM tries to set up for VAPIC mode, but we are in
++	 * legacy mode. So, we force legacy mode instead.
++	 */
++	if (!AMD_IOMMU_GUEST_IR_VAPIC(amd_iommu_guest_ir)) {
++		pr_debug("AMD-Vi: %s: Fall back to using intr legacy remap\n",
++			 __func__);
++		pi_data->is_guest_mode = false;
++	}
++
++	iommu = amd_iommu_rlookup_table[irte_info->devid];
++	if (iommu == NULL)
++		return -EINVAL;
++
++	pi_data->prev_ga_tag = ir_data->cached_ga_tag;
++	if (pi_data->is_guest_mode) {
++		/* Setting */
++		irte->hi.fields.ga_root_ptr = (pi_data->base >> 12);
++		irte->hi.fields.vector = vcpu_pi_info->vector;
++		irte->lo.fields_vapic.guest_mode = 1;
++		irte->lo.fields_vapic.ga_tag = pi_data->ga_tag;
++
++		ir_data->cached_ga_tag = pi_data->ga_tag;
++	} else {
++		/* Un-Setting */
++		struct irq_cfg *cfg = irqd_cfg(data);
++
++		irte->hi.val = 0;
++		irte->lo.val = 0;
++		irte->hi.fields.vector = cfg->vector;
++		irte->lo.fields_remap.guest_mode = 0;
++		irte->lo.fields_remap.destination = cfg->dest_apicid;
++		irte->lo.fields_remap.int_type = apic->irq_delivery_mode;
++		irte->lo.fields_remap.dm = apic->irq_dest_mode;
++
++		/*
++		 * This communicates the ga_tag back to the caller
++		 * so that it can do all the necessary clean up.
++		 */
++		ir_data->cached_ga_tag = 0;
++	}
++
++	return modify_irte_ga(irte_info->devid, irte_info->index, irte, ir_data);
++}
++
+ static int amd_ir_set_affinity(struct irq_data *data,
+ 			       const struct cpumask *mask, bool force)
+ {
+@@ -4257,6 +4316,7 @@ static void ir_compose_msi_msg(struct ir
+ static struct irq_chip amd_ir_chip = {
+ 	.irq_ack = ir_ack_apic_edge,
+ 	.irq_set_affinity = amd_ir_set_affinity,
++	.irq_set_vcpu_affinity = amd_ir_set_vcpu_affinity,
+ 	.irq_compose_msi_msg = ir_compose_msi_msg,
+ };
+ 
+--- a/drivers/iommu/amd_iommu_types.h
++++ b/drivers/iommu/amd_iommu_types.h
+@@ -807,6 +807,7 @@ struct irq_2_irte {
+ };
+ 
+ struct amd_ir_data {
++	u32 cached_ga_tag;
+ 	struct irq_2_irte irq_2_irte;
+ 	struct msi_msg msi_entry;
+ 	void *entry;    /* Pointer to union irte or struct irte_ga */
+--- a/include/linux/amd-iommu.h
++++ b/include/linux/amd-iommu.h
+@@ -22,6 +22,20 @@
+ 
+ #include <linux/types.h>
+ 
++/*
++ * This is mainly used to communicate information back-and-forth
++ * between SVM and IOMMU for setting up and tearing down posted
++ * interrupt
++ */
++struct amd_iommu_pi_data {
++	u32 ga_tag;
++	u32 prev_ga_tag;
++	u64 base;
++	bool is_guest_mode;
++	struct vcpu_data *vcpu_data;
++	void *ir_data;
++};
++
+ #ifdef CONFIG_AMD_IOMMU
+ 
+ struct task_struct;
