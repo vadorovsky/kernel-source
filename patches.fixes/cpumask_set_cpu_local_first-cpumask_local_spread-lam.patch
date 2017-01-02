@@ -1,0 +1,152 @@
+From: Rusty Russell <rusty@rustcorp.com.au>
+Date: Sat, 9 May 2015 03:14:13 +0930
+Subject: cpumask_set_cpu_local_first => cpumask_local_spread, lament
+Patch-mainline: v4.1-rc6
+Git-commit: f36963c9d3f6f415732710da3acdd8608a9fa0e5 (partial)
+References: bug#919382 FATE#317529
+
+da91309e0a7e (cpumask: Utility function to set n'th cpu...) created a
+genuinely weird function.  I never saw it before, it went through DaveM.
+(He only does this to make us other maintainers feel better about our own
+mistakes.)
+
+cpumask_set_cpu_local_first's purpose is say "I need to spread things
+across N online cpus, choose the ones on this numa node first"; you call
+it in a loop.
+
+It can fail.  One of the two callers ignores this, the other aborts and
+fails the device open.
+
+It can fail in two ways: allocating the off-stack cpumask, or through a
+convoluted codepath which AFAICT can only occur if cpu_online_mask
+changes.  Which shouldn't happen, because if cpu_online_mask can change
+while you call this, it could return a now-offline cpu anyway.
+
+It contains a nonsensical test "!cpumask_of_node(numa_node)".  This was
+drawn to my attention by Geert, who said this causes a warning on Sparc.
+It sets a single bit in a cpumask instead of returning a cpu number,
+because that's what the callers want.
+
+It could be made more efficient by passing the previous cpu rather than
+an index, but that would be more invasive to the callers.
+
+Fixes: da91309e0a7e8966d916a74cce42ed170fde06bf
+Signed-off-by: Rusty Russell <rusty@rustcorp.com.au> (then rebased)
+Tested-by: Amir Vadai <amirv@mellanox.com>
+Acked-by: Amir Vadai <amirv@mellanox.com>
+Acked-by: David S. Miller <davem@davemloft.net>
+Acked-by: Benjamin Poirier <bpoirier@suse.com>
+---
+ drivers/net/ethernet/mellanox/mlx4/en_netdev.c |   10 +-----
+ drivers/net/ethernet/mellanox/mlx4/en_tx.c     |    6 +--
+ include/linux/cpumask.h                        |    6 +++
+ lib/cpumask.c                                  |   41 +++++++++++++++++++++++++
+ 4 files changed, 53 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -1271,17 +1271,13 @@ static int mlx4_en_init_affinity_hint(st
+ {
+ 	struct mlx4_en_rx_ring *ring = priv->rx_ring[ring_idx];
+ 	int numa_node = priv->mdev->dev->numa_node;
+-	int ret = 0;
+ 
+ 	if (!zalloc_cpumask_var(&ring->affinity_mask, GFP_KERNEL))
+ 		return -ENOMEM;
+ 
+-	ret = cpumask_set_cpu_local_first(ring_idx, numa_node,
+-					  ring->affinity_mask);
+-	if (ret)
+-		free_cpumask_var(ring->affinity_mask);
+-
+-	return ret;
++	cpumask_set_cpu(cpumask_local_spread(ring_idx, numa_node),
++			ring->affinity_mask);
++	return 0;
+ }
+ 
+ static void mlx4_en_free_affinity_hint(struct mlx4_en_priv *priv, int ring_idx)
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -138,9 +138,9 @@ int mlx4_en_create_tx_ring(struct mlx4_e
+ 	ring->queue_index = queue_index;
+ 
+ 	if (queue_index < priv->num_tx_rings_p_up)
+-		cpumask_set_cpu_local_first(queue_index,
+-					    priv->mdev->dev->numa_node,
+-					    &ring->affinity_mask);
++		cpumask_set_cpu(cpumask_local_spread(queue_index,
++						     priv->mdev->dev->numa_node),
++				&ring->affinity_mask);
+ 
+ 	*pring = ring;
+ 	return 0;
+--- a/include/linux/cpumask.h
++++ b/include/linux/cpumask.h
+@@ -156,6 +156,11 @@ static inline int cpumask_set_cpu_local_
+ 	return 0;
+ }
+ 
++static inline unsigned int cpumask_local_spread(unsigned int i, int node)
++{
++	return 0;
++}
++
+ #define for_each_cpu(cpu, mask)			\
+ 	for ((cpu) = 0; (cpu) < 1; (cpu)++, (void)mask)
+ #define for_each_cpu_not(cpu, mask)		\
+@@ -207,6 +212,7 @@ static inline unsigned int cpumask_next_
+ int cpumask_next_and(int n, const struct cpumask *, const struct cpumask *);
+ int cpumask_any_but(const struct cpumask *mask, unsigned int cpu);
+ int cpumask_set_cpu_local_first(int i, int numa_node, cpumask_t *dstp);
++unsigned int cpumask_local_spread(unsigned int i, int node);
+ 
+ /**
+  * for_each_cpu - iterate over every cpu in a mask
+--- a/lib/cpumask.c
++++ b/lib/cpumask.c
+@@ -239,3 +239,44 @@ out:
+ 	return ret;
+ }
+ EXPORT_SYMBOL(cpumask_set_cpu_local_first);
++
++/**
++ * cpumask_local_spread - select the i'th cpu with local numa cpu's first
++ * @i: index number
++ * @node: local numa_node
++ *
++ * This function selects an online CPU according to a numa aware policy;
++ * local cpus are returned first, followed by non-local ones, then it
++ * wraps around.
++ *
++ * It's not very efficient, but useful for setup.
++ */
++unsigned int cpumask_local_spread(unsigned int i, int node)
++{
++	int cpu;
++
++	/* Wrap: we always want a cpu. */
++	i %= num_online_cpus();
++
++	if (node == -1) {
++		for_each_cpu(cpu, cpu_online_mask)
++			if (i-- == 0)
++				return cpu;
++	} else {
++		/* NUMA first. */
++		for_each_cpu_and(cpu, cpumask_of_node(node), cpu_online_mask)
++			if (i-- == 0)
++				return cpu;
++
++		for_each_cpu(cpu, cpu_online_mask) {
++			/* Skip NUMA nodes, done above. */
++			if (cpumask_test_cpu(cpu, cpumask_of_node(node)))
++				continue;
++
++			if (i-- == 0)
++				return cpu;
++		}
++	}
++	BUG();
++}
++EXPORT_SYMBOL(cpumask_local_spread);
