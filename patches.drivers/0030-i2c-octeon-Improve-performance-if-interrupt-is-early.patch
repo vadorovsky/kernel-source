@@ -1,0 +1,152 @@
+From b7ed01efbf9877679962931acbb537a01f1fbf79 Mon Sep 17 00:00:00 2001
+From: Peter Swain <pswain@cavium.com>
+Date: Mon, 25 Apr 2016 16:33:37 +0200
+Subject: [PATCH 30/47] i2c: octeon: Improve performance if interrupt is early
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Git-commit: 1bb1ff3e7c74f4569dddf7bda8054a0bb6ed0073
+Patch-mainline: v4.7-rc1
+References: fate#321995
+
+There is a race between the TWSI interrupt and the condition
+that is required before proceeding:
+
+Low-level: interrupt flag bit must be set
+High-level controller: valid bit must be clear
+
+If the interrupt comes too early and the condition is not met
+the wait will time out, and the transfer is aborted leading
+to very poor performance.
+
+To avoid this race retry for the condition ~80 µs later.
+The retry is avoided on the very first invocation of
+wait_event_timeout() (which tests the condition before entering
+the wait and is therefore always wrong in this case).
+
+EEPROM reads on 100kHz i2c now measure ~5.2kB/s, about 1/2 what's
+achievable, and much better than the worst-case 100 bytes/sec before.
+
+While at it remove the debug print from the low-level wait function.
+
+Signed-off-by: Peter Swain <pswain@cavium.com>
+Signed-off-by: Jan Glauber <jglauber@cavium.com>
+Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+Signed-off-by: Mian Yousaf Kaukab <yousaf.kaukab@suse.com>
+---
+ drivers/i2c/busses/i2c-octeon.c | 55 ++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 46 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-octeon.c b/drivers/i2c/busses/i2c-octeon.c
+index 4fc471ce173e..cb418140cbbe 100644
+--- a/drivers/i2c/busses/i2c-octeon.c
++++ b/drivers/i2c/busses/i2c-octeon.c
+@@ -109,6 +109,8 @@
+ #define TWSI_INT_SDA		BIT_ULL(10)
+ #define TWSI_INT_SCL		BIT_ULL(11)
+ 
++#define I2C_OCTEON_EVENT_WAIT 80 /* microseconds */
++
+ struct octeon_i2c {
+ 	wait_queue_head_t queue;
+ 	struct i2c_adapter adap;
+@@ -339,11 +341,29 @@ static irqreturn_t octeon_i2c_hlc_isr78(int irq, void *dev_id)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static int octeon_i2c_test_iflg(struct octeon_i2c *i2c)
++static bool octeon_i2c_test_iflg(struct octeon_i2c *i2c)
+ {
+ 	return (octeon_i2c_ctl_read(i2c) & TWSI_CTL_IFLG);
+ }
+ 
++static bool octeon_i2c_test_ready(struct octeon_i2c *i2c, bool *first)
++{
++	if (octeon_i2c_test_iflg(i2c))
++		return true;
++
++	if (*first) {
++		*first = false;
++		return false;
++	}
++
++	/*
++	 * IRQ has signaled an event but IFLG hasn't changed.
++	 * Sleep and retry once.
++	 */
++	usleep_range(I2C_OCTEON_EVENT_WAIT, 2 * I2C_OCTEON_EVENT_WAIT);
++	return octeon_i2c_test_iflg(i2c);
++}
++
+ /**
+  * octeon_i2c_wait - wait for the IFLG to be set
+  * @i2c: The struct octeon_i2c
+@@ -353,15 +373,14 @@ static int octeon_i2c_test_iflg(struct octeon_i2c *i2c)
+ static int octeon_i2c_wait(struct octeon_i2c *i2c)
+ {
+ 	long time_left;
++	bool first = 1;
+ 
+ 	i2c->int_enable(i2c);
+-	time_left = wait_event_timeout(i2c->queue, octeon_i2c_test_iflg(i2c),
++	time_left = wait_event_timeout(i2c->queue, octeon_i2c_test_ready(i2c, &first),
+ 				       i2c->adap.timeout);
+ 	i2c->int_disable(i2c);
+-	if (!time_left) {
+-		dev_dbg(i2c->dev, "%s: timeout\n", __func__);
++	if (!time_left)
+ 		return -ETIMEDOUT;
+-	}
+ 
+ 	return 0;
+ }
+@@ -427,11 +446,28 @@ static int octeon_i2c_check_status(struct octeon_i2c *i2c, int final_read)
+ 	}
+ }
+ 
+-static bool octeon_i2c_hlc_test_ready(struct octeon_i2c *i2c)
++static bool octeon_i2c_hlc_test_valid(struct octeon_i2c *i2c)
++{
++	return (__raw_readq(i2c->twsi_base + SW_TWSI) & SW_TWSI_V) == 0;
++}
++
++static bool octeon_i2c_hlc_test_ready(struct octeon_i2c *i2c, bool *first)
+ {
+-	u64 val = __raw_readq(i2c->twsi_base + SW_TWSI);
++	/* check if valid bit is cleared */
++	if (octeon_i2c_hlc_test_valid(i2c))
++		return true;
+ 
+-	return (val & SW_TWSI_V) == 0;
++	if (*first) {
++		*first = false;
++		return false;
++	}
++
++	/*
++	 * IRQ has signaled an event but valid bit isn't cleared.
++	 * Sleep and retry once.
++	 */
++	usleep_range(I2C_OCTEON_EVENT_WAIT, 2 * I2C_OCTEON_EVENT_WAIT);
++	return octeon_i2c_hlc_test_valid(i2c);
+ }
+ 
+ static void octeon_i2c_hlc_int_enable(struct octeon_i2c *i2c)
+@@ -453,11 +489,12 @@ static void octeon_i2c_hlc_int_clear(struct octeon_i2c *i2c)
+  */
+ static int octeon_i2c_hlc_wait(struct octeon_i2c *i2c)
+ {
++	bool first = 1;
+ 	int time_left;
+ 
+ 	i2c->hlc_int_enable(i2c);
+ 	time_left = wait_event_timeout(i2c->queue,
+-				       octeon_i2c_hlc_test_ready(i2c),
++				       octeon_i2c_hlc_test_ready(i2c, &first),
+ 				       i2c->adap.timeout);
+ 	i2c->hlc_int_disable(i2c);
+ 	if (!time_left) {
+-- 
+2.11.0
+
