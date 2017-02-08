@@ -1,0 +1,212 @@
+From e8e23d0ea04243d07bbcb17c5b433c66ad50ce1a Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Wed, 24 Feb 2016 14:02:11 -0800
+Subject: dax: enable dax in the presence of known media errors (badblocks)
+Git-commit: 0a70bd43053331d99881211e1d09f32de531432f
+Patch-mainline: v4.7-rc1
+References: FATE#321135, FATE#321217, FATE#321256, FATE#321391, FATE#321393
+
+1/ If a mapping overlaps a bad sector fail the request.
+
+2/ Do not opportunistically report more dax-capable capacity than is
+   requested when errors present.
+
+Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+[vishal: fix a conflict with system RAM collision patches]
+[vishal: add a 'size' parameter to ->direct_access]
+[vishal: fix a conflict with DAX alignment check patches]
+Signed-off-by: Vishal Verma <vishal.l.verma@intel.com>
+Signed-off-by: Johannes Thumshirn <jthumshirn@suse.de>
+
+---
+ arch/powerpc/sysdev/axonram.c |  2 +-
+ drivers/block/brd.c           |  2 +-
+ drivers/nvdimm/pmem.c         | 10 +++++-
+ drivers/s390/block/dcssblk.c  |  4 +--
+ fs/block_dev.c                | 71 ++++++++++++++++++++++++++++++++++++++++++-
+ include/linux/blkdev.h        |  2 +-
+ 6 files changed, 84 insertions(+), 7 deletions(-)
+
+diff --git a/arch/powerpc/sysdev/axonram.c b/arch/powerpc/sysdev/axonram.c
+index 3955dd8..067e2de 100644
+--- a/arch/powerpc/sysdev/axonram.c
++++ b/arch/powerpc/sysdev/axonram.c
+@@ -143,7 +143,7 @@ axon_ram_make_request(struct request_queue *queue, struct bio *bio)
+  */
+ static long
+ axon_ram_direct_access(struct block_device *device, sector_t sector,
+-		       void __pmem **kaddr, pfn_t *pfn)
++		       void __pmem **kaddr, pfn_t *pfn, long size)
+ {
+ 	struct axon_ram_bank *bank = device->bd_disk->private_data;
+ 	loff_t offset = (loff_t)sector << AXON_RAM_SECTOR_SHIFT;
+diff --git a/drivers/block/brd.c b/drivers/block/brd.c
+index 7672488..956e4e1 100644
+--- a/drivers/block/brd.c
++++ b/drivers/block/brd.c
+@@ -376,7 +376,7 @@ static int brd_rw_page(struct block_device *bdev, sector_t sector,
+ 
+ #ifdef CONFIG_BLK_DEV_RAM_DAX
+ static long brd_direct_access(struct block_device *bdev, sector_t sector,
+-			void __pmem **kaddr, pfn_t *pfn)
++			void __pmem **kaddr, pfn_t *pfn, long size)
+ {
+ 	struct brd_device *brd = bdev->bd_disk->private_data;
+ 	struct page *page;
+diff --git a/drivers/nvdimm/pmem.c b/drivers/nvdimm/pmem.c
+index 583e3da..99d7150 100644
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -164,14 +164,22 @@ static int pmem_rw_page(struct block_device *bdev, sector_t sector,
+ }
+ 
+ static long pmem_direct_access(struct block_device *bdev, sector_t sector,
+-		      void __pmem **kaddr, pfn_t *pfn)
++		      void __pmem **kaddr, pfn_t *pfn, long size)
+ {
+ 	struct pmem_device *pmem = bdev->bd_queue->queuedata;
+ 	resource_size_t offset = sector * 512 + pmem->data_offset;
+ 
++	if (unlikely(is_bad_pmem(&pmem->bb, sector, size)))
++		return -EIO;
+ 	*kaddr = pmem->virt_addr + offset;
+ 	*pfn = phys_to_pfn_t(pmem->phys_addr + offset, pmem->pfn_flags);
+ 
++	/*
++	 * If badblocks are present, limit known good range to the
++	 * requested range.
++	 */
++	if (unlikely(pmem->bb.count))
++		return size;
+ 	return pmem->size - pmem->pfn_pad - offset;
+ }
+ 
+diff --git a/drivers/s390/block/dcssblk.c b/drivers/s390/block/dcssblk.c
+index 36357713..059320c 100644
+--- a/drivers/s390/block/dcssblk.c
++++ b/drivers/s390/block/dcssblk.c
+@@ -31,7 +31,7 @@ static void dcssblk_release(struct gendisk *disk, fmode_t mode);
+ static blk_qc_t dcssblk_make_request(struct request_queue *q,
+ 						struct bio *bio);
+ static long dcssblk_direct_access(struct block_device *bdev, sector_t secnum,
+-			 void __pmem **kaddr, pfn_t *pfn);
++			 void __pmem **kaddr, pfn_t *pfn, long size);
+ 
+ static char dcssblk_segments[DCSSBLK_PARM_LEN] = "\0";
+ 
+@@ -884,7 +884,7 @@ fail:
+ 
+ static long
+ dcssblk_direct_access (struct block_device *bdev, sector_t secnum,
+-			void __pmem **kaddr, pfn_t *pfn)
++			void __pmem **kaddr, pfn_t *pfn, long size)
+ {
+ 	struct dcssblk_dev_info *dev_info;
+ 	unsigned long offset, dev_sz;
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index 14eee14..8f0786c 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -509,7 +509,7 @@ long bdev_direct_access(struct block_device *bdev, struct blk_dax_ctl *dax)
+ 	sector += get_start_sect(bdev);
+ 	if (sector % (PAGE_SIZE / 512))
+ 		return -EINVAL;
+-	avail = ops->direct_access(bdev, sector, &dax->addr, &dax->pfn);
++	avail = ops->direct_access(bdev, sector, &dax->addr, &dax->pfn, size);
+ 	if (!avail)
+ 		return -ERANGE;
+ 	if (avail > 0 && avail & ~PAGE_MASK)
+@@ -518,6 +518,75 @@ long bdev_direct_access(struct block_device *bdev, struct blk_dax_ctl *dax)
+ }
+ EXPORT_SYMBOL_GPL(bdev_direct_access);
+ 
++/**
++ * bdev_dax_supported() - Check if the device supports dax for filesystem
++ * @sb: The superblock of the device
++ * @blocksize: The block size of the device
++ *
++ * This is a library function for filesystems to check if the block device
++ * can be mounted with dax option.
++ *
++ * Return: negative errno if unsupported, 0 if supported.
++ */
++int bdev_dax_supported(struct super_block *sb, int blocksize)
++{
++	struct blk_dax_ctl dax = {
++		.sector = 0,
++		.size = PAGE_SIZE,
++	};
++	int err;
++
++	if (blocksize != PAGE_SIZE) {
++		vfs_msg(sb, KERN_ERR, "error: unsupported blocksize for dax");
++		return -EINVAL;
++	}
++
++	err = bdev_direct_access(sb->s_bdev, &dax);
++	if (err < 0) {
++		switch (err) {
++		case -EOPNOTSUPP:
++			vfs_msg(sb, KERN_ERR,
++				"error: device does not support dax");
++			break;
++		case -EINVAL:
++			vfs_msg(sb, KERN_ERR,
++				"error: unaligned partition for dax");
++			break;
++		default:
++			vfs_msg(sb, KERN_ERR,
++				"error: dax access failed (%d)", err);
++		}
++		return err;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(bdev_dax_supported);
++
++/**
++ * bdev_dax_capable() - Return if the raw device is capable for dax
++ * @bdev: The device for raw block device access
++ */
++bool bdev_dax_capable(struct block_device *bdev)
++{
++	struct blk_dax_ctl dax = {
++		.size = PAGE_SIZE,
++	};
++
++	if (!IS_ENABLED(CONFIG_FS_DAX))
++		return false;
++
++	dax.sector = 0;
++	if (bdev_direct_access(bdev, &dax) < 0)
++		return false;
++
++	dax.sector = bdev->bd_part->nr_sects - (PAGE_SIZE / 512);
++	if (bdev_direct_access(bdev, &dax) < 0)
++		return false;
++
++	return true;
++}
++
+ /*
+  * pseudo-fs
+  */
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 4ec8696..ffd5acf 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1676,7 +1676,7 @@ struct block_device_operations {
+ 	int (*ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
+ 	int (*compat_ioctl) (struct block_device *, fmode_t, unsigned, unsigned long);
+ 	long (*direct_access)(struct block_device *, sector_t, void __pmem **,
+-			pfn_t *);
++			pfn_t *, long);
+ 	unsigned int (*check_events) (struct gendisk *disk,
+ 				      unsigned int clearing);
+ 	/* ->media_changed() is DEPRECATED, use ->check_events() instead */
+-- 
+1.8.5.6
+
