@@ -1,0 +1,216 @@
+From 0af50f9b084005ca4bab2cb06c9ebca0559894fb Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Wed, 15 Jun 2016 20:34:17 -0700
+Subject: tools/testing/nvdimm: replace CONFIG_DMA_CMA dependency with
+ vmalloc()
+Git-commit: ee8520fe8cd4cd2658ca555781eefeb4914c4ef9
+Patch-mainline: v4.8-rc1
+References: FATE#321135, FATE#321217, FATE#321256, FATE#321391, FATE#321393
+
+DMA_CMA is incompatible with SWIOTLB used in enterprise distro
+configurations.  Switch to vmalloc() allocations for all resources.
+
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Johannes Thumshirn <jthumshirn@suse.de>
+
+---
+ tools/testing/nvdimm/Kbuild       |  2 ++
+ tools/testing/nvdimm/pmem-dax.c   | 22 ++++++++++++++----
+ tools/testing/nvdimm/test/iomap.c | 16 +++++++++++++
+ tools/testing/nvdimm/test/nfit.c  | 48 +++++----------------------------------
+ 4 files changed, 41 insertions(+), 47 deletions(-)
+
+diff --git a/tools/testing/nvdimm/Kbuild b/tools/testing/nvdimm/Kbuild
+index 4adfa9c..62d5ac3 100644
+--- a/tools/testing/nvdimm/Kbuild
++++ b/tools/testing/nvdimm/Kbuild
+@@ -11,6 +11,8 @@ ldflags-y += --wrap=__devm_release_region
+ ldflags-y += --wrap=__request_region
+ ldflags-y += --wrap=__release_region
+ ldflags-y += --wrap=devm_memremap_pages
++ldflags-y += --wrap=insert_resource
++ldflags-y += --wrap=remove_resource
+ 
+ DRIVERS := ../../../drivers
+ NVDIMM_SRC := $(DRIVERS)/nvdimm
+diff --git a/tools/testing/nvdimm/pmem-dax.c b/tools/testing/nvdimm/pmem-dax.c
+index fdba77f..1e0218c 100644
+--- a/tools/testing/nvdimm/pmem-dax.c
++++ b/tools/testing/nvdimm/pmem-dax.c
+@@ -21,14 +21,26 @@ long pmem_direct_access(struct block_device *bdev, sector_t sector,
+ 	struct pmem_device *pmem = bdev->bd_queue->queuedata;
+ 	resource_size_t offset = sector * 512 + pmem->data_offset;
+ 
+-	/* disable DAX for nfit_test pmem devices */
+-	if (get_nfit_res(pmem->phys_addr + offset)) {
+-		dev_info_once(pmem->bb.dev, "dax is disabled for nfit_test\n");
++	if (unlikely(is_bad_pmem(&pmem->bb, sector, size)))
+ 		return -EIO;
++
++	/*
++	 * Limit dax to a single page at a time given vmalloc()-backed
++	 * in the nfit_test case.
++	 */
++	if (get_nfit_res(pmem->phys_addr + offset)) {
++		struct page *page;
++
++		*kaddr = pmem->virt_addr + offset;
++		page = vmalloc_to_page(pmem->virt_addr + offset);
++		*pfn = page_to_pfn_t(page);
++		dev_dbg_ratelimited(disk_to_dev(bdev->bd_disk)->parent,
++				"%s: sector: %#llx pfn: %#lx\n", __func__,
++				(unsigned long long) sector, page_to_pfn(page));
++
++		return PAGE_SIZE;
+ 	}
+ 
+-	if (unlikely(is_bad_pmem(&pmem->bb, sector, size)))
+-		return -EIO;
+ 	*kaddr = pmem->virt_addr + offset;
+ 	*pfn = phys_to_pfn_t(pmem->phys_addr + offset, pmem->pfn_flags);
+ 
+diff --git a/tools/testing/nvdimm/test/iomap.c b/tools/testing/nvdimm/test/iomap.c
+index 18a0120..36bfeda 100644
+--- a/tools/testing/nvdimm/test/iomap.c
++++ b/tools/testing/nvdimm/test/iomap.c
+@@ -241,6 +241,22 @@ struct resource *__wrap___request_region(struct resource *parent,
+ }
+ EXPORT_SYMBOL(__wrap___request_region);
+ 
++int __wrap_insert_resource(struct resource *parent, struct resource *res)
++{
++	if (get_nfit_res(res->start))
++		return 0;
++	return insert_resource(parent, res);
++}
++EXPORT_SYMBOL(__wrap_insert_resource);
++
++int __wrap_remove_resource(struct resource *res)
++{
++	if (get_nfit_res(res->start))
++		return 0;
++	return remove_resource(res);
++}
++EXPORT_SYMBOL(__wrap_remove_resource);
++
+ struct resource *__wrap___devm_request_region(struct device *dev,
+ 		struct resource *parent, resource_size_t start,
+ 		resource_size_t n, const char *name)
+diff --git a/tools/testing/nvdimm/test/nfit.c b/tools/testing/nvdimm/test/nfit.c
+index 03cf71e..8594e4d 100644
+--- a/tools/testing/nvdimm/test/nfit.c
++++ b/tools/testing/nvdimm/test/nfit.c
+@@ -471,11 +471,7 @@ static void release_nfit_res(void *data)
+ 	list_del(&nfit_res->list);
+ 	spin_unlock(&nfit_test_lock);
+ 
+-	if (is_vmalloc_addr(nfit_res->buf))
+-		vfree(nfit_res->buf);
+-	else
+-		dma_free_coherent(nfit_res->dev, resource_size(res),
+-				nfit_res->buf, res->start);
++	vfree(nfit_res->buf);
+ 	kfree(res);
+ 	kfree(nfit_res);
+ }
+@@ -508,9 +504,7 @@ static void *__test_alloc(struct nfit_test *t, size_t size, dma_addr_t *dma,
+ 
+ 	return nfit_res->buf;
+  err:
+-	if (buf && !is_vmalloc_addr(buf))
+-		dma_free_coherent(dev, size, buf, *dma);
+-	else if (buf)
++	if (buf)
+ 		vfree(buf);
+ 	kfree(res);
+ 	kfree(nfit_res);
+@@ -525,15 +519,6 @@ static void *test_alloc(struct nfit_test *t, size_t size, dma_addr_t *dma)
+ 	return __test_alloc(t, size, dma, buf);
+ }
+ 
+-static void *test_alloc_coherent(struct nfit_test *t, size_t size,
+-		dma_addr_t *dma)
+-{
+-	struct device *dev = &t->pdev.dev;
+-	void *buf = dma_alloc_coherent(dev, size, dma, GFP_KERNEL);
+-
+-	return __test_alloc(t, size, dma, buf);
+-}
+-
+ static struct nfit_test_resource *nfit_test_lookup(resource_size_t addr)
+ {
+ 	int i;
+@@ -593,15 +578,15 @@ static int nfit_test0_alloc(struct nfit_test *t)
+ 		return -ENOMEM;
+ 	t->nfit_size = nfit_size;
+ 
+-	t->spa_set[0] = test_alloc_coherent(t, SPA0_SIZE, &t->spa_set_dma[0]);
++	t->spa_set[0] = test_alloc(t, SPA0_SIZE, &t->spa_set_dma[0]);
+ 	if (!t->spa_set[0])
+ 		return -ENOMEM;
+ 
+-	t->spa_set[1] = test_alloc_coherent(t, SPA1_SIZE, &t->spa_set_dma[1]);
++	t->spa_set[1] = test_alloc(t, SPA1_SIZE, &t->spa_set_dma[1]);
+ 	if (!t->spa_set[1])
+ 		return -ENOMEM;
+ 
+-	t->spa_set[2] = test_alloc_coherent(t, SPA0_SIZE, &t->spa_set_dma[2]);
++	t->spa_set[2] = test_alloc(t, SPA0_SIZE, &t->spa_set_dma[2]);
+ 	if (!t->spa_set[2])
+ 		return -ENOMEM;
+ 
+@@ -640,7 +625,7 @@ static int nfit_test1_alloc(struct nfit_test *t)
+ 		return -ENOMEM;
+ 	t->nfit_size = nfit_size;
+ 
+-	t->spa_set[0] = test_alloc_coherent(t, SPA2_SIZE, &t->spa_set_dma[0]);
++	t->spa_set[0] = test_alloc(t, SPA2_SIZE, &t->spa_set_dma[0]);
+ 	if (!t->spa_set[0])
+ 		return -ENOMEM;
+ 
+@@ -1526,12 +1511,6 @@ static struct platform_driver nfit_test_driver = {
+ 	.id_table = nfit_test_id,
+ };
+ 
+-#ifdef CONFIG_CMA_SIZE_MBYTES
+-#define CMA_SIZE_MBYTES CONFIG_CMA_SIZE_MBYTES
+-#else
+-#define CMA_SIZE_MBYTES 0
+-#endif
+-
+ static __init int nfit_test_init(void)
+ {
+ 	int rc, i;
+@@ -1541,7 +1520,6 @@ static __init int nfit_test_init(void)
+ 	for (i = 0; i < NUM_NFITS; i++) {
+ 		struct nfit_test *nfit_test;
+ 		struct platform_device *pdev;
+-		static int once;
+ 
+ 		nfit_test = kzalloc(sizeof(*nfit_test), GFP_KERNEL);
+ 		if (!nfit_test) {
+@@ -1580,20 +1558,6 @@ static __init int nfit_test_init(void)
+ 			goto err_register;
+ 
+ 		instances[i] = nfit_test;
+-
+-		if (!once++) {
+-			dma_addr_t dma;
+-			void *buf;
+-
+-			buf = dma_alloc_coherent(&pdev->dev, SZ_128M, &dma,
+-					GFP_KERNEL);
+-			if (!buf) {
+-				rc = -ENOMEM;
+-				dev_warn(&pdev->dev, "need 128M of free cma\n");
+-				goto err_register;
+-			}
+-			dma_free_coherent(&pdev->dev, SZ_128M, buf, dma);
+-		}
+ 	}
+ 
+ 	rc = platform_driver_register(&nfit_test_driver);
+-- 
+1.8.5.6
+
