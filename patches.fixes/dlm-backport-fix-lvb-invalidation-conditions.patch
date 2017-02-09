@@ -1,0 +1,190 @@
+From ee7de840e408409f92e0f0f02e540aaa92d25069 Mon Sep 17 00:00:00 2001
+From: Eric Ren <zren@suse.com>
+Git-commit: da8c66638ae684c99abcb30e89d2803402e7ca20
+Patch-mainline: v3.8-rc1
+References: bsc#1005651
+Date: Thu, 1 Dec 2016 10:38:48 +0800
+Subject: [PATCH] dlm: backport "fix lvb invalidation conditions"
+
+Backport upstream commit da8c66638ae6 ("dlm: fix lvb
+invalidation conditions") for SLE11 SP3/SP4, with small
+changes below:
+
+1) fix conflicts;
+2) move recover_lvb() before recover_conversion();
+3) remove the if-else branch in which flag RSB_VALNOTVALID
+was cleared.
+
+The original commit message follows:
+"""
+dlm: fix lvb invalidation conditions
+
+When a node is removed that held a PW/EX lock, the
+existing master node should invalidate the lvb on the
+resource due to the purged lock.
+
+Previously, the existing master node was invalidating
+the lvb if it found only NL/CR locks on the resource
+during recovery for the removed node.  This could lead
+to cases where it invalidated the lvb and shouldn't
+have, or cases where it should have invalidated and
+didn't.
+
+When recovery selects a *new* master node for a
+resource, and that new master finds only NL/CR locks
+on the resource after lock recovery, it should
+invalidate the lvb.  This case was handled correctly
+(but was incorrectly applied to the existing master
+case also.)
+
+When a process exits while holding a PW/EX lock,
+the lvb on the resource should be invalidated.
+This was not happening.
+
+The lvb contents and VALNOTVALID flag should be
+recovered before granting locks in recovery so that
+the recovered lvb state is provided in the callback.
+The lvb was being recovered after the lock was granted.
+
+Signed-off-by: David Teigland <teigland@redhat.com>
+"""
+
+Signed-off-by: Eric Ren <zren@suse.com>
+---
+ fs/dlm/dlm_internal.h |  1 +
+ fs/dlm/lock.c         | 17 ++++++++++++++---
+ fs/dlm/recover.c      | 34 +++++++++++++++++++++++++++-------
+ 3 files changed, 42 insertions(+), 10 deletions(-)
+
+diff --git a/fs/dlm/dlm_internal.h b/fs/dlm/dlm_internal.h
+index 0262451..0f261d0 100644
+--- a/fs/dlm/dlm_internal.h
++++ b/fs/dlm/dlm_internal.h
+@@ -317,6 +317,7 @@ enum rsb_flags {
+ 	RSB_NEW_MASTER2,
+ 	RSB_RECOVER_CONVERT,
+ 	RSB_LOCKS_PURGED,
++	RSB_RECOVER_LVB_INVAL,
+ };
+ 
+ static inline void rsb_set_flag(struct dlm_rsb *r, enum rsb_flags flag)
+diff --git a/fs/dlm/lock.c b/fs/dlm/lock.c
+index 9013759..dd44bb8 100644
+--- a/fs/dlm/lock.c
++++ b/fs/dlm/lock.c
+@@ -4366,6 +4366,14 @@ static void purge_queue(struct dlm_rsb *r, struct list_head *queue,
+ 	list_for_each_entry_safe(lkb, safe, queue, lkb_statequeue) {
+ 		if (test(ls, lkb)) {
+ 			rsb_set_flag(r, RSB_LOCKS_PURGED);
++
++			/* tell recover_lvb to invalidate the lvb
++			  because a node holding EX/PW failed */
++			if ((lkb->lkb_exflags & DLM_LKF_VALBLK) &&
++			   (lkb->lkb_grmode >= DLM_LOCK_PW)) {
++			       rsb_set_flag(r, RSB_RECOVER_LVB_INVAL);
++			}
++
+ 			del_lkb(r, lkb);
+ 			/* this put should free the lkb */
+ 			if (!dlm_put_lkb(lkb))
+@@ -4928,15 +4936,18 @@ static int orphan_proc_lock(struct dlm_ls *ls, struct dlm_lkb *lkb)
+ 	return error;
+ }
+ 
+-/* The force flag allows the unlock to go ahead even if the lkb isn't granted.
+-   Regardless of what rsb queue the lock is on, it's removed and freed. */
++/* The FORCEUNLOCK flag allows the unlock to go ahead even if the lkb isn't
++   granted.  Regardless of what rsb queue the lock is on, it's removed and
++   freed.  The IVVALBLK flag causes the lvb on the resource to be invalidated
++   if our lock is PW/EX (it's ignored if our granted mode is smaller.) */
+ 
+ static int unlock_proc_lock(struct dlm_ls *ls, struct dlm_lkb *lkb)
+ {
+ 	struct dlm_args args;
+ 	int error;
+ 
+-	set_unlock_args(DLM_LKF_FORCEUNLOCK, lkb->lkb_ua, &args);
++	set_unlock_args(DLM_LKF_FORCEUNLOCK | DLM_LKF_IVVALBLK,
++			lkb->lkb_ua, &args);
+ 
+ 	error = unlock_lock(ls, lkb, &args);
+ 	if (error == -DLM_EUNLOCK)
+diff --git a/fs/dlm/recover.c b/fs/dlm/recover.c
+index 1463823..9bc9761 100644
+--- a/fs/dlm/recover.c
++++ b/fs/dlm/recover.c
+@@ -566,8 +566,14 @@ void dlm_recovered_lock(struct dlm_rsb *r)
+  * the VALNOTVALID flag if necessary, and determining the correct lvb contents
+  * based on the lvb's of the locks held on the rsb.
+  *
+- * RSB_VALNOTVALID is set if there are only NL/CR locks on the rsb.  If it
+- * was already set prior to recovery, it's not cleared, regardless of locks.
++ * RSB_VALNOTVALID is set in two cases:
++ *
++ * 1. we are master, but not new, and we purged an EX/PW lock held by a
++ * failed node (in dlm_recover_purge which set RSB_RECOVER_LVB_INVAL)
++ *
++ * 2. we are a new master, and there are only NL/CR locks left.
++ * (We could probably improve this by only invaliding in this way when
++ * the previous master left uncleanly.  VMS docs mention that.)
+  *
+  * The LVB contents are only considered for changing when this is a new master
+  * of the rsb (NEW_MASTER2).  Then, the rsb's lvb is taken from any lkb with
+@@ -583,6 +589,19 @@ static void recover_lvb(struct dlm_rsb *r)
+ 	int big_lock_exists = 0;
+ 	int lvblen = r->res_ls->ls_lvblen;
+ 
++	if (!rsb_flag(r, RSB_NEW_MASTER2) &&
++		rsb_flag(r, RSB_RECOVER_LVB_INVAL)) {
++                /* case 1 above */
++                rsb_set_flag(r, RSB_VALNOTVALID);
++                return;
++        }
++
++        if (!rsb_flag(r, RSB_NEW_MASTER2))
++		return;
++
++       /* we are the new master, so figure out if VALNOTVALID should
++          be set, and set the rsb lvb from the best lkb available. */
++
+ 	list_for_each_entry(lkb, &r->res_grantqueue, lkb_statequeue) {
+ 		if (!(lkb->lkb_exflags & DLM_LKF_VALBLK))
+ 			continue;
+@@ -621,13 +640,10 @@ static void recover_lvb(struct dlm_rsb *r)
+ 	if (!lock_lvb_exists)
+ 		goto out;
+ 
++	/* lvb is invalidated if only NL/CR locks remain */
+ 	if (!big_lock_exists)
+ 		rsb_set_flag(r, RSB_VALNOTVALID);
+ 
+-	/* don't mess with the lvb unless we're the new master */
+-	if (!rsb_flag(r, RSB_NEW_MASTER2))
+-		goto out;
+-
+ 	if (!r->res_lvbptr) {
+ 		r->res_lvbptr = dlm_allocate_lvb(r->res_ls);
+ 		if (!r->res_lvbptr)
+@@ -695,14 +711,18 @@ void dlm_recover_rsbs(struct dlm_ls *ls)
+ 	list_for_each_entry(r, &ls->ls_root_list, res_root_list) {
+ 		lock_rsb(r);
+ 		if (is_master(r)) {
++                        /* recover lvb before granting locks so the updated
++                           lvb/VALNOTVALID is presented in the completion */
++                        recover_lvb(r);
++
+ 			if (rsb_flag(r, RSB_RECOVER_CONVERT))
+ 				recover_conversion(r);
+ 			if (rsb_flag(r, RSB_NEW_MASTER2))
+ 				set_locks_purged(r);
+-			recover_lvb(r);
+ 			count++;
+ 		}
+ 		rsb_clear_flag(r, RSB_RECOVER_CONVERT);
++		rsb_clear_flag(r, RSB_RECOVER_LVB_INVAL);
+ 		rsb_clear_flag(r, RSB_NEW_MASTER2);
+ 		unlock_rsb(r);
+ 	}
+-- 
+2.6.6
+
