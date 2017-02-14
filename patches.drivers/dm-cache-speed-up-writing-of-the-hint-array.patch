@@ -1,0 +1,252 @@
+From: Joe Thornber <ejt@redhat.com>
+Date: Thu, 15 Sep 2016 09:23:46 -0400
+Subject: dm cache: speed up writing of the hint array
+References: bsc#1023798,FATE#321463
+Git-commit: 4e781b498ee5008ede91362d91404a362e7a46b3
+Patch-Mainline: v4.9-rc1
+
+It's far quicker to always delete the hint array and recreate with
+dm_array_new() because we avoid the copying caused by mutation.
+
+Also simplifies the policy interface, replacing the walk_hints() with
+the simpler get_hint().
+
+Signed-off-by: Joe Thornber <ejt@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/md/dm-cache-metadata.c        | 80 ++++++++++++-----------------------
+ drivers/md/dm-cache-policy-cleaner.c  |  2 +-
+ drivers/md/dm-cache-policy-internal.h |  6 +--
+ drivers/md/dm-cache-policy-smq.c      | 38 +++--------------
+ drivers/md/dm-cache-policy.h          | 10 ++---
+ 5 files changed, 42 insertions(+), 94 deletions(-)
+
+diff --git a/drivers/md/dm-cache-metadata.c b/drivers/md/dm-cache-metadata.c
+index 3970cda..a60f10a 100644
+--- a/drivers/md/dm-cache-metadata.c
++++ b/drivers/md/dm-cache-metadata.c
+@@ -1368,10 +1368,24 @@ int dm_cache_get_metadata_dev_size(struct dm_cache_metadata *cmd,
+ 
+ /*----------------------------------------------------------------*/
+ 
+-static int begin_hints(struct dm_cache_metadata *cmd, struct dm_cache_policy *policy)
++static int get_hint(uint32_t index, void *value_le, void *context)
++{
++	uint32_t value;
++	struct dm_cache_policy *policy = context;
++
++	value = policy_get_hint(policy, to_cblock(index));
++	*((__le32 *) value_le) = cpu_to_le32(value);
++
++	return 0;
++}
++
++/*
++ * It's quicker to always delete the hint array, and recreate with
++ * dm_array_new().
++ */
++static int write_hints(struct dm_cache_metadata *cmd, struct dm_cache_policy *policy)
+ {
+ 	int r;
+-	__le32 value;
+ 	size_t hint_size;
+ 	const char *policy_name = dm_cache_policy_get_name(policy);
+ 	const unsigned *policy_version = dm_cache_policy_get_version(policy);
+@@ -1380,63 +1394,23 @@ static int begin_hints(struct dm_cache_metadata *cmd, struct dm_cache_policy *po
+ 	    (strlen(policy_name) > sizeof(cmd->policy_name) - 1))
+ 		return -EINVAL;
+ 
+-	if (!policy_unchanged(cmd, policy)) {
+-		strncpy(cmd->policy_name, policy_name, sizeof(cmd->policy_name));
+-		memcpy(cmd->policy_version, policy_version, sizeof(cmd->policy_version));
++	strncpy(cmd->policy_name, policy_name, sizeof(cmd->policy_name));
++	memcpy(cmd->policy_version, policy_version, sizeof(cmd->policy_version));
+ 
+-		hint_size = dm_cache_policy_get_hint_size(policy);
+-		if (!hint_size)
+-			return 0; /* short-circuit hints initialization */
+-		cmd->policy_hint_size = hint_size;
++	hint_size = dm_cache_policy_get_hint_size(policy);
++	if (!hint_size)
++		return 0; /* short-circuit hints initialization */
++	cmd->policy_hint_size = hint_size;
+ 
+-		if (cmd->hint_root) {
+-			r = dm_array_del(&cmd->hint_info, cmd->hint_root);
+-			if (r)
+-				return r;
+-		}
+-
+-		r = dm_array_empty(&cmd->hint_info, &cmd->hint_root);
++	if (cmd->hint_root) {
++		r = dm_array_del(&cmd->hint_info, cmd->hint_root);
+ 		if (r)
+ 			return r;
+-
+-		value = cpu_to_le32(0);
+-		__dm_bless_for_disk(&value);
+-		r = dm_array_resize(&cmd->hint_info, cmd->hint_root, 0,
+-				    from_cblock(cmd->cache_blocks),
+-				    &value, &cmd->hint_root);
+-		if (r)
+-			return r;
+-	}
+-
+-	return 0;
+-}
+-
+-static int save_hint(void *context, dm_cblock_t cblock, dm_oblock_t oblock, uint32_t hint)
+-{
+-	struct dm_cache_metadata *cmd = context;
+-	__le32 value = cpu_to_le32(hint);
+-	int r;
+-
+-	__dm_bless_for_disk(&value);
+-
+-	r = dm_array_set_value(&cmd->hint_info, cmd->hint_root,
+-			       from_cblock(cblock), &value, &cmd->hint_root);
+-	cmd->changed = true;
+-
+-	return r;
+-}
+-
+-static int write_hints(struct dm_cache_metadata *cmd, struct dm_cache_policy *policy)
+-{
+-	int r;
+-
+-	r = begin_hints(cmd, policy);
+-	if (r) {
+-		DMERR("begin_hints failed");
+-		return r;
+ 	}
+ 
+-	return policy_walk_mappings(policy, save_hint, cmd);
++	return dm_array_new(&cmd->hint_info, &cmd->hint_root,
++			    from_cblock(cmd->cache_blocks),
++			    get_hint, policy);
+ }
+ 
+ int dm_cache_write_hints(struct dm_cache_metadata *cmd, struct dm_cache_policy *policy)
+diff --git a/drivers/md/dm-cache-policy-cleaner.c b/drivers/md/dm-cache-policy-cleaner.c
+index 14aaaf0..2e8a8f1 100644
+--- a/drivers/md/dm-cache-policy-cleaner.c
++++ b/drivers/md/dm-cache-policy-cleaner.c
+@@ -395,7 +395,7 @@ static void init_policy_functions(struct policy *p)
+ 	p->policy.set_dirty = wb_set_dirty;
+ 	p->policy.clear_dirty = wb_clear_dirty;
+ 	p->policy.load_mapping = wb_load_mapping;
+-	p->policy.walk_mappings = NULL;
++	p->policy.get_hint = NULL;
+ 	p->policy.remove_mapping = wb_remove_mapping;
+ 	p->policy.writeback_work = wb_writeback_work;
+ 	p->policy.force_mapping = wb_force_mapping;
+diff --git a/drivers/md/dm-cache-policy-internal.h b/drivers/md/dm-cache-policy-internal.h
+index 2816018..808ee0e 100644
+--- a/drivers/md/dm-cache-policy-internal.h
++++ b/drivers/md/dm-cache-policy-internal.h
+@@ -48,10 +48,10 @@ static inline int policy_load_mapping(struct dm_cache_policy *p,
+ 	return p->load_mapping(p, oblock, cblock, hint, hint_valid);
+ }
+ 
+-static inline int policy_walk_mappings(struct dm_cache_policy *p,
+-				      policy_walk_fn fn, void *context)
++static inline uint32_t policy_get_hint(struct dm_cache_policy *p,
++				       dm_cblock_t cblock)
+ {
+-	return p->walk_mappings ? p->walk_mappings(p, fn, context) : 0;
++	return p->get_hint ? p->get_hint(p, cblock) : 0;
+ }
+ 
+ static inline int policy_writeback_work(struct dm_cache_policy *p,
+diff --git a/drivers/md/dm-cache-policy-smq.c b/drivers/md/dm-cache-policy-smq.c
+index cf48a61..f3cec4e 100644
+--- a/drivers/md/dm-cache-policy-smq.c
++++ b/drivers/md/dm-cache-policy-smq.c
+@@ -1375,41 +1375,15 @@ static int smq_load_mapping(struct dm_cache_policy *p,
+ 	return 0;
+ }
+ 
+-static int smq_save_hints(struct smq_policy *mq, struct queue *q,
+-			  policy_walk_fn fn, void *context)
+-{
+-	int r;
+-	unsigned level;
+-	struct entry *e;
+-
+-	for (level = 0; level < q->nr_levels; level++)
+-		for (e = l_head(q->es, q->qs + level); e; e = l_next(q->es, e)) {
+-			if (!e->sentinel) {
+-				r = fn(context, infer_cblock(mq, e),
+-				       e->oblock, e->level);
+-				if (r)
+-					return r;
+-			}
+-		}
+-
+-	return 0;
+-}
+-
+-static int smq_walk_mappings(struct dm_cache_policy *p, policy_walk_fn fn,
+-			     void *context)
++static uint32_t smq_get_hint(struct dm_cache_policy *p, dm_cblock_t cblock)
+ {
+ 	struct smq_policy *mq = to_smq_policy(p);
+-	int r = 0;
++	struct entry *e = get_entry(&mq->cache_alloc, from_cblock(cblock));
+ 
+-	/*
+-	 * We don't need to lock here since this method is only called once
+-	 * the IO has stopped.
+-	 */
+-	r = smq_save_hints(mq, &mq->clean, fn, context);
+-	if (!r)
+-		r = smq_save_hints(mq, &mq->dirty, fn, context);
++	if (!e->allocated)
++		return 0;
+ 
+-	return r;
++	return e->level;
+ }
+ 
+ static void __remove_mapping(struct smq_policy *mq, dm_oblock_t oblock)
+@@ -1616,7 +1590,7 @@ static void init_policy_functions(struct smq_policy *mq, bool mimic_mq)
+ 	mq->policy.set_dirty = smq_set_dirty;
+ 	mq->policy.clear_dirty = smq_clear_dirty;
+ 	mq->policy.load_mapping = smq_load_mapping;
+-	mq->policy.walk_mappings = smq_walk_mappings;
++	mq->policy.get_hint = smq_get_hint;
+ 	mq->policy.remove_mapping = smq_remove_mapping;
+ 	mq->policy.remove_cblock = smq_remove_cblock;
+ 	mq->policy.writeback_work = smq_writeback_work;
+diff --git a/drivers/md/dm-cache-policy.h b/drivers/md/dm-cache-policy.h
+index 05db56e..aa10b14 100644
+--- a/drivers/md/dm-cache-policy.h
++++ b/drivers/md/dm-cache-policy.h
+@@ -90,9 +90,6 @@ struct policy_result {
+ 	dm_cblock_t cblock;	/* POLICY_HIT, POLICY_NEW, POLICY_REPLACE */
+ };
+ 
+-typedef int (*policy_walk_fn)(void *context, dm_cblock_t cblock,
+-			      dm_oblock_t oblock, uint32_t hint);
+-
+ /*
+  * The cache policy object.  Just a bunch of methods.  It is envisaged that
+  * this structure will be embedded in a bigger, policy specific structure
+@@ -158,8 +155,11 @@ struct dm_cache_policy {
+ 	int (*load_mapping)(struct dm_cache_policy *p, dm_oblock_t oblock,
+ 			    dm_cblock_t cblock, uint32_t hint, bool hint_valid);
+ 
+-	int (*walk_mappings)(struct dm_cache_policy *p, policy_walk_fn fn,
+-			     void *context);
++	/*
++	 * Gets the hint for a given cblock.  Called in a single threaded
++	 * context.  So no locking required.
++	 */
++	uint32_t (*get_hint)(struct dm_cache_policy *p, dm_cblock_t cblock);
+ 
+ 	/*
+ 	 * Override functions used on the error paths of the core target.
+-- 
+1.8.5.6
+
