@@ -1,0 +1,142 @@
+From: Alexander Duyck <alexander.h.duyck@intel.com>
+Date: Wed, 14 Dec 2016 15:05:34 -0800
+Subject: igb: update code to better handle incrementing page count
+Patch-mainline: v4.10-rc1
+Git-commit: bd4171a5d4c2827f4ae7a235389648d7c149a41b
+References: bsc#1024361 FATE#321242 bsc#1024365 FATE#321243
+
+Update the driver code so that we do bulk updates of the page reference
+count instead of just incrementing it by one reference at a time.  The
+advantage to doing this is that we cut down on atomic operations and
+this in turn should give us a slight improvement in cycles per packet.
+In addition if we eventually move this over to using build_skb the gains
+will be more noticeable.
+
+Link: http://lkml.kernel.org/r/20161110113616.76501.17072.stgit@ahduyck-blue-test.jf.intel.com
+Signed-off-by: Alexander Duyck <alexander.h.duyck@intel.com>
+Acked-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+Cc: "David S. Miller" <davem@davemloft.net>
+Cc: "James E.J. Bottomley" <jejb@parisc-linux.org>
+Cc: Chris Metcalf <cmetcalf@mellanox.com>
+Cc: David Howells <dhowells@redhat.com>
+Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+Cc: Hans-Christian Noren Egtvedt <egtvedt@samfundet.no>
+Cc: Helge Deller <deller@gmx.de>
+Cc: James Hogan <james.hogan@imgtec.com>
+Cc: Jonas Bonn <jonas@southpole.se>
+Cc: Keguang Zhang <keguang.zhang@gmail.com>
+Cc: Ley Foon Tan <lftan@altera.com>
+Cc: Mark Salter <msalter@redhat.com>
+Cc: Max Filippov <jcmvbkbc@gmail.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Michal Simek <monstr@monstr.eu>
+Cc: Ralf Baechle <ralf@linux-mips.org>
+Cc: Rich Felker <dalias@libc.org>
+Cc: Richard Kuo <rkuo@codeaurora.org>
+Cc: Russell King <linux@armlinux.org.uk>
+Cc: Steven Miao <realmz6@gmail.com>
+Cc: Tobias Klauser <tklauser@distanz.ch>
+Cc: Vineet Gupta <vgupta@synopsys.com>
+Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Benjamin Poirier <bpoirier@suse.com>
+---
+ drivers/net/ethernet/intel/igb/igb.h      |    7 ++++++-
+ drivers/net/ethernet/intel/igb/igb_main.c |   26 ++++++++++++++++++--------
+ 2 files changed, 24 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/ethernet/intel/igb/igb.h
++++ b/drivers/net/ethernet/intel/igb/igb.h
+@@ -210,7 +210,12 @@ struct igb_tx_buffer {
+ struct igb_rx_buffer {
+ 	dma_addr_t dma;
+ 	struct page *page;
+-	unsigned int page_offset;
++#if (BITS_PER_LONG > 32) || (PAGE_SIZE >= 65536)
++	__u32 page_offset;
++#else
++	__u16 page_offset;
++#endif
++	__u16 pagecnt_bias;
+ };
+ 
+ struct igb_tx_queue_stats {
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -3912,7 +3912,8 @@ static void igb_clean_rx_ring(struct igb
+ 			       buffer_info->dma,
+ 			       PAGE_SIZE,
+ 			       DMA_FROM_DEVICE);
+-		__free_page(buffer_info->page);
++		__page_frag_drain(buffer_info->page, 0,
++				  buffer_info->pagecnt_bias);
+ 
+ 		buffer_info->page = NULL;
+ 	}
+@@ -6765,13 +6766,15 @@ static bool igb_can_reuse_rx_page(struct
+ 				  struct page *page,
+ 				  unsigned int truesize)
+ {
++	unsigned int pagecnt_bias = rx_buffer->pagecnt_bias--;
++
+ 	/* avoid re-using remote pages */
+ 	if (unlikely(igb_page_is_reserved(page)))
+ 		return false;
+ 
+ #if (PAGE_SIZE < 8192)
+ 	/* if we are only owner of page we can reuse it */
+-	if (unlikely(page_count(page) != 1))
++	if (unlikely(atomic_read(&page->_count) != pagecnt_bias))
+ 		return false;
+ 
+ 	/* flip page offset to other buffer */
+@@ -6784,10 +6787,14 @@ static bool igb_can_reuse_rx_page(struct
+ 		return false;
+ #endif
+ 
+-	/* Even if we own the page, we are not allowed to use atomic_set()
+-	 * This would break get_page_unless_zero() users.
+-	 */
+-	atomic_inc(&page->_count);
++	/* If we have drained the page fragment pool we need to update
++	 * the pagecnt_bias and page count so that we fully restock the
++	 * number of references the driver holds.
++	 */
++	if (unlikely(pagecnt_bias == 1)) {
++		atomic_add(USHRT_MAX, &page->_count);
++		rx_buffer->pagecnt_bias = USHRT_MAX;
++	}
+ 
+ 	return true;
+ }
+@@ -6839,7 +6846,6 @@ static bool igb_add_rx_frag(struct igb_r
+ 			return true;
+ 
+ 		/* this page cannot be reused so discard it */
+-		__free_page(page);
+ 		return false;
+ 	}
+ 
+@@ -6910,9 +6916,12 @@ static struct sk_buff *igb_fetch_rx_buff
+ 		/* hand second half of page back to the ring */
+ 		igb_reuse_rx_page(rx_ring, rx_buffer);
+ 	} else {
+-		/* we are not reusing the buffer so unmap it */
++		/* We are not reusing the buffer so unmap it and free
++		 * any references we are holding to it
++		 */
+ 		dma_unmap_page(rx_ring->dev, rx_buffer->dma,
+ 			       PAGE_SIZE, DMA_FROM_DEVICE);
++		__page_frag_drain(page, 0, rx_buffer->pagecnt_bias);
+ 	}
+ 
+ 	/* clear contents of rx_buffer */
+@@ -7185,6 +7194,7 @@ static bool igb_alloc_mapped_page(struct
+ 	bi->dma = dma;
+ 	bi->page = page;
+ 	bi->page_offset = 0;
++	bi->pagecnt_bias = 1;
+ 
+ 	return true;
+ }
