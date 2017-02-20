@@ -1,0 +1,185 @@
+From: Jens Axboe <axboe@fb.com>
+Date: Fri, 4 Nov 2016 09:34:34 -0600
+Subject: block: move poll code to blk-mq
+References: bsc#1020989,FATE#322379
+Git-commit: bbd7bb7017d5c2b1e75f3818b4ce88fa58bb0eab
+Patch-Mainline: v4.10-rc1
+
+The poll code is blk-mq specific, let's move it to blk-mq.c. This
+is a prep patch for improving the polling code.
+
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ block/blk-core.c             | 46 -------------------------------------
+ block/blk-mq.c               | 54 ++++++++++++++++++++++++++++++++++++++++++++
+ drivers/nvme/target/io-cmd.c |  2 +-
+ fs/direct-io.c               |  2 +-
+ include/linux/blkdev.h       |  2 +-
+ 5 files changed, 57 insertions(+), 49 deletions(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 516858a..bda7c21 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -3308,52 +3308,6 @@ void blk_finish_plug(struct blk_plug *plug)
+ }
+ EXPORT_SYMBOL(blk_finish_plug);
+ 
+-bool blk_poll(struct request_queue *q, blk_qc_t cookie)
+-{
+-	struct blk_plug *plug;
+-	long state;
+-	unsigned int queue_num;
+-	struct blk_mq_hw_ctx *hctx;
+-
+-	if (!q->mq_ops || !q->mq_ops->poll || !blk_qc_t_valid(cookie) ||
+-	    !test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
+-		return false;
+-
+-	queue_num = blk_qc_t_to_queue_num(cookie);
+-	hctx = q->queue_hw_ctx[queue_num];
+-	hctx->poll_considered++;
+-
+-	plug = current->plug;
+-	if (plug)
+-		blk_flush_plug_list(plug, false);
+-
+-	state = current->state;
+-	while (!need_resched()) {
+-		int ret;
+-
+-		hctx->poll_invoked++;
+-
+-		ret = q->mq_ops->poll(hctx, blk_qc_t_to_tag(cookie));
+-		if (ret > 0) {
+-			hctx->poll_success++;
+-			set_current_state(TASK_RUNNING);
+-			return true;
+-		}
+-
+-		if (signal_pending_state(state, current))
+-			set_current_state(TASK_RUNNING);
+-
+-		if (current->state == TASK_RUNNING)
+-			return true;
+-		if (ret < 0)
+-			break;
+-		cpu_relax();
+-	}
+-
+-	return false;
+-}
+-EXPORT_SYMBOL_GPL(blk_poll);
+-
+ #ifdef CONFIG_PM
+ /**
+  * blk_pm_runtime_init - Block layer runtime PM initialization routine
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index debe635..31f0e34 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2489,6 +2489,60 @@ void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues)
+ }
+ EXPORT_SYMBOL_GPL(blk_mq_update_nr_hw_queues);
+ 
++static bool __blk_mq_poll(struct blk_mq_hw_ctx *hctx, struct request *rq)
++{
++	struct request_queue *q = hctx->queue;
++	long state;
++
++	hctx->poll_considered++;
++
++	state = current->state;
++	while (!need_resched()) {
++		int ret;
++
++		hctx->poll_invoked++;
++
++		ret = q->mq_ops->poll(hctx, rq->tag);
++		if (ret > 0) {
++			hctx->poll_success++;
++			set_current_state(TASK_RUNNING);
++			return true;
++		}
++
++		if (signal_pending_state(state, current))
++			set_current_state(TASK_RUNNING);
++
++		if (current->state == TASK_RUNNING)
++			return true;
++		if (ret < 0)
++			break;
++		cpu_relax();
++	}
++
++	return false;
++}
++
++bool blk_mq_poll(struct request_queue *q, blk_qc_t cookie)
++{
++	struct blk_mq_hw_ctx *hctx;
++	struct blk_plug *plug;
++	struct request *rq;
++
++	if (!q->mq_ops || !q->mq_ops->poll || !blk_qc_t_valid(cookie) ||
++	    !test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
++		return false;
++
++	plug = current->plug;
++	if (plug)
++		blk_flush_plug_list(plug, false);
++
++	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
++	rq = blk_mq_tag_to_rq(hctx->tags, blk_qc_t_to_tag(cookie));
++
++	return __blk_mq_poll(hctx, rq);
++}
++EXPORT_SYMBOL_GPL(blk_mq_poll);
++
+ void blk_mq_disable_hotplug(void)
+ {
+ 	mutex_lock(&all_q_mutex);
+diff --git a/drivers/nvme/target/io-cmd.c b/drivers/nvme/target/io-cmd.c
+index c2784cf..ef52b1e 100644
+--- a/drivers/nvme/target/io-cmd.c
++++ b/drivers/nvme/target/io-cmd.c
+@@ -96,7 +96,7 @@ static void nvmet_execute_rw(struct nvmet_req *req)
+ 
+ 	cookie = submit_bio(bio);
+ 
+-	blk_poll(bdev_get_queue(req->ns->bdev), cookie);
++	blk_mq_poll(bdev_get_queue(req->ns->bdev), cookie);
+ }
+ 
+ static void nvmet_execute_flush(struct nvmet_req *req)
+diff --git a/fs/direct-io.c b/fs/direct-io.c
+index 5b1e52e..92aad6c 100644
+--- a/fs/direct-io.c
++++ b/fs/direct-io.c
+@@ -453,7 +453,7 @@ static struct bio *dio_await_one(struct dio *dio)
+ 		dio->waiter = current;
+ 		spin_unlock_irqrestore(&dio->bio_lock, flags);
+ 		if (!(dio->iocb->ki_flags & IOCB_HIPRI) ||
+-		    !blk_poll(bdev_get_queue(dio->bio_bdev), dio->bio_cookie))
++		    !blk_mq_poll(bdev_get_queue(dio->bio_bdev), dio->bio_cookie))
+ 			io_schedule();
+ 		/* wake up sets us TASK_RUNNING */
+ 		spin_lock_irqsave(&dio->bio_lock, flags);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 1f3be02..de95515 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -952,7 +952,7 @@ extern int blk_execute_rq(struct request_queue *, struct gendisk *,
+ extern void blk_execute_rq_nowait(struct request_queue *, struct gendisk *,
+ 				  struct request *, int, rq_end_io_fn *);
+ 
+-bool blk_poll(struct request_queue *q, blk_qc_t cookie);
++bool blk_mq_poll(struct request_queue *q, blk_qc_t cookie);
+ 
+ static inline struct request_queue *bdev_get_queue(struct block_device *bdev)
+ {
+-- 
+1.8.5.6
+
