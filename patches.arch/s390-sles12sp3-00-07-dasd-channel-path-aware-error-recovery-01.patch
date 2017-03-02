@@ -1,0 +1,1077 @@
+From: Stefan Haberland <sth@linux.vnet.ibm.com>
+Subject: s390/dasd: extend dasd path handling
+Patch-mainline: v4.10-rc1
+Git-commit: c93461515a1a16486f4e483cb34170366fa73ea1
+References: bsc#1025481, FATE#321528, LTC#146543
+
+Summary:     s390/dasd: channel path aware error recovery
+Description: With this feature, the DASD device driver more robustly handles 
+             DASDs that are attached via multiple channel paths and are
+             subject to constant Interface-Control-Checks (IFCCs) and
+             Channel-Control-Checks (CCCs) or loss of High-Performance-FICON 
+             (HPF) functionality on one or more of these paths.
+             If a channel path does not work correctly, it is removed from
+             normal operation as long as other channel paths are available.
+             All extended error recovery states can be queried and reset via
+             user space interfaces.
+
+Upstream-Description:
+
+             s390/dasd: extend dasd path handling
+
+             Store flags and path_data per channel path.
+             Implement get/set functions for various path masks.
+             The patch does not add functional changes.
+
+             Signed-off-by: Stefan Haberland <sth@linux.vnet.ibm.com>
+             Reviewed-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+             Reviewed-by: Jan Hoeppner <hoeppner@linux.vnet.ibm.com>
+             Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+
+Signed-off-by: Stefan Haberland <sth@linux.vnet.ibm.com>
+Acked-by: John Jolly <jjolly@suse.com>
+---
+ drivers/s390/block/dasd.c          |  101 ++++-----
+ drivers/s390/block/dasd_3990_erp.c |    6 
+ drivers/s390/block/dasd_devmap.c   |   10 
+ drivers/s390/block/dasd_eckd.c     |  119 ++++-------
+ drivers/s390/block/dasd_eckd.h     |    3 
+ drivers/s390/block/dasd_erp.c      |    2 
+ drivers/s390/block/dasd_fba.c      |    2 
+ drivers/s390/block/dasd_int.h      |  381 ++++++++++++++++++++++++++++++++++++-
+ 8 files changed, 476 insertions(+), 148 deletions(-)
+
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -1454,9 +1454,9 @@ int dasd_start_IO(struct dasd_ccw_req *c
+ 	cqr->starttime = jiffies;
+ 	cqr->retries--;
+ 	if (!test_bit(DASD_CQR_VERIFY_PATH, &cqr->flags)) {
+-		cqr->lpm &= device->path_data.opm;
++		cqr->lpm &= dasd_path_get_opm(device);
+ 		if (!cqr->lpm)
+-			cqr->lpm = device->path_data.opm;
++			cqr->lpm = dasd_path_get_opm(device);
+ 	}
+ 	if (cqr->cpmode == 1) {
+ 		rc = ccw_device_tm_start(device->cdev, cqr->cpaddr,
+@@ -1489,8 +1489,8 @@ int dasd_start_IO(struct dasd_ccw_req *c
+ 			DBF_DEV_EVENT(DBF_WARNING, device,
+ 				      "start_IO: selected paths gone (%x)",
+ 				      cqr->lpm);
+-		} else if (cqr->lpm != device->path_data.opm) {
+-			cqr->lpm = device->path_data.opm;
++		} else if (cqr->lpm != dasd_path_get_opm(device)) {
++			cqr->lpm = dasd_path_get_opm(device);
+ 			DBF_DEV_EVENT(DBF_DEBUG, device, "%s",
+ 				      "start_IO: selected paths gone,"
+ 				      " retry on all paths");
+@@ -1499,11 +1499,10 @@ int dasd_start_IO(struct dasd_ccw_req *c
+ 				      "start_IO: all paths in opm gone,"
+ 				      " do path verification");
+ 			dasd_generic_last_path_gone(device);
+-			device->path_data.opm = 0;
+-			device->path_data.ppm = 0;
+-			device->path_data.npm = 0;
+-			device->path_data.tbvpm =
+-				ccw_device_get_path_mask(device->cdev);
++			dasd_path_no_path(device);
++			dasd_path_set_tbvpm(device,
++					  ccw_device_get_path_mask(
++						  device->cdev));
+ 		}
+ 		break;
+ 	case -ENODEV:
+@@ -1645,7 +1644,7 @@ void dasd_int_handler(struct ccw_device
+ 		switch (PTR_ERR(irb)) {
+ 		case -EIO:
+ 			if (cqr && cqr->status == DASD_CQR_CLEAR_PENDING) {
+-				device = (struct dasd_device *) cqr->startdev;
++				device = cqr->startdev;
+ 				cqr->status = DASD_CQR_CLEARED;
+ 				dasd_device_clear_timer(device);
+ 				wake_up(&dasd_flush_wq);
+@@ -1742,13 +1741,13 @@ void dasd_int_handler(struct ccw_device
+ 		 */
+ 		if (!test_bit(DASD_CQR_FLAGS_USE_ERP, &cqr->flags) &&
+ 		    cqr->retries > 0) {
+-			if (cqr->lpm == device->path_data.opm)
++			if (cqr->lpm == dasd_path_get_opm(device))
+ 				DBF_DEV_EVENT(DBF_DEBUG, device,
+ 					      "default ERP in fastpath "
+ 					      "(%i retries left)",
+ 					      cqr->retries);
+ 			if (!test_bit(DASD_CQR_VERIFY_PATH, &cqr->flags))
+-				cqr->lpm = device->path_data.opm;
++				cqr->lpm = dasd_path_get_opm(device);
+ 			cqr->status = DASD_CQR_QUEUED;
+ 			next = cqr;
+ 		} else
+@@ -1989,17 +1988,18 @@ static void __dasd_device_check_path_eve
+ {
+ 	int rc;
+ 
+-	if (device->path_data.tbvpm) {
+-		if (device->stopped & ~(DASD_STOPPED_DC_WAIT |
+-					DASD_UNRESUMED_PM))
+-			return;
+-		rc = device->discipline->verify_path(
+-			device, device->path_data.tbvpm);
+-		if (rc)
+-			dasd_device_set_timer(device, 50);
+-		else
+-			device->path_data.tbvpm = 0;
+-	}
++	if (!dasd_path_get_tbvpm(device))
++		return;
++
++	if (device->stopped &
++	    ~(DASD_STOPPED_DC_WAIT | DASD_UNRESUMED_PM))
++		return;
++	rc = device->discipline->verify_path(device,
++					     dasd_path_get_tbvpm(device));
++	if (rc)
++		dasd_device_set_timer(device, 50);
++	else
++		dasd_path_clear_all_verify(device);
+ };
+ 
+ /*
+@@ -3622,14 +3622,12 @@ int dasd_generic_notify(struct ccw_devic
+ 	case CIO_GONE:
+ 	case CIO_BOXED:
+ 	case CIO_NO_PATH:
+-		device->path_data.opm = 0;
+-		device->path_data.ppm = 0;
+-		device->path_data.npm = 0;
++		dasd_path_no_path(device);
+ 		ret = dasd_generic_last_path_gone(device);
+ 		break;
+ 	case CIO_OPER:
+ 		ret = 1;
+-		if (device->path_data.opm)
++		if (dasd_path_get_opm(device))
+ 			ret = dasd_generic_path_operational(device);
+ 		break;
+ 	}
+@@ -3640,48 +3638,32 @@ EXPORT_SYMBOL_GPL(dasd_generic_notify);
+ 
+ void dasd_generic_path_event(struct ccw_device *cdev, int *path_event)
+ {
+-	int chp;
+-	__u8 oldopm, eventlpm;
+ 	struct dasd_device *device;
++	int chp, oldopm;
+ 
+ 	device = dasd_device_from_cdev_locked(cdev);
+ 	if (IS_ERR(device))
+ 		return;
++
++	oldopm = dasd_path_get_opm(device);
+ 	for (chp = 0; chp < 8; chp++) {
+-		eventlpm = 0x80 >> chp;
+ 		if (path_event[chp] & PE_PATH_GONE) {
+-			oldopm = device->path_data.opm;
+-			device->path_data.opm &= ~eventlpm;
+-			device->path_data.ppm &= ~eventlpm;
+-			device->path_data.npm &= ~eventlpm;
+-			if (oldopm && !device->path_data.opm) {
+-				dev_warn(&device->cdev->dev,
+-					 "No verified channel paths remain "
+-					 "for the device\n");
+-				DBF_DEV_EVENT(DBF_WARNING, device,
+-					      "%s", "last verified path gone");
+-				dasd_eer_write(device, NULL, DASD_EER_NOPATH);
+-				dasd_device_set_stop_bits(device,
+-							  DASD_STOPPED_DC_WAIT);
+-			}
++			dasd_path_notoper(device, chp);
+ 		}
+ 		if (path_event[chp] & PE_PATH_AVAILABLE) {
+-			device->path_data.opm &= ~eventlpm;
+-			device->path_data.ppm &= ~eventlpm;
+-			device->path_data.npm &= ~eventlpm;
+-			device->path_data.tbvpm |= eventlpm;
++			dasd_path_available(device, chp);
+ 			dasd_schedule_device_bh(device);
+ 		}
+ 		if (path_event[chp] & PE_PATHGROUP_ESTABLISHED) {
+-			if (!(device->path_data.opm & eventlpm) &&
+-			    !(device->path_data.tbvpm & eventlpm)) {
++			if (!dasd_path_is_operational(device, chp) &&
++			    !dasd_path_need_verify(device, chp)) {
+ 				/*
+ 				 * we can not establish a pathgroup on an
+ 				 * unavailable path, so trigger a path
+ 				 * verification first
+ 				 */
+-				device->path_data.tbvpm |= eventlpm;
+-				dasd_schedule_device_bh(device);
++			dasd_path_available(device, chp);
++			dasd_schedule_device_bh(device);
+ 			}
+ 			DBF_DEV_EVENT(DBF_WARNING, device, "%s",
+ 				      "Pathgroup re-established\n");
+@@ -3689,17 +3671,26 @@ void dasd_generic_path_event(struct ccw_
+ 				device->discipline->kick_validate(device);
+ 		}
+ 	}
++	if (oldopm && !dasd_path_get_opm(device)) {
++		dev_warn(&device->cdev->dev,
++			 "No verified channel paths remain for the device\n");
++		DBF_DEV_EVENT(DBF_WARNING, device,
++			      "%s", "last verified path gone");
++		dasd_eer_write(device, NULL, DASD_EER_NOPATH);
++		dasd_device_set_stop_bits(device,
++					  DASD_STOPPED_DC_WAIT);
++	}
+ 	dasd_put_device(device);
+ }
+ EXPORT_SYMBOL_GPL(dasd_generic_path_event);
+ 
+ int dasd_generic_verify_path(struct dasd_device *device, __u8 lpm)
+ {
+-	if (!device->path_data.opm && lpm) {
+-		device->path_data.opm = lpm;
++	if (!dasd_path_get_opm(device) && lpm) {
++		dasd_path_set_opm(device, lpm);
+ 		dasd_generic_path_operational(device);
+ 	} else
+-		device->path_data.opm |= lpm;
++		dasd_path_add_opm(device, lpm);
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(dasd_generic_verify_path);
+--- a/drivers/s390/block/dasd_3990_erp.c
++++ b/drivers/s390/block/dasd_3990_erp.c
+@@ -152,7 +152,7 @@ dasd_3990_erp_alternate_path(struct dasd
+ 	opm = ccw_device_get_path_mask(device->cdev);
+ 	spin_unlock_irqrestore(get_ccwdev_lock(device->cdev), flags);
+ 	if (erp->lpm == 0)
+-		erp->lpm = device->path_data.opm &
++		erp->lpm = dasd_path_get_opm(device) &
+ 			~(erp->irb.esw.esw0.sublog.lpum);
+ 	else
+ 		erp->lpm &= ~(erp->irb.esw.esw0.sublog.lpum);
+@@ -273,7 +273,7 @@ static struct dasd_ccw_req *dasd_3990_er
+ 	    !test_bit(DASD_CQR_VERIFY_PATH, &erp->flags)) {
+ 		erp->status = DASD_CQR_FILLED;
+ 		erp->retries = 10;
+-		erp->lpm = erp->startdev->path_data.opm;
++		erp->lpm = dasd_path_get_opm(erp->startdev);
+ 		erp->function = dasd_3990_erp_action_1_sec;
+ 	}
+ 	return erp;
+@@ -1914,7 +1914,7 @@ dasd_3990_erp_compound_path(struct dasd_
+ 		    !test_bit(DASD_CQR_VERIFY_PATH, &erp->flags)) {
+ 			/* reset the lpm and the status to be able to
+ 			 * try further actions. */
+-			erp->lpm = erp->startdev->path_data.opm;
++			erp->lpm = dasd_path_get_opm(erp->startdev);
+ 			erp->status = DASD_CQR_NEED_ERP;
+ 		}
+ 	}
+--- a/drivers/s390/block/dasd_devmap.c
++++ b/drivers/s390/block/dasd_devmap.c
+@@ -1468,11 +1468,11 @@ static ssize_t dasd_pm_show(struct devic
+ 	if (IS_ERR(device))
+ 		return sprintf(buf, "0\n");
+ 
+-	opm = device->path_data.opm;
+-	nppm = device->path_data.npm;
+-	cablepm = device->path_data.cablepm;
+-	cuirpm = device->path_data.cuirpm;
+-	hpfpm = device->path_data.hpfpm;
++	opm = dasd_path_get_opm(device);
++	nppm = dasd_path_get_nppm(device);
++	cablepm = dasd_path_get_cablepm(device);
++	cuirpm = dasd_path_get_cuirpm(device);
++	hpfpm = dasd_path_get_hpfpm(device);
+ 	dasd_put_device(device);
+ 
+ 	return sprintf(buf, "%02x %02x %02x %02x %02x\n", opm, nppm,
+--- a/drivers/s390/block/dasd_eckd.c
++++ b/drivers/s390/block/dasd_eckd.c
+@@ -1042,8 +1042,8 @@ static void dasd_eckd_clear_conf_data(st
+ 	private->conf_data = NULL;
+ 	private->conf_len = 0;
+ 	for (i = 0; i < 8; i++) {
+-		kfree(private->path_conf_data[i]);
+-		private->path_conf_data[i] = NULL;
++		kfree(device->path[i].conf_data);
++		device->path[i].conf_data = NULL;
+ 	}
+ }
+ 
+@@ -1055,12 +1055,10 @@ static int dasd_eckd_read_conf(struct da
+ 	int rc, path_err, pos;
+ 	__u8 lpm, opm;
+ 	struct dasd_eckd_private *private, path_private;
+-	struct dasd_path *path_data;
+ 	struct dasd_uid *uid;
+ 	char print_path_uid[60], print_device_uid[60];
+ 
+ 	private = (struct dasd_eckd_private *) device->private;
+-	path_data = &device->path_data;
+ 	opm = ccw_device_get_path_mask(device->cdev);
+ 	conf_data_saved = 0;
+ 	path_err = 0;
+@@ -1081,7 +1079,7 @@ static int dasd_eckd_read_conf(struct da
+ 					"No configuration data "
+ 					"retrieved");
+ 			/* no further analysis possible */
+-			path_data->opm |= lpm;
++			dasd_path_add_opm(device, opm);
+ 			continue;	/* no error */
+ 		}
+ 		/* save first valid configuration data */
+@@ -1098,8 +1096,7 @@ static int dasd_eckd_read_conf(struct da
+ 			}
+ 			pos = pathmask_to_pos(lpm);
+ 			/* store per path conf_data */
+-			private->path_conf_data[pos] =
+-				(struct dasd_conf_data *) conf_data;
++			device->path[pos].conf_data = conf_data;
+ 			/*
+ 			 * build device UID that other path data
+ 			 * can be compared to it
+@@ -1154,37 +1151,29 @@ static int dasd_eckd_read_conf(struct da
+ 					"device %s instead of %s\n", lpm,
+ 					print_path_uid, print_device_uid);
+ 				path_err = -EINVAL;
+-				path_data->cablepm |= lpm;
++				dasd_path_add_cablepm(device, lpm);
+ 				continue;
+ 			}
+ 			pos = pathmask_to_pos(lpm);
+ 			/* store per path conf_data */
+-			private->path_conf_data[pos] =
+-				(struct dasd_conf_data *) conf_data;
++			device->path[pos].conf_data = conf_data;
+ 			path_private.conf_data = NULL;
+ 			path_private.conf_len = 0;
+ 		}
+ 		switch (dasd_eckd_path_access(conf_data, conf_len)) {
+ 		case 0x02:
+-			path_data->npm |= lpm;
++			dasd_path_add_nppm(device, lpm);
+ 			break;
+ 		case 0x03:
+-			path_data->ppm |= lpm;
++			dasd_path_add_ppm(device, lpm);
+ 			break;
+ 		}
+-		if (!path_data->opm) {
+-			path_data->opm = lpm;
++		if (!dasd_path_get_opm(device)) {
++			dasd_path_set_opm(device, lpm);
+ 			dasd_generic_path_operational(device);
+ 		} else {
+-			path_data->opm |= lpm;
++			dasd_path_add_opm(device, lpm);
+ 		}
+-		/*
+-		 * if the path is used
+-		 * it should not be in one of the negative lists
+-		 */
+-		path_data->cablepm &= ~lpm;
+-		path_data->hpfpm &= ~lpm;
+-		path_data->cuirpm &= ~lpm;
+ 	}
+ 
+ 	return path_err;
+@@ -1223,14 +1212,11 @@ static int rebuild_device_uid(struct das
+ 			      struct path_verification_work_data *data)
+ {
+ 	struct dasd_eckd_private *private;
+-	struct dasd_path *path_data;
+-	__u8 lpm, opm;
++	__u8 lpm, opm = dasd_path_get_opm(device);
+ 	int rc;
+ 
+ 	rc = -ENODEV;
+ 	private = (struct dasd_eckd_private *) device->private;
+-	path_data = &device->path_data;
+-	opm = device->path_data.opm;
+ 
+ 	for (lpm = 0x80; lpm; lpm >>= 1) {
+ 		if (!(lpm & opm))
+@@ -1362,7 +1348,7 @@ static void do_path_verification_work(st
+ 		 * in other case the device UID may have changed and
+ 		 * the first working path UID will be used as device UID
+ 		 */
+-		if (device->path_data.opm &&
++		if (dasd_path_get_opm(device) &&
+ 		    dasd_eckd_compare_path_uid(device, &path_private)) {
+ 			/*
+ 			 * the comparison was not successful
+@@ -1412,23 +1398,17 @@ static void do_path_verification_work(st
+ 		 * situation in dasd_start_IO.
+ 		 */
+ 		spin_lock_irqsave(get_ccwdev_lock(device->cdev), flags);
+-		if (!device->path_data.opm && opm) {
+-			device->path_data.opm = opm;
+-			device->path_data.cablepm &= ~opm;
+-			device->path_data.cuirpm &= ~opm;
+-			device->path_data.hpfpm &= ~opm;
++		if (!dasd_path_get_opm(device) && opm) {
++			dasd_path_set_opm(device, opm);
+ 			dasd_generic_path_operational(device);
+ 		} else {
+-			device->path_data.opm |= opm;
+-			device->path_data.cablepm &= ~opm;
+-			device->path_data.cuirpm &= ~opm;
+-			device->path_data.hpfpm &= ~opm;
+-		}
+-		device->path_data.npm |= npm;
+-		device->path_data.ppm |= ppm;
+-		device->path_data.tbvpm |= epm;
+-		device->path_data.cablepm |= cablepm;
+-		device->path_data.hpfpm |= hpfpm;
++			dasd_path_add_opm(device, opm);
++		}
++		dasd_path_add_nppm(device, npm);
++		dasd_path_add_ppm(device, ppm);
++		dasd_path_add_tbvpm(device, epm);
++		dasd_path_add_cablepm(device, cablepm);
++		dasd_path_add_nohpfpm(device, hpfpm);
+ 		spin_unlock_irqrestore(get_ccwdev_lock(device->cdev), flags);
+ 	}
+ 	clear_bit(DASD_FLAG_PATH_VERIFY, &device->flags);
+@@ -1849,13 +1829,13 @@ static void dasd_eckd_uncheck_device(str
+ 	private->gneq = NULL;
+ 	private->conf_len = 0;
+ 	for (i = 0; i < 8; i++) {
+-		kfree(private->path_conf_data[i]);
+-		if ((__u8 *)private->path_conf_data[i] ==
++		kfree(device->path[i].conf_data);
++		if ((__u8 *)device->path[i].conf_data ==
+ 		    private->conf_data) {
+ 			private->conf_data = NULL;
+ 			private->conf_len = 0;
+ 		}
+-		private->path_conf_data[i] = NULL;
++		device->path[i].conf_data = NULL;
+ 	}
+ 	kfree(private->conf_data);
+ 	private->conf_data = NULL;
+@@ -2509,7 +2489,7 @@ static void dasd_eckd_handle_terminated_
+ 	if (cqr->block && (cqr->startdev != cqr->block->base)) {
+ 		dasd_eckd_reset_ccw_to_base_io(cqr);
+ 		cqr->startdev = cqr->block->base;
+-		cqr->lpm = cqr->block->base->path_data.opm;
++		cqr->lpm = dasd_path_get_opm(cqr->block->base);
+ 	}
+ };
+ 
+@@ -2783,7 +2763,7 @@ static struct dasd_ccw_req *dasd_eckd_bu
+ 	cqr->memdev = startdev;
+ 	cqr->block = block;
+ 	cqr->expires = startdev->default_expires * HZ;	/* default 5 minutes */
+-	cqr->lpm = startdev->path_data.ppm;
++	cqr->lpm = dasd_path_get_ppm(startdev);
+ 	cqr->retries = startdev->default_retries;
+ 	cqr->buildclk = get_tod_clock();
+ 	cqr->status = DASD_CQR_FILLED;
+@@ -2958,7 +2938,7 @@ static struct dasd_ccw_req *dasd_eckd_bu
+ 	cqr->memdev = startdev;
+ 	cqr->block = block;
+ 	cqr->expires = startdev->default_expires * HZ;	/* default 5 minutes */
+-	cqr->lpm = startdev->path_data.ppm;
++	cqr->lpm = dasd_path_get_ppm(startdev);
+ 	cqr->retries = startdev->default_retries;
+ 	cqr->buildclk = get_tod_clock();
+ 	cqr->status = DASD_CQR_FILLED;
+@@ -3251,7 +3231,7 @@ static struct dasd_ccw_req *dasd_eckd_bu
+ 	cqr->memdev = startdev;
+ 	cqr->block = block;
+ 	cqr->expires = startdev->default_expires * HZ;	/* default 5 minutes */
+-	cqr->lpm = startdev->path_data.ppm;
++	cqr->lpm = dasd_path_get_ppm(startdev);
+ 	cqr->retries = startdev->default_retries;
+ 	cqr->buildclk = get_tod_clock();
+ 	cqr->status = DASD_CQR_FILLED;
+@@ -3478,7 +3458,7 @@ static struct dasd_ccw_req *dasd_raw_bui
+ 	cqr->memdev = startdev;
+ 	cqr->block = block;
+ 	cqr->expires = startdev->default_expires * HZ;
+-	cqr->lpm = startdev->path_data.ppm;
++	cqr->lpm = dasd_path_get_ppm(startdev);
+ 	cqr->retries = startdev->default_retries;
+ 	cqr->buildclk = get_tod_clock();
+ 	cqr->status = DASD_CQR_FILLED;
+@@ -4860,21 +4840,19 @@ static struct dasd_conf_data *dasd_eckd_
+ 						     __u8 lpum,
+ 						     struct dasd_cuir_message *cuir)
+ {
+-	struct dasd_eckd_private *private;
+ 	struct dasd_conf_data *conf_data;
+ 	int path, pos;
+ 
+-	private = (struct dasd_eckd_private *) device->private;
+ 	if (cuir->record_selector == 0)
+ 		goto out;
+ 	for (path = 0x80, pos = 0; path; path >>= 1, pos++) {
+-		conf_data = private->path_conf_data[pos];
++		conf_data = device->path[pos].conf_data;
+ 		if (conf_data->gneq.record_selector ==
+ 		    cuir->record_selector)
+ 			return conf_data;
+ 	}
+ out:
+-	return private->path_conf_data[pathmask_to_pos(lpum)];
++	return device->path[pathmask_to_pos(lpum)].conf_data;
+ }
+ 
+ /*
+@@ -4891,7 +4869,6 @@ static int dasd_eckd_cuir_scope(struct d
+ {
+ 	struct dasd_conf_data *ref_conf_data;
+ 	unsigned long bitmask = 0, mask = 0;
+-	struct dasd_eckd_private *private;
+ 	struct dasd_conf_data *conf_data;
+ 	unsigned int pos, path;
+ 	char *ref_gneq, *gneq;
+@@ -4904,7 +4881,6 @@ static int dasd_eckd_cuir_scope(struct d
+ 	    !(cuir->neq_map[0] | cuir->neq_map[1] | cuir->neq_map[2]))
+ 		return lpum;
+ 
+-	private = (struct dasd_eckd_private *) device->private;
+ 	/* get reference conf data */
+ 	ref_conf_data = dasd_eckd_get_ref_conf(device, lpum, cuir);
+ 	/* reference ned is determined by ned_map field */
+@@ -4916,11 +4892,10 @@ static int dasd_eckd_cuir_scope(struct d
+ 	mask |= cuir->neq_map[1] << 8;
+ 	mask |= cuir->neq_map[0] << 16;
+ 
+-	for (path = 0x80; path; path >>= 1) {
++	for (path = 0; path < 8; path++) {
+ 		/* initialise data per path */
+ 		bitmask = mask;
+-		pos = pathmask_to_pos(path);
+-		conf_data = private->path_conf_data[pos];
++		conf_data = device->path[path].conf_data;
+ 		pos = 8 - ffs(cuir->ned_map);
+ 		ned = (char *) &conf_data->neds[pos];
+ 		/* compare reference ned and per path ned */
+@@ -4941,7 +4916,7 @@ static int dasd_eckd_cuir_scope(struct d
+ 			continue;
+ 		/* device and path match the reference values
+ 		   add path to CUIR scope */
+-		tbcpm |= path;
++		tbcpm |= 0x80 >> path;
+ 	}
+ 	return tbcpm;
+ }
+@@ -4978,16 +4953,16 @@ static int dasd_eckd_cuir_remove_path(st
+ 
+ 	tbcpm = dasd_eckd_cuir_scope(device, lpum, cuir);
+ 	/* nothing to do if path is not in use */
+-	if (!(device->path_data.opm & tbcpm))
++	if (!(dasd_path_get_opm(device) & tbcpm))
+ 		return 0;
+-	if (!(device->path_data.opm & ~tbcpm)) {
++	if (!(dasd_path_get_opm(device) & ~tbcpm)) {
+ 		/* no path would be left if the CUIR action is taken
+ 		   return error */
+ 		return -EINVAL;
+ 	}
+ 	/* remove device from operational path mask */
+-	device->path_data.opm &= ~tbcpm;
+-	device->path_data.cuirpm |= tbcpm;
++	dasd_path_remove_opm(device, tbcpm);
++	dasd_path_add_cuirpm(device, tbcpm);
+ 	return tbcpm;
+ }
+ 
+@@ -5082,8 +5057,8 @@ static int dasd_eckd_cuir_resume(struct
+ 				 alias_list) {
+ 		tbcpm = dasd_eckd_cuir_scope(dev, lpum, cuir);
+ 		paths |= tbcpm;
+-		if (!(dev->path_data.opm & tbcpm)) {
+-			dev->path_data.tbvpm |= tbcpm;
++		if (!(dasd_path_get_opm(dev) & tbcpm)) {
++			dasd_path_add_tbvpm(dev, tbcpm);
+ 			dasd_schedule_device_bh(dev);
+ 		}
+ 	}
+@@ -5092,8 +5067,8 @@ static int dasd_eckd_cuir_resume(struct
+ 				 alias_list) {
+ 		tbcpm = dasd_eckd_cuir_scope(dev, lpum, cuir);
+ 		paths |= tbcpm;
+-		if (!(dev->path_data.opm & tbcpm)) {
+-			dev->path_data.tbvpm |= tbcpm;
++		if (!(dasd_path_get_opm(dev) & tbcpm)) {
++			dasd_path_add_tbvpm(dev, tbcpm);
+ 			dasd_schedule_device_bh(dev);
+ 		}
+ 	}
+@@ -5106,8 +5081,8 @@ static int dasd_eckd_cuir_resume(struct
+ 					 alias_list) {
+ 			tbcpm = dasd_eckd_cuir_scope(dev, lpum, cuir);
+ 			paths |= tbcpm;
+-			if (!(dev->path_data.opm & tbcpm)) {
+-				dev->path_data.tbvpm |= tbcpm;
++			if (!(dasd_path_get_opm(dev) & tbcpm)) {
++				dasd_path_add_tbvpm(dev, tbcpm);
+ 				dasd_schedule_device_bh(dev);
+ 			}
+ 		}
+@@ -5116,8 +5091,8 @@ static int dasd_eckd_cuir_resume(struct
+ 					 alias_list) {
+ 			tbcpm = dasd_eckd_cuir_scope(dev, lpum, cuir);
+ 			paths |= tbcpm;
+-			if (!(dev->path_data.opm & tbcpm)) {
+-				dev->path_data.tbvpm |= tbcpm;
++			if (!(dasd_path_get_opm(dev) & tbcpm)) {
++				dasd_path_add_tbvpm(dev, tbcpm);
+ 				dasd_schedule_device_bh(dev);
+ 			}
+ 		}
+--- a/drivers/s390/block/dasd_eckd.h
++++ b/drivers/s390/block/dasd_eckd.h
+@@ -534,8 +534,7 @@ struct dasd_eckd_private {
+ 	struct dasd_eckd_characteristics rdc_data;
+ 	u8 *conf_data;
+ 	int conf_len;
+-	/* per path configuration data */
+-	struct dasd_conf_data *path_conf_data[8];
++
+ 	/* pointers to specific parts in the conf_data */
+ 	struct dasd_ned *ned;
+ 	struct dasd_sneq *sneq;
+--- a/drivers/s390/block/dasd_erp.c
++++ b/drivers/s390/block/dasd_erp.c
+@@ -96,7 +96,7 @@ dasd_default_erp_action(struct dasd_ccw_
+                              "default ERP called (%i retries left)",
+                              cqr->retries);
+ 		if (!test_bit(DASD_CQR_VERIFY_PATH, &cqr->flags))
+-			cqr->lpm = device->path_data.opm;
++			cqr->lpm = dasd_path_get_opm(device);
+ 		cqr->status = DASD_CQR_FILLED;
+         } else {
+ 		pr_err("%s: default ERP has run out of retries and failed\n",
+--- a/drivers/s390/block/dasd_fba.c
++++ b/drivers/s390/block/dasd_fba.c
+@@ -170,7 +170,7 @@ dasd_fba_check_characteristics(struct da
+ 
+ 	device->default_expires = DASD_EXPIRES;
+ 	device->default_retries = FBA_DEFAULT_RETRIES;
+-	device->path_data.opm = LPM_ANYPATH;
++	dasd_path_set_opm(device, LPM_ANYPATH);
+ 
+ 	readonly = dasd_device_is_ro(device);
+ 	if (readonly)
+--- a/drivers/s390/block/dasd_int.h
++++ b/drivers/s390/block/dasd_int.h
+@@ -55,6 +55,7 @@
+ #include <asm/debug.h>
+ #include <asm/dasd.h>
+ #include <asm/idals.h>
++#include <linux/bitops.h>
+ 
+ /* DASD discipline magic */
+ #define DASD_ECKD_MAGIC 0xC5C3D2C4
+@@ -380,17 +381,23 @@ extern struct dasd_discipline *dasd_diag
+ #define DASD_EER_STATECHANGE 3
+ #define DASD_EER_PPRCSUSPEND 4
+ 
++/* DASD path handling */
++
++#define DASD_PATH_OPERATIONAL  1
++#define DASD_PATH_TBV	       2
++#define DASD_PATH_PP	       3
++#define DASD_PATH_NPP	       4
++#define DASD_PATH_MISCABLED    5
++#define DASD_PATH_NOHPF        6
++#define DASD_PATH_CUIR	       7
++
++
+ struct dasd_path {
+-	__u8 opm;
+-	__u8 tbvpm;
+-	__u8 ppm;
+-	__u8 npm;
+-	/* paths that are not used because of a special condition */
+-	__u8 cablepm; /* miss-cabled */
+-	__u8 hpfpm;   /* the HPF requirements of the other paths are not met */
+-	__u8 cuirpm;  /* CUIR varied offline */
++	unsigned long flags;
++	struct dasd_conf_data *conf_data;
+ };
+ 
++
+ struct dasd_profile_info {
+ 	/* legacy part of profile data, as in dasd_profile_info_t */
+ 	unsigned int dasd_io_reqs;	 /* number of requests processed */
+@@ -441,7 +448,8 @@ struct dasd_device {
+ 	struct dasd_discipline *discipline;
+ 	struct dasd_discipline *base_discipline;
+ 	char *private;
+-	struct dasd_path path_data;
++	struct dasd_path path[8];
++	__u8 opm;
+ 
+ 	/* Device state and target state. */
+ 	int state, target;
+@@ -815,4 +823,359 @@ static inline int dasd_eer_enabled(struc
+ #define dasd_eer_enabled(d)	(0)
+ #endif	/* CONFIG_DASD_ERR */
+ 
++
++/* DASD path handling functions */
++
++/*
++ * helper functions to modify bit masks for a given channel path for a device
++ */
++static inline int dasd_path_is_operational(struct dasd_device *device, int chp)
++{
++	return test_bit(DASD_PATH_OPERATIONAL, &device->path[chp].flags);
++}
++
++static inline int dasd_path_need_verify(struct dasd_device *device, int chp)
++{
++	return test_bit(DASD_PATH_TBV, &device->path[chp].flags);
++}
++
++static inline void dasd_path_verify(struct dasd_device *device, int chp)
++{
++	__set_bit(DASD_PATH_TBV, &device->path[chp].flags);
++}
++
++static inline void dasd_path_clear_verify(struct dasd_device *device, int chp)
++{
++	__clear_bit(DASD_PATH_TBV, &device->path[chp].flags);
++}
++
++static inline void dasd_path_clear_all_verify(struct dasd_device *device)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++)
++		dasd_path_clear_verify(device, chp);
++}
++
++static inline void dasd_path_operational(struct dasd_device *device, int chp)
++{
++	__set_bit(DASD_PATH_OPERATIONAL, &device->path[chp].flags);
++	device->opm |= (0x80 >> chp);
++}
++
++static inline void dasd_path_nonpreferred(struct dasd_device *device, int chp)
++{
++	__set_bit(DASD_PATH_NPP, &device->path[chp].flags);
++}
++
++static inline int dasd_path_is_nonpreferred(struct dasd_device *device, int chp)
++{
++	return test_bit(DASD_PATH_NPP, &device->path[chp].flags);
++}
++
++static inline void dasd_path_clear_nonpreferred(struct dasd_device *device,
++						int chp)
++{
++	__clear_bit(DASD_PATH_NPP, &device->path[chp].flags);
++}
++
++static inline void dasd_path_preferred(struct dasd_device *device, int chp)
++{
++	__set_bit(DASD_PATH_PP, &device->path[chp].flags);
++}
++
++static inline int dasd_path_is_preferred(struct dasd_device *device, int chp)
++{
++	return test_bit(DASD_PATH_PP, &device->path[chp].flags);
++}
++
++static inline void dasd_path_clear_preferred(struct dasd_device *device,
++					     int chp)
++{
++	__clear_bit(DASD_PATH_PP, &device->path[chp].flags);
++}
++
++static inline void dasd_path_clear_oper(struct dasd_device *device, int chp)
++{
++	__clear_bit(DASD_PATH_OPERATIONAL, &device->path[chp].flags);
++	device->opm &= ~(0x80 >> chp);
++}
++
++static inline void dasd_path_clear_cable(struct dasd_device *device, int chp)
++{
++	__clear_bit(DASD_PATH_MISCABLED, &device->path[chp].flags);
++}
++
++static inline void dasd_path_cuir(struct dasd_device *device, int chp)
++{
++	__set_bit(DASD_PATH_CUIR, &device->path[chp].flags);
++}
++
++static inline int dasd_path_is_cuir(struct dasd_device *device, int chp)
++{
++	return test_bit(DASD_PATH_CUIR, &device->path[chp].flags);
++}
++
++static inline void dasd_path_clear_cuir(struct dasd_device *device, int chp)
++{
++	__clear_bit(DASD_PATH_CUIR, &device->path[chp].flags);
++}
++
++static inline void dasd_path_clear_nohpf(struct dasd_device *device, int chp)
++{
++	__clear_bit(DASD_PATH_NOHPF, &device->path[chp].flags);
++}
++
++static inline void dasd_path_miscabled(struct dasd_device *device, int chp)
++{
++	__set_bit(DASD_PATH_MISCABLED, &device->path[chp].flags);
++}
++
++static inline int dasd_path_is_miscabled(struct dasd_device *device, int chp)
++{
++	return test_bit(DASD_PATH_MISCABLED, &device->path[chp].flags);
++}
++
++static inline void dasd_path_nohpf(struct dasd_device *device, int chp)
++{
++	__set_bit(DASD_PATH_NOHPF, &device->path[chp].flags);
++}
++
++static inline int dasd_path_is_nohpf(struct dasd_device *device, int chp)
++{
++	return test_bit(DASD_PATH_NOHPF, &device->path[chp].flags);
++}
++
++/*
++ * get functions for path masks
++ * will return a path masks for the given device
++ */
++
++static inline __u8 dasd_path_get_opm(struct dasd_device *device)
++{
++	return device->opm;
++}
++
++static inline __u8 dasd_path_get_tbvpm(struct dasd_device *device)
++{
++	int chp;
++	__u8 tbvpm = 0x00;
++
++	for (chp = 0; chp < 8; chp++)
++		if (dasd_path_need_verify(device, chp))
++			tbvpm |= 0x80 >> chp;
++	return tbvpm;
++}
++
++static inline __u8 dasd_path_get_nppm(struct dasd_device *device)
++{
++	int chp;
++	__u8 npm = 0x00;
++
++	for (chp = 0; chp < 8; chp++) {
++		if (dasd_path_is_nonpreferred(device, chp))
++			npm |= 0x80 >> chp;
++	}
++	return npm;
++}
++
++static inline __u8 dasd_path_get_ppm(struct dasd_device *device)
++{
++	int chp;
++	__u8 ppm = 0x00;
++
++	for (chp = 0; chp < 8; chp++)
++		if (dasd_path_is_preferred(device, chp))
++			ppm |= 0x80 >> chp;
++	return ppm;
++}
++
++static inline __u8 dasd_path_get_cablepm(struct dasd_device *device)
++{
++	int chp;
++	__u8 cablepm = 0x00;
++
++	for (chp = 0; chp < 8; chp++)
++		if (dasd_path_is_miscabled(device, chp))
++			cablepm |= 0x80 >> chp;
++	return cablepm;
++}
++
++static inline __u8 dasd_path_get_cuirpm(struct dasd_device *device)
++{
++	int chp;
++	__u8 cuirpm = 0x00;
++
++	for (chp = 0; chp < 8; chp++)
++		if (dasd_path_is_cuir(device, chp))
++			cuirpm |= 0x80 >> chp;
++	return cuirpm;
++}
++
++static inline __u8 dasd_path_get_hpfpm(struct dasd_device *device)
++{
++	int chp;
++	__u8 hpfpm = 0x00;
++
++	for (chp = 0; chp < 8; chp++)
++		if (dasd_path_is_nohpf(device, chp))
++			hpfpm |= 0x80 >> chp;
++	return hpfpm;
++}
++
++/*
++ * add functions for path masks
++ * the existing path mask will be extended by the given path mask
++ */
++static inline void dasd_path_add_tbvpm(struct dasd_device *device, __u8 pm)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++)
++		if (pm & (0x80 >> chp))
++			dasd_path_verify(device, chp);
++}
++
++static inline void dasd_path_add_opm(struct dasd_device *device, __u8 pm)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++)
++		if (pm & (0x80 >> chp)) {
++			dasd_path_operational(device, chp);
++			/*
++			 * if the path is used
++			 * it should not be in one of the negative lists
++			 */
++			dasd_path_clear_nohpf(device, chp);
++			dasd_path_clear_cuir(device, chp);
++			dasd_path_clear_cable(device, chp);
++		}
++}
++
++static inline void dasd_path_add_cablepm(struct dasd_device *device, __u8 pm)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++)
++		if (pm & (0x80 >> chp))
++			dasd_path_miscabled(device, chp);
++}
++
++static inline void dasd_path_add_cuirpm(struct dasd_device *device, __u8 pm)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++)
++		if (pm & (0x80 >> chp))
++			dasd_path_cuir(device, chp);
++}
++
++static inline void dasd_path_add_nppm(struct dasd_device *device, __u8 pm)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++)
++		if (pm & (0x80 >> chp))
++			dasd_path_nonpreferred(device, chp);
++}
++
++static inline void dasd_path_add_nohpfpm(struct dasd_device *device, __u8 pm)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++)
++		if (pm & (0x80 >> chp))
++			dasd_path_nohpf(device, chp);
++}
++
++static inline void dasd_path_add_ppm(struct dasd_device *device, __u8 pm)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++)
++		if (pm & (0x80 >> chp))
++			dasd_path_preferred(device, chp);
++}
++
++/*
++ * set functions for path masks
++ * the existing path mask will be replaced by the given path mask
++ */
++static inline void dasd_path_set_tbvpm(struct dasd_device *device, __u8 pm)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++)
++		if (pm & (0x80 >> chp))
++			dasd_path_verify(device, chp);
++		else
++			dasd_path_clear_verify(device, chp);
++}
++
++static inline void dasd_path_set_opm(struct dasd_device *device, __u8 pm)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++) {
++		dasd_path_clear_oper(device, chp);
++		if (pm & (0x80 >> chp)) {
++			dasd_path_operational(device, chp);
++			/*
++			 * if the path is used
++			 * it should not be in one of the negative lists
++			 */
++			dasd_path_clear_nohpf(device, chp);
++			dasd_path_clear_cuir(device, chp);
++			dasd_path_clear_cable(device, chp);
++		}
++	}
++}
++
++/*
++ * remove functions for path masks
++ * the existing path mask will be cleared with the given path mask
++ */
++static inline void dasd_path_remove_opm(struct dasd_device *device, __u8 pm)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++) {
++		if (pm & (0x80 >> chp))
++			dasd_path_clear_oper(device, chp);
++	}
++}
++
++/*
++ * add the newly available path to the to be verified pm and remove it from
++ * normal operation until it is verified
++ */
++static inline void dasd_path_available(struct dasd_device *device, int chp)
++{
++	dasd_path_clear_oper(device, chp);
++	dasd_path_verify(device, chp);
++}
++
++static inline void dasd_path_notoper(struct dasd_device *device, int chp)
++{
++	dasd_path_clear_oper(device, chp);
++	dasd_path_clear_preferred(device, chp);
++	dasd_path_clear_nonpreferred(device, chp);
++}
++
++/*
++ * remove all paths from normal operation
++ */
++static inline void dasd_path_no_path(struct dasd_device *device)
++{
++	int chp;
++
++	for (chp = 0; chp < 8; chp++)
++		dasd_path_notoper(device, chp);
++
++	dasd_path_clear_all_verify(device);
++}
++
++/* end - path handling */
++
+ #endif				/* DASD_H */
