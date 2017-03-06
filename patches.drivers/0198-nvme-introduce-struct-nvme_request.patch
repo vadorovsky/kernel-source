@@ -1,0 +1,535 @@
+From 64e832c2d75e94128776f22b37d711c36888001a Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@lst.de>
+Date: Thu, 10 Nov 2016 07:32:33 -0800
+Subject: nvme: introduce struct nvme_request
+References: bsc#993388, FATE#321732
+Git-commit: d49187e97e94e2eb613cb6fed810356972077cc3
+Patch-mainline: v4.10-rc1
+
+This adds a shared per-request structure for all NVMe I/O.  This structure
+is embedded as the first member in all NVMe transport drivers request
+private data and allows to implement common functionality between the
+drivers.
+
+The first use is to replace the current abuse of the SCSI command
+passthrough fields in struct request for the NVMe command passthrough,
+but it will grow a field more fields to allow implementing things
+like common abort handlers in the future.
+
+The passthrough commands are handled by having a pointer to the SQE
+(struct nvme_command) in struct nvme_request, and the union of the
+possible result fields, which had to be turned from an anonymous
+into a named union for that purpose.  This avoids having to pass
+a reference to a full CQE around and thus makes checking the result
+a lot more lightweight.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Keith Busch <keith.busch@intel.com>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Signed-off-by: Johannes Thumshirn <jthumshirn@suse.de>
+
+---
+ drivers/nvme/host/core.c          |   28 +++++++++++++---------------
+ drivers/nvme/host/fabrics.c       |   26 +++++++++++++-------------
+ drivers/nvme/host/nvme.h          |   16 +++++++++++++++-
+ drivers/nvme/host/pci.c           |    4 ++--
+ drivers/nvme/host/rdma.c          |   11 +++--------
+ drivers/nvme/target/core.c        |    8 ++++----
+ drivers/nvme/target/fabrics-cmd.c |   14 +++++++-------
+ drivers/nvme/target/loop.c        |   12 ++++++------
+ drivers/nvme/target/nvmet.h       |    2 +-
+ include/linux/nvme.h              |   10 +++++-----
+ 10 files changed, 69 insertions(+), 62 deletions(-)
+
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -229,8 +229,7 @@ struct request *nvme_alloc_request(struc
+ 	req->__sector = (sector_t) -1;
+ 	req->bio = req->biotail = NULL;
+ 
+-	req->cmd = (unsigned char *)cmd;
+-	req->cmd_len = sizeof(struct nvme_command);
++	nvme_req(req)->cmd = cmd;
+ 
+ 	return req;
+ }
+@@ -329,7 +328,7 @@ int nvme_setup_cmd(struct nvme_ns *ns, s
+ 	int ret = 0;
+ 
+ 	if (req->cmd_type == REQ_TYPE_DRV_PRIV)
+-		memcpy(cmd, req->cmd, sizeof(*cmd));
++		memcpy(cmd, nvme_req(req)->cmd, sizeof(*cmd));
+ 	else if (req->cmd_flags & REQ_FLUSH)
+ 		nvme_setup_flush(ns, cmd);
+ 	else if (req->cmd_flags & REQ_DISCARD)
+@@ -346,7 +345,7 @@ EXPORT_SYMBOL_GPL(nvme_setup_cmd);
+  * if the result is positive, it's an NVM Express status code
+  */
+ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+-		struct nvme_completion *cqe, void *buffer, unsigned bufflen,
++		union nvme_result *result, void *buffer, unsigned bufflen,
+ 		unsigned timeout, int qid, int at_head, int flags)
+ {
+ 	struct request *req;
+@@ -357,7 +356,6 @@ int __nvme_submit_sync_cmd(struct reques
+ 		return PTR_ERR(req);
+ 
+ 	req->timeout = timeout ? timeout : ADMIN_TIMEOUT;
+-	req->special = cqe;
+ 
+ 	if (buffer && bufflen) {
+ 		ret = blk_rq_map_kern(q, req, buffer, bufflen, GFP_KERNEL);
+@@ -366,6 +364,8 @@ int __nvme_submit_sync_cmd(struct reques
+ 	}
+ 
+ 	blk_execute_rq(req->q, NULL, req, at_head);
++	if (result)
++		*result = nvme_req(req)->result;
+ 	ret = req->errors;
+  out:
+ 	blk_mq_free_request(req);
+@@ -387,7 +387,6 @@ int __nvme_submit_user_cmd(struct reques
+ 		u32 *result, unsigned timeout)
+ {
+ 	bool write = nvme_is_write(cmd);
+-	struct nvme_completion cqe;
+ 	struct nvme_ns *ns = q->queuedata;
+ 	struct gendisk *disk = ns ? ns->disk : NULL;
+ 	struct request *req;
+@@ -400,7 +399,6 @@ int __nvme_submit_user_cmd(struct reques
+ 		return PTR_ERR(req);
+ 
+ 	req->timeout = timeout ? timeout : ADMIN_TIMEOUT;
+-	req->special = &cqe;
+ 
+ 	if (ubuffer && bufflen) {
+ 		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen,
+@@ -455,7 +453,7 @@ int __nvme_submit_user_cmd(struct reques
+ 	blk_execute_rq(req->q, disk, req, 0);
+ 	ret = req->errors;
+ 	if (result)
+-		*result = le32_to_cpu(cqe.result);
++		*result = le32_to_cpu(nvme_req(req)->result.u32);
+ 	if (meta && !ret && !write) {
+ 		if (copy_to_user(meta_buffer, meta, meta_len))
+ 			ret = -EFAULT;
+@@ -604,7 +602,7 @@ int nvme_get_features(struct nvme_ctrl *
+ 		      void *buffer, size_t buflen, u32 *result)
+ {
+ 	struct nvme_command c;
+-	struct nvme_completion cqe;
++	union nvme_result res;
+ 	int ret;
+ 
+ 	memset(&c, 0, sizeof(c));
+@@ -612,10 +610,10 @@ int nvme_get_features(struct nvme_ctrl *
+ 	c.features.nsid = cpu_to_le32(nsid);
+ 	c.features.fid = cpu_to_le32(fid);
+ 
+-	ret = __nvme_submit_sync_cmd(dev->admin_q, &c, &cqe, buffer, buflen, 0,
++	ret = __nvme_submit_sync_cmd(dev->admin_q, &c, &res, buffer, buflen, 0,
+ 			NVME_QID_ANY, 0, 0);
+ 	if (ret >= 0 && result)
+-		*result = le32_to_cpu(cqe.result);
++		*result = le32_to_cpu(res.u32);
+ 	return ret;
+ }
+ 
+@@ -623,7 +621,7 @@ int nvme_set_features(struct nvme_ctrl *
+ 		      void *buffer, size_t buflen, u32 *result)
+ {
+ 	struct nvme_command c;
+-	struct nvme_completion cqe;
++	union nvme_result res;
+ 	int ret;
+ 
+ 	memset(&c, 0, sizeof(c));
+@@ -631,10 +629,10 @@ int nvme_set_features(struct nvme_ctrl *
+ 	c.features.fid = cpu_to_le32(fid);
+ 	c.features.dword11 = cpu_to_le32(dword11);
+ 
+-	ret = __nvme_submit_sync_cmd(dev->admin_q, &c, &cqe,
++	ret = __nvme_submit_sync_cmd(dev->admin_q, &c, &res,
+ 			buffer, buflen, 0, NVME_QID_ANY, 0, 0);
+ 	if (ret >= 0 && result)
+-		*result = le32_to_cpu(cqe.result);
++		*result = le32_to_cpu(res.u32);
+ 	return ret;
+ }
+ 
+@@ -1885,7 +1883,7 @@ void nvme_complete_async_event(struct nv
+ 		struct nvme_completion *cqe)
+ {
+ 	u16 status = le16_to_cpu(cqe->status) >> 1;
+-	u32 result = le32_to_cpu(cqe->result);
++	u32 result = le32_to_cpu(cqe->result.u32);
+ 
+ 	if (status == NVME_SC_SUCCESS || status == NVME_SC_ABORT_REQ) {
+ 		++ctrl->event_limit;
+--- a/drivers/nvme/host/fabrics.c
++++ b/drivers/nvme/host/fabrics.c
+@@ -159,7 +159,7 @@ EXPORT_SYMBOL_GPL(nvmf_get_subsysnqn);
+ int nvmf_reg_read32(struct nvme_ctrl *ctrl, u32 off, u32 *val)
+ {
+ 	struct nvme_command cmd;
+-	struct nvme_completion cqe;
++	union nvme_result res;
+ 	int ret;
+ 
+ 	memset(&cmd, 0, sizeof(cmd));
+@@ -167,11 +167,11 @@ int nvmf_reg_read32(struct nvme_ctrl *ct
+ 	cmd.prop_get.fctype = nvme_fabrics_type_property_get;
+ 	cmd.prop_get.offset = cpu_to_le32(off);
+ 
+-	ret = __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, &cqe, NULL, 0, 0,
++	ret = __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, &res, NULL, 0, 0,
+ 			NVME_QID_ANY, 0, 0);
+ 
+ 	if (ret >= 0)
+-		*val = le64_to_cpu(cqe.result64);
++		*val = le64_to_cpu(res.u64);
+ 	if (unlikely(ret != 0))
+ 		dev_err(ctrl->device,
+ 			"Property Get error: %d, offset %#x\n",
+@@ -205,7 +205,7 @@ EXPORT_SYMBOL_GPL(nvmf_reg_read32);
+ int nvmf_reg_read64(struct nvme_ctrl *ctrl, u32 off, u64 *val)
+ {
+ 	struct nvme_command cmd;
+-	struct nvme_completion cqe;
++	union nvme_result res;
+ 	int ret;
+ 
+ 	memset(&cmd, 0, sizeof(cmd));
+@@ -214,11 +214,11 @@ int nvmf_reg_read64(struct nvme_ctrl *ct
+ 	cmd.prop_get.attrib = 1;
+ 	cmd.prop_get.offset = cpu_to_le32(off);
+ 
+-	ret = __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, &cqe, NULL, 0, 0,
++	ret = __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, &res, NULL, 0, 0,
+ 			NVME_QID_ANY, 0, 0);
+ 
+ 	if (ret >= 0)
+-		*val = le64_to_cpu(cqe.result64);
++		*val = le64_to_cpu(res.u64);
+ 	if (unlikely(ret != 0))
+ 		dev_err(ctrl->device,
+ 			"Property Get error: %d, offset %#x\n",
+@@ -366,7 +366,7 @@ static void nvmf_log_connect_error(struc
+ int nvmf_connect_admin_queue(struct nvme_ctrl *ctrl)
+ {
+ 	struct nvme_command cmd;
+-	struct nvme_completion cqe;
++	union nvme_result res;
+ 	struct nvmf_connect_data *data;
+ 	int ret;
+ 
+@@ -391,16 +391,16 @@ int nvmf_connect_admin_queue(struct nvme
+ 	strncpy(data->subsysnqn, ctrl->opts->subsysnqn, NVMF_NQN_SIZE);
+ 	strncpy(data->hostnqn, ctrl->opts->host->nqn, NVMF_NQN_SIZE);
+ 
+-	ret = __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, &cqe,
++	ret = __nvme_submit_sync_cmd(ctrl->admin_q, &cmd, &res,
+ 			data, sizeof(*data), 0, NVME_QID_ANY, 1,
+ 			BLK_MQ_REQ_RESERVED | BLK_MQ_REQ_NOWAIT);
+ 	if (ret) {
+-		nvmf_log_connect_error(ctrl, ret, le32_to_cpu(cqe.result),
++		nvmf_log_connect_error(ctrl, ret, le32_to_cpu(res.u32),
+ 				       &cmd, data);
+ 		goto out_free_data;
+ 	}
+ 
+-	ctrl->cntlid = le16_to_cpu(cqe.result16);
++	ctrl->cntlid = le16_to_cpu(res.u16);
+ 
+ out_free_data:
+ 	kfree(data);
+@@ -432,7 +432,7 @@ int nvmf_connect_io_queue(struct nvme_ct
+ {
+ 	struct nvme_command cmd;
+ 	struct nvmf_connect_data *data;
+-	struct nvme_completion cqe;
++	union nvme_result res;
+ 	int ret;
+ 
+ 	memset(&cmd, 0, sizeof(cmd));
+@@ -450,11 +450,11 @@ int nvmf_connect_io_queue(struct nvme_ct
+ 	strncpy(data->subsysnqn, ctrl->opts->subsysnqn, NVMF_NQN_SIZE);
+ 	strncpy(data->hostnqn, ctrl->opts->host->nqn, NVMF_NQN_SIZE);
+ 
+-	ret = __nvme_submit_sync_cmd(ctrl->connect_q, &cmd, &cqe,
++	ret = __nvme_submit_sync_cmd(ctrl->connect_q, &cmd, &res,
+ 			data, sizeof(*data), 0, qid, 1,
+ 			BLK_MQ_REQ_RESERVED | BLK_MQ_REQ_NOWAIT);
+ 	if (ret) {
+-		nvmf_log_connect_error(ctrl, ret, le32_to_cpu(cqe.result),
++		nvmf_log_connect_error(ctrl, ret, le32_to_cpu(res.u32),
+ 				       &cmd, data);
+ 	}
+ 	kfree(data);
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -78,6 +78,20 @@ enum nvme_quirks {
+ 	NVME_QUIRK_DELAY_BEFORE_CHK_RDY		= (1 << 3),
+ };
+ 
++/*
++ * Common request structure for NVMe passthrough.  All drivers must have
++ * this structure as the first member of their request-private data.
++ */
++struct nvme_request {
++	struct nvme_command	*cmd;
++	union nvme_result	result;
++};
++
++static inline struct nvme_request *nvme_req(struct request *req)
++{
++	return blk_mq_rq_to_pdu(req);
++}
++
+ /* The below value is the specific amount of delay needed before checking
+  * readiness in case of the PCI_DEVICE(0x1c58, 0x0003), which needs the
+  * NVME_QUIRK_DELAY_BEFORE_CHK_RDY quirk enabled. The value (in ms) was
+@@ -278,7 +292,7 @@ int nvme_setup_cmd(struct nvme_ns *ns, s
+ int nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		void *buf, unsigned bufflen);
+ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
+-		struct nvme_completion *cqe, void *buffer, unsigned bufflen,
++		union nvme_result *result, void *buffer, unsigned bufflen,
+ 		unsigned timeout, int qid, int at_head, int flags);
+ int nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		void __user *ubuffer, unsigned bufflen, u32 *result,
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -141,6 +141,7 @@ struct nvme_queue {
+  * allocated to store the PRP list.
+  */
+ struct nvme_iod {
++	struct nvme_request req;
+ 	struct nvme_queue *nvmeq;
+ 	int aborted;
+ 	int npages;		/* In the PRP list. 0 means small pool in use */
+@@ -695,8 +696,7 @@ static void __nvme_process_cq(struct nvm
+ 		}
+ 
+ 		req = blk_mq_tag_to_rq(*nvmeq->tags, cqe.command_id);
+-		if (req->cmd_type == REQ_TYPE_DRV_PRIV && req->special)
+-			memcpy(req->special, &cqe, sizeof(cqe));
++		nvme_req(req)->result = cqe.result;
+ 		blk_mq_complete_request(req, le16_to_cpu(cqe.status) >> 1);
+ 
+ 	}
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -73,6 +73,7 @@ struct nvme_rdma_qe {
+ 
+ struct nvme_rdma_queue;
+ struct nvme_rdma_request {
++	struct nvme_request	req;
+ 	struct ib_mr		*mr;
+ 	struct nvme_rdma_qe	sqe;
+ 	struct ib_sge		sge[1 + NVME_RDMA_MAX_INLINE_SEGMENTS];
+@@ -1120,13 +1121,10 @@ static void nvme_rdma_submit_async_event
+ static int nvme_rdma_process_nvme_rsp(struct nvme_rdma_queue *queue,
+ 		struct nvme_completion *cqe, struct ib_wc *wc, int tag)
+ {
+-	u16 status = le16_to_cpu(cqe->status);
+ 	struct request *rq;
+ 	struct nvme_rdma_request *req;
+ 	int ret = 0;
+ 
+-	status >>= 1;
+-
+ 	rq = blk_mq_tag_to_rq(nvme_rdma_tagset(queue), cqe->command_id);
+ 	if (!rq) {
+ 		dev_err(queue->ctrl->ctrl.device,
+@@ -1137,9 +1135,6 @@ static int nvme_rdma_process_nvme_rsp(st
+ 	}
+ 	req = blk_mq_rq_to_pdu(rq);
+ 
+-	if (rq->cmd_type == REQ_TYPE_DRV_PRIV && rq->special)
+-		memcpy(rq->special, cqe, sizeof(*cqe));
+-
+ 	if (rq->tag == tag)
+ 		ret = 1;
+ 
+@@ -1147,8 +1142,8 @@ static int nvme_rdma_process_nvme_rsp(st
+ 	    wc->ex.invalidate_rkey == req->mr->rkey)
+ 		req->need_inval = false;
+ 
+-	blk_mq_complete_request(rq, status);
+-
++	req->req.result = cqe->result;
++	blk_mq_complete_request(rq, le16_to_cpu(cqe->status) >> 1);
+ 	return ret;
+ }
+ 
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@ -616,7 +616,7 @@ u16 nvmet_ctrl_find_get(const char *subs
+ 	if (!subsys) {
+ 		pr_warn("connect request for invalid subsystem %s!\n",
+ 			subsysnqn);
+-		req->rsp->result = IPO_IATTR_CONNECT_DATA(subsysnqn);
++		req->rsp->result.u32 = IPO_IATTR_CONNECT_DATA(subsysnqn);
+ 		return NVME_SC_CONNECT_INVALID_PARAM | NVME_SC_DNR;
+ 	}
+ 
+@@ -637,7 +637,7 @@ u16 nvmet_ctrl_find_get(const char *subs
+ 
+ 	pr_warn("could not find controller %d for subsys %s / host %s\n",
+ 		cntlid, subsysnqn, hostnqn);
+-	req->rsp->result = IPO_IATTR_CONNECT_DATA(cntlid);
++	req->rsp->result.u32 = IPO_IATTR_CONNECT_DATA(cntlid);
+ 	status = NVME_SC_CONNECT_INVALID_PARAM | NVME_SC_DNR;
+ 
+ out:
+@@ -699,7 +699,7 @@ u16 nvmet_alloc_ctrl(const char *subsysn
+ 	if (!subsys) {
+ 		pr_warn("connect request for invalid subsystem %s!\n",
+ 			subsysnqn);
+-		req->rsp->result = IPO_IATTR_CONNECT_DATA(subsysnqn);
++		req->rsp->result.u32 = IPO_IATTR_CONNECT_DATA(subsysnqn);
+ 		goto out;
+ 	}
+ 
+@@ -708,7 +708,7 @@ u16 nvmet_alloc_ctrl(const char *subsysn
+ 	if (!nvmet_host_allowed(req, subsys, hostnqn)) {
+ 		pr_info("connect by host %s for subsystem %s not allowed\n",
+ 			hostnqn, subsysnqn);
+-		req->rsp->result = IPO_IATTR_CONNECT_DATA(hostnqn);
++		req->rsp->result.u32 = IPO_IATTR_CONNECT_DATA(hostnqn);
+ 		up_read(&nvmet_config_sem);
+ 		goto out_put_subsystem;
+ 	}
+--- a/drivers/nvme/target/fabrics-cmd.c
++++ b/drivers/nvme/target/fabrics-cmd.c
+@@ -69,7 +69,7 @@ static void nvmet_execute_prop_get(struc
+ 		}
+ 	}
+ 
+-	req->rsp->result64 = cpu_to_le64(val);
++	req->rsp->result.u64 = cpu_to_le64(val);
+ 	nvmet_req_complete(req, status);
+ }
+ 
+@@ -125,7 +125,7 @@ static void nvmet_execute_admin_connect(
+ 	d = kmap(sg_page(req->sg)) + req->sg->offset;
+ 
+ 	/* zero out initial completion result, assign values as needed */
+-	req->rsp->result = 0;
++	req->rsp->result.u32 = 0;
+ 
+ 	if (c->recfmt != 0) {
+ 		pr_warn("invalid connect version (%d).\n",
+@@ -138,7 +138,7 @@ static void nvmet_execute_admin_connect(
+ 		pr_warn("connect attempt for invalid controller ID %#x\n",
+ 			d->cntlid);
+ 		status = NVME_SC_CONNECT_INVALID_PARAM | NVME_SC_DNR;
+-		req->rsp->result = IPO_IATTR_CONNECT_DATA(cntlid);
++		req->rsp->result.u32 = IPO_IATTR_CONNECT_DATA(cntlid);
+ 		goto out;
+ 	}
+ 
+@@ -155,7 +155,7 @@ static void nvmet_execute_admin_connect(
+ 
+ 	pr_info("creating controller %d for NQN %s.\n",
+ 			ctrl->cntlid, ctrl->hostnqn);
+-	req->rsp->result16 = cpu_to_le16(ctrl->cntlid);
++	req->rsp->result.u16 = cpu_to_le16(ctrl->cntlid);
+ 
+ out:
+ 	kunmap(sg_page(req->sg));
+@@ -173,7 +173,7 @@ static void nvmet_execute_io_connect(str
+ 	d = kmap(sg_page(req->sg)) + req->sg->offset;
+ 
+ 	/* zero out initial completion result, assign values as needed */
+-	req->rsp->result = 0;
++	req->rsp->result.u32 = 0;
+ 
+ 	if (c->recfmt != 0) {
+ 		pr_warn("invalid connect version (%d).\n",
+@@ -191,14 +191,14 @@ static void nvmet_execute_io_connect(str
+ 	if (unlikely(qid > ctrl->subsys->max_qid)) {
+ 		pr_warn("invalid queue id (%d)\n", qid);
+ 		status = NVME_SC_CONNECT_INVALID_PARAM | NVME_SC_DNR;
+-		req->rsp->result = IPO_IATTR_CONNECT_SQE(qid);
++		req->rsp->result.u32 = IPO_IATTR_CONNECT_SQE(qid);
+ 		goto out_ctrl_put;
+ 	}
+ 
+ 	status = nvmet_install_queue(ctrl, req);
+ 	if (status) {
+ 		/* pass back cntlid that had the issue of installing queue */
+-		req->rsp->result16 = cpu_to_le16(ctrl->cntlid);
++		req->rsp->result.u16 = cpu_to_le16(ctrl->cntlid);
+ 		goto out_ctrl_put;
+ 	}
+ 
+--- a/drivers/nvme/target/loop.c
++++ b/drivers/nvme/target/loop.c
+@@ -36,6 +36,7 @@
+ 	(NVME_LOOP_AQ_DEPTH - NVME_LOOP_NR_AEN_COMMANDS)
+ 
+ struct nvme_loop_iod {
++	struct nvme_request	nvme_req;
+ 	struct nvme_command	cmd;
+ 	struct nvme_completion	rsp;
+ 	struct nvmet_req	req;
+@@ -112,10 +113,10 @@ static void nvme_loop_complete_rq(struct
+ 	blk_mq_end_request(req, error);
+ }
+ 
+-static void nvme_loop_queue_response(struct nvmet_req *nvme_req)
++static void nvme_loop_queue_response(struct nvmet_req *req)
+ {
+ 	struct nvme_loop_iod *iod =
+-		container_of(nvme_req, struct nvme_loop_iod, req);
++		container_of(req, struct nvme_loop_iod, req);
+ 	struct nvme_completion *cqe = &iod->rsp;
+ 
+ 	/*
+@@ -128,11 +129,10 @@ static void nvme_loop_queue_response(str
+ 			cqe->command_id >= NVME_LOOP_AQ_BLKMQ_DEPTH)) {
+ 		nvme_complete_async_event(&iod->queue->ctrl->ctrl, cqe);
+ 	} else {
+-		struct request *req = blk_mq_rq_from_pdu(iod);
++		struct request *rq = blk_mq_rq_from_pdu(iod);
+ 
+-		if (req->cmd_type == REQ_TYPE_DRV_PRIV && req->special)
+-			memcpy(req->special, cqe, sizeof(*cqe));
+-		blk_mq_complete_request(req, le16_to_cpu(cqe->status) >> 1);
++		iod->nvme_req.result = cqe->result;
++		blk_mq_complete_request(rq, le16_to_cpu(cqe->status) >> 1);
+ 	}
+ }
+ 
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -237,7 +237,7 @@ static inline void nvmet_set_status(stru
+ 
+ static inline void nvmet_set_result(struct nvmet_req *req, u32 result)
+ {
+-	req->rsp->result = cpu_to_le32(result);
++	req->rsp->result.u32 = cpu_to_le32(result);
+ }
+ 
+ /*
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -980,11 +980,11 @@ struct nvme_completion {
+ 	/*
+ 	 * Used by Admin and Fabrics commands to return data:
+ 	 */
+-	union {
+-		__le16	result16;
+-		__le32	result;
+-		__le64	result64;
+-	};
++	union nvme_result {
++		__le16	u16;
++		__le32	u32;
++		__le64	u64;
++	} result;
+ 	__le16	sq_head;	/* how much of this queue may be reclaimed */
+ 	__le16	sq_id;		/* submission queue that generated this entry */
+ 	__u16	command_id;	/* of the command which completed */
