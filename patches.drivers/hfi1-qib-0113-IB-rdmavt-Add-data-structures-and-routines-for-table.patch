@@ -1,0 +1,207 @@
+From: Mike Marciniszyn <mike.marciniszyn@intel.com>
+Date: Fri, 1 Jul 2016 16:02:07 -0700
+Subject: [PATCH 113/296] IB/rdmavt: Add data structures and routines for table
+ driven post send
+Patch-mainline: v4.8-rc1
+Git-commit: afcf8f7647780aa147ad68be48d223cd50311b9a
+References: FATE#321231 FATE#321473
+
+Add flexibility for driver dependent operations in post send
+because different drivers will have differing post send
+operation support.
+
+This includes data structure definitions to support a table
+driven scheme along with the necessary validation routine
+using the new table.
+
+Reviewed-by: Ashutosh Dixit <ashutosh.dixit@intel.com>
+Reviewed-by: Jianxin Xiong <jianxin.xiong@intel.com>
+Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+Signed-off-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/sw/rdmavt/qp.c | 67 ++++++++++++++++++++++++++++++++++++---
+ include/rdma/rdma_vt.h            |  3 ++
+ include/rdma/rdmavt_qp.h          | 28 +++++++++++++---
+ 3 files changed, 89 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/infiniband/sw/rdmavt/qp.c b/drivers/infiniband/sw/rdmavt/qp.c
+index 41ba7e9..d2b5b54 100644
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@ -613,6 +613,7 @@ struct ib_qp *rvt_create_qp(struct ib_pd *ibpd,
+ 	struct rvt_dev_info *rdi = ib_to_rvt(ibpd->device);
+ 	void *priv = NULL;
+ 	gfp_t gfp;
++	size_t sqsize;
+ 
+ 	if (!rdi)
+ 		return ERR_PTR(-EINVAL);
+@@ -643,7 +644,8 @@ struct ib_qp *rvt_create_qp(struct ib_pd *ibpd,
+ 		    init_attr->cap.max_recv_wr == 0)
+ 			return ERR_PTR(-EINVAL);
+ 	}
+-
++	sqsize =
++		init_attr->cap.max_send_wr + 1;
+ 	switch (init_attr->qp_type) {
+ 	case IB_QPT_SMI:
+ 	case IB_QPT_GSI:
+@@ -658,11 +660,11 @@ struct ib_qp *rvt_create_qp(struct ib_pd *ibpd,
+ 			sizeof(struct rvt_swqe);
+ 		if (gfp == GFP_NOIO)
+ 			swq = __vmalloc(
+-				(init_attr->cap.max_send_wr + 1) * sz,
++				sqsize * sz,
+ 				gfp | __GFP_ZERO, PAGE_KERNEL);
+ 		else
+ 			swq = vzalloc_node(
+-				(init_attr->cap.max_send_wr + 1) * sz,
++				sqsize * sz,
+ 				rdi->dparms.node);
+ 		if (!swq)
+ 			return ERR_PTR(-ENOMEM);
+@@ -747,7 +749,7 @@ struct ib_qp *rvt_create_qp(struct ib_pd *ibpd,
+ 		INIT_LIST_HEAD(&qp->rspwait);
+ 		qp->state = IB_QPS_RESET;
+ 		qp->s_wq = swq;
+-		qp->s_size = init_attr->cap.max_send_wr + 1;
++		qp->s_size = sqsize;
+ 		qp->s_avail = init_attr->cap.max_send_wr;
+ 		qp->s_max_sge = init_attr->cap.max_send_sge;
+ 		if (init_attr->sq_sig_type == IB_SIGNAL_REQ_WR)
+@@ -1440,12 +1442,65 @@ int rvt_post_recv(struct ib_qp *ibqp, struct ib_recv_wr *wr,
+ }
+ 
+ /**
+- * qp_get_savail - return number of avail send entries
++ * rvt_qp_valid_operation - validate post send wr request
++ * @qp - the qp
++ * @post-parms - the post send table for the driver
++ * @wr - the work request
+  *
++ * The routine validates the operation based on the
++ * validation table an returns the length of the operation
++ * which can extend beyond the ib_send_bw.  Operation
++ * dependent flags key atomic operation validation.
++ *
++ * There is an exception for UD qps that validates the pd and
++ * overrides the length to include the additional UD specific
++ * length.
++ *
++ * Returns a negative error or the length of the work request
++ * for building the swqe.
++ */
++static inline int rvt_qp_valid_operation(
++	struct rvt_qp *qp,
++	const struct rvt_operation_params *post_parms,
++	struct ib_send_wr *wr)
++{
++	int len;
++
++	if (wr->opcode >= RVT_OPERATION_MAX || !post_parms[wr->opcode].length)
++		return -EINVAL;
++	if (!(post_parms[wr->opcode].qpt_support & BIT(qp->ibqp.qp_type)))
++		return -EINVAL;
++	if ((post_parms[wr->opcode].flags & RVT_OPERATION_PRIV) &&
++	    ibpd_to_rvtpd(qp->ibqp.pd)->user)
++		return -EINVAL;
++	if (post_parms[wr->opcode].flags & RVT_OPERATION_ATOMIC_SGE &&
++	    (wr->num_sge == 0 ||
++	     wr->sg_list[0].length < sizeof(u64) ||
++	     wr->sg_list[0].addr & (sizeof(u64) - 1)))
++		return -EINVAL;
++	if (post_parms[wr->opcode].flags & RVT_OPERATION_ATOMIC &&
++	    !qp->s_max_rd_atomic)
++		return -EINVAL;
++	len = post_parms[wr->opcode].length;
++	/* UD specific */
++	if (qp->ibqp.qp_type != IB_QPT_UC &&
++	    qp->ibqp.qp_type != IB_QPT_RC) {
++		if (qp->ibqp.pd != ud_wr(wr)->ah->pd)
++			return -EINVAL;
++		len = sizeof(struct ib_ud_wr);
++	}
++	return len;
++}
++
++/**
++ * qp_get_savail - return number of avail send entries
+  * @qp - the qp
+  *
+  * This assumes the s_hlock is held but the s_last
+  * qp variable is uncontrolled.
++ *
++ * The return is adjusted to not count device specific
++ * reserved operations.
+  */
+ static inline u32 qp_get_savail(struct rvt_qp *qp)
+ {
+@@ -1481,6 +1536,8 @@ static int rvt_post_one_wr(struct rvt_qp *qp,
+ 	u8 log_pmtu;
+ 	int ret;
+ 
++	BUILD_BUG_ON(IB_QPT_MAX >= (sizeof(u32) * BITS_PER_BYTE));
++
+ 	/* IB spec says that num_sge == 0 is OK. */
+ 	if (unlikely(wr->num_sge > qp->s_max_sge))
+ 		return -EINVAL;
+diff --git a/include/rdma/rdma_vt.h b/include/rdma/rdma_vt.h
+index 8f4a0fb..d7fe20a 100644
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@ -351,6 +351,9 @@ struct rvt_dev_info {
+ 	/* Driver specific properties */
+ 	struct rvt_driver_params dparms;
+ 
++	/* post send table */
++	const struct rvt_operation_params *post_parms;
++
+ 	struct rvt_mregion __rcu *dma_mr;
+ 	struct rvt_lkey_table lkey_table;
+ 
+diff --git a/include/rdma/rdmavt_qp.h b/include/rdma/rdmavt_qp.h
+index ac3bfc3..a53a00d 100644
+--- a/include/rdma/rdmavt_qp.h
++++ b/include/rdma/rdmavt_qp.h
+@@ -227,11 +227,31 @@ struct rvt_ack_entry {
+ 
+ #define	RC_QP_SCALING_INTERVAL	5
+ 
+-/*
+- * Variables prefixed with s_ are for the requester (sender).
+- * Variables prefixed with r_ are for the responder (receiver).
+- * Variables prefixed with ack_ are for responder replies.
++#define RVT_OPERATION_PRIV        0x00000001
++#define RVT_OPERATION_ATOMIC      0x00000002
++#define RVT_OPERATION_ATOMIC_SGE  0x00000004
++
++#define RVT_OPERATION_MAX (IB_WR_RESERVED10 + 1)
++
++/**
++ * rvt_operation_params - op table entry
++ * @length - the length to copy into the swqe entry
++ * @qpt_support - a bit mask indicating QP type support
++ * @flags - RVT_OPERATION flags (see above)
++ *
++ * This supports table driven post send so that
++ * the driver can have differing an potentially
++ * different sets of operations.
+  *
++ **/
++
++struct rvt_operation_params {
++	size_t length;
++	u32 qpt_support;
++	u32 flags;
++};
++
++/*
+  * Common variables are protected by both r_rq.lock and s_lock in that order
+  * which only happens in modify_qp() or changing the QP 'state'.
+  */
+-- 
+1.8.5.6
+
