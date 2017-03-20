@@ -1,0 +1,132 @@
+From: Jianxin Xiong <jianxin.xiong@intel.com>
+Date: Mon, 25 Jul 2016 13:38:25 -0700
+Subject: [PATCH 122/296] IB/rdmavt: Handle local operations in post send
+Patch-mainline: v4.8-rc1
+Git-commit: d9f8723924d5955979d05cb7f4f10d9ebac39b7d
+References: FATE#321231 FATE#321473
+
+Some work requests are local operations, such as IB_WR_REG_MR and
+IB_WR_LOCAL_INV. They differ from non-local operations in that:
+
+(1) Local operations can be processed immediately without being posted
+to the send queue if neither fencing nor completion generation is needed.
+However, to ensure correct ordering, once a local operation is posted to
+the work queue due to fencing or completion requiement, all subsequent
+local operations must also be posted to the work queue until all the
+local operations on the work queue have completed.
+
+(2) Local operations don't send packets over the wire and thus don't
+need (and shouldn't update) the packet sequence numbers.
+
+Define a new a flag bit for the post send table to identify local
+operations.
+
+Add a new field to the QP structure to track the number of local
+operations on the send queue to determine if direct processing of new
+local operations should be enabled/disabled.
+
+Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+Signed-off-by: Jianxin Xiong <jianxin.xiong@intel.com>
+Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+Signed-off-by: Doug Ledford <dledford@redhat.com>
+Acked-by: Thomas Bogendoerfer <tbogendoerfer@suse.de>
+---
+ drivers/infiniband/sw/rdmavt/qp.c | 45 ++++++++++++++++++++++++++++++++++-----
+ include/rdma/rdmavt_qp.h          |  3 +++
+ 2 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/infiniband/sw/rdmavt/qp.c b/drivers/infiniband/sw/rdmavt/qp.c
+index ebc37f5..f79b809 100644
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@ -743,6 +743,7 @@ struct ib_qp *rvt_create_qp(struct ib_pd *ibpd,
+ 		spin_lock_init(&qp->s_lock);
+ 		spin_lock_init(&qp->r_rq.lock);
+ 		atomic_set(&qp->refcount, 0);
++		atomic_set(&qp->local_ops_pending, 0);
+ 		init_waitqueue_head(&qp->wait);
+ 		init_timer(&qp->s_timer);
+ 		qp->s_timer.data = (unsigned long)qp;
+@@ -1548,6 +1549,31 @@ static int rvt_post_one_wr(struct rvt_qp *qp,
+ 		return ret;
+ 	cplen = ret;
+ 
++	/*
++	 * Local operations including fast register and local invalidate
++	 * can be processed immediately w/o being posted to the send queue
++	 * if neither fencing nor completion generation is needed. However,
++	 * once fencing or completion is requested, direct processing of
++	 * following local operations must be disabled until all the local
++	 * operations posted to the send queue have completed. This is
++	 * necessary to ensure the correct ordering.
++	 */
++	if ((rdi->post_parms[wr->opcode].flags & RVT_OPERATION_LOCAL) &&
++	    !(wr->send_flags & (IB_SEND_FENCE | IB_SEND_SIGNALED)) &&
++	    !atomic_read(&qp->local_ops_pending)) {
++		struct ib_reg_wr *reg = reg_wr(wr);
++
++		switch (wr->opcode) {
++		case IB_WR_REG_MR:
++			return rvt_fast_reg_mr(qp, reg->mr, reg->key,
++					       reg->access);
++		case IB_WR_LOCAL_INV:
++			return rvt_invalidate_rkey(qp, wr->ex.invalidate_rkey);
++		default:
++			return -EINVAL;
++		}
++	}
++
+ 	/* check for avail */
+ 	if (unlikely(!qp->s_avail)) {
+ 		qp->s_avail = qp_get_savail(qp);
+@@ -1612,11 +1638,20 @@ static int rvt_post_one_wr(struct rvt_qp *qp,
+ 		atomic_inc(&ibah_to_rvtah(ud_wr(wr)->ah)->refcount);
+ 	}
+ 
+-	wqe->ssn = qp->s_ssn++;
+-	wqe->psn = qp->s_next_psn;
+-	wqe->lpsn = wqe->psn +
+-			(wqe->length ? ((wqe->length - 1) >> log_pmtu) : 0);
+-	qp->s_next_psn = wqe->lpsn + 1;
++	if (rdi->post_parms[wr->opcode].flags & RVT_OPERATION_LOCAL) {
++		atomic_inc(&qp->local_ops_pending);
++		wqe->ssn = 0;
++		wqe->psn = 0;
++		wqe->lpsn = 0;
++	} else {
++		wqe->ssn = qp->s_ssn++;
++		wqe->psn = qp->s_next_psn;
++		wqe->lpsn = wqe->psn +
++				(wqe->length ?
++					((wqe->length - 1) >> log_pmtu) :
++					0);
++		qp->s_next_psn = wqe->lpsn + 1;
++	}
+ 	trace_rvt_post_one_wr(qp, wqe);
+ 	smp_wmb(); /* see request builders */
+ 	qp->s_avail--;
+diff --git a/include/rdma/rdmavt_qp.h b/include/rdma/rdmavt_qp.h
+index a53a00d..716744d 100644
+--- a/include/rdma/rdmavt_qp.h
++++ b/include/rdma/rdmavt_qp.h
+@@ -230,6 +230,7 @@ struct rvt_ack_entry {
+ #define RVT_OPERATION_PRIV        0x00000001
+ #define RVT_OPERATION_ATOMIC      0x00000002
+ #define RVT_OPERATION_ATOMIC_SGE  0x00000004
++#define RVT_OPERATION_LOCAL       0x00000008
+ 
+ #define RVT_OPERATION_MAX (IB_WR_RESERVED10 + 1)
+ 
+@@ -362,6 +363,8 @@ struct rvt_qp {
+ 	struct rvt_sge_state s_ack_rdma_sge;
+ 	struct timer_list s_timer;
+ 
++	atomic_t local_ops_pending; /* number of fast_reg/local_inv reqs */
++
+ 	/*
+ 	 * This sge list MUST be last. Do not add anything below here.
+ 	 */
+-- 
+1.8.5.6
+
