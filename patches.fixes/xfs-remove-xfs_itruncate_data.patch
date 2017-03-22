@@ -1,0 +1,455 @@
+From fbaad10256f1a408698fdd2b87854174676323ef Mon Sep 17 00:00:00 2001
+From: Christoph Hellwig <hch@infradead.org>
+Date: Sun, 18 Dec 2011 20:00:04 +0000
+Subject: [PATCH 04/10] xfs: remove xfs_itruncate_data
+Git-commit: 673e8e597c06eb81954bf21a10f5cce74a1de8f1                            
+Patch-mainline: v3.3-rc1                                                        
+References: bsc#1024788
+
+This wrapper isn't overly useful, not to say rather confusing.
+
+Around the call to xfs_itruncate_extents it does:
+
+ - add tracing
+ - add a few asserts in debug builds
+ - conditionally update the inode size in two places
+ - log the inode
+
+Both the tracing and the inode logging can be moved to xfs_itruncate_extents
+as they are useful for the attribute fork as well - in fact the attr code
+already does an equivalent xfs_trans_log_inode call just after calling
+xfs_itruncate_extents.  The conditional size updates are a mess, and there
+was no reason to do them in two places anyway, as the first one was
+conditional on the inode having extents - but without extents we
+xfs_itruncate_extents would be a no-op and the placement wouldn't matter
+anyway.  Instead move the size assignments and the asserts that make sense
+to the callers that want it.
+
+As a side effect of this clean up xfs_setattr_size by introducing variables
+for the old and new inode size, and moving the size updates into a common
+place.
+
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Ben Myers <bpm@sgi.com>
+Acked-by: Nikolay Borisov <nborisov@suse.com>
+---
+ fs/xfs/linux-2.6/xfs_iops.c    |  66 +++++++++++++---------
+ fs/xfs/linux-2.6/xfs_trace.h   |   4 +-
+ fs/xfs/quota/xfs_qm_syscalls.c |   9 ++-
+ fs/xfs/xfs_attr.c              |   4 --
+ fs/xfs/xfs_inode.c             | 124 ++++-------------------------------------
+ fs/xfs/xfs_inode.h             |   2 -
+ fs/xfs/xfs_vnodeops.c          |  18 +++++-
+ 7 files changed, 75 insertions(+), 152 deletions(-)
+
+diff --git a/fs/xfs/linux-2.6/xfs_iops.c b/fs/xfs/linux-2.6/xfs_iops.c
+index a5eeb6cd2f8b..d7b4512b2743 100644
+--- a/fs/xfs/linux-2.6/xfs_iops.c
++++ b/fs/xfs/linux-2.6/xfs_iops.c
+@@ -750,6 +750,7 @@ xfs_setattr_size(
+ 	struct xfs_mount	*mp = ip->i_mount;
+ 	struct inode		*inode = VFS_I(ip);
+ 	int			mask = iattr->ia_valid;
++	xfs_off_t		oldsize, newsize;
+ 	struct xfs_trans	*tp;
+ 	int			error;
+ 	uint			lock_flags;
+@@ -777,19 +778,22 @@ xfs_setattr_size(
+ 		lock_flags |= XFS_IOLOCK_EXCL;
+ 	xfs_ilock(ip, lock_flags);
+ 
++	oldsize = ip->i_size;
++	newsize = iattr->ia_size;
++
+ 	/*
+ 	 * Short circuit the truncate case for zero length files.
+ 	 */
+-	if (iattr->ia_size == 0 &&
+-	    ip->i_size == 0 && ip->i_d.di_nextents == 0) {
+-		xfs_iunlock(ip, XFS_ILOCK_EXCL);
+-		lock_flags &= ~XFS_ILOCK_EXCL;
+-		if (mask & ATTR_CTIME) {
+-			inode->i_mtime = inode->i_ctime =
+-					current_fs_time(inode->i_sb);
+-			xfs_mark_inode_dirty_sync(ip);
+-		}
+-		goto out_unlock;
++	if (newsize == 0 && oldsize == 0 && ip->i_d.di_nextents == 0) {
++		if (!(mask & (ATTR_CTIME|ATTR_MTIME)))
++			goto out_unlock;
++
++		/*
++		 * Use the regular setattr path to update the timestamps.
++		 */
++		xfs_iunlock(ip, lock_flags);
++		iattr->ia_valid &= ~ATTR_SIZE;
++		return xfs_setattr_nonsize(ip, iattr, 0);
+ 	}
+ 
+ 	/*
+@@ -806,14 +810,14 @@ xfs_setattr_size(
+ 	 * the inode to the transaction, because the inode cannot be unlocked
+ 	 * once it is a part of the transaction.
+ 	 */
+-	if (iattr->ia_size > ip->i_size) {
++	if (newsize > oldsize) {
+ 		/*
+ 		 * Do the first part of growing a file: zero any data in the
+ 		 * last block that is beyond the old EOF.  We need to do this
+ 		 * before the inode is joined to the transaction to modify
+ 		 * i_size.
+ 		 */
+-		error = xfs_zero_eof(ip, iattr->ia_size, ip->i_size);
++		error = xfs_zero_eof(ip, newsize, oldsize);
+ 		if (error)
+ 			goto out_unlock;
+ 	}
+@@ -832,9 +836,9 @@ xfs_setattr_size(
+ 	 * here and prevents waiting for other data not within the range we
+ 	 * care about here.
+ 	 */
+-	if (ip->i_size != ip->i_d.di_size && iattr->ia_size > ip->i_d.di_size) {
+-		error = xfs_flush_pages(ip, ip->i_d.di_size, iattr->ia_size,
+-					XBF_ASYNC, FI_NONE);
++	if (oldsize != ip->i_d.di_size && newsize > ip->i_d.di_size) {
++		error = xfs_flush_pages(ip, ip->i_d.di_size, newsize, XBF_ASYNC,
++					FI_NONE);
+ 		if (error)
+ 			goto out_unlock;
+ 	}
+@@ -844,8 +848,7 @@ xfs_setattr_size(
+ 	 */
+ 	xfs_ioend_wait(ip);
+ 
+-	error = -block_truncate_page(inode->i_mapping, iattr->ia_size,
+-				     xfs_get_blocks);
++	error = -block_truncate_page(inode->i_mapping, newsize, xfs_get_blocks);
+ 	if (error)
+ 		goto out_unlock;
+ 
+@@ -856,7 +859,7 @@ xfs_setattr_size(
+ 	if (error)
+ 		goto out_trans_cancel;
+ 
+-	truncate_setsize(inode, iattr->ia_size);
++	truncate_setsize(inode, newsize);
+ 
+ 	commit_flags = XFS_TRANS_RELEASE_LOG_RES;
+ 	lock_flags |= XFS_ILOCK_EXCL;
+@@ -875,19 +878,30 @@ xfs_setattr_size(
+ 	 * these flags set.  For all other operations the VFS set these flags
+ 	 * explicitly if it wants a timestamp update.
+ 	 */
+-	if (iattr->ia_size != ip->i_size &&
+-	    (!(mask & (ATTR_CTIME | ATTR_MTIME)))) {
++	if (newsize != oldsize && (!(mask & (ATTR_CTIME | ATTR_MTIME)))) {
+ 		iattr->ia_ctime = iattr->ia_mtime =
+ 			current_fs_time(inode->i_sb);
+ 		mask |= ATTR_CTIME | ATTR_MTIME;
+ 	}
+ 
+-	if (iattr->ia_size > ip->i_size) {
+-		ip->i_d.di_size = iattr->ia_size;
+-		ip->i_size = iattr->ia_size;
+-	} else if (iattr->ia_size <= ip->i_size ||
+-		   (iattr->ia_size == 0 && ip->i_d.di_nextents)) {
+-		error = xfs_itruncate_data(&tp, ip, iattr->ia_size);
++	/*
++	 * The first thing we do is set the size to new_size permanently on
++	 * disk.  This way we don't have to worry about anyone ever being able
++	 * to look at the data being freed even in the face of a crash.
++	 * What we're getting around here is the case where we free a block, it
++	 * is allocated to another file, it is written to, and then we crash.
++	 * If the new data gets written to the file but the log buffers
++	 * containing the free and reallocation don't, then we'd end up with
++	 * garbage in the blocks being freed.  As long as we make the new size
++	 * permanent before actually freeing any blocks it doesn't matter if
++	 * they get written to.
++	 */
++	ip->i_d.di_size = newsize;
++	ip->i_size = newsize;
++	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
++
++	if (newsize <= oldsize) {
++		error = xfs_itruncate_extents(&tp, ip, XFS_DATA_FORK, newsize);
+ 		if (error)
+ 			goto out_trans_abort;
+ 
+diff --git a/fs/xfs/linux-2.6/xfs_trace.h b/fs/xfs/linux-2.6/xfs_trace.h
+index 8c5768967aea..8ae18954a487 100644
+--- a/fs/xfs/linux-2.6/xfs_trace.h
++++ b/fs/xfs/linux-2.6/xfs_trace.h
+@@ -1061,8 +1061,8 @@ DECLARE_EVENT_CLASS(xfs_itrunc_class,
+ DEFINE_EVENT(xfs_itrunc_class, name, \
+ 	TP_PROTO(struct xfs_inode *ip, xfs_fsize_t new_size), \
+ 	TP_ARGS(ip, new_size))
+-DEFINE_ITRUNC_EVENT(xfs_itruncate_data_start);
+-DEFINE_ITRUNC_EVENT(xfs_itruncate_data_end);
++DEFINE_ITRUNC_EVENT(xfs_itruncate_extents_start);
++DEFINE_ITRUNC_EVENT(xfs_itruncate_extents_end);
+ 
+ TRACE_EVENT(xfs_pagecache_inval,
+ 	TP_PROTO(struct xfs_inode *ip, xfs_off_t start, xfs_off_t finish),
+diff --git a/fs/xfs/quota/xfs_qm_syscalls.c b/fs/xfs/quota/xfs_qm_syscalls.c
+index 369cd0c3619c..171660674da4 100644
+--- a/fs/xfs/quota/xfs_qm_syscalls.c
++++ b/fs/xfs/quota/xfs_qm_syscalls.c
+@@ -31,6 +31,7 @@
+ #include "xfs_mount.h"
+ #include "xfs_bmap_btree.h"
+ #include "xfs_inode.h"
++#include "xfs_inode_item.h"
+ #include "xfs_itable.h"
+ #include "xfs_bmap.h"
+ #include "xfs_rtalloc.h"
+@@ -263,13 +264,19 @@ xfs_qm_scall_trunc_qfile(
+ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
+ 	xfs_trans_ijoin(tp, ip);
+ 
+-	error = xfs_itruncate_data(&tp, ip, 0);
++	ip->i_d.di_size = 0;
++	ip->i_size = 0;
++	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
++
++	error = xfs_itruncate_extents(&tp, ip, XFS_DATA_FORK, 0);
+ 	if (error) {
+ 		xfs_trans_cancel(tp, XFS_TRANS_RELEASE_LOG_RES |
+ 				     XFS_TRANS_ABORT);
+ 		goto out_unlock;
+ 	}
+ 
++	ASSERT(ip->i_d.di_nextents == 0);
++
+ 	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
+ 	error = xfs_trans_commit(tp, XFS_TRANS_RELEASE_LOG_RES);
+ 
+diff --git a/fs/xfs/xfs_attr.c b/fs/xfs/xfs_attr.c
+index c8eda7e6b4d7..830b4978056e 100644
+--- a/fs/xfs/xfs_attr.c
++++ b/fs/xfs/xfs_attr.c
+@@ -839,10 +839,6 @@ xfs_attr_inactive(xfs_inode_t *dp)
+ 	if (error)
+ 		goto out;
+ 
+-	/*
+-	 * Commit the last in the sequence of transactions.
+-	 */
+-	xfs_trans_log_inode(trans, dp, XFS_ILOG_CORE);
+ 	error = xfs_trans_commit(trans, XFS_TRANS_RELEASE_LOG_RES);
+ 	xfs_iunlock(dp, XFS_ILOCK_EXCL);
+ 
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 93fb525b3f21..fe75d1389d4b 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -1173,52 +1173,6 @@ xfs_ialloc(
+ }
+ 
+ /*
+- * Check to make sure that there are no blocks allocated to the
+- * file beyond the size of the file.  We don't check this for
+- * files with fixed size extents or real time extents, but we
+- * at least do it for regular files.
+- */
+-#ifdef DEBUG
+-STATIC void
+-xfs_isize_check(
+-	struct xfs_inode	*ip,
+-	xfs_fsize_t		isize)
+-{
+-	struct xfs_mount	*mp = ip->i_mount;
+-	xfs_fileoff_t		map_first;
+-	int			nimaps;
+-	xfs_bmbt_irec_t		imaps[2];
+-	int			error;
+-
+-	if ((ip->i_d.di_mode & S_IFMT) != S_IFREG)
+-		return;
+-
+-	if (XFS_IS_REALTIME_INODE(ip))
+-		return;
+-
+-	if (ip->i_d.di_flags & XFS_DIFLAG_EXTSIZE)
+-		return;
+-
+-	nimaps = 2;
+-	map_first = XFS_B_TO_FSB(mp, (xfs_ufsize_t)isize);
+-	/*
+-	 * The filesystem could be shutting down, so bmapi may return
+-	 * an error.
+-	 */
+-	error = xfs_bmapi_read(ip, map_first,
+-			 (XFS_B_TO_FSB(mp,
+-			       (xfs_ufsize_t)XFS_MAXIOFFSET(mp)) - map_first),
+-			 imaps, &nimaps, XFS_BMAPI_ENTIRE);
+-	if (error)
+-		return;
+-	ASSERT(nimaps == 1);
+-	ASSERT(imaps[0].br_startblock == HOLESTARTBLOCK);
+-}
+-#else	/* DEBUG */
+-#define xfs_isize_check(ip, isize)
+-#endif	/* DEBUG */
+-
+-/*
+  * Free up the underlying blocks past new_size.  The new size must be smaller
+  * than the current size.  This routine can be used both for the attribute and
+  * data fork, and does not modify the inode size, which is left to the caller.
+@@ -1266,6 +1220,8 @@ xfs_itruncate_extents(
+ 	ASSERT(ip->i_itemp->ili_lock_flags == 0);
+ 	ASSERT(!XFS_NOT_DQATTACHED(mp, ip));
+ 
++	trace_xfs_itruncate_extents_start(ip, new_size);
++
+ 	/*
+ 	 * Since it is possible for space to become allocated beyond
+ 	 * the end of the file (in a crash where the space is allocated
+@@ -1333,6 +1289,14 @@ xfs_itruncate_extents(
+ 			goto out;
+ 	}
+ 
++	/*
++	 * Always re-log the inode so that our permanent transaction can keep
++	 * on rolling it forward in the log.
++	 */
++	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
++
++	trace_xfs_itruncate_extents_end(ip, new_size);
++
+ out:
+ 	*tpp = tp;
+ 	return error;
+@@ -1346,74 +1310,6 @@ out_bmap_cancel:
+ 	goto out;
+ }
+ 
+-int
+-xfs_itruncate_data(
+-	struct xfs_trans	**tpp,
+-	struct xfs_inode	*ip,
+-	xfs_fsize_t		new_size)
+-{
+-	int			error;
+-
+-	trace_xfs_itruncate_data_start(ip, new_size);
+-
+-	/*
+-	 * The first thing we do is set the size to new_size permanently on
+-	 * disk.  This way we don't have to worry about anyone ever being able
+-	 * to look at the data being freed even in the face of a crash.
+-	 * What we're getting around here is the case where we free a block, it
+-	 * is allocated to another file, it is written to, and then we crash.
+-	 * If the new data gets written to the file but the log buffers
+-	 * containing the free and reallocation don't, then we'd end up with
+-	 * garbage in the blocks being freed.  As long as we make the new_size
+-	 * permanent before actually freeing any blocks it doesn't matter if
+-	 * they get written to.
+-	 */
+-	if (ip->i_d.di_nextents > 0) {
+-		/*
+-		 * If we are not changing the file size then do not update
+-		 * the on-disk file size - we may be called from
+-		 * xfs_inactive_free_eofblocks().  If we update the on-disk
+-		 * file size and then the system crashes before the contents
+-		 * of the file are flushed to disk then the files may be
+-		 * full of holes (ie NULL files bug).
+-		 */
+-		if (ip->i_size != new_size) {
+-			ip->i_d.di_size = new_size;
+-			ip->i_size = new_size;
+-			xfs_trans_log_inode(*tpp, ip, XFS_ILOG_CORE);
+-		}
+-	}
+-
+-	error = xfs_itruncate_extents(tpp, ip, XFS_DATA_FORK, new_size);
+-	if (error)
+-		return error;
+-
+-	/*
+-	 * If we are not changing the file size then do not update the on-disk
+-	 * file size - we may be called from xfs_inactive_free_eofblocks().
+-	 * If we update the on-disk file size and then the system crashes
+-	 * before the contents of the file are flushed to disk then the files
+-	 * may be full of holes (ie NULL files bug).
+-	 */
+-	xfs_isize_check(ip, new_size);
+-	if (ip->i_size != new_size) {
+-		ip->i_d.di_size = new_size;
+-		ip->i_size = new_size;
+-	}
+-
+-	ASSERT(new_size != 0 || ip->i_delayed_blks == 0);
+-	ASSERT(new_size != 0 || ip->i_d.di_nextents == 0);
+-
+-	/*
+-	 * Always re-log the inode so that our permanent transaction can keep
+-	 * on rolling it forward in the log.
+-	 */
+-	xfs_trans_log_inode(*tpp, ip, XFS_ILOG_CORE);
+-
+-	trace_xfs_itruncate_data_end(ip, new_size);
+-	return 0;
+-}
+-
+ /*
+  * This is called when the inode's link count goes to 0.
+  * We place the on-disk inode on a list in the AGI.  It
+diff --git a/fs/xfs/xfs_inode.h b/fs/xfs/xfs_inode.h
+index a5d24c91ebf8..bc1008c97bcc 100644
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@ -493,8 +493,6 @@ int		xfs_ifree(struct xfs_trans *, xfs_inode_t *,
+ 			   struct xfs_bmap_free *);
+ int		xfs_itruncate_extents(struct xfs_trans **, struct xfs_inode *,
+ 				      int, xfs_fsize_t);
+-int		xfs_itruncate_data(struct xfs_trans **, struct xfs_inode *,
+-				   xfs_fsize_t);
+ int		xfs_iunlink(struct xfs_trans *, xfs_inode_t *);
+ 
+ void		xfs_iext_realloc(xfs_inode_t *, int, int);
+diff --git a/fs/xfs/xfs_vnodeops.c b/fs/xfs/xfs_vnodeops.c
+index 619016070eb2..c702e518d599 100644
+--- a/fs/xfs/xfs_vnodeops.c
++++ b/fs/xfs/xfs_vnodeops.c
+@@ -223,7 +223,14 @@ xfs_free_eofblocks(
+ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
+ 		xfs_trans_ijoin(tp, ip);
+ 
+-		error = xfs_itruncate_data(&tp, ip, ip->i_size);
++		/*
++		 * Do not update the on-disk file size.  If we update the
++		 * on-disk file size and then the system crashes before the
++		 * contents of the file are flushed to disk then the files
++		 * may be full of holes (ie NULL files bug).
++		 */
++		error = xfs_itruncate_extents(&tp, ip, XFS_DATA_FORK,
++					      ip->i_size);
+ 		if (error) {
+ 			/*
+ 			 * If we get an error at this point we simply don't
+@@ -668,14 +675,19 @@ xfs_inactive(
+ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
+ 		xfs_trans_ijoin(tp, ip);
+ 
+-		error = xfs_itruncate_data(&tp, ip, 0);
++		ip->i_d.di_size = 0;
++		ip->i_size = 0;
++		xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
++
++		error = xfs_itruncate_extents(&tp, ip, XFS_DATA_FORK, 0);
+ 		if (error) {
+ 			xfs_trans_cancel(tp,
+ 				XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
+ 			xfs_iunlock(ip, XFS_IOLOCK_EXCL | XFS_ILOCK_EXCL);
+ 			return VN_INACTIVE_CACHE;
+ 		}
+-	} else if ((ip->i_d.di_mode & S_IFMT) == S_IFLNK) {
++		ASSERT(ip->i_d.di_nextents == 0);
++	} else if (S_ISLNK(ip->i_d.di_mode)) {
+ 
+ 		/*
+ 		 * If we get an error while cleaning up a
+-- 
+2.7.4
+
