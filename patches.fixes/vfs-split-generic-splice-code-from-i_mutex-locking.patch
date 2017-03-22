@@ -1,0 +1,165 @@
+From 5ec5802d1f94ef8431edff52ccd93d1443e70939 Mon Sep 17 00:00:00 2001
+From: Nikolay Borisov <nborisov@suse.com>
+Date: Mon, 20 Mar 2017 16:13:57 +0200
+Subject: [PATCH 07/10] vfs: split generic splice code from i_mutex locking
+References: bsc#1024788
+Patch-mainline: Never, solved in upstream in a different way
+
+XFS holds locks that should be nested inside the inode->i_mutex when
+generic_file_splice_write is called. This function takes the
+i_mutex, and so we get a lock inversion that triggers lockdep
+warnings and has been found to cause real deadlocks.
+
+XFS does not need the splice code to take the i_mutex to do the page
+cache manipulation, so modify the generic splice code to use an
+actor function for the code that currently requires the i_mutex to
+be taken.  Convert generic_file_splice_write() to use this new
+interface supplying a generic actor function that performs the same
+actions as the existing code.
+
+Signed-off-by: Dave Chinner <dchinner@redhat.com>
+Acked-by: Nikolay Borisov <nborisov@suse.com>
+---
+ fs/splice.c            | 69 ++++++++++++++++++++++++++++++++------------------
+ include/linux/splice.h |  6 +++++
+ 2 files changed, 51 insertions(+), 24 deletions(-)
+
+diff --git a/fs/splice.c b/fs/splice.c
+index 372da4f30255..6b03f4d62704 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -979,13 +979,46 @@ ssize_t splice_from_pipe(struct pipe_inode_info *pipe, struct file *out,
+ 	return ret;
+ }
+ 
++
++
++static ssize_t generic_file_splice_write_actor(struct pipe_inode_info *pipe,
++                                              struct splice_desc *sd)
++{
++	struct file *out = sd->u.file;
++	struct inode *inode = out->f_mapping->host;
++	loff_t tmp_pos = sd->pos;
++	size_t tmp_count = sd->total_len;
++	ssize_t ret;
++	
++	mutex_lock_nested(&inode->i_mutex, I_MUTEX_CHILD);
++	ret = generic_write_checks(out, &tmp_pos, &tmp_count,
++				   S_ISBLK(inode->i_mode));
++	if (ret < 0 || tmp_count == 0)
++		goto out_unlock;
++
++	sd->total_len = tmp_count;
++	WARN_ON(sd->pos != tmp_pos);
++
++	ret = file_remove_suid(out);
++	if (!ret) {
++		ret = file_update_time(out);
++		if (!ret)
++			ret = splice_from_pipe_feed(pipe, sd, pipe_to_file);
++	}
++
++out_unlock:
++	mutex_unlock(&inode->i_mutex);
++	return ret;
++}
++
+ /**
+- * generic_file_splice_write - splice data from a pipe to a file
++ * splice_write_to_file- splice data from a pipe to a file
+  * @pipe:	pipe info
+  * @out:	file to write to
+  * @ppos:	position in @out
+  * @len:	number of bytes to splice
+  * @flags:	splice modifier flags
++ * @actor:     worker that does the splicing from the pipe to the file
+  *
+  * Description:
+  *    Will either move or copy pages (determined by @flags options) from
+@@ -993,8 +1026,9 @@ ssize_t splice_from_pipe(struct pipe_inode_info *pipe, struct file *out,
+  *
+  */
+ ssize_t
+-generic_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
+-			  loff_t *ppos, size_t len, unsigned int flags)
++splice_write_to_file(struct pipe_inode_info *pipe, struct file *out,
++			  loff_t *ppos, size_t len, unsigned int flags,
++			  splice_write_actor actor)
+ {
+ 	struct address_space *mapping = out->f_mapping;
+ 	struct inode *inode = mapping->host;
+@@ -1010,31 +1044,11 @@ generic_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
+ 
+ 	splice_from_pipe_begin(&sd);
+ 	do {
+-		size_t tmp_count = sd.total_len;
+-		loff_t tmp_pos = sd.pos;
+-
+ 		ret = splice_from_pipe_next(pipe, &sd);
+ 		if (ret <= 0)
+ 			break;
+ 
+-		mutex_lock_nested(&inode->i_mutex, I_MUTEX_CHILD);
+-		ret = generic_write_checks(out, &tmp_pos, &tmp_count,
+-					   S_ISBLK(inode->i_mode));
+-		if (ret < 0 || tmp_count == 0) {
+-			mutex_unlock(&inode->i_mutex);
+-			break;
+-		}
+-		sd.total_len = tmp_count;
+-		WARN_ON(sd.pos != tmp_pos);
+-
+-		ret = file_remove_suid(out);
+-		if (!ret) {
+-			ret = file_update_time(out);
+-			if (!ret)
+-				ret = splice_from_pipe_feed(pipe, &sd,
+-							    pipe_to_file);
+-		}
+-		mutex_unlock(&inode->i_mutex);
++		ret = actor(pipe, &sd);
+ 	} while (ret > 0);
+ 	splice_from_pipe_end(pipe, &sd);
+ 
+@@ -1059,7 +1073,14 @@ generic_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
+ 
+ 	return ret;
+ }
++EXPORT_SYMBOL(splice_write_to_file);
+ 
++ssize_t generic_file_splice_write(struct pipe_inode_info *pipe,
++               struct file *out, loff_t *ppos, size_t len, unsigned int flags)
++{
++	return splice_write_to_file(pipe, out, ppos, len, flags,
++											generic_file_splice_write_actor);
++}
+ EXPORT_SYMBOL(generic_file_splice_write);
+ 
+ static int write_pipe_buf(struct pipe_inode_info *pipe, struct pipe_buffer *buf,
+diff --git a/include/linux/splice.h b/include/linux/splice.h
+index 09a545a7dfa3..e9cc89c1c9ef 100644
+--- a/include/linux/splice.h
++++ b/include/linux/splice.h
+@@ -63,6 +63,10 @@ typedef int (splice_actor)(struct pipe_inode_info *, struct pipe_buffer *,
+ typedef int (splice_direct_actor)(struct pipe_inode_info *,
+ 				  struct splice_desc *);
+ 
++typedef ssize_t (splice_write_actor)(struct pipe_inode_info *, 
++									struct splice_desc *);
++
++
+ extern ssize_t splice_from_pipe(struct pipe_inode_info *, struct file *,
+ 				loff_t *, size_t, unsigned int,
+ 				splice_actor *);
+@@ -82,6 +86,8 @@ extern ssize_t splice_to_pipe(struct pipe_inode_info *,
+ 			      struct splice_pipe_desc *);
+ extern ssize_t splice_direct_to_actor(struct file *, struct splice_desc *,
+ 				      splice_direct_actor *);
++extern ssize_t splice_write_to_file(struct pipe_inode_info *, struct file *,
++						loff_t *, size_t, unsigned int, splice_write_actor *);
+ 
+ /*
+  * for dynamic pipe sizing
+-- 
+2.7.4
+
