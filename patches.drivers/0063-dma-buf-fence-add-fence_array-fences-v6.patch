@@ -1,0 +1,294 @@
+From e1cd42a7cff7e07b6fc045ba92d04526d8f8357b Mon Sep 17 00:00:00 2001
+From: Gustavo Padovan <gustavo.padovan@collabora.co.uk>
+Date: Wed, 1 Jun 2016 15:10:03 +0200
+Subject: [PATCH 63/88] dma-buf/fence: add fence_array fences v6
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: b3dfbdf261e076a997f812323edfdba84ba80256
+Patch-mainline: v4.8-rc1
+References: fate#321223
+
+struct fence_array inherits from struct fence and carries a
+collection of fences that needs to be waited together.
+
+It is useful to translate a sync_file to a fence to remove the complexity
+of dealing with sync_files on DRM drivers. So even if there are many
+fences in the sync_file that needs to waited for a commit to happen,
+they all get added to the fence_collection and passed for DRM use as
+a standard struct fence.
+
+That means that no changes needed to any driver besides supporting fences.
+
+To avoid fence_array's fence allocates a new timeline if needed (when
+combining fences from different timelines).
+
+v2: Comments by Daniel Vetter:
+	- merge fence_collection_init() and fence_collection_add()
+	- only add callbacks at ->enable_signalling()
+	- remove fence_collection_put()
+	- check for type on to_fence_collection()
+	- adjust fence_is_later() and fence_later() to WARN_ON() if they
+	are used with collection fences.
+
+v3: - Initialize fence_cb.node at fence init.
+
+    Comments by Chris Wilson:
+	- return "unbound" on fence_collection_get_timeline_name()
+	- don't stop adding callbacks if one fails
+	- remove redundant !! on fence_collection_enable_signaling()
+	- remove redundant () on fence_collection_signaled
+	- use fence_default_wait() instead
+
+v4 (chk): Rework, simplification and cleanup:
+	- Drop FENCE_NO_CONTEXT handling, always allocate a context.
+	- Rename to fence_array.
+	- Return fixed driver name.
+	- Register only one callback at a time.
+	- Document that create function takes ownership of array.
+
+v5 (chk): More work and fixes:
+	- Avoid deadlocks by adding all callbacks at once again.
+	- Stop trying to remove the callbacks.
+	- Provide context and sequence number for the array fence.
+
+v6 (chk): Fixes found during testing
+	- Fix stupid typo in _enable_signaling().
+
+Signed-off-by: Gustavo Padovan <gustavo.padovan@collabora.co.uk>
+Signed-off-by: Christian König <christian.koenig@amd.com>
+Reviewed-by: Gustavo Padovan <gustavo.padovan@collabora.co.uk>
+Acked-by: Sumit Semwal <sumit.semwal@linaro.org>
+[danvet: Improve commit message as suggested by Gustavo.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/1464786612-5010-3-git-send-email-deathsimple@vodafone.de
+Signed-off-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ drivers/dma-buf/Makefile      |   2 +-
+ drivers/dma-buf/fence-array.c | 127 ++++++++++++++++++++++++++++++++++++++++++
+ include/linux/fence-array.h   |  72 ++++++++++++++++++++++++
+ 3 files changed, 200 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/dma-buf/fence-array.c
+ create mode 100644 include/linux/fence-array.h
+
+diff --git a/drivers/dma-buf/Makefile b/drivers/dma-buf/Makefile
+index 4a424eca75ed..f353db213a81 100644
+--- a/drivers/dma-buf/Makefile
++++ b/drivers/dma-buf/Makefile
+@@ -1,2 +1,2 @@
+-obj-y := dma-buf.o fence.o reservation.o seqno-fence.o
++obj-y := dma-buf.o fence.o reservation.o seqno-fence.o fence-array.o
+ obj-$(CONFIG_SYNC_FILE)		+= sync_file.o
+diff --git a/drivers/dma-buf/fence-array.c b/drivers/dma-buf/fence-array.c
+new file mode 100644
+index 000000000000..81412175a420
+--- /dev/null
++++ b/drivers/dma-buf/fence-array.c
+@@ -0,0 +1,127 @@
++/*
++ * fence-array: aggregate fences to be waited together
++ *
++ * Copyright (C) 2016 Collabora Ltd
++ * Copyright (C) 2016 Advanced Micro Devices, Inc.
++ * Authors:
++ *	Gustavo Padovan <gustavo@padovan.org>
++ *	Christian König <christian.koenig@amd.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#include <linux/export.h>
++#include <linux/slab.h>
++#include <linux/fence-array.h>
++
++static void fence_array_cb_func(struct fence *f, struct fence_cb *cb);
++
++static const char *fence_array_get_driver_name(struct fence *fence)
++{
++	return "fence_array";
++}
++
++static const char *fence_array_get_timeline_name(struct fence *fence)
++{
++	return "unbound";
++}
++
++static void fence_array_cb_func(struct fence *f, struct fence_cb *cb)
++{
++	struct fence_array_cb *array_cb =
++		container_of(cb, struct fence_array_cb, cb);
++	struct fence_array *array = array_cb->array;
++
++	if (atomic_dec_and_test(&array->num_pending))
++		fence_signal(&array->base);
++}
++
++static bool fence_array_enable_signaling(struct fence *fence)
++{
++	struct fence_array *array = to_fence_array(fence);
++	struct fence_array_cb *cb = (void *)(&array[1]);
++	unsigned i;
++
++	for (i = 0; i < array->num_fences; ++i) {
++		cb[i].array = array;
++		if (fence_add_callback(array->fences[i], &cb[i].cb,
++				       fence_array_cb_func))
++			if (atomic_dec_and_test(&array->num_pending))
++				return false;
++	}
++
++	return true;
++}
++
++static bool fence_array_signaled(struct fence *fence)
++{
++	struct fence_array *array = to_fence_array(fence);
++
++	return atomic_read(&array->num_pending) == 0;
++}
++
++static void fence_array_release(struct fence *fence)
++{
++	struct fence_array *array = to_fence_array(fence);
++	unsigned i;
++
++	for (i = 0; i < array->num_fences; ++i)
++		fence_put(array->fences[i]);
++
++	kfree(array->fences);
++	fence_free(fence);
++}
++
++const struct fence_ops fence_array_ops = {
++	.get_driver_name = fence_array_get_driver_name,
++	.get_timeline_name = fence_array_get_timeline_name,
++	.enable_signaling = fence_array_enable_signaling,
++	.signaled = fence_array_signaled,
++	.wait = fence_default_wait,
++	.release = fence_array_release,
++};
++
++/**
++ * fence_array_create - Create a custom fence array
++ * @num_fences:	[in]	number of fences to add in the array
++ * @fences:	[in]	array containing the fences
++ * @context:	[in]	fence context to use
++ * @seqno:	[in]	sequence number to use
++ *
++ * Allocate a fence_array object and initialize the base fence with fence_init().
++ * In case of error it returns NULL.
++ *
++ * The caller should allocte the fences array with num_fences size
++ * and fill it with the fences it wants to add to the object. Ownership of this
++ * array is take and fence_put() is used on each fence on release.
++ */
++struct fence_array *fence_array_create(int num_fences, struct fence **fences,
++				       u64 context, unsigned seqno)
++{
++	struct fence_array *array;
++	size_t size = sizeof(*array);
++
++	/* Allocate the callback structures behind the array. */
++	size += num_fences * sizeof(struct fence_array_cb);
++	array = kzalloc(size, GFP_KERNEL);
++	if (!array)
++		return NULL;
++
++	spin_lock_init(&array->lock);
++	fence_init(&array->base, &fence_array_ops, &array->lock,
++		   context, seqno);
++
++	array->num_fences = num_fences;
++	atomic_set(&array->num_pending, num_fences);
++	array->fences = fences;
++
++	return array;
++}
++EXPORT_SYMBOL(fence_array_create);
+diff --git a/include/linux/fence-array.h b/include/linux/fence-array.h
+new file mode 100644
+index 000000000000..593ab983129e
+--- /dev/null
++++ b/include/linux/fence-array.h
+@@ -0,0 +1,72 @@
++/*
++ * fence-array: aggregates fence to be waited together
++ *
++ * Copyright (C) 2016 Collabora Ltd
++ * Copyright (C) 2016 Advanced Micro Devices, Inc.
++ * Authors:
++ *	Gustavo Padovan <gustavo@padovan.org>
++ *	Christian König <christian.koenig@amd.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++
++#ifndef __LINUX_FENCE_ARRAY_H
++#define __LINUX_FENCE_ARRAY_H
++
++#include <linux/fence.h>
++
++/**
++ * struct fence_array_cb - callback helper for fence array
++ * @cb: fence callback structure for signaling
++ * @array: reference to the parent fence array object
++ */
++struct fence_array_cb {
++	struct fence_cb cb;
++	struct fence_array *array;
++};
++
++/**
++ * struct fence_array - fence to represent an array of fences
++ * @base: fence base class
++ * @lock: spinlock for fence handling
++ * @num_fences: number of fences in the array
++ * @num_pending: fences in the array still pending
++ * @fences: array of the fences
++ */
++struct fence_array {
++	struct fence base;
++
++	spinlock_t lock;
++	unsigned num_fences;
++	atomic_t num_pending;
++	struct fence **fences;
++};
++
++extern const struct fence_ops fence_array_ops;
++
++/**
++ * to_fence_array - cast a fence to a fence_array
++ * @fence: fence to cast to a fence_array
++ *
++ * Returns NULL if the fence is not a fence_array,
++ * or the fence_array otherwise.
++ */
++static inline struct fence_array *to_fence_array(struct fence *fence)
++{
++	if (fence->ops != &fence_array_ops)
++		return NULL;
++
++	return container_of(fence, struct fence_array, base);
++}
++
++struct fence_array *fence_array_create(int num_fences, struct fence **fences,
++				       u64 context, unsigned seqno);
++
++#endif /* __LINUX_FENCE_ARRAY_H */
+-- 
+2.12.0
