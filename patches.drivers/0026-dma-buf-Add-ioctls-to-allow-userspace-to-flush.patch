@@ -1,0 +1,201 @@
+From e6d0c061ba35218eb4a1c141e33e854fc562cb62 Mon Sep 17 00:00:00 2001
+From: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date: Thu, 11 Feb 2016 20:04:51 -0200
+Subject: [PATCH 26/88] dma-buf: Add ioctls to allow userspace to flush
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Git-commit: c11e391da2a8fe973c3c2398452000bed505851e
+Patch-mainline: v4.6-rc1
+References: fate#321223
+
+The userspace might need some sort of cache coherency management e.g. when CPU
+and GPU domains are being accessed through dma-buf at the same time. To
+circumvent this problem there are begin/end coherency markers, that forward
+directly to existing dma-buf device drivers vfunc hooks. Userspace can make use
+of those markers through the DMA_BUF_IOCTL_SYNC ioctl. The sequence would be
+used like following:
+     - mmap dma-buf fd
+     - for each drawing/upload cycle in CPU 1. SYNC_START ioctl, 2. read/write
+       to mmap area 3. SYNC_END ioctl. This can be repeated as often as you
+       want (with the new data being consumed by the GPU or say scanout device)
+     - munmap once you don't need the buffer any more
+
+v2 (Tiago): Fix header file type names (u64 -> __u64)
+v3 (Tiago): Add documentation. Use enum dma_buf_sync_flags to the begin/end
+dma-buf functions. Check for overflows in start/length.
+v4 (Tiago): use 2d regions for sync.
+v5 (Tiago): forget about 2d regions (v4); use _IOW in DMA_BUF_IOCTL_SYNC and
+remove range information from struct dma_buf_sync.
+v6 (Tiago): use __u64 structured padded flags instead enum. Adjust
+documentation about the recommendation on using sync ioctls.
+v7 (Tiago): Alex' nit on flags definition and being even more wording in the
+doc about sync usage.
+v9 (Tiago): remove useless is_dma_buf_file check. Fix sync.flags conditionals
+and its mask order check. Add <linux/types.h> include in dma-buf.h.
+
+Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Cc: David Herrmann <dh.herrmann@gmail.com>
+Cc: Sumit Semwal <sumit.semwal@linaro.org>
+Reviewed-by: Stéphane Marchesin <marcheu@chromium.org>
+Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+Signed-off-by: Tiago Vignatti <tiago.vignatti@intel.com>
+Reviewed-by: David Herrmann <dh.herrmann@gmail.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: http://patchwork.freedesktop.org/patch/msgid/1455228291-29640-1-git-send-email-tiago.vignatti@intel.com
+Signed-off-by: Patrik Jakobsson <pjakobsson@suse.de>
+---
+ Documentation/dma-buf-sharing.txt | 21 +++++++++++++++++-
+ drivers/dma-buf/dma-buf.c         | 45 +++++++++++++++++++++++++++++++++++++++
+ include/uapi/linux/dma-buf.h      | 40 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 105 insertions(+), 1 deletion(-)
+ create mode 100644 include/uapi/linux/dma-buf.h
+
+diff --git a/Documentation/dma-buf-sharing.txt b/Documentation/dma-buf-sharing.txt
+index 4f4a84b6903a..32ac32e773e1 100644
+--- a/Documentation/dma-buf-sharing.txt
++++ b/Documentation/dma-buf-sharing.txt
+@@ -350,7 +350,26 @@ Being able to mmap an export dma-buf buffer object has 2 main use-cases:
+    handles, too). So it's beneficial to support this in a similar fashion on
+    dma-buf to have a good transition path for existing Android userspace.
+ 
+-   No special interfaces, userspace simply calls mmap on the dma-buf fd.
++   No special interfaces, userspace simply calls mmap on the dma-buf fd, making
++   sure that the cache synchronization ioctl (DMA_BUF_IOCTL_SYNC) is *always*
++   used when the access happens. This is discussed next paragraphs.
++
++   Some systems might need some sort of cache coherency management e.g. when
++   CPU and GPU domains are being accessed through dma-buf at the same time. To
++   circumvent this problem there are begin/end coherency markers, that forward
++   directly to existing dma-buf device drivers vfunc hooks. Userspace can make
++   use of those markers through the DMA_BUF_IOCTL_SYNC ioctl. The sequence
++   would be used like following:
++     - mmap dma-buf fd
++     - for each drawing/upload cycle in CPU 1. SYNC_START ioctl, 2. read/write
++       to mmap area 3. SYNC_END ioctl. This can be repeated as often as you
++       want (with the new data being consumed by the GPU or say scanout device)
++     - munmap once you don't need the buffer any more
++
++    Therefore, for correctness and optimal performance, systems with the memory
++    cache shared by the GPU and CPU i.e. the "coherent" and also the
++    "incoherent" are always required to use SYNC_START and SYNC_END before and
++    after, respectively, when accessing the mapped address.
+ 
+ 2. Supporting existing mmap interfaces in importers
+ 
+diff --git a/drivers/dma-buf/dma-buf.c b/drivers/dma-buf/dma-buf.c
+index b2ac13b4ddaa..9810d1df0691 100644
+--- a/drivers/dma-buf/dma-buf.c
++++ b/drivers/dma-buf/dma-buf.c
+@@ -34,6 +34,8 @@
+ #include <linux/poll.h>
+ #include <linux/reservation.h>
+ 
++#include <uapi/linux/dma-buf.h>
++
+ static inline int is_dma_buf_file(struct file *);
+ 
+ struct dma_buf_list {
+@@ -251,11 +253,54 @@ out:
+ 	return events;
+ }
+ 
++static long dma_buf_ioctl(struct file *file,
++			  unsigned int cmd, unsigned long arg)
++{
++	struct dma_buf *dmabuf;
++	struct dma_buf_sync sync;
++	enum dma_data_direction direction;
++
++	dmabuf = file->private_data;
++
++	switch (cmd) {
++	case DMA_BUF_IOCTL_SYNC:
++		if (copy_from_user(&sync, (void __user *) arg, sizeof(sync)))
++			return -EFAULT;
++
++		if (sync.flags & ~DMA_BUF_SYNC_VALID_FLAGS_MASK)
++			return -EINVAL;
++
++		switch (sync.flags & DMA_BUF_SYNC_RW) {
++		case DMA_BUF_SYNC_READ:
++			direction = DMA_FROM_DEVICE;
++			break;
++		case DMA_BUF_SYNC_WRITE:
++			direction = DMA_TO_DEVICE;
++			break;
++		case DMA_BUF_SYNC_RW:
++			direction = DMA_BIDIRECTIONAL;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		if (sync.flags & DMA_BUF_SYNC_END)
++			dma_buf_end_cpu_access(dmabuf, direction);
++		else
++			dma_buf_begin_cpu_access(dmabuf, direction);
++
++		return 0;
++	default:
++		return -ENOTTY;
++	}
++}
++
+ static const struct file_operations dma_buf_fops = {
+ 	.release	= dma_buf_release,
+ 	.mmap		= dma_buf_mmap_internal,
+ 	.llseek		= dma_buf_llseek,
+ 	.poll		= dma_buf_poll,
++	.unlocked_ioctl	= dma_buf_ioctl,
+ };
+ 
+ /*
+diff --git a/include/uapi/linux/dma-buf.h b/include/uapi/linux/dma-buf.h
+new file mode 100644
+index 000000000000..fb0dedb7c121
+--- /dev/null
++++ b/include/uapi/linux/dma-buf.h
+@@ -0,0 +1,40 @@
++/*
++ * Framework for buffer objects that can be shared across devices/subsystems.
++ *
++ * Copyright(C) 2015 Intel Ltd
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef _DMA_BUF_UAPI_H_
++#define _DMA_BUF_UAPI_H_
++
++#include <linux/types.h>
++
++/* begin/end dma-buf functions used for userspace mmap. */
++struct dma_buf_sync {
++	__u64 flags;
++};
++
++#define DMA_BUF_SYNC_READ      (1 << 0)
++#define DMA_BUF_SYNC_WRITE     (2 << 0)
++#define DMA_BUF_SYNC_RW        (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
++#define DMA_BUF_SYNC_START     (0 << 2)
++#define DMA_BUF_SYNC_END       (1 << 2)
++#define DMA_BUF_SYNC_VALID_FLAGS_MASK \
++	(DMA_BUF_SYNC_RW | DMA_BUF_SYNC_END)
++
++#define DMA_BUF_BASE		'b'
++#define DMA_BUF_IOCTL_SYNC	_IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
++
++#endif
+-- 
+2.12.0
