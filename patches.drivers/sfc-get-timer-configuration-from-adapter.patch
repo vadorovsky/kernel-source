@@ -1,0 +1,261 @@
+From: Bert Kenward <bkenward@solarflare.com>
+Date: Thu, 11 Aug 2016 13:02:36 +0100
+Subject: sfc: get timer configuration from adapter
+Patch-mainline: v4.9-rc1
+Git-commit: d95e329a55baaea8c00d1b3e0ce22c974d447524
+References: bsc#1017967 FATE#321663
+
+On SFN8000 series adapters the MC provides a method to get the timer
+quantum and the maximum timer setting. We revert to the old values if the
+new call is unavailable.
+
+Signed-off-by: Bert Kenward <bkenward@solarflare.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Acked-by: David Chang <dchang@suse.com>
+---
+ drivers/net/ethernet/sfc/ef10.c       |  142 +++++++++++++++++++++++++++-------
+ drivers/net/ethernet/sfc/efx.c        |    9 +-
+ drivers/net/ethernet/sfc/falcon.c     |    2 
+ drivers/net/ethernet/sfc/net_driver.h |    2 
+ drivers/net/ethernet/sfc/siena.c      |    3 
+ 5 files changed, 125 insertions(+), 33 deletions(-)
+
+--- a/drivers/net/ethernet/sfc/ef10.c
++++ b/drivers/net/ethernet/sfc/ef10.c
+@@ -233,6 +233,116 @@ static int efx_ef10_get_sysclk_freq(stru
+ 	return rc > 0 ? rc : -ERANGE;
+ }
+ 
++static int efx_ef10_get_timer_workarounds(struct efx_nic *efx)
++{
++	struct efx_ef10_nic_data *nic_data = efx->nic_data;
++	unsigned int implemented;
++	unsigned int enabled;
++	int rc;
++
++	nic_data->workaround_35388 = false;
++	nic_data->workaround_61265 = false;
++
++	rc = efx_mcdi_get_workarounds(efx, &implemented, &enabled);
++
++	if (rc == -ENOSYS) {
++		/* Firmware without GET_WORKAROUNDS - not a problem. */
++		rc = 0;
++	} else if (rc == 0) {
++		/* Bug61265 workaround is always enabled if implemented. */
++		if (enabled & MC_CMD_GET_WORKAROUNDS_OUT_BUG61265)
++			nic_data->workaround_61265 = true;
++
++		if (enabled & MC_CMD_GET_WORKAROUNDS_OUT_BUG35388) {
++			nic_data->workaround_35388 = true;
++		} else if (implemented & MC_CMD_GET_WORKAROUNDS_OUT_BUG35388) {
++			/* Workaround is implemented but not enabled.
++			 * Try to enable it.
++			 */
++			rc = efx_mcdi_set_workaround(efx,
++						     MC_CMD_WORKAROUND_BUG35388,
++						     true, NULL);
++			if (rc == 0)
++				nic_data->workaround_35388 = true;
++			/* If we failed to set the workaround just carry on. */
++			rc = 0;
++		}
++	}
++
++	netif_dbg(efx, probe, efx->net_dev,
++		  "workaround for bug 35388 is %sabled\n",
++		  nic_data->workaround_35388 ? "en" : "dis");
++	netif_dbg(efx, probe, efx->net_dev,
++		  "workaround for bug 61265 is %sabled\n",
++		  nic_data->workaround_61265 ? "en" : "dis");
++
++	return rc;
++}
++
++static void efx_ef10_process_timer_config(struct efx_nic *efx,
++					  const efx_dword_t *data)
++{
++	unsigned int max_count;
++
++	if (EFX_EF10_WORKAROUND_61265(efx)) {
++		efx->timer_quantum_ns = MCDI_DWORD(data,
++			GET_EVQ_TMR_PROPERTIES_OUT_MCDI_TMR_STEP_NS);
++		efx->timer_max_ns = MCDI_DWORD(data,
++			GET_EVQ_TMR_PROPERTIES_OUT_MCDI_TMR_MAX_NS);
++	} else if (EFX_EF10_WORKAROUND_35388(efx)) {
++		efx->timer_quantum_ns = MCDI_DWORD(data,
++			GET_EVQ_TMR_PROPERTIES_OUT_BUG35388_TMR_NS_PER_COUNT);
++		max_count = MCDI_DWORD(data,
++			GET_EVQ_TMR_PROPERTIES_OUT_BUG35388_TMR_MAX_COUNT);
++		efx->timer_max_ns = max_count * efx->timer_quantum_ns;
++	} else {
++		efx->timer_quantum_ns = MCDI_DWORD(data,
++			GET_EVQ_TMR_PROPERTIES_OUT_TMR_REG_NS_PER_COUNT);
++		max_count = MCDI_DWORD(data,
++			GET_EVQ_TMR_PROPERTIES_OUT_TMR_REG_MAX_COUNT);
++		efx->timer_max_ns = max_count * efx->timer_quantum_ns;
++	}
++
++	netif_dbg(efx, probe, efx->net_dev,
++		  "got timer properties from MC: quantum %u ns; max %u ns\n",
++		  efx->timer_quantum_ns, efx->timer_max_ns);
++}
++
++static int efx_ef10_get_timer_config(struct efx_nic *efx)
++{
++	MCDI_DECLARE_BUF(outbuf, MC_CMD_GET_EVQ_TMR_PROPERTIES_OUT_LEN);
++	int rc;
++
++	rc = efx_ef10_get_timer_workarounds(efx);
++	if (rc)
++		return rc;
++
++	rc = efx_mcdi_rpc_quiet(efx, MC_CMD_GET_EVQ_TMR_PROPERTIES, NULL, 0,
++				outbuf, sizeof(outbuf), NULL);
++
++	if (rc == 0) {
++		efx_ef10_process_timer_config(efx, outbuf);
++	} else if (rc == -ENOSYS || rc == -EPERM) {
++		/* Not available - fall back to Huntington defaults. */
++		unsigned int quantum;
++
++		rc = efx_ef10_get_sysclk_freq(efx);
++		if (rc < 0)
++			return rc;
++
++		quantum = 1536000 / rc; /* 1536 cycles */
++		efx->timer_quantum_ns = quantum;
++		efx->timer_max_ns = efx->type->timer_period_max * quantum;
++		rc = 0;
++	} else {
++		efx_mcdi_display_error(efx, MC_CMD_GET_EVQ_TMR_PROPERTIES,
++				       MC_CMD_GET_EVQ_TMR_PROPERTIES_OUT_LEN,
++				       NULL, 0, rc);
++	}
++
++	return rc;
++}
++
+ static int efx_ef10_get_mac_address_pf(struct efx_nic *efx, u8 *mac_address)
+ {
+ 	MCDI_DECLARE_BUF(outbuf, MC_CMD_GET_MAC_ADDRESSES_OUT_LEN);
+@@ -533,33 +643,11 @@ static int efx_ef10_probe(struct efx_nic
+ 	if (rc)
+ 		goto fail5;
+ 
+-	rc = efx_ef10_get_sysclk_freq(efx);
++	rc = efx_ef10_get_timer_config(efx);
+ 	if (rc < 0)
+ 		goto fail5;
+ 	efx->timer_quantum_ns = 1536000 / rc; /* 1536 cycles */
+ 
+-	/* Check whether firmware supports bug 35388 workaround.
+-	 * First try to enable it, then if we get EPERM, just
+-	 * ask if it's already enabled
+-	 */
+-	rc = efx_mcdi_set_workaround(efx, MC_CMD_WORKAROUND_BUG35388, true, NULL);
+-	if (rc == 0) {
+-		nic_data->workaround_35388 = true;
+-	} else if (rc == -EPERM) {
+-		unsigned int enabled;
+-
+-		rc = efx_mcdi_get_workarounds(efx, NULL, &enabled);
+-		if (rc)
+-			goto fail3;
+-		nic_data->workaround_35388 = enabled &
+-			MC_CMD_GET_WORKAROUNDS_OUT_BUG35388;
+-	} else if (rc != -ENOSYS && rc != -ENOENT) {
+-		goto fail5;
+-	}
+-	netif_dbg(efx, probe, efx->net_dev,
+-		  "workaround for bug 35388 is %sabled\n",
+-		  nic_data->workaround_35388 ? "en" : "dis");
+-
+ 	rc = efx_mcdi_mon_probe(efx);
+ 	if (rc && rc != -EPERM)
+ 		goto fail5;
+@@ -2643,11 +2731,10 @@ static int efx_ef10_ev_init(struct efx_c
+ 	/* Successfully created event queue on channel 0 */
+ 	rc = efx_mcdi_get_workarounds(efx, &implemented, &enabled);
+ 	if (rc == -ENOSYS) {
+-		/* GET_WORKAROUNDS was implemented before these workarounds,
+-		 * thus they must be unavailable in this firmware.
++		/* GET_WORKAROUNDS was implemented before this workaround,
++		 * thus it must be unavailable in this firmware.
+ 		 */
+ 		nic_data->workaround_26807 = false;
+-		nic_data->workaround_61265 = false;
+ 		rc = 0;
+ 	} else if (rc) {
+ 		goto fail;
+@@ -2687,9 +2774,6 @@ static int efx_ef10_ev_init(struct efx_c
+ 				rc = 0;
+ 			}
+ 		}
+-
+-		nic_data->workaround_61265 =
+-			!!(implemented & MC_CMD_GET_WORKAROUNDS_OUT_BUG61265);
+ 	}
+ 
+ 	if (!rc)
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@ -1979,12 +1979,13 @@ int efx_init_irq_moderation(struct efx_n
+ 			    bool rx_may_override_tx)
+ {
+ 	struct efx_channel *channel;
+-	unsigned int irq_mod_max = DIV_ROUND_UP(efx->type->timer_period_max *
+-						efx->timer_quantum_ns,
+-						1000);
++	unsigned int timer_max_us;
++
+ 	EFX_ASSERT_RESET_SERIALISED(efx);
+ 
+-	if (tx_usecs > irq_mod_max || rx_usecs > irq_mod_max)
++	timer_max_us = efx->timer_max_ns / 1000;
++
++	if (tx_usecs > timer_max_us || rx_usecs > timer_max_us)
+ 		return -EINVAL;
+ 
+ 	if (tx_usecs != rx_usecs && efx->tx_channel_offset == 0 &&
+--- a/drivers/net/ethernet/sfc/falcon.c
++++ b/drivers/net/ethernet/sfc/falcon.c
+@@ -2376,6 +2376,8 @@ static int falcon_probe_nic(struct efx_n
+ 			     EFX_MAX_CHANNELS);
+ 	efx->max_tx_channels = efx->max_channels;
+ 	efx->timer_quantum_ns = 4968; /* 621 cycles */
++	efx->timer_max_ns = efx->type->timer_period_max *
++			    efx->timer_quantum_ns;
+ 
+ 	/* Initialise I2C adapter */
+ 	board = falcon_board(efx);
+--- a/drivers/net/ethernet/sfc/net_driver.h
++++ b/drivers/net/ethernet/sfc/net_driver.h
+@@ -810,6 +810,7 @@ struct vfdi_status;
+  * @membase: Memory BAR value
+  * @interrupt_mode: Interrupt mode
+  * @timer_quantum_ns: Interrupt timer quantum, in nanoseconds
++ * @timer_max_ns: Interrupt timer maximum value, in nanoseconds
+  * @irq_rx_adaptive: Adaptive IRQ moderation enabled for RX event queues
+  * @irq_rx_mod_step_us: Step size for IRQ moderation for RX event queues
+  * @irq_rx_moderation_us: IRQ moderation time for RX event queues
+@@ -941,6 +942,7 @@ struct efx_nic {
+ 
+ 	enum efx_int_mode interrupt_mode;
+ 	unsigned int timer_quantum_ns;
++	unsigned int timer_max_ns;
+ 	bool irq_rx_adaptive;
+ 	unsigned int irq_mod_step_us;
+ 	unsigned int irq_rx_moderation_us;
+--- a/drivers/net/ethernet/sfc/siena.c
++++ b/drivers/net/ethernet/sfc/siena.c
+@@ -227,6 +227,9 @@ static int siena_probe_nvconfig(struct e
+ 	efx->timer_quantum_ns =
+ 		(caps & (1 << MC_CMD_CAPABILITIES_TURBO_ACTIVE_LBN)) ?
+ 		3072 : 6144; /* 768 cycles */
++	efx->timer_max_ns = efx->type->timer_period_max *
++			    efx->timer_quantum_ns;
++
+ 	return rc;
+ }
+ 
