@@ -1,0 +1,145 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Mon, 2 May 2016 15:45:19 +0200
+Subject: target: consolidate and fix session shutdown
+References: bsc#1019675,FATE#321701
+Git-commit: bc6e6bb470eda42f44bcac96c261cff1216577b3
+Patch-Mainline: v4.7-rc1
+
+Factor out a helper to shutdown sessions for a Node ACL, and make it
+properly restart the list walk after dropping the lock.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/target/target_core_tpg.c | 87 +++++++++++++++-------------------------
+ 1 file changed, 33 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/target/target_core_tpg.c b/drivers/target/target_core_tpg.c
+index ecab77f..f128a59 100644
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@ -336,44 +336,47 @@ struct se_node_acl *core_tpg_add_initiator_node_acl(
+ 	return acl;
+ }
+ 
+-void core_tpg_del_initiator_node_acl(struct se_node_acl *acl)
++static void target_shutdown_sessions(struct se_node_acl *acl, bool acl_stop)
+ {
+-	struct se_portal_group *tpg = acl->se_tpg;
+-	LIST_HEAD(sess_list);
+-	struct se_session *sess, *sess_tmp;
++	struct se_session *sess;
+ 	unsigned long flags;
+-	int rc;
+-
+-	mutex_lock(&tpg->acl_node_mutex);
+-	if (acl->dynamic_node_acl) {
+-		acl->dynamic_node_acl = 0;
+-	}
+-	list_del(&acl->acl_list);
+-	mutex_unlock(&tpg->acl_node_mutex);
++	int ret;
+ 
+ 	spin_lock_irqsave(&acl->nacl_sess_lock, flags);
+-	acl->acl_stop = 1;
+-
+-	list_for_each_entry_safe(sess, sess_tmp, &acl->acl_sess_list,
+-				sess_acl_list) {
+-		if (sess->sess_tearing_down != 0)
++	if (acl_stop)
++		acl->acl_stop = 1;
++restart:
++	list_for_each_entry(sess, &acl->acl_sess_list, sess_acl_list) {
++		if (sess->sess_tearing_down)
+ 			continue;
+-
+ 		if (!target_get_session(sess))
+ 			continue;
+-		list_move(&sess->sess_acl_list, &sess_list);
+-	}
+-	spin_unlock_irqrestore(&acl->nacl_sess_lock, flags);
+ 
+-	list_for_each_entry_safe(sess, sess_tmp, &sess_list, sess_acl_list) {
+ 		list_del(&sess->sess_acl_list);
+ 
+-		rc = tpg->se_tpg_tfo->shutdown_session(sess);
+-		target_put_session(sess);
+-		if (!rc)
+-			continue;
++		spin_unlock_irqrestore(&acl->nacl_sess_lock, flags);
++		ret = acl->se_tpg->se_tpg_tfo->shutdown_session(sess);
+ 		target_put_session(sess);
++		if (ret)
++			target_put_session(sess);
++		spin_lock_irqsave(&acl->nacl_sess_lock, flags);
++		goto restart;
+ 	}
++	spin_unlock_irqrestore(&acl->nacl_sess_lock, flags);
++}
++
++void core_tpg_del_initiator_node_acl(struct se_node_acl *acl)
++{
++	struct se_portal_group *tpg = acl->se_tpg;
++
++	mutex_lock(&tpg->acl_node_mutex);
++	if (acl->dynamic_node_acl)
++		acl->dynamic_node_acl = 0;
++	list_del(&acl->acl_list);
++	mutex_unlock(&tpg->acl_node_mutex);
++
++	target_shutdown_sessions(acl, true);
++
+ 	target_put_nacl(acl);
+ 	/*
+ 	 * Wait for last target_put_nacl() to complete in target_complete_nacl()
+@@ -400,11 +403,7 @@ int core_tpg_set_initiator_node_queue_depth(
+ 	struct se_node_acl *acl,
+ 	u32 queue_depth)
+ {
+-	LIST_HEAD(sess_list);
+ 	struct se_portal_group *tpg = acl->se_tpg;
+-	struct se_session *sess, *sess_tmp;
+-	unsigned long flags;
+-	int rc;
+ 
+ 	/*
+ 	 * User has requested to change the queue depth for a Initiator Node.
+@@ -413,30 +412,10 @@ int core_tpg_set_initiator_node_queue_depth(
+ 	 */
+ 	target_set_nacl_queue_depth(tpg, acl, queue_depth);
+ 
+-	spin_lock_irqsave(&acl->nacl_sess_lock, flags);
+-	list_for_each_entry_safe(sess, sess_tmp, &acl->acl_sess_list,
+-				 sess_acl_list) {
+-		if (sess->sess_tearing_down != 0)
+-			continue;
+-		if (!target_get_session(sess))
+-			continue;
+-		spin_unlock_irqrestore(&acl->nacl_sess_lock, flags);
+-
+-		/*
+-		 * Finally call tpg->se_tpg_tfo->close_session() to force session
+-		 * reinstatement to occur if there is an active session for the
+-		 * $FABRIC_MOD Initiator Node in question.
+-		 */
+-		rc = tpg->se_tpg_tfo->shutdown_session(sess);
+-		target_put_session(sess);
+-		if (!rc) {
+-			spin_lock_irqsave(&acl->nacl_sess_lock, flags);
+-			continue;
+-		}
+-		target_put_session(sess);
+-		spin_lock_irqsave(&acl->nacl_sess_lock, flags);
+-	}
+-	spin_unlock_irqrestore(&acl->nacl_sess_lock, flags);
++	/*
++	 * Shutdown all pending sessions to force session reinstatement.
++	 */
++	target_shutdown_sessions(acl, false);
+ 
+ 	pr_debug("Successfully changed queue depth to: %d for Initiator"
+ 		" Node: %s on %s Target Portal Group: %u\n", acl->queue_depth,
+-- 
+1.8.5.6
+
