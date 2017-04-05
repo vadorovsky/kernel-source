@@ -1,0 +1,382 @@
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Fri, 29 Apr 2016 19:54:20 +0200
+Subject: libceph: variable-sized ceph_object_id
+Git-commit: d30291b985d1854565d7f2c82a4457869d5265e8
+Patch-mainline: v4.7-rc1
+References: FATE#322288
+
+Currently ceph_object_id can hold object names of up to 100
+(CEPH_MAX_OID_NAME_LEN) characters.  This is enough for all use cases,
+expect one - long rbd image names:
+
+- a format 1 header is named "<imgname>.rbd"
+- an object that points to a format 2 header is named "rbd_id.<imgname>"
+
+We operate on these potentially long-named objects during rbd map, and,
+for format 1 images, during header refresh.  (A format 2 header name is
+a small system-generated string.)
+
+Lift this 100 character limit by making ceph_object_id be able to point
+to an externally-allocated string.  Apart from being able to work with
+almost arbitrarily-long named objects, this allows us to reduce the
+size of ceph_object_id from >100 bytes to 64 bytes.
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+[luis: replace extra ceph_oid_set_name in rbd_img_obj_creatrunc_submit().]
+---
+ drivers/block/rbd.c         |   12 ++++-
+ fs/ceph/addr.c              |    6 --
+ fs/ceph/file.c              |    2 
+ fs/ceph/ioctl.c             |    2 
+ include/linux/ceph/osdmap.h |   62 +++++++++++++++++------------
+ net/ceph/debugfs.c          |    2 
+ net/ceph/osd_client.c       |   16 ++++---
+ net/ceph/osdmap.c           |   93 +++++++++++++++++++++++++++++++++++++++++++-
+ 8 files changed, 153 insertions(+), 42 deletions(-)
+
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -2014,7 +2014,9 @@ static struct ceph_osd_request *rbd_osd_
+ 	osd_req->r_priv = obj_request;
+ 
+ 	osd_req->r_base_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
+-	ceph_oid_set_name(&osd_req->r_base_oid, obj_request->object_name);
++	if (ceph_oid_aprintf(&osd_req->r_base_oid, GFP_NOIO, "%s",
++			     obj_request->object_name))
++		goto fail;
+ 
+ 	if (ceph_osdc_alloc_messages(osd_req, GFP_NOIO))
+ 		goto fail;
+@@ -2065,7 +2067,9 @@ rbd_osd_req_create_copyup(struct rbd_obj
+ 	osd_req->r_priv = obj_request;
+ 
+ 	osd_req->r_base_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
+-	ceph_oid_set_name(&osd_req->r_base_oid, obj_request->object_name);
++	if (ceph_oid_aprintf(&osd_req->r_base_oid, GFP_NOIO, "%s",
++			     obj_request->object_name))
++		goto fail;
+ 
+ 	if (ceph_osdc_alloc_messages(osd_req, GFP_NOIO))
+ 		goto fail;
+@@ -3191,7 +3195,9 @@ rbd_img_obj_creatrunc_submit(struct rbd_
+ 	osd_req->r_callback = rbd_osd_req_callback;
+ 	osd_req->r_priv = creatrunc_req;
+ 	osd_req->r_base_oloc.pool = ceph_file_layout_pg_pool(rbd_dev->layout);
+-	ceph_oid_set_name(&osd_req->r_base_oid, creatrunc_req->object_name);
++	if (ceph_oid_aprintf(&osd_req->r_base_oid, GFP_NOIO, "%s",
++			     creatrunc_req->object_name))
++		goto fail_creatrunc_request;
+ 
+ 	creatrunc_req->osd_req = osd_req;
+ 	rbd_obj_request_get(obj_request);
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -1757,9 +1757,7 @@ static int __ceph_pool_perm_get(struct c
+ 	rd_req->r_flags = CEPH_OSD_FLAG_READ;
+ 	osd_req_op_init(rd_req, 0, CEPH_OSD_OP_STAT, 0);
+ 	rd_req->r_base_oloc.pool = pool;
+-	snprintf(rd_req->r_base_oid.name, sizeof(rd_req->r_base_oid.name),
+-		 "%llx.00000000", ci->i_vino.ino);
+-	rd_req->r_base_oid.name_len = strlen(rd_req->r_base_oid.name);
++	ceph_oid_printf(&rd_req->r_base_oid, "%llx.00000000", ci->i_vino.ino);
+ 
+ 	err = ceph_osdc_alloc_messages(rd_req, GFP_NOFS);
+ 	if (err)
+@@ -1776,7 +1774,7 @@ static int __ceph_pool_perm_get(struct c
+ 			  CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK;
+ 	osd_req_op_init(wr_req, 0, CEPH_OSD_OP_CREATE, CEPH_OSD_OP_FLAG_EXCL);
+ 	wr_req->r_base_oloc.pool = pool;
+-	wr_req->r_base_oid = rd_req->r_base_oid;
++	ceph_oid_copy(&wr_req->r_base_oid, &rd_req->r_base_oid);
+ 
+ 	err = ceph_osdc_alloc_messages(wr_req, GFP_NOFS);
+ 	if (err)
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -715,7 +715,7 @@ static void ceph_aio_retry_work(struct w
+ 			CEPH_OSD_FLAG_ONDISK |
+ 			CEPH_OSD_FLAG_WRITE;
+ 	req->r_base_oloc = orig_req->r_base_oloc;
+-	req->r_base_oid = orig_req->r_base_oid;
++	ceph_oid_copy(&req->r_base_oid, &orig_req->r_base_oid);
+ 
+ 	ret = ceph_osdc_alloc_messages(req, GFP_NOFS);
+ 	if (ret) {
+--- a/fs/ceph/ioctl.c
++++ b/fs/ceph/ioctl.c
+@@ -213,7 +213,7 @@ static long ceph_ioctl_get_dataloc(struc
+ 		 ceph_ino(inode), dl.object_no);
+ 
+ 	oloc.pool = ceph_file_layout_pg_pool(ci->i_layout);
+-	ceph_oid_set_name(&oid, dl.object_name);
++	ceph_oid_printf(&oid, "%s", dl.object_name);
+ 
+ 	r = ceph_oloc_oid_to_pg(osdc->osdmap, &oloc, &oid, &pgid);
+ 	if (r < 0) {
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@ -64,11 +64,47 @@ struct ceph_object_locator {
+  */
+ #define CEPH_MAX_OID_NAME_LEN 100
+ 
++/*
++ * 51-char inline_name is long enough for all cephfs and all but one
++ * rbd requests: <imgname> in "<imgname>.rbd"/"rbd_id.<imgname>" can be
++ * arbitrarily long (~PAGE_SIZE).  It's done once during rbd map; all
++ * other rbd requests fit into inline_name.
++ *
++ * Makes ceph_object_id 64 bytes on 64-bit.
++ */
++#define CEPH_OID_INLINE_LEN 52
++
++/*
++ * Both inline and external buffers have space for a NUL-terminator,
++ * which is carried around.  It's not required though - RADOS object
++ * names don't have to be NUL-terminated and may contain NULs.
++ */
+ struct ceph_object_id {
+-	char name[CEPH_MAX_OID_NAME_LEN];
++	char *name;
++	char inline_name[CEPH_OID_INLINE_LEN];
+ 	int name_len;
+ };
+ 
++static inline void ceph_oid_init(struct ceph_object_id *oid)
++{
++	oid->name = oid->inline_name;
++	oid->name_len = 0;
++}
++
++static inline bool ceph_oid_empty(const struct ceph_object_id *oid)
++{
++	return oid->name == oid->inline_name && !oid->name_len;
++}
++
++void ceph_oid_copy(struct ceph_object_id *dest,
++		   const struct ceph_object_id *src);
++__printf(2, 3)
++void ceph_oid_printf(struct ceph_object_id *oid, const char *fmt, ...);
++__printf(3, 4)
++int ceph_oid_aprintf(struct ceph_object_id *oid, gfp_t gfp,
++		     const char *fmt, ...);
++void ceph_oid_destroy(struct ceph_object_id *oid);
++
+ struct ceph_pg_mapping {
+ 	struct rb_node node;
+ 	struct ceph_pg pgid;
+@@ -113,30 +149,6 @@ struct ceph_osdmap {
+ 	int crush_scratch_ary[CEPH_PG_MAX_SIZE * 3];
+ };
+ 
+-static inline void ceph_oid_set_name(struct ceph_object_id *oid,
+-				     const char *name)
+-{
+-	int len;
+-
+-	len = strlen(name);
+-	if (len > sizeof(oid->name)) {
+-		WARN(1, "ceph_oid_set_name '%s' len %d vs %zu, truncating\n",
+-		     name, len, sizeof(oid->name));
+-		len = sizeof(oid->name);
+-	}
+-
+-	memcpy(oid->name, name, len);
+-	oid->name_len = len;
+-}
+-
+-static inline void ceph_oid_copy(struct ceph_object_id *dest,
+-				 struct ceph_object_id *src)
+-{
+-	BUG_ON(src->name_len > sizeof(dest->name));
+-	memcpy(dest->name, src->name, src->name_len);
+-	dest->name_len = src->name_len;
+-}
+-
+ static inline int ceph_osd_exists(struct ceph_osdmap *map, int osd)
+ {
+ 	return osd >= 0 && osd < map->max_osd &&
+--- a/net/ceph/debugfs.c
++++ b/net/ceph/debugfs.c
+@@ -161,7 +161,7 @@ static int osdc_show(struct seq_file *s,
+ 			   req->r_osd ? req->r_osd->o_osd : -1,
+ 			   req->r_pgid.pool, req->r_pgid.seed);
+ 
+-		seq_printf(s, "%.*s", req->r_base_oid.name_len,
++		seq_printf(s, "%*pE", req->r_base_oid.name_len,
+ 			   req->r_base_oid.name);
+ 
+ 		if (req->r_reassert_version.epoch)
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -482,7 +482,10 @@ static void ceph_osdc_release_request(st
+ 	for (which = 0; which < req->r_num_ops; which++)
+ 		osd_req_op_data_release(req, which);
+ 
++	ceph_oid_destroy(&req->r_base_oid);
++	ceph_oid_destroy(&req->r_target_oid);
+ 	ceph_put_snap_context(req->r_snapc);
++
+ 	if (req->r_mempool)
+ 		mempool_free(req, req->r_osdc->req_mempool);
+ 	else if (req->r_num_ops <= CEPH_OSD_SLAB_OPS)
+@@ -549,7 +552,9 @@ struct ceph_osd_request *ceph_osdc_alloc
+ 	INIT_LIST_HEAD(&req->r_req_lru_item);
+ 	INIT_LIST_HEAD(&req->r_osd_item);
+ 
++	ceph_oid_init(&req->r_base_oid);
+ 	req->r_base_oloc.pool = -1;
++	ceph_oid_init(&req->r_target_oid);
+ 	req->r_target_oloc.pool = -1;
+ 
+ 	dout("%s req %p\n", __func__, req);
+@@ -563,6 +568,8 @@ int ceph_osdc_alloc_messages(struct ceph
+ 	struct ceph_msg *msg;
+ 	int msg_size;
+ 
++	WARN_ON(ceph_oid_empty(&req->r_base_oid));
++
+ 	/* create request message */
+ 	msg_size = 4 + 4 + 4; /* client_inc, osdmap_epoch, flags */
+ 	msg_size += 4 + 4 + 4 + 8; /* mtime, reassert_version */
+@@ -1088,10 +1095,7 @@ struct ceph_osd_request *ceph_osdc_new_r
+ 	}
+ 
+ 	req->r_base_oloc.pool = ceph_file_layout_pg_pool(*layout);
+-
+-	snprintf(req->r_base_oid.name, sizeof(req->r_base_oid.name),
+-		 "%llx.%08llx", vino.ino, objnum);
+-	req->r_base_oid.name_len = strlen(req->r_base_oid.name);
++	ceph_oid_printf(&req->r_base_oid, "%llx.%08llx", vino.ino, objnum);
+ 
+ 	r = ceph_osdc_alloc_messages(req, GFP_NOFS);
+ 	if (r)
+@@ -1639,7 +1643,7 @@ static int __calc_request_pg(struct ceph
+ 		req->r_target_oloc = req->r_base_oloc; /* struct */
+ 		need_check_tiering = true;
+ 	}
+-	if (req->r_target_oid.name_len == 0) {
++	if (ceph_oid_empty(&req->r_target_oid)) {
+ 		ceph_oid_copy(&req->r_target_oid, &req->r_base_oid);
+ 		need_check_tiering = true;
+ 	}
+@@ -2754,7 +2758,7 @@ void ceph_osdc_build_request(struct ceph
+ 	/* oid */
+ 	ceph_encode_32(&p, req->r_base_oid.name_len);
+ 	memcpy(p, req->r_base_oid.name, req->r_base_oid.name_len);
+-	dout("oid '%.*s' len %d\n", req->r_base_oid.name_len,
++	dout("oid %*pE len %d\n", req->r_base_oid.name_len,
+ 	     req->r_base_oid.name, req->r_base_oid.name_len);
+ 	p += req->r_base_oid.name_len;
+ 
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -1450,8 +1450,99 @@ bad:
+ 	return ERR_PTR(err);
+ }
+ 
++void ceph_oid_copy(struct ceph_object_id *dest,
++		   const struct ceph_object_id *src)
++{
++	WARN_ON(!ceph_oid_empty(dest));
++
++	if (src->name != src->inline_name) {
++		/* very rare, see ceph_object_id definition */
++		dest->name = kmalloc(src->name_len + 1,
++				     GFP_NOIO | __GFP_NOFAIL);
++	}
++
++	memcpy(dest->name, src->name, src->name_len + 1);
++	dest->name_len = src->name_len;
++}
++EXPORT_SYMBOL(ceph_oid_copy);
++
++static __printf(2, 0)
++int oid_printf_vargs(struct ceph_object_id *oid, const char *fmt, va_list ap)
++{
++	int len;
++
++	WARN_ON(!ceph_oid_empty(oid));
++
++	len = vsnprintf(oid->inline_name, sizeof(oid->inline_name), fmt, ap);
++	if (len >= sizeof(oid->inline_name))
++		return len;
+ 
++	oid->name_len = len;
++	return 0;
++}
++
++/*
++ * If oid doesn't fit into inline buffer, BUG.
++ */
++void ceph_oid_printf(struct ceph_object_id *oid, const char *fmt, ...)
++{
++	va_list ap;
++
++	va_start(ap, fmt);
++	BUG_ON(oid_printf_vargs(oid, fmt, ap));
++	va_end(ap);
++}
++EXPORT_SYMBOL(ceph_oid_printf);
+ 
++static __printf(3, 0)
++int oid_aprintf_vargs(struct ceph_object_id *oid, gfp_t gfp,
++		      const char *fmt, va_list ap)
++{
++	va_list aq;
++	int len;
++
++	va_copy(aq, ap);
++	len = oid_printf_vargs(oid, fmt, aq);
++	va_end(aq);
++
++	if (len) {
++		char *external_name;
++
++		external_name = kmalloc(len + 1, gfp);
++		if (!external_name)
++			return -ENOMEM;
++
++		oid->name = external_name;
++		WARN_ON(vsnprintf(oid->name, len + 1, fmt, ap) != len);
++		oid->name_len = len;
++	}
++
++	return 0;
++}
++
++/*
++ * If oid doesn't fit into inline buffer, allocate.
++ */
++int ceph_oid_aprintf(struct ceph_object_id *oid, gfp_t gfp,
++		     const char *fmt, ...)
++{
++	va_list ap;
++	int ret;
++
++	va_start(ap, fmt);
++	ret = oid_aprintf_vargs(oid, gfp, fmt, ap);
++	va_end(ap);
++
++	return ret;
++}
++EXPORT_SYMBOL(ceph_oid_aprintf);
++
++void ceph_oid_destroy(struct ceph_object_id *oid)
++{
++	if (oid->name != oid->inline_name)
++		kfree(oid->name);
++}
++EXPORT_SYMBOL(ceph_oid_destroy);
+ 
+ /*
+  * calculate file layout from given offset, length.
+@@ -1543,7 +1634,7 @@ int ceph_oloc_oid_to_pg(struct ceph_osdm
+ 	pg_out->seed = ceph_str_hash(pi->object_hash, oid->name,
+ 				     oid->name_len);
+ 
+-	dout("%s '%.*s' pgid %llu.%x\n", __func__, oid->name_len, oid->name,
++	dout("%s %*pE pgid %llu.%x\n", __func__, oid->name_len, oid->name,
+ 	     pg_out->pool, pg_out->seed);
+ 	return 0;
+ }
