@@ -1,0 +1,168 @@
+From a85dd7b8df52e35d8ee3794c65cac5c39128fd80 Mon Sep 17 00:00:00 2001
+From: Song Liu <songliubraving@fb.com>
+Date: Mon, 23 Jan 2017 17:12:57 -0800
+Subject: [PATCH] md/r5cache: flush data only stripes in r5l_recovery_log()
+Git-commit: a85dd7b8df52e35d8ee3794c65cac5c39128fd80
+Patch-mainline: v4.10-rc6
+References: FATE#321488
+
+For safer operation, all arrays start in write-through mode, which has been
+better tested and is more mature. And actually the write-through/write-mode
+isn't persistent after array restarted, so we always start array in
+write-through mode. However, if recovery found data-only stripes before the
+shutdown (from previous write-back mode), it is not safe to start the array in
+write-through mode, as write-through mode can not handle stripes with data in
+write-back cache. To solve this problem, we flush all data-only stripes in
+r5l_recovery_log(). When r5l_recovery_log() returns, the array starts with
+empty cache in write-through mode.
+
+This logic is implemented in r5c_recovery_flush_data_only_stripes():
+
+1. enable write back cache
+2. flush all stripes
+3. wake up conf->mddev->thread
+4. wait for all stripes get flushed (reuse wait_for_quiescent)
+5. disable write back cache
+
+The wait in 4 will be waked up in release_inactive_stripe_list()
+when conf->active_stripes reaches 0.
+
+It is safe to wake up mddev->thread here because all the resource
+required for the thread has been initialized.
+
+Signed-off-by: Song Liu <songliubraving@fb.com>
+Signed-off-by: Shaohua Li <shli@fb.com>
+Signed-off-by: Coly Li <colyli@suse.de>
+
+---
+ drivers/md/md.c          |  5 +++++
+ drivers/md/raid5-cache.c | 56 ++++++++++++++++++++++++++++++++++--------------
+ 2 files changed, 45 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 82821ee..01175da 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -5291,6 +5291,11 @@ int md_run(struct mddev *mddev)
+ 	if (start_readonly && mddev->ro == 0)
+ 		mddev->ro = 2; /* read-only, but switch on first write */
+ 
++	/*
++	 * NOTE: some pers->run(), for example r5l_recovery_log(), wakes
++	 * up mddev->thread. It is important to initialize critical
++	 * resources for mddev->thread BEFORE calling pers->run().
++	 */
+ 	err = pers->run(mddev);
+ 	if (err)
+ 		pr_warn("md: pers->run() failed ...\n");
+diff --git a/drivers/md/raid5-cache.c b/drivers/md/raid5-cache.c
+index 95dcaa0..3d7dda8 100644
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@ -2060,7 +2060,7 @@ static int
+ r5c_recovery_rewrite_data_only_stripes(struct r5l_log *log,
+ 				       struct r5l_recovery_ctx *ctx)
+ {
+-	struct stripe_head *sh, *next;
++	struct stripe_head *sh;
+ 	struct mddev *mddev = log->rdev->mddev;
+ 	struct page *page;
+ 	sector_t next_checkpoint = MaxSector;
+@@ -2074,7 +2074,7 @@ r5c_recovery_rewrite_data_only_stripes(struct r5l_log *log,
+ 
+ 	WARN_ON(list_empty(&ctx->cached_list));
+ 
+-	list_for_each_entry_safe(sh, next, &ctx->cached_list, lru) {
++	list_for_each_entry(sh, &ctx->cached_list, lru) {
+ 		struct r5l_meta_block *mb;
+ 		int i;
+ 		int offset;
+@@ -2124,14 +2124,39 @@ r5c_recovery_rewrite_data_only_stripes(struct r5l_log *log,
+ 		ctx->pos = write_pos;
+ 		ctx->seq += 1;
+ 		next_checkpoint = sh->log_start;
+-		list_del_init(&sh->lru);
+-		raid5_release_stripe(sh);
+ 	}
+ 	log->next_checkpoint = next_checkpoint;
+ 	__free_page(page);
+ 	return 0;
+ }
+ 
++static void r5c_recovery_flush_data_only_stripes(struct r5l_log *log,
++						 struct r5l_recovery_ctx *ctx)
++{
++	struct mddev *mddev = log->rdev->mddev;
++	struct r5conf *conf = mddev->private;
++	struct stripe_head *sh, *next;
++
++	if (ctx->data_only_stripes == 0)
++		return;
++
++	log->r5c_journal_mode = R5C_JOURNAL_MODE_WRITE_BACK;
++
++	list_for_each_entry_safe(sh, next, &ctx->cached_list, lru) {
++		r5c_make_stripe_write_out(sh);
++		set_bit(STRIPE_HANDLE, &sh->state);
++		list_del_init(&sh->lru);
++		raid5_release_stripe(sh);
++	}
++
++	md_wakeup_thread(conf->mddev->thread);
++	/* reuse conf->wait_for_quiescent in recovery */
++	wait_event(conf->wait_for_quiescent,
++		   atomic_read(&conf->active_stripes) == 0);
++
++	log->r5c_journal_mode = R5C_JOURNAL_MODE_WRITE_THROUGH;
++}
++
+ static int r5l_recovery_log(struct r5l_log *log)
+ {
+ 	struct mddev *mddev = log->rdev->mddev;
+@@ -2158,32 +2183,31 @@ static int r5l_recovery_log(struct r5l_log *log)
+ 	pos = ctx.pos;
+ 	ctx.seq += 10000;
+ 
+-	if (ctx.data_only_stripes == 0) {
+-		log->next_checkpoint = ctx.pos;
+-		r5l_log_write_empty_meta_block(log, ctx.pos, ctx.seq++);
+-		ctx.pos = r5l_ring_add(log, ctx.pos, BLOCK_SECTORS);
+-	}
+ 
+ 	if ((ctx.data_only_stripes == 0) && (ctx.data_parity_stripes == 0))
+ 		pr_debug("md/raid:%s: starting from clean shutdown\n",
+ 			 mdname(mddev));
+-	else {
++	else
+ 		pr_debug("md/raid:%s: recovering %d data-only stripes and %d data-parity stripes\n",
+ 			 mdname(mddev), ctx.data_only_stripes,
+ 			 ctx.data_parity_stripes);
+ 
+-		if (ctx.data_only_stripes > 0)
+-			if (r5c_recovery_rewrite_data_only_stripes(log, &ctx)) {
+-				pr_err("md/raid:%s: failed to rewrite stripes to journal\n",
+-				       mdname(mddev));
+-				return -EIO;
+-			}
++	if (ctx.data_only_stripes == 0) {
++		log->next_checkpoint = ctx.pos;
++		r5l_log_write_empty_meta_block(log, ctx.pos, ctx.seq++);
++		ctx.pos = r5l_ring_add(log, ctx.pos, BLOCK_SECTORS);
++	} else if (r5c_recovery_rewrite_data_only_stripes(log, &ctx)) {
++		pr_err("md/raid:%s: failed to rewrite stripes to journal\n",
++		       mdname(mddev));
++		return -EIO;
+ 	}
+ 
+ 	log->log_start = ctx.pos;
+ 	log->seq = ctx.seq;
+ 	log->last_checkpoint = pos;
+ 	r5l_write_super(log, pos);
++
++	r5c_recovery_flush_data_only_stripes(log, &ctx);
+ 	return 0;
+ }
+ 
+-- 
+2.10.2
+
