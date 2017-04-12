@@ -1,0 +1,160 @@
+From: "Yan, Zheng" <zyan@redhat.com>
+Date: Fri, 15 Apr 2016 13:56:12 +0800
+Subject: ceph: don't call truncate_pagecache in ceph_writepages_start
+Git-commit: 6c93df5db628e710697c43bc1bd78a786549a548
+Patch-mainline: v4.7-rc1
+References: FATE#322288
+
+truncate_pagecache() may decrease inode's reference. This can cause
+deadlock if inode's last reference is dropped and iput_final() wants
+to evict the inode. (evict() calls inode_wait_for_writeback(), which
+waits for ceph_writepages_start() to return).
+
+The fix is use work thead to truncate dirty pages. Also add 'forced
+umount' check to ceph_update_writeable_page(), which prevents new
+pages getting dirty.
+
+Signed-off-by: Yan, Zheng <zyan@redhat.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+---
+ fs/ceph/addr.c       |   14 ++++++++++++--
+ fs/ceph/inode.c      |   11 +++++++++++
+ fs/ceph/mds_client.c |   22 +++++++++++++++-------
+ 3 files changed, 38 insertions(+), 9 deletions(-)
+
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -714,8 +714,11 @@ static int ceph_writepages_start(struct
+ 	     (wbc->sync_mode == WB_SYNC_ALL ? "ALL" : "HOLD"));
+ 
+ 	if (ACCESS_ONCE(fsc->mount_state) == CEPH_MOUNT_SHUTDOWN) {
+-		pr_warn("writepage_start %p on forced umount\n", inode);
+-		truncate_pagecache(inode, 0);
++		if (ci->i_wrbuffer_ref > 0) {
++			pr_warn_ratelimited(
++				"writepage_start %p %lld forced umount\n",
++				inode, ceph_ino(inode));
++		}
+ 		mapping_set_error(mapping, -EIO);
+ 		return -EIO; /* we're in a forced umount, don't write! */
+ 	}
+@@ -1126,6 +1129,7 @@ static int ceph_update_writeable_page(st
+ 			    struct page *page)
+ {
+ 	struct inode *inode = file_inode(file);
++	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+ 	struct ceph_inode_info *ci = ceph_inode(inode);
+ 	loff_t page_off = pos & PAGE_CACHE_MASK;
+ 	int pos_in_page = pos & ~PAGE_CACHE_MASK;
+@@ -1134,6 +1138,12 @@ static int ceph_update_writeable_page(st
+ 	int r;
+ 	struct ceph_snap_context *snapc, *oldest;
+ 
++	if (ACCESS_ONCE(fsc->mount_state) == CEPH_MOUNT_SHUTDOWN) {
++		dout(" page %p forced umount\n", page);
++		unlock_page(page);
++		return -EIO;
++	}
++
+ retry_locked:
+ 	/* writepages currently holds page lock, but if we change that later, */
+ 	wait_on_page_writeback(page);
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -1633,10 +1633,21 @@ static void ceph_invalidate_work(struct
+ 	struct ceph_inode_info *ci = container_of(work, struct ceph_inode_info,
+ 						  i_pg_inv_work);
+ 	struct inode *inode = &ci->vfs_inode;
++	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+ 	u32 orig_gen;
+ 	int check = 0;
+ 
+ 	mutex_lock(&ci->i_truncate_mutex);
++
++	if (ACCESS_ONCE(fsc->mount_state) == CEPH_MOUNT_SHUTDOWN) {
++		pr_warn_ratelimited("invalidate_pages %p %lld forced umount\n",
++				    inode, ceph_ino(inode));
++		mapping_set_error(inode->i_mapping, -EIO);
++		truncate_pagecache(inode, 0);
++		mutex_unlock(&ci->i_truncate_mutex);
++		goto out;
++	}
++
+ 	spin_lock(&ci->i_ceph_lock);
+ 	dout("invalidate_pages %p gen %d revoking %d\n", inode,
+ 	     ci->i_rdcache_gen, ci->i_rdcache_revoking);
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -1123,9 +1123,11 @@ out:
+ static int remove_session_caps_cb(struct inode *inode, struct ceph_cap *cap,
+ 				  void *arg)
+ {
++	struct ceph_fs_client *fsc = (struct ceph_fs_client *)arg;
+ 	struct ceph_inode_info *ci = ceph_inode(inode);
+ 	LIST_HEAD(to_remove);
+-	int drop = 0;
++	bool drop = false;
++	bool invalidate = false;
+ 
+ 	dout("removing cap %p, ci is %p, inode is %p\n",
+ 	     cap, ci, &ci->vfs_inode);
+@@ -1133,11 +1135,14 @@ static int remove_session_caps_cb(struct
+ 	__ceph_remove_cap(cap, false);
+ 	if (!ci->i_auth_cap) {
+ 		struct ceph_cap_flush *cf;
+-		struct ceph_mds_client *mdsc =
+-			ceph_sb_to_client(inode->i_sb)->mdsc;
++		struct ceph_mds_client *mdsc = fsc->mdsc;
+ 
+ 		ci->i_ceph_flags |= CEPH_I_CAP_DROPPED;
+ 
++		if (ci->i_wrbuffer_ref > 0 &&
++		    ACCESS_ONCE(fsc->mount_state) == CEPH_MOUNT_SHUTDOWN)
++			invalidate = true;
++
+ 		while (true) {
+ 			struct rb_node *n = rb_first(&ci->i_cap_flush_tree);
+ 			if (!n)
+@@ -1159,7 +1164,7 @@ static int remove_session_caps_cb(struct
+ 				inode, ceph_ino(inode));
+ 			ci->i_dirty_caps = 0;
+ 			list_del_init(&ci->i_dirty_item);
+-			drop = 1;
++			drop = true;
+ 		}
+ 		if (!list_empty(&ci->i_flushing_item)) {
+ 			pr_warn_ratelimited(
+@@ -1169,7 +1174,7 @@ static int remove_session_caps_cb(struct
+ 			ci->i_flushing_caps = 0;
+ 			list_del_init(&ci->i_flushing_item);
+ 			mdsc->num_cap_flushing--;
+-			drop = 1;
++			drop = true;
+ 		}
+ 		spin_unlock(&mdsc->cap_dirty_lock);
+ 
+@@ -1188,6 +1193,8 @@ static int remove_session_caps_cb(struct
+ 	}
+ 
+ 	wake_up_all(&ci->i_cap_wq);
++	if (invalidate)
++		ceph_queue_invalidate(inode);
+ 	if (drop)
+ 		iput(inode);
+ 	return 0;
+@@ -1198,12 +1205,13 @@ static int remove_session_caps_cb(struct
+  */
+ static void remove_session_caps(struct ceph_mds_session *session)
+ {
++	struct ceph_fs_client *fsc = session->s_mdsc->fsc;
++	struct super_block *sb = fsc->sb;
+ 	dout("remove_session_caps on %p\n", session);
+-	iterate_session_caps(session, remove_session_caps_cb, NULL);
++	iterate_session_caps(session, remove_session_caps_cb, fsc);
+ 
+ 	spin_lock(&session->s_cap_lock);
+ 	if (session->s_nr_caps > 0) {
+-		struct super_block *sb = session->s_mdsc->fsc->sb;
+ 		struct inode *inode;
+ 		struct ceph_cap *cap, *prev = NULL;
+ 		struct ceph_vino vino;
