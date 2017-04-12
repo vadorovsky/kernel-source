@@ -1,0 +1,198 @@
+From: "Yan, Zheng" <zyan@redhat.com>
+Date: Wed, 15 Jun 2016 16:29:18 +0800
+Subject: ceph: wait unsafe sync writes for evicting inode
+Git-commit: 9a5530c63889ac928a45c4645ab0bc23b4fbfcb8
+Patch-mainline: v4.8-rc1
+References: FATE#322288
+
+Otherwise ceph_sync_write_unsafe() may access/modify freed inode.
+
+Signed-off-by: Yan, Zheng <zyan@redhat.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+---
+ fs/ceph/caps.c  | 50 ++------------------------------------------------
+ fs/ceph/file.c  | 48 ++++++++++++++++++++++++++++++++++++++++++++++++
+ fs/ceph/inode.c |  8 ++++++++
+ fs/ceph/super.c |  1 +
+ fs/ceph/super.h |  2 ++
+ 5 files changed, 61 insertions(+), 48 deletions(-)
+
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index a08d245f16f5..1e48377f18a7 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -1928,53 +1928,6 @@ static int caps_are_flushed(struct inode *inode, u64 flush_tid)
+ }
+ 
+ /*
+- * Wait on any unsafe replies for the given inode.  First wait on the
+- * newest request, and make that the upper bound.  Then, if there are
+- * more requests, keep waiting on the oldest as long as it is still older
+- * than the original request.
+- */
+-static void sync_write_wait(struct inode *inode)
+-{
+-	struct ceph_inode_info *ci = ceph_inode(inode);
+-	struct list_head *head = &ci->i_unsafe_writes;
+-	struct ceph_osd_request *req;
+-	u64 last_tid;
+-
+-	if (!S_ISREG(inode->i_mode))
+-		return;
+-
+-	spin_lock(&ci->i_unsafe_lock);
+-	if (list_empty(head))
+-		goto out;
+-
+-	/* set upper bound as _last_ entry in chain */
+-	req = list_last_entry(head, struct ceph_osd_request,
+-			      r_unsafe_item);
+-	last_tid = req->r_tid;
+-
+-	do {
+-		ceph_osdc_get_request(req);
+-		spin_unlock(&ci->i_unsafe_lock);
+-		dout("sync_write_wait on tid %llu (until %llu)\n",
+-		     req->r_tid, last_tid);
+-		wait_for_completion(&req->r_safe_completion);
+-		spin_lock(&ci->i_unsafe_lock);
+-		ceph_osdc_put_request(req);
+-
+-		/*
+-		 * from here on look at first entry in chain, since we
+-		 * only want to wait for anything older than last_tid
+-		 */
+-		if (list_empty(head))
+-			break;
+-		req = list_first_entry(head, struct ceph_osd_request,
+-				       r_unsafe_item);
+-	} while (req->r_tid < last_tid);
+-out:
+-	spin_unlock(&ci->i_unsafe_lock);
+-}
+-
+-/*
+  * wait for any unsafe requests to complete.
+  */
+ static int unsafe_request_wait(struct inode *inode)
+@@ -2026,7 +1979,8 @@ int ceph_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+ 	int dirty;
+ 
+ 	dout("fsync %p%s\n", inode, datasync ? " datasync" : "");
+-	sync_write_wait(inode);
++
++	ceph_sync_write_wait(inode);
+ 
+ 	ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
+ 	if (ret < 0)
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 033e88753875..7f2ef262cdf7 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -821,6 +821,54 @@ static void ceph_sync_write_unsafe(struct ceph_osd_request *req, bool unsafe)
+ 	}
+ }
+ 
++/*
++ * Wait on any unsafe replies for the given inode.  First wait on the
++ * newest request, and make that the upper bound.  Then, if there are
++ * more requests, keep waiting on the oldest as long as it is still older
++ * than the original request.
++ */
++void ceph_sync_write_wait(struct inode *inode)
++{
++	struct ceph_inode_info *ci = ceph_inode(inode);
++	struct list_head *head = &ci->i_unsafe_writes;
++	struct ceph_osd_request *req;
++	u64 last_tid;
++
++	if (!S_ISREG(inode->i_mode))
++		return;
++
++	spin_lock(&ci->i_unsafe_lock);
++	if (list_empty(head))
++		goto out;
++
++	/* set upper bound as _last_ entry in chain */
++
++	req = list_last_entry(head, struct ceph_osd_request,
++			      r_unsafe_item);
++	last_tid = req->r_tid;
++
++	do {
++		ceph_osdc_get_request(req);
++		spin_unlock(&ci->i_unsafe_lock);
++
++		dout("sync_write_wait on tid %llu (until %llu)\n",
++		     req->r_tid, last_tid);
++		wait_for_completion(&req->r_safe_completion);
++		ceph_osdc_put_request(req);
++
++		spin_lock(&ci->i_unsafe_lock);
++		/*
++		 * from here on look at first entry in chain, since we
++		 * only want to wait for anything older than last_tid
++		 */
++		if (list_empty(head))
++			break;
++		req = list_first_entry(head, struct ceph_osd_request,
++				       r_unsafe_item);
++	} while (req->r_tid < last_tid);
++out:
++	spin_unlock(&ci->i_unsafe_lock);
++}
+ 
+ static ssize_t
+ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index 8ca843371d4b..6e16269277bd 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -585,6 +585,14 @@ int ceph_drop_inode(struct inode *inode)
+ 	return 1;
+ }
+ 
++void ceph_evict_inode(struct inode *inode)
++{
++	/* wait unsafe sync writes */
++	ceph_sync_write_wait(inode);
++	truncate_inode_pages_final(&inode->i_data);
++	clear_inode(inode);
++}
++
+ static inline blkcnt_t calc_inode_blocks(u64 size)
+ {
+ 	return (size + (1<<9) - 1) >> 9;
+diff --git a/fs/ceph/super.c b/fs/ceph/super.c
+index 91e02481ce06..a5b2275e1573 100644
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@ -731,6 +731,7 @@ static const struct super_operations ceph_super_ops = {
+ 	.destroy_inode	= ceph_destroy_inode,
+ 	.write_inode    = ceph_write_inode,
+ 	.drop_inode	= ceph_drop_inode,
++	.evict_inode	= ceph_evict_inode,
+ 	.sync_fs        = ceph_sync_fs,
+ 	.put_super	= ceph_put_super,
+ 	.show_options   = ceph_show_options,
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index 50846e6f6a8c..d5b9077467a4 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -749,6 +749,7 @@ extern const struct inode_operations ceph_file_iops;
+ extern struct inode *ceph_alloc_inode(struct super_block *sb);
+ extern void ceph_destroy_inode(struct inode *inode);
+ extern int ceph_drop_inode(struct inode *inode);
++extern void ceph_evict_inode(struct inode *inode);
+ 
+ extern struct inode *ceph_get_inode(struct super_block *sb,
+ 				    struct ceph_vino vino);
+@@ -927,6 +928,7 @@ extern int ceph_atomic_open(struct inode *dir, struct dentry *dentry,
+ extern int ceph_release(struct inode *inode, struct file *filp);
+ extern void ceph_fill_inline_data(struct inode *inode, struct page *locked_page,
+ 				  char *data, size_t len);
++extern void ceph_sync_write_wait(struct inode *inode);
+ /* dir.c */
+ extern const struct file_operations ceph_dir_fops;
+ extern const struct file_operations ceph_snapdir_fops;
+

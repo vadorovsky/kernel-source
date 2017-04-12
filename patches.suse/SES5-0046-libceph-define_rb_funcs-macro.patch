@@ -1,0 +1,483 @@
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Thu, 28 Apr 2016 16:07:22 +0200
+Subject: libceph: DEFINE_RB_FUNCS macro
+Git-commit: fcd00b68bbe2bf5606cb45c2cd4a250a390bcc1f
+Patch-mainline: v4.7-rc1
+References: FATE#322288
+
+Given
+
+    struct foo {
+        u64 id;
+        struct rb_node bar_node;
+    };
+
+generate insert_bar(), erase_bar() and lookup_bar() functions with
+
+    DEFINE_RB_FUNCS(bar, struct foo, id, bar_node)
+
+The key is assumed to be an integer (u64, int, etc), compared with
+< and >.  nodefld has to be initialized with RB_CLEAR_NODE().
+
+Start using it for MDS, MON and OSD requests and OSD sessions.
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+---
+ fs/ceph/mds_client.c         |   54 +++++------------------
+ include/linux/ceph/libceph.h |   57 +++++++++++++++++++++++++
+ net/ceph/mon_client.c        |   52 +++--------------------
+ net/ceph/osd_client.c        |   97 ++++---------------------------------------
+ 4 files changed, 88 insertions(+), 172 deletions(-)
+
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -568,51 +568,23 @@ void ceph_mdsc_release_request(struct kr
+ 	kfree(req);
+ }
+ 
++DEFINE_RB_FUNCS(request, struct ceph_mds_request, r_tid, r_node)
++
+ /*
+  * lookup session, bump ref if found.
+  *
+  * called under mdsc->mutex.
+  */
+-static struct ceph_mds_request *__lookup_request(struct ceph_mds_client *mdsc,
+-					     u64 tid)
++static struct ceph_mds_request *
++lookup_get_request(struct ceph_mds_client *mdsc, u64 tid)
+ {
+ 	struct ceph_mds_request *req;
+-	struct rb_node *n = mdsc->request_tree.rb_node;
+ 
+-	while (n) {
+-		req = rb_entry(n, struct ceph_mds_request, r_node);
+-		if (tid < req->r_tid)
+-			n = n->rb_left;
+-		else if (tid > req->r_tid)
+-			n = n->rb_right;
+-		else {
+-			ceph_mdsc_get_request(req);
+-			return req;
+-		}
+-	}
+-	return NULL;
+-}
+-
+-static void __insert_request(struct ceph_mds_client *mdsc,
+-			     struct ceph_mds_request *new)
+-{
+-	struct rb_node **p = &mdsc->request_tree.rb_node;
+-	struct rb_node *parent = NULL;
+-	struct ceph_mds_request *req = NULL;
+-
+-	while (*p) {
+-		parent = *p;
+-		req = rb_entry(parent, struct ceph_mds_request, r_node);
+-		if (new->r_tid < req->r_tid)
+-			p = &(*p)->rb_left;
+-		else if (new->r_tid > req->r_tid)
+-			p = &(*p)->rb_right;
+-		else
+-			BUG();
+-	}
++	req = lookup_request(&mdsc->request_tree, tid);
++	if (req)
++		ceph_mdsc_get_request(req);
+ 
+-	rb_link_node(&new->r_node, parent, p);
+-	rb_insert_color(&new->r_node, &mdsc->request_tree);
++	return req;
+ }
+ 
+ /*
+@@ -631,7 +603,7 @@ static void __register_request(struct ce
+ 				  req->r_num_caps);
+ 	dout("__register_request %p tid %lld\n", req, req->r_tid);
+ 	ceph_mdsc_get_request(req);
+-	__insert_request(mdsc, req);
++	insert_request(&mdsc->request_tree, req);
+ 
+ 	req->r_uid = current_fsuid();
+ 	req->r_gid = current_fsgid();
+@@ -667,8 +639,7 @@ static void __unregister_request(struct
+ 		}
+ 	}
+ 
+-	rb_erase(&req->r_node, &mdsc->request_tree);
+-	RB_CLEAR_NODE(&req->r_node);
++	erase_request(&mdsc->request_tree, req);
+ 
+ 	if (req->r_unsafe_dir && req->r_got_unsafe) {
+ 		struct ceph_inode_info *ci = ceph_inode(req->r_unsafe_dir);
+@@ -1725,6 +1696,7 @@ ceph_mdsc_create_request(struct ceph_mds
+ 	INIT_LIST_HEAD(&req->r_unsafe_target_item);
+ 	req->r_fmode = -1;
+ 	kref_init(&req->r_kref);
++	RB_CLEAR_NODE(&req->r_node);
+ 	INIT_LIST_HEAD(&req->r_wait);
+ 	init_completion(&req->r_completion);
+ 	init_completion(&req->r_safe_completion);
+@@ -2417,7 +2389,7 @@ static void handle_reply(struct ceph_mds
+ 	/* get request, session */
+ 	tid = le64_to_cpu(msg->hdr.tid);
+ 	mutex_lock(&mdsc->mutex);
+-	req = __lookup_request(mdsc, tid);
++	req = lookup_get_request(mdsc, tid);
+ 	if (!req) {
+ 		dout("handle_reply on unknown tid %llu\n", tid);
+ 		mutex_unlock(&mdsc->mutex);
+@@ -2606,7 +2578,7 @@ static void handle_forward(struct ceph_m
+ 	fwd_seq = ceph_decode_32(&p);
+ 
+ 	mutex_lock(&mdsc->mutex);
+-	req = __lookup_request(mdsc, tid);
++	req = lookup_get_request(mdsc, tid);
+ 	if (!req) {
+ 		dout("forward tid %llu to mds%d - req dne\n", tid, next_mds);
+ 		goto out;  /* dup reply? */
+--- a/include/linux/ceph/libceph.h
++++ b/include/linux/ceph/libceph.h
+@@ -180,6 +180,63 @@ static inline int calc_pages_for(u64 off
+ 		(off >> PAGE_CACHE_SHIFT);
+ }
+ 
++/*
++ * These are not meant to be generic - an integer key is assumed.
++ */
++#define DEFINE_RB_INSDEL_FUNCS(name, type, keyfld, nodefld)		\
++static void insert_##name(struct rb_root *root, type *t)		\
++{									\
++	struct rb_node **n = &root->rb_node;				\
++	struct rb_node *parent = NULL;					\
++									\
++	BUG_ON(!RB_EMPTY_NODE(&t->nodefld));				\
++									\
++	while (*n) {							\
++		type *cur = rb_entry(*n, type, nodefld);		\
++									\
++		parent = *n;						\
++		if (t->keyfld < cur->keyfld)				\
++			n = &(*n)->rb_left;				\
++		else if (t->keyfld > cur->keyfld)			\
++			n = &(*n)->rb_right;				\
++		else							\
++			BUG();						\
++	}								\
++									\
++	rb_link_node(&t->nodefld, parent, n);				\
++	rb_insert_color(&t->nodefld, root);				\
++}									\
++static void erase_##name(struct rb_root *root, type *t)			\
++{									\
++	BUG_ON(RB_EMPTY_NODE(&t->nodefld));				\
++	rb_erase(&t->nodefld, root);					\
++	RB_CLEAR_NODE(&t->nodefld);					\
++}
++
++#define DEFINE_RB_LOOKUP_FUNC(name, type, keyfld, nodefld)		\
++static type *lookup_##name(struct rb_root *root,			\
++			   typeof(((type *)0)->keyfld) key)		\
++{									\
++	struct rb_node *n = root->rb_node;				\
++									\
++	while (n) {							\
++		type *cur = rb_entry(n, type, nodefld);			\
++									\
++		if (key < cur->keyfld)					\
++			n = n->rb_left;					\
++		else if (key > cur->keyfld)				\
++			n = n->rb_right;				\
++		else							\
++			return cur;					\
++	}								\
++									\
++	return NULL;							\
++}
++
++#define DEFINE_RB_FUNCS(name, type, keyfld, nodefld)			\
++DEFINE_RB_INSDEL_FUNCS(name, type, keyfld, nodefld)			\
++DEFINE_RB_LOOKUP_FUNC(name, type, keyfld, nodefld)
++
+ extern struct kmem_cache *ceph_inode_cachep;
+ extern struct kmem_cache *ceph_cap_cachep;
+ extern struct kmem_cache *ceph_cap_flush_cachep;
+--- a/net/ceph/mon_client.c
++++ b/net/ceph/mon_client.c
+@@ -478,45 +478,7 @@ out:
+ /*
+  * generic requests (currently statfs, mon_get_version)
+  */
+-static struct ceph_mon_generic_request *__lookup_generic_req(
+-	struct ceph_mon_client *monc, u64 tid)
+-{
+-	struct ceph_mon_generic_request *req;
+-	struct rb_node *n = monc->generic_request_tree.rb_node;
+-
+-	while (n) {
+-		req = rb_entry(n, struct ceph_mon_generic_request, node);
+-		if (tid < req->tid)
+-			n = n->rb_left;
+-		else if (tid > req->tid)
+-			n = n->rb_right;
+-		else
+-			return req;
+-	}
+-	return NULL;
+-}
+-
+-static void __insert_generic_request(struct ceph_mon_client *monc,
+-			    struct ceph_mon_generic_request *new)
+-{
+-	struct rb_node **p = &monc->generic_request_tree.rb_node;
+-	struct rb_node *parent = NULL;
+-	struct ceph_mon_generic_request *req = NULL;
+-
+-	while (*p) {
+-		parent = *p;
+-		req = rb_entry(parent, struct ceph_mon_generic_request, node);
+-		if (new->tid < req->tid)
+-			p = &(*p)->rb_left;
+-		else if (new->tid > req->tid)
+-			p = &(*p)->rb_right;
+-		else
+-			BUG();
+-	}
+-
+-	rb_link_node(&new->node, parent, p);
+-	rb_insert_color(&new->node, &monc->generic_request_tree);
+-}
++DEFINE_RB_FUNCS(generic_request, struct ceph_mon_generic_request, tid, node)
+ 
+ static void release_generic_request(struct kref *kref)
+ {
+@@ -551,7 +513,7 @@ static struct ceph_msg *get_generic_repl
+ 	struct ceph_msg *m;
+ 
+ 	mutex_lock(&monc->mutex);
+-	req = __lookup_generic_req(monc, tid);
++	req = lookup_generic_request(&monc->generic_request_tree, tid);
+ 	if (!req) {
+ 		dout("get_generic_reply %lld dne\n", tid);
+ 		*skip = 1;
+@@ -578,14 +540,14 @@ static int __do_generic_request(struct c
+ 	/* register request */
+ 	req->tid = tid != 0 ? tid : ++monc->last_tid;
+ 	req->request->hdr.tid = cpu_to_le64(req->tid);
+-	__insert_generic_request(monc, req);
++	insert_generic_request(&monc->generic_request_tree, req);
+ 	ceph_con_send(&monc->con, ceph_msg_get(req->request));
+ 	mutex_unlock(&monc->mutex);
+ 
+ 	err = wait_for_completion_interruptible(&req->completion);
+ 
+ 	mutex_lock(&monc->mutex);
+-	rb_erase(&req->node, &monc->generic_request_tree);
++	erase_generic_request(&monc->generic_request_tree, req);
+ 
+ 	if (!err)
+ 		err = req->result;
+@@ -619,7 +581,7 @@ static void handle_statfs_reply(struct c
+ 	dout("handle_statfs_reply %p tid %llu\n", msg, tid);
+ 
+ 	mutex_lock(&monc->mutex);
+-	req = __lookup_generic_req(monc, tid);
++	req = lookup_generic_request(&monc->generic_request_tree, tid);
+ 	if (req) {
+ 		*(struct ceph_statfs *)req->buf = reply->st;
+ 		req->result = 0;
+@@ -651,6 +613,7 @@ int ceph_monc_do_statfs(struct ceph_mon_
+ 		return -ENOMEM;
+ 
+ 	kref_init(&req->kref);
++	RB_CLEAR_NODE(&req->node);
+ 	req->buf = buf;
+ 	init_completion(&req->completion);
+ 
+@@ -696,7 +659,7 @@ static void handle_get_version_reply(str
+ 		goto bad;
+ 
+ 	mutex_lock(&monc->mutex);
+-	req = __lookup_generic_req(monc, handle);
++	req = lookup_generic_request(&monc->generic_request_tree, handle);
+ 	if (req) {
+ 		*(u64 *)req->buf = ceph_decode_64(&p);
+ 		req->result = 0;
+@@ -732,6 +695,7 @@ int ceph_monc_do_get_version(struct ceph
+ 		return -ENOMEM;
+ 
+ 	kref_init(&req->kref);
++	RB_CLEAR_NODE(&req->node);
+ 	req->buf = newest;
+ 	init_completion(&req->completion);
+ 
+--- a/net/ceph/osd_client.c
++++ b/net/ceph/osd_client.c
+@@ -1104,45 +1104,7 @@ EXPORT_SYMBOL(ceph_osdc_new_request);
+ /*
+  * We keep osd requests in an rbtree, sorted by ->r_tid.
+  */
+-static void __insert_request(struct ceph_osd_client *osdc,
+-			     struct ceph_osd_request *new)
+-{
+-	struct rb_node **p = &osdc->requests.rb_node;
+-	struct rb_node *parent = NULL;
+-	struct ceph_osd_request *req = NULL;
+-
+-	while (*p) {
+-		parent = *p;
+-		req = rb_entry(parent, struct ceph_osd_request, r_node);
+-		if (new->r_tid < req->r_tid)
+-			p = &(*p)->rb_left;
+-		else if (new->r_tid > req->r_tid)
+-			p = &(*p)->rb_right;
+-		else
+-			BUG();
+-	}
+-
+-	rb_link_node(&new->r_node, parent, p);
+-	rb_insert_color(&new->r_node, &osdc->requests);
+-}
+-
+-static struct ceph_osd_request *__lookup_request(struct ceph_osd_client *osdc,
+-						 u64 tid)
+-{
+-	struct ceph_osd_request *req;
+-	struct rb_node *n = osdc->requests.rb_node;
+-
+-	while (n) {
+-		req = rb_entry(n, struct ceph_osd_request, r_node);
+-		if (tid < req->r_tid)
+-			n = n->rb_left;
+-		else if (tid > req->r_tid)
+-			n = n->rb_right;
+-		else
+-			return req;
+-	}
+-	return NULL;
+-}
++DEFINE_RB_FUNCS(request, struct ceph_osd_request, r_tid, r_node)
+ 
+ static struct ceph_osd_request *
+ __lookup_request_ge(struct ceph_osd_client *osdc,
+@@ -1330,6 +1292,8 @@ static void put_osd(struct ceph_osd *osd
+ 	}
+ }
+ 
++DEFINE_RB_FUNCS(osd, struct ceph_osd, o_osd, o_node)
++
+ /*
+  * remove an osd from our map
+  */
+@@ -1340,8 +1304,7 @@ static void __remove_osd(struct ceph_osd
+ 	WARN_ON(!list_empty(&osd->o_linger_requests));
+ 
+ 	list_del_init(&osd->o_osd_lru);
+-	rb_erase(&osd->o_node, &osdc->osds);
+-	RB_CLEAR_NODE(&osd->o_node);
++	erase_osd(&osdc->osds, osd);
+ }
+ 
+ static void remove_osd(struct ceph_osd_client *osdc, struct ceph_osd *osd)
+@@ -1417,45 +1380,6 @@ static int __reset_osd(struct ceph_osd_c
+ 	return 0;
+ }
+ 
+-static void __insert_osd(struct ceph_osd_client *osdc, struct ceph_osd *new)
+-{
+-	struct rb_node **p = &osdc->osds.rb_node;
+-	struct rb_node *parent = NULL;
+-	struct ceph_osd *osd = NULL;
+-
+-	dout("__insert_osd %p osd%d\n", new, new->o_osd);
+-	while (*p) {
+-		parent = *p;
+-		osd = rb_entry(parent, struct ceph_osd, o_node);
+-		if (new->o_osd < osd->o_osd)
+-			p = &(*p)->rb_left;
+-		else if (new->o_osd > osd->o_osd)
+-			p = &(*p)->rb_right;
+-		else
+-			BUG();
+-	}
+-
+-	rb_link_node(&new->o_node, parent, p);
+-	rb_insert_color(&new->o_node, &osdc->osds);
+-}
+-
+-static struct ceph_osd *__lookup_osd(struct ceph_osd_client *osdc, int o)
+-{
+-	struct ceph_osd *osd;
+-	struct rb_node *n = osdc->osds.rb_node;
+-
+-	while (n) {
+-		osd = rb_entry(n, struct ceph_osd, o_node);
+-		if (o < osd->o_osd)
+-			n = n->rb_left;
+-		else if (o > osd->o_osd)
+-			n = n->rb_right;
+-		else
+-			return osd;
+-	}
+-	return NULL;
+-}
+-
+ static void __schedule_osd_timeout(struct ceph_osd_client *osdc)
+ {
+ 	schedule_delayed_work(&osdc->timeout_work,
+@@ -1477,7 +1401,7 @@ static void __register_request(struct ce
+ 	req->r_tid = ++osdc->last_tid;
+ 	req->r_request->hdr.tid = cpu_to_le64(req->r_tid);
+ 	dout("__register_request %p tid %lld\n", req, req->r_tid);
+-	__insert_request(osdc, req);
++	insert_request(&osdc->requests, req);
+ 	ceph_osdc_get_request(req);
+ 	osdc->num_requests++;
+ 	if (osdc->num_requests == 1) {
+@@ -1499,8 +1423,7 @@ static void __unregister_request(struct
+ 	}
+ 
+ 	dout("__unregister_request %p tid %lld\n", req, req->r_tid);
+-	rb_erase(&req->r_node, &osdc->requests);
+-	RB_CLEAR_NODE(&req->r_node);
++	erase_request(&osdc->requests, req);
+ 	osdc->num_requests--;
+ 
+ 	if (req->r_osd) {
+@@ -1711,7 +1634,7 @@ static int __map_request(struct ceph_osd
+ 		req->r_osd = NULL;
+ 	}
+ 
+-	req->r_osd = __lookup_osd(osdc, o);
++	req->r_osd = lookup_osd(&osdc->osds, o);
+ 	if (!req->r_osd && o >= 0) {
+ 		err = -ENOMEM;
+ 		req->r_osd = create_osd(osdc, o);
+@@ -1721,7 +1644,7 @@ static int __map_request(struct ceph_osd
+ 		}
+ 
+ 		dout("map_request osd %p is osd%d\n", req->r_osd, o);
+-		__insert_osd(osdc, req->r_osd);
++		insert_osd(&osdc->osds, req->r_osd);
+ 
+ 		ceph_con_open(&req->r_osd->o_con,
+ 			      CEPH_ENTITY_TYPE_OSD, o,
+@@ -2051,7 +1974,7 @@ static void handle_reply(struct ceph_osd
+ 	/* lookup */
+ 	down_read(&osdc->map_sem);
+ 	mutex_lock(&osdc->request_mutex);
+-	req = __lookup_request(osdc, tid);
++	req = lookup_request(&osdc->requests, tid);
+ 	if (req == NULL) {
+ 		dout("handle_reply tid %llu dne\n", tid);
+ 		goto bad_mutex;
+@@ -3133,7 +3056,7 @@ static struct ceph_msg *get_reply(struct
+ 
+ 	tid = le64_to_cpu(hdr->tid);
+ 	mutex_lock(&osdc->request_mutex);
+-	req = __lookup_request(osdc, tid);
++	req = lookup_request(&osdc->requests, tid);
+ 	if (!req) {
+ 		dout("%s osd%d tid %llu unknown, skipping\n", __func__,
+ 		     osd->o_osd, tid);
