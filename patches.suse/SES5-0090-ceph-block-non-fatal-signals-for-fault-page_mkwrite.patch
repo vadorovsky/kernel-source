@@ -1,0 +1,164 @@
+From: "Yan, Zheng" <zyan@redhat.com>
+Date: Tue, 10 May 2016 18:40:28 +0800
+Subject: ceph: block non-fatal signals for fault/page_mkwrite
+Git-commit: 4f7e89f6ace0f6cd2f20110efd2d405e26bcbf31
+Patch-mainline: v4.7-rc1
+References: FATE#322288
+
+Fault and page_mkwrite are supposed to be uninterruptable. But they
+call ceph functions that are interruptible. So they should block
+signals before calling functions that are interruptible
+
+Signed-off-by: Yan, Zheng <zyan@redhat.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+[luis: adjust context and use PAGE_CACHE_SHIFT instead of PAGE_SHIFT due
+ to missing commit 09cbfeaf1a5a ("mm, fs: get rid of PAGE_CACHE_* and
+ page_cache_{get,release} macros")]
+---
+ fs/ceph/addr.c |   66 +++++++++++++++++++++++++++++++++------------------------
+ 1 file changed, 39 insertions(+), 27 deletions(-)
+
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -1314,6 +1314,17 @@ const struct address_space_operations ce
+ 	.direct_IO = ceph_direct_io,
+ };
+ 
++static void ceph_block_sigs(sigset_t *oldset)
++{
++	sigset_t mask;
++	siginitsetinv(&mask, sigmask(SIGKILL));
++	sigprocmask(SIG_BLOCK, &mask, oldset);
++}
++
++static void ceph_restore_sigs(sigset_t *oldset)
++{
++	sigprocmask(SIG_SETMASK, oldset, NULL);
++}
+ 
+ /*
+  * vm ops
+@@ -1326,6 +1337,9 @@ static int ceph_filemap_fault(struct vm_
+ 	struct page *pinned_page = NULL;
+ 	loff_t off = vmf->pgoff << PAGE_CACHE_SHIFT;
+ 	int want, got, ret;
++	sigset_t oldset;
++
++	ceph_block_sigs(&oldset);
+ 
+ 	dout("filemap_fault %p %llx.%llx %llu~%zd trying to get caps\n",
+ 	     inode, ceph_vinop(inode), off, (size_t)PAGE_CACHE_SIZE);
+@@ -1333,16 +1347,12 @@ static int ceph_filemap_fault(struct vm_
+ 		want = CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_LAZYIO;
+ 	else
+ 		want = CEPH_CAP_FILE_CACHE;
+-	while (1) {
+-		got = 0;
+-		ret = ceph_get_caps(ci, CEPH_CAP_FILE_RD, want,
+-				    -1, &got, &pinned_page);
+-		if (ret == 0)
+-			break;
+-		if (ret != -ERESTARTSYS) {
+-			WARN_ON(1);
+-			return VM_FAULT_SIGBUS;
+-		}
++
++	got = 0;
++	ret = ceph_get_caps(ci, CEPH_CAP_FILE_RD, want, -1, &got, &pinned_page);
++	if (ret < 0) {
++		ret = VM_FAULT_SIGBUS;
++		goto out_restore;
+ 	}
+ 	dout("filemap_fault %p %llu~%zd got cap refs on %s\n",
+ 	     inode, off, (size_t)PAGE_CACHE_SIZE, ceph_cap_string(got));
+@@ -1360,7 +1370,7 @@ static int ceph_filemap_fault(struct vm_
+ 	ceph_put_cap_refs(ci, got);
+ 
+ 	if (ret != -EAGAIN)
+-		return ret;
++		goto out_restore;
+ 
+ 	/* read inline data */
+ 	if (off >= PAGE_CACHE_SIZE) {
+@@ -1374,7 +1384,7 @@ static int ceph_filemap_fault(struct vm_
+ 						~__GFP_FS));
+ 		if (!page) {
+ 			ret = VM_FAULT_OOM;
+-			goto out;
++			goto out_inline;
+ 		}
+ 		ret1 = __ceph_do_getattr(inode, page,
+ 					 CEPH_STAT_CAP_INLINE_DATA, true);
+@@ -1382,7 +1392,7 @@ static int ceph_filemap_fault(struct vm_
+ 			unlock_page(page);
+ 			page_cache_release(page);
+ 			ret = VM_FAULT_SIGBUS;
+-			goto out;
++			goto out_inline;
+ 		}
+ 		if (ret1 < PAGE_CACHE_SIZE)
+ 			zero_user_segment(page, ret1, PAGE_CACHE_SIZE);
+@@ -1391,10 +1401,12 @@ static int ceph_filemap_fault(struct vm_
+ 		SetPageUptodate(page);
+ 		vmf->page = page;
+ 		ret = VM_FAULT_MAJOR | VM_FAULT_LOCKED;
++out_inline:
++		dout("filemap_fault %p %llu~%zd read inline data ret %d\n",
++		     inode, off, (size_t)PAGE_CACHE_SIZE, ret);
+ 	}
+-out:
+-	dout("filemap_fault %p %llu~%zd read inline data ret %d\n",
+-	     inode, off, (size_t)PAGE_CACHE_SIZE, ret);
++out_restore:
++	ceph_restore_sigs(&oldset);
+ 	return ret;
+ }
+ 
+@@ -1412,11 +1424,14 @@ static int ceph_page_mkwrite(struct vm_a
+ 	loff_t size = i_size_read(inode);
+ 	size_t len;
+ 	int want, got, ret;
++	sigset_t oldset;
+ 
+ 	prealloc_cf = ceph_alloc_cap_flush();
+ 	if (!prealloc_cf)
+ 		return VM_FAULT_SIGBUS;
+ 
++	ceph_block_sigs(&oldset);
++
+ 	if (ci->i_inline_version != CEPH_INLINE_NONE) {
+ 		struct page *locked_page = NULL;
+ 		if (off == 0) {
+@@ -1443,17 +1458,13 @@ static int ceph_page_mkwrite(struct vm_a
+ 		want = CEPH_CAP_FILE_BUFFER | CEPH_CAP_FILE_LAZYIO;
+ 	else
+ 		want = CEPH_CAP_FILE_BUFFER;
+-	while (1) {
+-		got = 0;
+-		ret = ceph_get_caps(ci, CEPH_CAP_FILE_WR, want, off + len,
+-				    &got, NULL);
+-		if (ret == 0)
+-			break;
+-		if (ret != -ERESTARTSYS) {
+-			WARN_ON(1);
+-			ret = VM_FAULT_SIGBUS;
+-			goto out_free;
+-		}
++
++	got = 0;
++	ret = ceph_get_caps(ci, CEPH_CAP_FILE_WR, want, off + len,
++			    &got, NULL);
++	if (ret < 0) {
++		ret = VM_FAULT_SIGBUS;
++		goto out_free;
+ 	}
+ 	dout("page_mkwrite %p %llu~%zd got cap refs on %s\n",
+ 	     inode, off, len, ceph_cap_string(got));
+@@ -1498,6 +1509,7 @@ out:
+ 	     inode, off, len, ceph_cap_string(got), ret);
+ 	ceph_put_cap_refs(ci, got);
+ out_free:
++	ceph_restore_sigs(&oldset);
+ 	ceph_free_cap_flush(prealloc_cf);
+ 
+ 	return ret;

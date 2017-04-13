@@ -1,0 +1,227 @@
+From: "Yan, Zheng" <zyan@redhat.com>
+Date: Wed, 18 May 2016 15:25:03 +0800
+Subject: ceph: disable fscache when inode is opened for write
+Git-commit: 46b59b2be05a71d80d76883d2f495f182d768f47
+Patch-mainline: v4.7-rc2
+References: FATE#322288
+
+All other filesystems do not add dirty pages to fscache. They all
+disable fscache when inode is opened for write. Only ceph adds
+dirty pages to fscache, but the code is buggy.
+
+Signed-off-by: Yan, Zheng <zyan@redhat.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+[luis: adjusted context; in ceph_fscache_register_inode_cookie() ended up
+ replacing 'mutex_unlock(&inode->i_mutex)' by 'inode_unlock(inode)'. ]
+---
+ fs/ceph/addr.c  |    2 --
+ fs/ceph/cache.c |   56 +++++++++++++++++++++++++++++++++++++++-----------------
+ fs/ceph/cache.h |   30 ++++++++++++------------------
+ fs/ceph/file.c  |   19 ++-----------------
+ 4 files changed, 53 insertions(+), 54 deletions(-)
+
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -536,8 +536,6 @@ static int writepage_nounlock(struct pag
+ 	    CONGESTION_ON_THRESH(fsc->mount_options->congestion_kb))
+ 		set_bdi_congested(&fsc->backing_dev_info, BLK_RW_ASYNC);
+ 
+-	ceph_readpage_to_fscache(inode, page);
+-
+ 	set_page_writeback(page);
+ 	err = ceph_osdc_writepages(osdc, ceph_vino(inode),
+ 				   &ci->i_layout, snapc,
+--- a/fs/ceph/cache.c
++++ b/fs/ceph/cache.c
+@@ -181,32 +181,26 @@ static const struct fscache_cookie_def c
+ 	.now_uncached	= ceph_fscache_inode_now_uncached,
+ };
+ 
+-void ceph_fscache_register_inode_cookie(struct ceph_fs_client* fsc,
+-					struct ceph_inode_info* ci)
++void ceph_fscache_register_inode_cookie(struct inode *inode)
+ {
+-	struct inode* inode = &ci->vfs_inode;
++	struct ceph_inode_info *ci = ceph_inode(inode);
++	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
+ 
+ 	/* No caching for filesystem */
+ 	if (fsc->fscache == NULL)
+ 		return;
+ 
+ 	/* Only cache for regular files that are read only */
+-	if ((ci->vfs_inode.i_mode & S_IFREG) == 0)
++	if (!S_ISREG(inode->i_mode))
+ 		return;
+ 
+-	/* Avoid multiple racing open requests */
+-	mutex_lock(&inode->i_mutex);
+-
+-	if (ci->fscache)
+-		goto done;
+-
+-	ci->fscache = fscache_acquire_cookie(fsc->fscache,
+-					     &ceph_fscache_inode_object_def,
+-					     ci, true);
+-	fscache_check_consistency(ci->fscache);
+-done:
+-	mutex_unlock(&inode->i_mutex);
+-
++	inode_lock_nested(inode, I_MUTEX_CHILD);
++	if (!ci->fscache) {
++		ci->fscache = fscache_acquire_cookie(fsc->fscache,
++					&ceph_fscache_inode_object_def,
++					ci, false);
++	}
++	inode_unlock(inode);
+ }
+ 
+ void ceph_fscache_unregister_inode_cookie(struct ceph_inode_info* ci)
+@@ -222,6 +216,34 @@ void ceph_fscache_unregister_inode_cooki
+ 	fscache_relinquish_cookie(cookie, 0);
+ }
+ 
++static bool ceph_fscache_can_enable(void *data)
++{
++	struct inode *inode = data;
++	return !inode_is_open_for_write(inode);
++}
++
++void ceph_fscache_file_set_cookie(struct inode *inode, struct file *filp)
++{
++	struct ceph_inode_info *ci = ceph_inode(inode);
++
++	if (!fscache_cookie_valid(ci->fscache))
++		return;
++
++	if (inode_is_open_for_write(inode)) {
++		dout("fscache_file_set_cookie %p %p disabling cache\n",
++		     inode, filp);
++		fscache_disable_cookie(ci->fscache, false);
++		fscache_uncache_all_inode_pages(ci->fscache, inode);
++	} else {
++		fscache_enable_cookie(ci->fscache, ceph_fscache_can_enable,
++				inode);
++		if (fscache_cookie_enabled(ci->fscache)) {
++			dout("fscache_file_set_cookie %p %p enabing cache\n",
++			     inode, filp);
++		}
++	}
++}
++
+ static void ceph_vfs_readpage_complete(struct page *page, void *data, int error)
+ {
+ 	if (!error)
+--- a/fs/ceph/cache.h
++++ b/fs/ceph/cache.h
+@@ -35,9 +35,9 @@ int ceph_fscache_register_fs(struct ceph
+ void ceph_fscache_unregister_fs(struct ceph_fs_client* fsc);
+ 
+ void ceph_fscache_inode_init(struct ceph_inode_info *ci);
+-void ceph_fscache_register_inode_cookie(struct ceph_fs_client* fsc,
+-					struct ceph_inode_info* ci);
++void ceph_fscache_register_inode_cookie(struct inode *inode);
+ void ceph_fscache_unregister_inode_cookie(struct ceph_inode_info* ci);
++void ceph_fscache_file_set_cookie(struct inode *inode, struct file *filp);
+ 
+ int ceph_readpage_from_fscache(struct inode *inode, struct page *page);
+ int ceph_readpages_from_fscache(struct inode *inode,
+@@ -48,12 +48,6 @@ void ceph_readpage_to_fscache(struct ino
+ void ceph_invalidate_fscache_page(struct inode* inode, struct page *page);
+ void ceph_queue_revalidate(struct inode *inode);
+ 
+-static inline void ceph_fscache_update_objectsize(struct inode *inode)
+-{
+-	struct ceph_inode_info *ci = ceph_inode(inode);
+-	fscache_attr_changed(ci->fscache);
+-}
+-
+ static inline void ceph_fscache_invalidate(struct inode *inode)
+ {
+ 	fscache_invalidate(ceph_inode(inode)->fscache);
+@@ -112,8 +106,16 @@ static inline void ceph_fscache_inode_in
+ {
+ }
+ 
+-static inline void ceph_fscache_register_inode_cookie(struct ceph_fs_client* parent_fsc,
+-						      struct ceph_inode_info* ci)
++static inline void ceph_fscache_register_inode_cookie(struct inode *inode)
++{
++}
++
++static inline void ceph_fscache_unregister_inode_cookie(struct ceph_inode_info* ci)
++{
++}
++
++static inline void ceph_fscache_file_set_cookie(struct inode *inode,
++						struct file *filp)
+ {
+ }
+ 
+@@ -141,10 +143,6 @@ static inline void ceph_readpage_to_fsca
+ {
+ }
+ 
+-static inline void ceph_fscache_update_objectsize(struct inode *inode)
+-{
+-}
+-
+ static inline void ceph_fscache_invalidate(struct inode *inode)
+ {
+ }
+@@ -154,10 +152,6 @@ static inline void ceph_invalidate_fscac
+ {
+ }
+ 
+-static inline void ceph_fscache_unregister_inode_cookie(struct ceph_inode_info* ci)
+-{
+-}
+-
+ static inline int ceph_release_fscache_page(struct page *page, gfp_t gfp)
+ {
+ 	return 1;
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -137,23 +137,11 @@ static int ceph_init_file(struct inode *
+ {
+ 	struct ceph_file_info *cf;
+ 	int ret = 0;
+-	struct ceph_inode_info *ci = ceph_inode(inode);
+-	struct ceph_fs_client *fsc = ceph_sb_to_client(inode->i_sb);
+-	struct ceph_mds_client *mdsc = fsc->mdsc;
+ 
+ 	switch (inode->i_mode & S_IFMT) {
+ 	case S_IFREG:
+-		/* First file open request creates the cookie, we want to keep
+-		 * this cookie around for the filetime of the inode as not to
+-		 * have to worry about fscache register / revoke / operation
+-		 * races.
+-		 *
+-		 * Also, if we know the operation is going to invalidate data
+-		 * (non readonly) just nuke the cache right away.
+-		 */
+-		ceph_fscache_register_inode_cookie(mdsc->fsc, ci);
+-		if ((fmode & CEPH_FILE_MODE_WR))
+-			ceph_fscache_invalidate(inode);
++		ceph_fscache_register_inode_cookie(inode);
++		ceph_fscache_file_set_cookie(inode, file);
+ 	case S_IFDIR:
+ 		dout("init_file %p %p 0%o (regular)\n", inode, file,
+ 		     inode->i_mode);
+@@ -1408,7 +1396,6 @@ retry_snap:
+ 			iov_iter_advance(from, written);
+ 		ceph_put_snap_context(snapc);
+ 	} else {
+-		loff_t old_size = i_size_read(inode);
+ 		/*
+ 		 * No need to acquire the i_truncate_mutex. Because
+ 		 * the MDS revokes Fwb caps before sending truncate
+@@ -1419,8 +1406,6 @@ retry_snap:
+ 		written = generic_perform_write(file, from, pos);
+ 		if (likely(written >= 0))
+ 			iocb->ki_pos = pos + written;
+-		if (i_size_read(inode) > old_size)
+-			ceph_fscache_update_objectsize(inode);
+ 		mutex_unlock(&inode->i_mutex);
+ 	}
+ 
