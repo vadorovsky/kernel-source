@@ -1,0 +1,149 @@
+From: Ilya Dryomov <idryomov@gmail.com>
+Date: Tue, 31 Jan 2017 15:55:06 +0100
+Subject: crush: merge working data and scratch
+Git-commit: 743efcffffc6620ab44ea9ec67c7e4e28dfa7742
+Patch-mainline: v4.11-rc1
+References: FATE#322288
+
+Much like Arlo Guthrie, I decided that one big pile is better than two
+little piles.
+
+Reflects ceph.git commit 95c2df6c7e0b22d2ea9d91db500cf8b9441c73ba.
+
+Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+Acked-by: Luis Henriques <lhenriques@suse.com>
+---
+ include/linux/ceph/osdmap.h  |  3 +--
+ include/linux/crush/mapper.h | 14 +++++++++++++-
+ net/ceph/crush/mapper.c      | 17 +++++++----------
+ net/ceph/osdmap.c            | 14 ++++++++------
+ 4 files changed, 29 insertions(+), 19 deletions(-)
+
+diff --git a/include/linux/ceph/osdmap.h b/include/linux/ceph/osdmap.h
+index cef1cab789b9..8cebdc4158c3 100644
+--- a/include/linux/ceph/osdmap.h
++++ b/include/linux/ceph/osdmap.h
+@@ -173,8 +173,7 @@ struct ceph_osdmap {
+ 	 * the list of osds that store+replicate them. */
+ 	struct crush_map *crush;
+ 
+-	struct mutex crush_scratch_mutex;
+-	int crush_scratch_ary[CEPH_PG_MAX_SIZE * 3];
++	struct mutex crush_workspace_mutex;
+ 	void *crush_workspace;
+ };
+ 
+diff --git a/include/linux/crush/mapper.h b/include/linux/crush/mapper.h
+index 3303c7fd8a31..c95e19e1ff11 100644
+--- a/include/linux/crush/mapper.h
++++ b/include/linux/crush/mapper.h
+@@ -15,7 +15,19 @@ extern int crush_do_rule(const struct crush_map *map,
+ 			 int ruleno,
+ 			 int x, int *result, int result_max,
+ 			 const __u32 *weights, int weight_max,
+-			 void *cwin, int *scratch);
++			 void *cwin);
++
++/*
++ * Returns the exact amount of workspace that will need to be used
++ * for a given combination of crush_map and result_max. The caller can
++ * then allocate this much on its own, either on the stack, in a
++ * per-thread long-lived buffer, or however it likes.
++ */
++static inline size_t crush_work_size(const struct crush_map *map,
++				     int result_max)
++{
++	return map->working_size + result_max * 3 * sizeof(__u32);
++}
+ 
+ void crush_init_workspace(const struct crush_map *map, void *v);
+ 
+diff --git a/net/ceph/crush/mapper.c b/net/ceph/crush/mapper.c
+index 9e75be5ec716..2e31217ccae3 100644
+--- a/net/ceph/crush/mapper.c
++++ b/net/ceph/crush/mapper.c
+@@ -855,23 +855,22 @@ void crush_init_workspace(const struct crush_map *map, void *v)
+  * @result_max: maximum result size
+  * @weight: weight vector (for map leaves)
+  * @weight_max: size of weight vector
+- * @cwin: pointer to at least map->working_size bytes of memory
+- * @scratch: scratch vector for private use; must be >= 3 * result_max
++ * @cwin: pointer to at least crush_work_size() bytes of memory
+  */
+ int crush_do_rule(const struct crush_map *map,
+ 		  int ruleno, int x, int *result, int result_max,
+ 		  const __u32 *weight, int weight_max,
+-		  void *cwin, int *scratch)
++		  void *cwin)
+ {
+ 	int result_len;
+ 	struct crush_work *cw = cwin;
+-	int *a = scratch;
+-	int *b = scratch + result_max;
+-	int *c = scratch + result_max*2;
++	int *a = cwin + map->working_size;
++	int *b = a + result_max;
++	int *c = b + result_max;
++	int *w = a;
++	int *o = b;
+ 	int recurse_to_leaf;
+-	int *w;
+ 	int wsize = 0;
+-	int *o;
+ 	int osize;
+ 	int *tmp;
+ 	const struct crush_rule *rule;
+@@ -902,8 +901,6 @@ int crush_do_rule(const struct crush_map *map,
+ 
+ 	rule = map->rules[ruleno];
+ 	result_len = 0;
+-	w = a;
+-	o = b;
+ 
+ 	for (step = 0; step < rule->len; step++) {
+ 		int firstn = 0;
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index 3892e7fa7747..2374956c4d40 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -743,7 +743,7 @@ struct ceph_osdmap *ceph_osdmap_alloc(void)
+ 	map->pool_max = -1;
+ 	map->pg_temp = RB_ROOT;
+ 	map->primary_temp = RB_ROOT;
+-	mutex_init(&map->crush_scratch_mutex);
++	mutex_init(&map->crush_workspace_mutex);
+ 
+ 	return map;
+ }
+@@ -836,11 +836,14 @@ static int osdmap_set_max_osd(struct ceph_osdmap *map, int max)
+ static int osdmap_set_crush(struct ceph_osdmap *map, struct crush_map *crush)
+ {
+ 	void *workspace;
++	size_t work_size;
+ 
+ 	if (IS_ERR(crush))
+ 		return PTR_ERR(crush);
+ 
+-	workspace = kmalloc(crush->working_size, GFP_NOIO);
++	work_size = crush_work_size(crush, CEPH_PG_MAX_SIZE);
++	dout("%s work_size %zu bytes\n", __func__, work_size);
++	workspace = kmalloc(work_size, GFP_NOIO);
+ 	if (!workspace) {
+ 		crush_destroy(crush);
+ 		return -ENOMEM;
+@@ -1974,11 +1977,10 @@ static int do_crush(struct ceph_osdmap *map, int ruleno, int x,
+ 
+ 	BUG_ON(result_max > CEPH_PG_MAX_SIZE);
+ 
+-	mutex_lock(&map->crush_scratch_mutex);
++	mutex_lock(&map->crush_workspace_mutex);
+ 	r = crush_do_rule(map->crush, ruleno, x, result, result_max,
+-			  weight, weight_max, map->crush_workspace,
+-			  map->crush_scratch_ary);
+-	mutex_unlock(&map->crush_scratch_mutex);
++			  weight, weight_max, map->crush_workspace);
++	mutex_unlock(&map->crush_workspace_mutex);
+ 
+ 	return r;
+ }
+
