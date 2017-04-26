@@ -1,0 +1,198 @@
+From: =?UTF-8?q?Radim=20Kr=C4=8Dm=C3=A1=C5=99?= <rkrcmar@redhat.com>
+Date: Tue, 12 Jul 2016 22:09:28 +0200
+Subject: KVM: x86: add a flag to disable KVM x2apic broadcast quirk
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v4.8-rc1
+Git-commit: c519265f2aa348b2f1b9ecf8fbe20bb7c0fb102e
+References: FATE#321335
+
+Add KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK as a feature flag to
+KVM_CAP_X2APIC_API.
+
+The quirk made KVM interpret 0xff as a broadcast even in x2APIC mode.
+The enableable capability is needed in order to support standard x2APIC and
+remain backward compatible.
+
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+[Expand kvm_apic_mda comment. - Paolo]
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Bruce Rogers <brogers@suse.com>
+---
+ Documentation/virtual/kvm/api.txt |  6 +++++
+ arch/x86/include/asm/kvm_host.h   |  1 +
+ arch/x86/kvm/lapic.c              | 53 +++++++++++++++++++++++++++++----------
+ arch/x86/kvm/x86.c                |  5 +++-
+ include/uapi/linux/kvm.h          |  1 +
+ 5 files changed, 52 insertions(+), 14 deletions(-)
+
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index 276ca9d91c66..4cfaa6c5eec3 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -3750,12 +3750,18 @@ Returns: 0 on success, -EINVAL when args[0] contains invalid features
+ Valid feature flags in args[0] are
+ 
+ #define KVM_X2APIC_API_USE_32BIT_IDS            (1ULL << 0)
++#define KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK  (1ULL << 1)
+ 
+ Enabling KVM_X2APIC_API_USE_32BIT_IDS changes the behavior of
+ KVM_SET_GSI_ROUTING, KVM_SIGNAL_MSI, KVM_SET_LAPIC, and KVM_GET_LAPIC,
+ allowing the use of 32-bit APIC IDs.  See KVM_CAP_X2APIC_API in their
+ respective sections.
+ 
++KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK must be enabled for x2APIC to work
++in logical mode or with more than 255 VCPUs.  Otherwise, KVM treats 0xff
++as a broadcast even in x2APIC mode in order to support physical x2APIC
++without interrupt remapping.  This is undesirable in logical mode,
++where 0xff represents CPUs 0-7 in cluster 0.
+ 
+ 
+ 8. Other capabilities.
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 33edab435dde..732b756aba38 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -738,6 +738,7 @@ struct kvm_arch {
+ 	bool disabled_lapic_found;
+ 
+ 	bool x2apic_format;
++	bool x2apic_broadcast_quirk_disabled;
+ };
+ 
+ struct kvm_vm_stat {
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 52da011c8114..0d4d25756df0 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -622,17 +622,30 @@ static bool kvm_apic_match_logical_addr(struct kvm_lapic *apic, u32 mda)
+ 	}
+ }
+ 
+-/* KVM APIC implementation has two quirks
+- *  - dest always begins at 0 while xAPIC MDA has offset 24,
+- *  - IOxAPIC messages have to be delivered (directly) to x2APIC.
++/* The KVM local APIC implementation has two quirks:
++ *
++ *  - the xAPIC MDA stores the destination at bits 24-31, while this
++ *    is not true of struct kvm_lapic_irq's dest_id field.  This is
++ *    just a quirk in the API and is not problematic.
++ *
++ *  - in-kernel IOAPIC messages have to be delivered directly to
++ *    x2APIC, because the kernel does not support interrupt remapping.
++ *    In order to support broadcast without interrupt remapping, x2APIC
++ *    rewrites the destination of non-IPI messages from APIC_BROADCAST
++ *    to X2APIC_BROADCAST.
++ *
++ * The broadcast quirk can be disabled with KVM_CAP_X2APIC_API.  This is
++ * important when userspace wants to use x2APIC-format MSIs, because
++ * APIC_BROADCAST (0xff) is a legal route for "cluster 0, CPUs 0-7".
+  */
+-static u32 kvm_apic_mda(unsigned int dest_id, struct kvm_lapic *source,
+-                                              struct kvm_lapic *target)
++static u32 kvm_apic_mda(struct kvm_vcpu *vcpu, unsigned int dest_id,
++		struct kvm_lapic *source, struct kvm_lapic *target)
+ {
+ 	bool ipi = source != NULL;
+ 	bool x2apic_mda = apic_x2apic_mode(ipi ? source : target);
+ 
+-	if (!ipi && dest_id == APIC_BROADCAST && x2apic_mda)
++	if (!vcpu->kvm->arch.x2apic_broadcast_quirk_disabled &&
++	    !ipi && dest_id == APIC_BROADCAST && x2apic_mda)
+ 		return X2APIC_BROADCAST;
+ 
+ 	return x2apic_mda ? dest_id : SET_APIC_DEST_FIELD(dest_id);
+@@ -642,7 +655,7 @@ bool kvm_apic_match_dest(struct kvm_vcpu *vcpu, struct kvm_lapic *source,
+ 			   int short_hand, unsigned int dest, int dest_mode)
+ {
+ 	struct kvm_lapic *target = vcpu->arch.apic;
+-	u32 mda = kvm_apic_mda(dest, source, target);
++	u32 mda = kvm_apic_mda(vcpu, dest, source, target);
+ 
+ 	apic_debug("target %p, source %p, dest 0x%x, "
+ 		   "dest_mode 0x%x, short_hand 0x%x\n",
+@@ -694,6 +707,25 @@ static void kvm_apic_disabled_lapic_found(struct kvm *kvm)
+ 	}
+ }
+ 
++static bool kvm_apic_is_broadcast_dest(struct kvm *kvm, struct kvm_lapic **src,
++		struct kvm_lapic_irq *irq, struct kvm_apic_map *map)
++{
++	if (kvm->arch.x2apic_broadcast_quirk_disabled) {
++		if ((irq->dest_id == APIC_BROADCAST &&
++				map->mode != KVM_APIC_MODE_X2APIC))
++			return true;
++		if (irq->dest_id == X2APIC_BROADCAST)
++			return true;
++	} else {
++		bool x2apic_ipi = src && *src && apic_x2apic_mode(*src);
++		if (irq->dest_id == (x2apic_ipi ?
++		                     X2APIC_BROADCAST : APIC_BROADCAST))
++			return true;
++	}
++
++	return false;
++}
++
+ /* Return true if the interrupt can be handled by using *bitmap as index mask
+  * for valid destinations in *dst array.
+  * Return false if kvm_apic_map_get_dest_lapic did nothing useful.
+@@ -707,7 +739,6 @@ static inline bool kvm_apic_map_get_dest_lapic(struct kvm *kvm,
+ 		unsigned long *bitmap)
+ {
+ 	int i, lowest;
+-	bool x2apic_ipi;
+ 
+ 	if (irq->shorthand == APIC_DEST_SELF && src) {
+ 		*dst = src;
+@@ -716,11 +747,7 @@ static inline bool kvm_apic_map_get_dest_lapic(struct kvm *kvm,
+ 	} else if (irq->shorthand)
+ 		return false;
+ 
+-	x2apic_ipi = src && *src && apic_x2apic_mode(*src);
+-	if (irq->dest_id == (x2apic_ipi ? X2APIC_BROADCAST : APIC_BROADCAST))
+-		return false;
+-
+-	if (!map)
++	if (!map || kvm_apic_is_broadcast_dest(kvm, src, irq, map))
+ 		return false;
+ 
+ 	if (irq->dest_mode == APIC_DEST_PHYSICAL) {
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 4ab0d1077f54..9a6c99fe02b4 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -90,7 +90,8 @@ static u64 __read_mostly efer_reserved_bits = ~((u64)EFER_SCE);
+ #define VM_STAT(x) offsetof(struct kvm, stat.x), KVM_STAT_VM
+ #define VCPU_STAT(x) offsetof(struct kvm_vcpu, stat.x), KVM_STAT_VCPU
+ 
+-#define KVM_X2APIC_API_VALID_FLAGS (KVM_X2APIC_API_USE_32BIT_IDS)
++#define KVM_X2APIC_API_VALID_FLAGS (KVM_X2APIC_API_USE_32BIT_IDS | \
++                                    KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK)
+ 
+ static void update_cr8_intercept(struct kvm_vcpu *vcpu);
+ static void process_nmi(struct kvm_vcpu *vcpu);
+@@ -3788,6 +3789,8 @@ split_irqchip_unlock:
+ 
+ 		if (cap->args[0] & KVM_X2APIC_API_USE_32BIT_IDS)
+ 			kvm->arch.x2apic_format = true;
++		if (cap->args[0] & KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK)
++			kvm->arch.x2apic_broadcast_quirk_disabled = true;
+ 
+ 		r = 0;
+ 		break;
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index 7c7de9652258..03987092a653 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1297,5 +1297,6 @@ struct kvm_assigned_msix_entry {
+ #define KVM_ARM_DEV_EL1_PTIMER		(1 << 1)
+ #define KVM_ARM_DEV_PMU			(1 << 2)
+ #define KVM_X2APIC_API_USE_32BIT_IDS            (1ULL << 0)
++#define KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK  (1ULL << 1)
+ 
+ #endif /* __LINUX_KVM_H */
+-- 
+2.12.2
+

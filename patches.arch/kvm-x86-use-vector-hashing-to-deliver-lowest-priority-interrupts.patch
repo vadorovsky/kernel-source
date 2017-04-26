@@ -1,0 +1,233 @@
+From: Feng Wu <feng.wu@intel.com>
+Date: Mon, 25 Jan 2016 16:53:33 +0800
+Subject: KVM: x86: Use vector-hashing to deliver lowest-priority interrupts
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Patch-mainline: v4.6-rc1
+Git-commit: 520040146a0af36f7875ec06b58f44b19a0edf53
+References: FATE#321335
+
+Use vector-hashing to deliver lowest-priority interrupts, As an
+example, modern Intel CPUs in server platform use this method to
+handle lowest-priority interrupts.
+
+Signed-off-by: Feng Wu <feng.wu@intel.com>
+Reviewed-by: Radim Krčmář <rkrcmar@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Bruce Rogers <brogers@suse.com>
+---
+ arch/x86/include/asm/kvm_host.h |  2 ++
+ arch/x86/kvm/irq_comm.c         | 25 +++++++++++++++++----
+ arch/x86/kvm/lapic.c            | 50 ++++++++++++++++++++++++++++++++++++++---
+ arch/x86/kvm/lapic.h            |  2 ++
+ arch/x86/kvm/x86.c              |  9 ++++++++
+ arch/x86/kvm/x86.h              |  1 +
+ 6 files changed, 82 insertions(+), 7 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index a9a984bafacb..d2b6857f9ae2 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -731,6 +731,8 @@ struct kvm_arch {
+ 	struct page *avic_logical_id_table_page;
+ 	struct page *avic_physical_id_table_page;
+ 	struct hlist_node hnode;
++
++	bool disabled_lapic_found;
+ };
+ 
+ struct kvm_vm_stat {
+diff --git a/arch/x86/kvm/irq_comm.c b/arch/x86/kvm/irq_comm.c
+index 29fe1a533c2b..b17b91814ef5 100644
+--- a/arch/x86/kvm/irq_comm.c
++++ b/arch/x86/kvm/irq_comm.c
+@@ -34,6 +34,7 @@
+ #include "lapic.h"
+ 
+ #include "hyperv.h"
++#include "x86.h"
+ 
+ static int kvm_set_pic_irq(struct kvm_kernel_irq_routing_entry *e,
+ 			   struct kvm *kvm, int irq_source_id, int level,
+@@ -70,6 +71,8 @@ int kvm_irq_delivery_to_apic(struct kvm *kvm, struct kvm_lapic *src,
+ {
+ 	int i, r = -1;
+ 	struct kvm_vcpu *vcpu, *lowest = NULL;
++	unsigned long dest_vcpu_bitmap[BITS_TO_LONGS(KVM_MAX_VCPUS)];
++	unsigned int dest_vcpus = 0;
+ 
+ 	if (irq->dest_mode == 0 && irq->dest_id == 0xff &&
+ 			kvm_lowest_prio_delivery(irq)) {
+@@ -80,6 +83,8 @@ int kvm_irq_delivery_to_apic(struct kvm *kvm, struct kvm_lapic *src,
+ 	if (kvm_irq_delivery_to_apic_fast(kvm, src, irq, &r, dest_map))
+ 		return r;
+ 
++	memset(dest_vcpu_bitmap, 0, sizeof(dest_vcpu_bitmap));
++
+ 	kvm_for_each_vcpu(i, vcpu, kvm) {
+ 		if (!kvm_apic_present(vcpu))
+ 			continue;
+@@ -93,13 +98,25 @@ int kvm_irq_delivery_to_apic(struct kvm *kvm, struct kvm_lapic *src,
+ 				r = 0;
+ 			r += kvm_apic_set_irq(vcpu, irq, dest_map);
+ 		} else if (kvm_lapic_enabled(vcpu)) {
+-			if (!lowest)
+-				lowest = vcpu;
+-			else if (kvm_apic_compare_prio(vcpu, lowest) < 0)
+-				lowest = vcpu;
++			if (!kvm_vector_hashing_enabled()) {
++				if (!lowest)
++					lowest = vcpu;
++				else if (kvm_apic_compare_prio(vcpu, lowest) < 0)
++					lowest = vcpu;
++			} else {
++				__set_bit(i, dest_vcpu_bitmap);
++				dest_vcpus++;
++			}
+ 		}
+ 	}
+ 
++	if (dest_vcpus != 0) {
++		int idx = kvm_vector_to_index(irq->vector, dest_vcpus,
++					dest_vcpu_bitmap, KVM_MAX_VCPUS);
++
++		lowest = kvm_get_vcpu(kvm, idx);
++	}
++
+ 	if (lowest)
+ 		r = kvm_apic_set_irq(lowest, irq, dest_map);
+ 
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 5e079d26b98c..6e9d480c65a4 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -652,6 +652,22 @@ bool kvm_apic_match_dest(struct kvm_vcpu *vcpu, struct kvm_lapic *source,
+ }
+ EXPORT_SYMBOL_GPL(kvm_apic_match_dest);
+ 
++int kvm_vector_to_index(u32 vector, u32 dest_vcpus,
++		       const unsigned long *bitmap, u32 bitmap_size)
++{
++	u32 mod;
++	int i, idx = -1;
++
++	mod = vector % dest_vcpus;
++
++	for (i = 0; i <= mod; i++) {
++		idx = find_next_bit(bitmap, bitmap_size, idx + 1);
++		BUG_ON(idx == bitmap_size);
++	}
++
++	return idx;
++}
++
+ bool kvm_irq_delivery_to_apic_fast(struct kvm *kvm, struct kvm_lapic *src,
+ 		struct kvm_lapic_irq *irq, int *r, struct dest_map *dest_map)
+ {
+@@ -704,21 +720,49 @@ bool kvm_irq_delivery_to_apic_fast(struct kvm *kvm, struct kvm_lapic *src,
+ 
+ 		dst = map->logical_map[cid];
+ 
+-		if (kvm_lowest_prio_delivery(irq)) {
++		if (!kvm_lowest_prio_delivery(irq))
++			goto set_irq;
++
++		if (!kvm_vector_hashing_enabled()) {
+ 			int l = -1;
+ 			for_each_set_bit(i, &bitmap, 16) {
+ 				if (!dst[i])
+ 					continue;
+ 				if (l < 0)
+ 					l = i;
+-				else if (kvm_apic_compare_prio(dst[i]->vcpu, dst[l]->vcpu) < 0)
++				else if (kvm_apic_compare_prio(dst[i]->vcpu,
++							dst[l]->vcpu) < 0)
+ 					l = i;
+ 			}
+-
+ 			bitmap = (l >= 0) ? 1 << l : 0;
++		} else {
++			int idx;
++			unsigned int dest_vcpus;
++
++			dest_vcpus = hweight16(bitmap);
++			if (dest_vcpus == 0)
++				goto out;
++
++			idx = kvm_vector_to_index(irq->vector,
++				dest_vcpus, &bitmap, 16);
++
++			/*
++			 * We may find a hardware disabled LAPIC here, if that
++			 * is the case, print out a error message once for each
++			 * guest and return.
++			 */
++			if (!dst[idx] && !kvm->arch.disabled_lapic_found) {
++				kvm->arch.disabled_lapic_found = true;
++				printk(KERN_INFO
++					"Disabled LAPIC found during irq injection\n");
++				goto out;
++			}
++
++			bitmap = (idx >= 0) ? 1 << idx : 0;
+ 		}
+ 	}
+ 
++set_irq:
+ 	for_each_set_bit(i, &bitmap, 16) {
+ 		if (!dst[i])
+ 			continue;
+diff --git a/arch/x86/kvm/lapic.h b/arch/x86/kvm/lapic.h
+index c783dc535679..fd63656562d4 100644
+--- a/arch/x86/kvm/lapic.h
++++ b/arch/x86/kvm/lapic.h
+@@ -211,4 +211,6 @@ void wait_lapic_expire(struct kvm_vcpu *vcpu);
+ 
+ bool kvm_intr_is_single_vcpu_fast(struct kvm *kvm, struct kvm_lapic_irq *irq,
+ 			struct kvm_vcpu **dest_vcpu);
++int kvm_vector_to_index(u32 vector, u32 dest_vcpus,
++			const unsigned long *bitmap, u32 bitmap_size);
+ #endif
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 3dd3e9b6fd68..f44043494355 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -124,6 +124,9 @@ module_param(tsc_tolerance_ppm, uint, S_IRUGO | S_IWUSR);
+ unsigned int __read_mostly lapic_timer_advance_ns = 0;
+ module_param(lapic_timer_advance_ns, uint, S_IRUGO | S_IWUSR);
+ 
++static bool __read_mostly vector_hashing = true;
++module_param(vector_hashing, bool, S_IRUGO);
++
+ static bool __read_mostly backwards_tsc_observed = false;
+ 
+ #define KVM_NR_SHARED_MSRS 16
+@@ -8373,6 +8376,12 @@ int kvm_arch_update_irqfd_routing(struct kvm *kvm, unsigned int host_irq,
+ 	return kvm_x86_ops->update_pi_irte(kvm, host_irq, guest_irq, set);
+ }
+ 
++bool kvm_vector_hashing_enabled(void)
++{
++	return vector_hashing;
++}
++EXPORT_SYMBOL_GPL(kvm_vector_hashing_enabled);
++
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_exit);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_fast_mmio);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_inj_virq);
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 0f71d5d7e452..e3bf68a496b7 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -179,6 +179,7 @@ int kvm_mtrr_set_msr(struct kvm_vcpu *vcpu, u32 msr, u64 data);
+ int kvm_mtrr_get_msr(struct kvm_vcpu *vcpu, u32 msr, u64 *pdata);
+ bool kvm_mtrr_check_gfn_range_consistency(struct kvm_vcpu *vcpu, gfn_t gfn,
+ 					  int page_num);
++bool kvm_vector_hashing_enabled(void);
+ 
+ #define KVM_SUPPORTED_XCR0     (XFEATURE_MASK_FP | XFEATURE_MASK_SSE \
+ 				| XFEATURE_MASK_YMM | XFEATURE_MASK_BNDREGS \
+-- 
+2.12.2
+
