@@ -1,0 +1,332 @@
+From: Varun Prakash <varun@chelsio.com>
+Date: Fri, 13 Jan 2017 20:53:25 +0530
+Subject: target/cxgbit: add T6 iSCSI DDP completion feature
+References: bsc#1036489
+Git-commit: 79e57cfe00f40d509e2d007a5662db26cdbc74db
+Patch-Mainline: v4.11-rc1
+
+Chelsio T6 adapters reduce number of completion
+to host by generating single completion for all
+directly placed(DDP) iSCSI pdus in a sequence,
+completion contains iSCSI hdr of the last pdu
+in a sequence.
+
+On receiving DDP completion cxgbit driver finds
+iSCSI cmd using iscsit_find_cmd_from_itt_or_dump(),
+then updates cmd->write_data_done, cmd->next_burst_len,
+cmd->data_sn and calls __iscsit_check_dataout_hdr()
+to validate iSCSI hdr.
+
+(Update __iscsit_check_dataout_hdr parameter usage - nab)
+
+Signed-off-by: Varun Prakash <varun@chelsio.com>
+Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
+---
+ drivers/target/iscsi/cxgbit/cxgbit_cm.c     |  3 ++
+ drivers/target/iscsi/cxgbit/cxgbit_lro.h    |  5 +-
+ drivers/target/iscsi/cxgbit/cxgbit_main.c   | 67 +++++++++++++++++-------
+ drivers/target/iscsi/cxgbit/cxgbit_target.c | 81 +++++++++++++++++++++--------
+ 4 files changed, 113 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/target/iscsi/cxgbit/cxgbit_cm.c b/drivers/target/iscsi/cxgbit/cxgbit_cm.c
+index b26c85a..37a0518 100644
+--- a/drivers/target/iscsi/cxgbit/cxgbit_cm.c
++++ b/drivers/target/iscsi/cxgbit/cxgbit_cm.c
+@@ -1114,6 +1114,9 @@ cxgbit_pass_accept_rpl(struct cxgbit_sock *csk, struct cpl_pass_accept_req *req)
+ 	opt2 = RX_CHANNEL_V(0) |
+ 		RSS_QUEUE_VALID_F | RSS_QUEUE_V(csk->rss_qid);
+ 
++	if (!is_t5(lldi->adapter_type))
++		opt2 |= RX_FC_DISABLE_F;
++
+ 	if (req->tcpopt.tstamp)
+ 		opt2 |= TSTAMPS_EN_F;
+ 	if (req->tcpopt.sack)
+diff --git a/drivers/target/iscsi/cxgbit/cxgbit_lro.h b/drivers/target/iscsi/cxgbit/cxgbit_lro.h
+index 28c11bd..dcaed3a 100644
+--- a/drivers/target/iscsi/cxgbit/cxgbit_lro.h
++++ b/drivers/target/iscsi/cxgbit/cxgbit_lro.h
+@@ -31,8 +31,9 @@ enum cxgbit_pducb_flags {
+ 	PDUCBF_RX_DATA		= (1 << 1), /* received pdu payload */
+ 	PDUCBF_RX_STATUS	= (1 << 2), /* received ddp status */
+ 	PDUCBF_RX_DATA_DDPD	= (1 << 3), /* pdu payload ddp'd */
+-	PDUCBF_RX_HCRC_ERR	= (1 << 4), /* header digest error */
+-	PDUCBF_RX_DCRC_ERR	= (1 << 5), /* data digest error */
++	PDUCBF_RX_DDP_CMP	= (1 << 4), /* ddp completion */
++	PDUCBF_RX_HCRC_ERR	= (1 << 5), /* header digest error */
++	PDUCBF_RX_DCRC_ERR	= (1 << 6), /* data digest error */
+ };
+ 
+ struct cxgbit_lro_pdu_cb {
+diff --git a/drivers/target/iscsi/cxgbit/cxgbit_main.c b/drivers/target/iscsi/cxgbit/cxgbit_main.c
+index 6531aaa..4fd775a 100644
+--- a/drivers/target/iscsi/cxgbit/cxgbit_main.c
++++ b/drivers/target/iscsi/cxgbit/cxgbit_main.c
+@@ -165,29 +165,24 @@ static int cxgbit_uld_state_change(void *handle, enum cxgb4_state state)
+ }
+ 
+ static void
+-cxgbit_proc_ddp_status(unsigned int tid, struct cpl_rx_data_ddp *cpl,
+-		       struct cxgbit_lro_pdu_cb *pdu_cb)
++cxgbit_process_ddpvld(struct cxgbit_sock *csk, struct cxgbit_lro_pdu_cb *pdu_cb,
++		      u32 ddpvld)
+ {
+-	unsigned int status = ntohl(cpl->ddpvld);
+ 
+-	pdu_cb->flags |= PDUCBF_RX_STATUS;
+-	pdu_cb->ddigest = ntohl(cpl->ulp_crc);
+-	pdu_cb->pdulen = ntohs(cpl->len);
+-
+-	if (status & (1 << CPL_RX_ISCSI_DDP_STATUS_HCRC_SHIFT)) {
+-		pr_info("tid 0x%x, status 0x%x, hcrc bad.\n", tid, status);
++	if (ddpvld & (1 << CPL_RX_ISCSI_DDP_STATUS_HCRC_SHIFT)) {
++		pr_info("tid 0x%x, status 0x%x, hcrc bad.\n", csk->tid, ddpvld);
+ 		pdu_cb->flags |= PDUCBF_RX_HCRC_ERR;
+ 	}
+ 
+-	if (status & (1 << CPL_RX_ISCSI_DDP_STATUS_DCRC_SHIFT)) {
+-		pr_info("tid 0x%x, status 0x%x, dcrc bad.\n", tid, status);
++	if (ddpvld & (1 << CPL_RX_ISCSI_DDP_STATUS_DCRC_SHIFT)) {
++		pr_info("tid 0x%x, status 0x%x, dcrc bad.\n", csk->tid, ddpvld);
+ 		pdu_cb->flags |= PDUCBF_RX_DCRC_ERR;
+ 	}
+ 
+-	if (status & (1 << CPL_RX_ISCSI_DDP_STATUS_PAD_SHIFT))
+-		pr_info("tid 0x%x, status 0x%x, pad bad.\n", tid, status);
++	if (ddpvld & (1 << CPL_RX_ISCSI_DDP_STATUS_PAD_SHIFT))
++		pr_info("tid 0x%x, status 0x%x, pad bad.\n", csk->tid, ddpvld);
+ 
+-	if ((status & (1 << CPL_RX_ISCSI_DDP_STATUS_DDP_SHIFT)) &&
++	if ((ddpvld & (1 << CPL_RX_ISCSI_DDP_STATUS_DDP_SHIFT)) &&
+ 	    (!(pdu_cb->flags & PDUCBF_RX_DATA))) {
+ 		pdu_cb->flags |= PDUCBF_RX_DATA_DDPD;
+ 	}
+@@ -201,13 +196,17 @@ cxgbit_lro_add_packet_rsp(struct sk_buff *skb, u8 op, const __be64 *rsp)
+ 						lro_cb->pdu_idx);
+ 	struct cpl_rx_iscsi_ddp *cpl = (struct cpl_rx_iscsi_ddp *)(rsp + 1);
+ 
+-	cxgbit_proc_ddp_status(lro_cb->csk->tid, cpl, pdu_cb);
++	cxgbit_process_ddpvld(lro_cb->csk, pdu_cb, be32_to_cpu(cpl->ddpvld));
++
++	pdu_cb->flags |= PDUCBF_RX_STATUS;
++	pdu_cb->ddigest = ntohl(cpl->ulp_crc);
++	pdu_cb->pdulen = ntohs(cpl->len);
+ 
+ 	if (pdu_cb->flags & PDUCBF_RX_HDR)
+ 		pdu_cb->complete = true;
+ 
+-	lro_cb->complete = true;
+ 	lro_cb->pdu_totallen += pdu_cb->pdulen;
++	lro_cb->complete = true;
+ 	lro_cb->pdu_idx++;
+ }
+ 
+@@ -257,7 +256,7 @@ cxgbit_lro_add_packet_gl(struct sk_buff *skb, u8 op, const struct pkt_gl *gl)
+ 			cxgbit_skcb_flags(skb) = 0;
+ 
+ 		lro_cb->complete = false;
+-	} else {
++	} else if (op == CPL_ISCSI_DATA) {
+ 		struct cpl_iscsi_data *cpl = (struct cpl_iscsi_data *)gl->va;
+ 
+ 		offset = sizeof(struct cpl_iscsi_data);
+@@ -267,6 +266,36 @@ cxgbit_lro_add_packet_gl(struct sk_buff *skb, u8 op, const struct pkt_gl *gl)
+ 		pdu_cb->doffset = lro_cb->offset;
+ 		pdu_cb->nr_dfrags = gl->nfrags;
+ 		pdu_cb->dfrag_idx = skb_shinfo(skb)->nr_frags;
++		lro_cb->complete = false;
++	} else {
++		struct cpl_rx_iscsi_cmp *cpl;
++
++		cpl = (struct cpl_rx_iscsi_cmp *)gl->va;
++		offset = sizeof(struct cpl_rx_iscsi_cmp);
++		pdu_cb->flags |= (PDUCBF_RX_HDR | PDUCBF_RX_STATUS);
++		len = be16_to_cpu(cpl->len);
++		pdu_cb->hdr = gl->va + offset;
++		pdu_cb->hlen = len;
++		pdu_cb->hfrag_idx = skb_shinfo(skb)->nr_frags;
++		pdu_cb->ddigest = be32_to_cpu(cpl->ulp_crc);
++		pdu_cb->pdulen = ntohs(cpl->len);
++
++		if (unlikely(gl->nfrags > 1))
++			cxgbit_skcb_flags(skb) = 0;
++
++		cxgbit_process_ddpvld(lro_cb->csk, pdu_cb,
++				      be32_to_cpu(cpl->ddpvld));
++
++		if (pdu_cb->flags & PDUCBF_RX_DATA_DDPD) {
++			pdu_cb->flags |= PDUCBF_RX_DDP_CMP;
++			pdu_cb->complete = true;
++		} else if (pdu_cb->flags & PDUCBF_RX_DATA) {
++			pdu_cb->complete = true;
++		}
++
++		lro_cb->pdu_totallen += pdu_cb->hlen + pdu_cb->dlen;
++		lro_cb->complete = true;
++		lro_cb->pdu_idx++;
+ 	}
+ 
+ 	cxgbit_copy_frags(skb, gl, offset);
+@@ -413,6 +442,7 @@ cxgbit_uld_lro_rx_handler(void *hndl, const __be64 *rsp,
+ 	switch (op) {
+ 	case CPL_ISCSI_HDR:
+ 	case CPL_ISCSI_DATA:
++	case CPL_RX_ISCSI_CMP:
+ 	case CPL_RX_ISCSI_DDP:
+ 	case CPL_FW4_ACK:
+ 		lro_flush = false;
+@@ -459,7 +489,8 @@ cxgbit_uld_lro_rx_handler(void *hndl, const __be64 *rsp,
+ 			return 0;
+ 		}
+ 
+-		if (op == CPL_ISCSI_HDR || op == CPL_ISCSI_DATA) {
++		if ((op == CPL_ISCSI_HDR) || (op == CPL_ISCSI_DATA) ||
++		    (op == CPL_RX_ISCSI_CMP)) {
+ 			if (!cxgbit_lro_receive(csk, op, rsp, gl, lro_mgr,
+ 						napi))
+ 				return 0;
+diff --git a/drivers/target/iscsi/cxgbit/cxgbit_target.c b/drivers/target/iscsi/cxgbit/cxgbit_target.c
+index 70afbd4..be4da1d 100644
+--- a/drivers/target/iscsi/cxgbit/cxgbit_target.c
++++ b/drivers/target/iscsi/cxgbit/cxgbit_target.c
+@@ -1020,11 +1020,36 @@ static int cxgbit_handle_iscsi_dataout(struct cxgbit_sock *csk)
+ 	int rc, sg_nents, sg_off;
+ 	bool dcrc_err = false;
+ 
+-	rc = iscsit_check_dataout_hdr(conn, (unsigned char *)hdr, &cmd);
+-	if (rc < 0)
+-		return rc;
+-	else if (!cmd)
+-		return 0;
++	if (pdu_cb->flags & PDUCBF_RX_DDP_CMP) {
++		u32 offset = be32_to_cpu(hdr->offset);
++		u32 ddp_data_len;
++		u32 payload_length = ntoh24(hdr->dlength);
++		bool success = false;
++
++		cmd = iscsit_find_cmd_from_itt_or_dump(conn, hdr->itt, 0);
++		if (!cmd)
++			return 0;
++
++		ddp_data_len = offset - cmd->write_data_done;
++		atomic_long_add(ddp_data_len, &conn->sess->rx_data_octets);
++
++		cmd->write_data_done = offset;
++		cmd->next_burst_len = ddp_data_len;
++		cmd->data_sn = be32_to_cpu(hdr->datasn);
++
++		rc = __iscsit_check_dataout_hdr(conn, (unsigned char *)hdr,
++						cmd, payload_length, &success);
++		if (rc < 0)
++			return rc;
++		else if (!success)
++			return 0;
++	} else {
++		rc = iscsit_check_dataout_hdr(conn, (unsigned char *)hdr, &cmd);
++		if (rc < 0)
++			return rc;
++		else if (!cmd)
++			return 0;
++	}
+ 
+ 	if (pdu_cb->flags & PDUCBF_RX_DCRC_ERR) {
+ 		pr_err("ITT: 0x%08x, Offset: %u, Length: %u,"
+@@ -1388,6 +1413,9 @@ static void cxgbit_lro_hskb_reset(struct cxgbit_sock *csk)
+ 	for (i = 0; i < ssi->nr_frags; i++)
+ 		put_page(skb_frag_page(&ssi->frags[i]));
+ 	ssi->nr_frags = 0;
++	skb->data_len = 0;
++	skb->truesize -= skb->len;
++	skb->len = 0;
+ }
+ 
+ static void
+@@ -1401,39 +1429,42 @@ cxgbit_lro_skb_merge(struct cxgbit_sock *csk, struct sk_buff *skb, u8 pdu_idx)
+ 	unsigned int len = 0;
+ 
+ 	if (pdu_cb->flags & PDUCBF_RX_HDR) {
+-		hpdu_cb->flags = pdu_cb->flags;
++		u8 hfrag_idx = hssi->nr_frags;
++
++		hpdu_cb->flags |= pdu_cb->flags;
+ 		hpdu_cb->seq = pdu_cb->seq;
+ 		hpdu_cb->hdr = pdu_cb->hdr;
+ 		hpdu_cb->hlen = pdu_cb->hlen;
+ 
+-		memcpy(&hssi->frags[0], &ssi->frags[pdu_cb->hfrag_idx],
++		memcpy(&hssi->frags[hfrag_idx], &ssi->frags[pdu_cb->hfrag_idx],
+ 		       sizeof(skb_frag_t));
+ 
+-		get_page(skb_frag_page(&hssi->frags[0]));
+-		hssi->nr_frags = 1;
+-		hpdu_cb->frags = 1;
+-		hpdu_cb->hfrag_idx = 0;
++		get_page(skb_frag_page(&hssi->frags[hfrag_idx]));
++		hssi->nr_frags++;
++		hpdu_cb->frags++;
++		hpdu_cb->hfrag_idx = hfrag_idx;
+ 
+-		len = hssi->frags[0].size;
+-		hskb->len = len;
+-		hskb->data_len = len;
+-		hskb->truesize = len;
++		len = hssi->frags[hfrag_idx].size;
++		hskb->len += len;
++		hskb->data_len += len;
++		hskb->truesize += len;
+ 	}
+ 
+ 	if (pdu_cb->flags & PDUCBF_RX_DATA) {
+-		u8 hfrag_idx = 1, i;
++		u8 dfrag_idx = hssi->nr_frags, i;
+ 
+ 		hpdu_cb->flags |= pdu_cb->flags;
++		hpdu_cb->dfrag_idx = dfrag_idx;
+ 
+ 		len = 0;
+-		for (i = 0; i < pdu_cb->nr_dfrags; hfrag_idx++, i++) {
+-			memcpy(&hssi->frags[hfrag_idx],
++		for (i = 0; i < pdu_cb->nr_dfrags; dfrag_idx++, i++) {
++			memcpy(&hssi->frags[dfrag_idx],
+ 			       &ssi->frags[pdu_cb->dfrag_idx + i],
+ 			       sizeof(skb_frag_t));
+ 
+-			get_page(skb_frag_page(&hssi->frags[hfrag_idx]));
++			get_page(skb_frag_page(&hssi->frags[dfrag_idx]));
+ 
+-			len += hssi->frags[hfrag_idx].size;
++			len += hssi->frags[dfrag_idx].size;
+ 
+ 			hssi->nr_frags++;
+ 			hpdu_cb->frags++;
+@@ -1442,7 +1473,6 @@ cxgbit_lro_skb_merge(struct cxgbit_sock *csk, struct sk_buff *skb, u8 pdu_idx)
+ 		hpdu_cb->dlen = pdu_cb->dlen;
+ 		hpdu_cb->doffset = hpdu_cb->hlen;
+ 		hpdu_cb->nr_dfrags = pdu_cb->nr_dfrags;
+-		hpdu_cb->dfrag_idx = 1;
+ 		hskb->len += len;
+ 		hskb->data_len += len;
+ 		hskb->truesize += len;
+@@ -1527,10 +1557,15 @@ static int cxgbit_rx_lro_skb(struct cxgbit_sock *csk, struct sk_buff *skb)
+ 
+ static int cxgbit_rx_skb(struct cxgbit_sock *csk, struct sk_buff *skb)
+ {
++	struct cxgb4_lld_info *lldi = &csk->com.cdev->lldi;
+ 	int ret = -1;
+ 
+-	if (likely(cxgbit_skcb_flags(skb) & SKCBF_RX_LRO))
+-		ret = cxgbit_rx_lro_skb(csk, skb);
++	if (likely(cxgbit_skcb_flags(skb) & SKCBF_RX_LRO)) {
++		if (is_t5(lldi->adapter_type))
++			ret = cxgbit_rx_lro_skb(csk, skb);
++		else
++			ret = cxgbit_process_lro_skb(csk, skb);
++	}
+ 
+ 	__kfree_skb(skb);
+ 	return ret;
+-- 
+1.8.5.6
+
