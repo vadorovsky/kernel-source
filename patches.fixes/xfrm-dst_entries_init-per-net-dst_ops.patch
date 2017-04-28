@@ -1,0 +1,342 @@
+From: Dan Streetman <dan.streetman@canonical.com>
+Date: Thu, 29 Oct 2015 09:51:16 -0400
+Subject: xfrm: dst_entries_init() per-net dst_ops
+Patch-mainline: v4.4-rc8
+Git-commit: a8a572a6b5f2a79280d6e302cb3c1cb1fbaeb3e8
+References: bsc#1030814
+
+Remove the dst_entries_init/destroy calls for xfrm4 and xfrm6 dst_ops
+templates; their dst_entries counters will never be used.  Move the
+xfrm dst_ops initialization from the common xfrm/xfrm_policy.c to
+xfrm4/xfrm4_policy.c and xfrm6/xfrm6_policy.c, and call dst_entries_init
+and dst_entries_destroy for each net namespace.
+
+The ipv4 and ipv6 xfrms each create dst_ops template, and perform
+dst_entries_init on the templates.  The template values are copied to each
+net namespace's xfrm.xfrm*_dst_ops.  The problem there is the dst_ops
+pcpuc_entries field is a percpu counter and cannot be used correctly by
+simply copying it to another object.
+
+The result of this is a very subtle bug; changes to the dst entries
+counter from one net namespace may sometimes get applied to a different
+net namespace dst entries counter.  This is because of how the percpu
+counter works; it has a main count field as well as a pointer to the
+percpu variables.  Each net namespace maintains its own main count
+variable, but all point to one set of percpu variables.  When any net
+namespace happens to change one of the percpu variables to outside its
+small batch range, its count is moved to the net namespace's main count
+variable.  So with multiple net namespaces operating concurrently, the
+dst_ops entries counter can stray from the actual value that it should
+be; if counts are consistently moved from one net namespace to another
+(which my testing showed is likely), then one net namespace winds up
+with a negative dst_ops count while another winds up with a continually
+increasing count, eventually reaching its gc_thresh limit, which causes
+all new traffic on the net namespace to fail with -ENOBUFS.
+
+Signed-off-by: Dan Streetman <dan.streetman@canonical.com>
+Signed-off-by: Dan Streetman <ddstreet@ieee.org>
+Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+Acked-by: Michal Kubecek <mkubecek@suse.cz>
+
+---
+ net/ipv4/xfrm4_policy.c | 47 +++++++++++++++++++++++++++++++++---------
+ net/ipv6/xfrm6_policy.c | 54 +++++++++++++++++++++++++++++++++++--------------
+ net/xfrm/xfrm_policy.c  | 38 ----------------------------------
+ 3 files changed, 77 insertions(+), 62 deletions(-)
+
+diff --git a/net/ipv4/xfrm4_policy.c b/net/ipv4/xfrm4_policy.c
+index 5b1be7e5aa7d..dc0d128d563f 100644
+--- a/net/ipv4/xfrm4_policy.c
++++ b/net/ipv4/xfrm4_policy.c
+@@ -229,7 +229,7 @@ static void xfrm4_dst_ifdown(struct dst_entry *dst, struct net_device *dev,
+ 	xfrm_dst_ifdown(dst, dev);
+ }
+ 
+-static struct dst_ops xfrm4_dst_ops = {
++static struct dst_ops xfrm4_dst_ops_template = {
+ 	.family =		AF_INET,
+ 	.protocol =		cpu_to_be16(ETH_P_IP),
+ 	.gc =			xfrm4_garbage_collect,
+@@ -243,7 +243,7 @@ static struct dst_ops xfrm4_dst_ops = {
+ 
+ static struct xfrm_policy_afinfo xfrm4_policy_afinfo = {
+ 	.family = 		AF_INET,
+-	.dst_ops =		&xfrm4_dst_ops,
++	.dst_ops =		&xfrm4_dst_ops_template,
+ 	.dst_lookup =		xfrm4_dst_lookup,
+ 	.get_saddr =		xfrm4_get_saddr,
+ 	.decode_session =	_decode_session4,
+@@ -265,7 +265,7 @@ static struct ctl_table xfrm4_policy_table[] = {
+ 	{ }
+ };
+ 
+-static int __net_init xfrm4_net_init(struct net *net)
++static int __net_init xfrm4_net_sysctl_init(struct net *net)
+ {
+ 	struct ctl_table *table;
+ 	struct ctl_table_header *hdr;
+@@ -293,7 +293,7 @@ err_alloc:
+ 	return -ENOMEM;
+ }
+ 
+-static void __net_exit xfrm4_net_exit(struct net *net)
++static void __net_exit xfrm4_net_sysctl_exit(struct net *net)
+ {
+ 	struct ctl_table *table;
+ 
+@@ -305,12 +305,44 @@ static void __net_exit xfrm4_net_exit(struct net *net)
+ 	if (!net_eq(net, &init_net))
+ 		kfree(table);
+ }
++#else /* CONFIG_SYSCTL */
++static int inline xfrm4_net_sysctl_init(struct net *net)
++{
++	return 0;
++}
++
++static void inline xfrm4_net_sysctl_exit(struct net *net)
++{
++}
++#endif
++
++static int __net_init xfrm4_net_init(struct net *net)
++{
++	int ret;
++
++	memcpy(&net->xfrm.xfrm4_dst_ops, &xfrm4_dst_ops_template,
++	       sizeof(xfrm4_dst_ops_template));
++	ret = dst_entries_init(&net->xfrm.xfrm4_dst_ops);
++	if (ret)
++		return ret;
++
++	ret = xfrm4_net_sysctl_init(net);
++	if (ret)
++		dst_entries_destroy(&net->xfrm.xfrm4_dst_ops);
++
++	return ret;
++}
++
++static void __net_exit xfrm4_net_exit(struct net *net)
++{
++	xfrm4_net_sysctl_exit(net);
++	dst_entries_destroy(&net->xfrm.xfrm4_dst_ops);
++}
+ 
+ static struct pernet_operations __net_initdata xfrm4_net_ops = {
+ 	.init	= xfrm4_net_init,
+ 	.exit	= xfrm4_net_exit,
+ };
+-#endif
+ 
+ static void __init xfrm4_policy_init(void)
+ {
+@@ -329,13 +361,10 @@ void __init xfrm4_init(int rt_max_size)
+ 	 * That will let us store an ipsec connection per route table entry,
+ 	 * and start cleaning when were 1/2 full
+ 	 */
+-	xfrm4_dst_ops.gc_thresh = rt_max_size/2;
+-	dst_entries_init(&xfrm4_dst_ops);
++	xfrm4_dst_ops_template.gc_thresh = rt_max_size/2;
+ 
+ 	xfrm4_state_init();
+ 	xfrm4_policy_init();
+-#ifdef CONFIG_SYSCTL
+ 	register_pernet_subsys(&xfrm4_net_ops);
+-#endif
+ }
+ 
+diff --git a/net/ipv6/xfrm6_policy.c b/net/ipv6/xfrm6_policy.c
+index a93113fd7040..f7379bdeedef 100644
+--- a/net/ipv6/xfrm6_policy.c
++++ b/net/ipv6/xfrm6_policy.c
+@@ -260,7 +260,7 @@ static void xfrm6_dst_ifdown(struct dst_entry *dst, struct net_device *dev,
+ 	xfrm_dst_ifdown(dst, dev);
+ }
+ 
+-static struct dst_ops xfrm6_dst_ops = {
++static struct dst_ops xfrm6_dst_ops_template = {
+ 	.family =		AF_INET6,
+ 	.protocol =		cpu_to_be16(ETH_P_IPV6),
+ 	.gc =			xfrm6_garbage_collect,
+@@ -274,7 +274,7 @@ static struct dst_ops xfrm6_dst_ops = {
+ 
+ static struct xfrm_policy_afinfo xfrm6_policy_afinfo = {
+ 	.family =		AF_INET6,
+-	.dst_ops =		&xfrm6_dst_ops,
++	.dst_ops =		&xfrm6_dst_ops_template,
+ 	.dst_lookup =		xfrm6_dst_lookup,
+ 	.get_saddr = 		xfrm6_get_saddr,
+ 	.decode_session =	_decode_session6,
+@@ -306,7 +306,7 @@ static struct ctl_table xfrm6_policy_table[] = {
+ 	{ }
+ };
+ 
+-static int __net_init xfrm6_net_init(struct net *net)
++static int __net_init xfrm6_net_sysctl_init(struct net *net)
+ {
+ 	struct ctl_table *table;
+ 	struct ctl_table_header *hdr;
+@@ -334,7 +334,7 @@ err_alloc:
+ 	return -ENOMEM;
+ }
+ 
+-static void __net_exit xfrm6_net_exit(struct net *net)
++static void __net_exit xfrm6_net_sysctl_exit(struct net *net)
+ {
+ 	struct ctl_table *table;
+ 
+@@ -346,12 +346,44 @@ static void __net_exit xfrm6_net_exit(struct net *net)
+ 	if (!net_eq(net, &init_net))
+ 		kfree(table);
+ }
++#else /* CONFIG_SYSCTL */
++static int inline xfrm6_net_sysctl_init(struct net *net)
++{
++	return 0;
++}
++
++static void inline xfrm6_net_sysctl_exit(struct net *net)
++{
++}
++#endif
++
++static int __net_init xfrm6_net_init(struct net *net)
++{
++	int ret;
++
++	memcpy(&net->xfrm.xfrm6_dst_ops, &xfrm6_dst_ops_template,
++	       sizeof(xfrm6_dst_ops_template));
++	ret = dst_entries_init(&net->xfrm.xfrm6_dst_ops);
++	if (ret)
++		return ret;
++
++	ret = xfrm6_net_sysctl_init(net);
++	if (ret)
++		dst_entries_destroy(&net->xfrm.xfrm6_dst_ops);
++
++	return ret;
++}
++
++static void __net_exit xfrm6_net_exit(struct net *net)
++{
++	xfrm6_net_sysctl_exit(net);
++	dst_entries_destroy(&net->xfrm.xfrm6_dst_ops);
++}
+ 
+ static struct pernet_operations xfrm6_net_ops = {
+ 	.init	= xfrm6_net_init,
+ 	.exit	= xfrm6_net_exit,
+ };
+-#endif
+ 
+ int __init xfrm6_init(void)
+ {
+@@ -370,21 +402,16 @@ int __init xfrm6_init(void)
+ 	 * to that as a minimum as well
+ 	 */
+ 	gc_thresh = FIB6_TABLE_HASHSZ * 8;
+-	xfrm6_dst_ops.gc_thresh = (gc_thresh < 1024) ? 1024 : gc_thresh;
+-	dst_entries_init(&xfrm6_dst_ops);
++	xfrm6_dst_ops_template.gc_thresh = (gc_thresh < 1024) ? 1024 : gc_thresh;
+ 
+ 	ret = xfrm6_policy_init();
+-	if (ret) {
+-		dst_entries_destroy(&xfrm6_dst_ops);
++	if (ret)
+ 		goto out;
+-	}
+ 	ret = xfrm6_state_init();
+ 	if (ret)
+ 		goto out_policy;
+ 
+-#ifdef CONFIG_SYSCTL
+ 	register_pernet_subsys(&xfrm6_net_ops);
+-#endif
+ 
+ out:
+ 	return ret;
+@@ -395,11 +422,8 @@ out_policy:
+ 
+ void xfrm6_fini(void)
+ {
+-#ifdef CONFIG_SYSCTL
+ 	unregister_pernet_subsys(&xfrm6_net_ops);
+-#endif
+ 	//xfrm6_input_fini();
+ 	xfrm6_policy_fini();
+ 	xfrm6_state_fini();
+-	dst_entries_destroy(&xfrm6_dst_ops);
+ }
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index e66a1a9d9e1c..6481326b54de 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -2404,7 +2404,6 @@ static unsigned int xfrm_default_mtu(const struct dst_entry *dst)
+ 
+ int xfrm_policy_register_afinfo(struct xfrm_policy_afinfo *afinfo)
+ {
+-	struct net *net;
+ 	int err = 0;
+ 	if (unlikely(afinfo == NULL))
+ 		return -EINVAL;
+@@ -2433,26 +2432,6 @@ int xfrm_policy_register_afinfo(struct xfrm_policy_afinfo *afinfo)
+ 	}
+ 	write_unlock_bh(&xfrm_policy_afinfo_lock);
+ 
+-	rtnl_lock();
+-	for_each_net(net) {
+-		struct dst_ops *xfrm_dst_ops;
+-
+-		switch (afinfo->family) {
+-		case AF_INET:
+-			xfrm_dst_ops = &net->xfrm.xfrm4_dst_ops;
+-			break;
+-#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
+-		case AF_INET6:
+-			xfrm_dst_ops = &net->xfrm.xfrm6_dst_ops;
+-			break;
+-#endif
+-		default:
+-			BUG();
+-		}
+-		*xfrm_dst_ops = *afinfo->dst_ops;
+-	}
+-	rtnl_unlock();
+-
+ 	return err;
+ }
+ EXPORT_SYMBOL(xfrm_policy_register_afinfo);
+@@ -2483,22 +2462,6 @@ int xfrm_policy_unregister_afinfo(struct xfrm_policy_afinfo *afinfo)
+ }
+ EXPORT_SYMBOL(xfrm_policy_unregister_afinfo);
+ 
+-static void __net_init xfrm_dst_ops_init(struct net *net)
+-{
+-	struct xfrm_policy_afinfo *afinfo;
+-
+-	read_lock_bh(&xfrm_policy_afinfo_lock);
+-	afinfo = xfrm_policy_afinfo[AF_INET];
+-	if (afinfo)
+-		net->xfrm.xfrm4_dst_ops = *afinfo->dst_ops;
+-#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
+-	afinfo = xfrm_policy_afinfo[AF_INET6];
+-	if (afinfo)
+-		net->xfrm.xfrm6_dst_ops = *afinfo->dst_ops;
+-#endif
+-	read_unlock_bh(&xfrm_policy_afinfo_lock);
+-}
+-
+ static struct xfrm_policy_afinfo *xfrm_policy_get_afinfo(unsigned short family)
+ {
+ 	struct xfrm_policy_afinfo *afinfo;
+@@ -2661,7 +2624,6 @@ static int __net_init xfrm_net_init(struct net *net)
+ 	rv = xfrm_policy_init(net);
+ 	if (rv < 0)
+ 		goto out_policy;
+-	xfrm_dst_ops_init(net);
+ 	rv = xfrm_sysctl_init(net);
+ 	if (rv < 0)
+ 		goto out_sysctl;
+-- 
+2.12.2
+
