@@ -1,3 +1,4 @@
+From 3418d036c81dcb604b7c7c71b209d5890a8418aa Mon Sep 17 00:00:00 2001
 From: Artur Paszkiewicz <artur.paszkiewicz@intel.com>
 Date: Thu, 9 Mar 2017 09:59:59 +0100
 Subject: [PATCH] raid5-ppl: Partial Parity Log write logging implementation
@@ -40,20 +41,22 @@ implemented.
 
 Signed-off-by: Artur Paszkiewicz <artur.paszkiewicz@intel.com>
 Signed-off-by: Shaohua Li <shli@fb.com>
-Acked-by: NeilBrown <neilb@suse.com>
-
+Signed-off-by: Coly Li <colyli@suse.de>
 ---
- Documentation/md/raid5-ppl.txt |   44 ++
- drivers/md/Makefile            |    2 
- drivers/md/raid5-log.h         |   24 +
- drivers/md/raid5-ppl.c         |  703 +++++++++++++++++++++++++++++++++++++++++
- drivers/md/raid5.c             |   64 +++
- drivers/md/raid5.h             |   16 
- include/uapi/linux/raid/md_p.h |   27 +
- 7 files changed, 875 insertions(+), 5 deletions(-)
+ Documentation/md/raid5-ppl.txt |  44 +++
+ drivers/md/Makefile            |   2 +-
+ drivers/md/raid5-log.h         |  24 ++
+ drivers/md/raid5-ppl.c         | 703 +++++++++++++++++++++++++++++++++++++++++
+ drivers/md/raid5.c             |  64 +++-
+ drivers/md/raid5.h             |  10 +-
+ include/uapi/linux/raid/md_p.h |  27 ++
+ 7 files changed, 869 insertions(+), 5 deletions(-)
  create mode 100644 Documentation/md/raid5-ppl.txt
  create mode 100644 drivers/md/raid5-ppl.c
 
+diff --git a/Documentation/md/raid5-ppl.txt b/Documentation/md/raid5-ppl.txt
+new file mode 100644
+index 000000000000..127072b09363
 --- /dev/null
 +++ b/Documentation/md/raid5-ppl.txt
 @@ -0,0 +1,44 @@
@@ -101,9 +104,11 @@ Acked-by: NeilBrown <neilb@suse.com>
 +Currently, volatile write-back cache should be disabled on all member drives
 +when using PPL. Otherwise it cannot guarantee consistency in case of power
 +failure.
+diff --git a/drivers/md/Makefile b/drivers/md/Makefile
+index 3cbda1af87a0..4d48714ccc6b 100644
 --- a/drivers/md/Makefile
 +++ b/drivers/md/Makefile
-@@ -18,7 +18,7 @@ dm-cache-cleaner-y += dm-cache-policy-cl
+@@ -18,7 +18,7 @@ dm-cache-cleaner-y += dm-cache-policy-cleaner.o
  dm-era-y	+= dm-era-target.o
  dm-verity-y	+= dm-verity-target.o
  md-mod-y	+= md.o bitmap.o
@@ -112,15 +117,17 @@ Acked-by: NeilBrown <neilb@suse.com>
  
  # Note: link order is important.  All raid personalities
  # and must come before md.o, as they each initialise 
+diff --git a/drivers/md/raid5-log.h b/drivers/md/raid5-log.h
+index 2da4bd3bbd79..a67fb58513b9 100644
 --- a/drivers/md/raid5-log.h
 +++ b/drivers/md/raid5-log.h
-@@ -31,6 +31,20 @@ extern struct md_sysfs_entry r5c_journal
+@@ -31,6 +31,20 @@ extern struct md_sysfs_entry r5c_journal_mode;
  extern void r5c_update_on_rdev_error(struct mddev *mddev);
  extern bool r5c_big_stripe_cached(struct r5conf *conf, sector_t sect);
  
 +extern struct dma_async_tx_descriptor *
 +ops_run_partial_parity(struct stripe_head *sh, struct raid5_percpu *percpu,
-+			struct dma_async_tx_descriptor *tx);
++		       struct dma_async_tx_descriptor *tx);
 +extern int ppl_init_log(struct r5conf *conf);
 +extern void ppl_exit_log(struct r5conf *conf);
 +extern int ppl_write_stripe(struct r5conf *conf, struct stripe_head *sh);
@@ -135,7 +142,7 @@ Acked-by: NeilBrown <neilb@suse.com>
  static inline int log_stripe(struct stripe_head *sh, struct stripe_head_state *s)
  {
  	struct r5conf *conf = sh->raid_conf;
-@@ -45,6 +59,8 @@ static inline int log_stripe(struct stri
+@@ -45,6 +59,8 @@ static inline int log_stripe(struct stripe_head *sh, struct stripe_head_state *s
  			/* caching phase */
  			return r5c_cache_data(conf->log, sh);
  		}
@@ -144,7 +151,7 @@ Acked-by: NeilBrown <neilb@suse.com>
  	}
  
  	return -EAGAIN;
-@@ -56,24 +72,32 @@ static inline void log_stripe_write_fini
+@@ -56,24 +72,32 @@ static inline void log_stripe_write_finished(struct stripe_head *sh)
  
  	if (conf->log)
  		r5l_stripe_write_finished(sh);
@@ -177,6 +184,9 @@ Acked-by: NeilBrown <neilb@suse.com>
  
  	return 0;
  }
+diff --git a/drivers/md/raid5-ppl.c b/drivers/md/raid5-ppl.c
+new file mode 100644
+index 000000000000..db5b72b11594
 --- /dev/null
 +++ b/drivers/md/raid5-ppl.c
 @@ -0,0 +1,703 @@
@@ -883,9 +893,11 @@ Acked-by: NeilBrown <neilb@suse.com>
 +	__ppl_exit_log(ppl_conf);
 +	return ret;
 +}
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index f575f40d2acb..6b86e0826afe 100644
 --- a/drivers/md/raid5.c
 +++ b/drivers/md/raid5.c
-@@ -465,6 +465,11 @@ static void shrink_buffers(struct stripe
+@@ -482,6 +482,11 @@ static void shrink_buffers(struct stripe_head *sh)
  		sh->dev[i].page = NULL;
  		put_page(p);
  	}
@@ -897,7 +909,7 @@ Acked-by: NeilBrown <neilb@suse.com>
  }
  
  static int grow_buffers(struct stripe_head *sh, gfp_t gfp)
-@@ -481,6 +486,13 @@ static int grow_buffers(struct stripe_he
+@@ -498,6 +503,13 @@ static int grow_buffers(struct stripe_head *sh, gfp_t gfp)
  		sh->dev[i].page = page;
  		sh->dev[i].orig_page = page;
  	}
@@ -911,7 +923,7 @@ Acked-by: NeilBrown <neilb@suse.com>
  	return 0;
  }
  
-@@ -729,7 +741,7 @@ static bool stripe_can_batch(struct stri
+@@ -746,7 +758,7 @@ static bool stripe_can_batch(struct stripe_head *sh)
  {
  	struct r5conf *conf = sh->raid_conf;
  
@@ -920,7 +932,7 @@ Acked-by: NeilBrown <neilb@suse.com>
  		return false;
  	return test_bit(STRIPE_BATCH_READY, &sh->state) &&
  		!test_bit(STRIPE_BITMAP_PENDING, &sh->state) &&
-@@ -2075,6 +2087,9 @@ static void raid_run_ops(struct stripe_h
+@@ -2093,6 +2105,9 @@ static void raid_run_ops(struct stripe_head *sh, unsigned long ops_request)
  			async_tx_ack(tx);
  	}
  
@@ -930,7 +942,7 @@ Acked-by: NeilBrown <neilb@suse.com>
  	if (test_bit(STRIPE_OP_PREXOR, &ops_request)) {
  		if (level < 6)
  			tx = ops_run_prexor5(sh, percpu, tx);
-@@ -3155,6 +3170,12 @@ schedule_reconstruction(struct stripe_he
+@@ -3168,6 +3183,12 @@ schedule_reconstruction(struct stripe_head *sh, struct stripe_head_state *s,
  		s->locked++;
  	}
  
@@ -943,7 +955,7 @@ Acked-by: NeilBrown <neilb@suse.com>
  	pr_debug("%s: stripe %llu locked: %d ops_request: %lx\n",
  		__func__, (unsigned long long)sh->sector,
  		s->locked, s->ops_request);
-@@ -3202,6 +3223,36 @@ static int add_stripe_bio(struct stripe_
+@@ -3215,6 +3236,36 @@ static int add_stripe_bio(struct stripe_head *sh, struct bio *bi, int dd_idx,
  	if (*bip && (*bip)->bi_iter.bi_sector < bio_end_sector(bi))
  		goto overlap;
  
@@ -980,7 +992,7 @@ Acked-by: NeilBrown <neilb@suse.com>
  	if (!forwrite || previous)
  		clear_bit(STRIPE_BATCH_READY, &sh->state);
  
-@@ -7218,6 +7269,13 @@ static int raid5_run(struct mddev *mddev
+@@ -7208,6 +7259,13 @@ static int raid5_run(struct mddev *mddev)
  		BUG_ON(mddev->delta_disks != 0);
  	}
  
@@ -994,7 +1006,7 @@ Acked-by: NeilBrown <neilb@suse.com>
  	if (mddev->private == NULL)
  		conf = setup_conf(mddev);
  	else
-@@ -7699,7 +7757,7 @@ static int raid5_resize(struct mddev *md
+@@ -7689,7 +7747,7 @@ static int raid5_resize(struct mddev *mddev, sector_t sectors)
  	sector_t newsize;
  	struct r5conf *conf = mddev->private;
  
@@ -1003,7 +1015,7 @@ Acked-by: NeilBrown <neilb@suse.com>
  		return -EINVAL;
  	sectors &= ~((sector_t)conf->chunk_sectors - 1);
  	newsize = raid5_size(mddev, sectors, mddev->raid_disks);
-@@ -7750,7 +7808,7 @@ static int check_reshape(struct mddev *m
+@@ -7740,7 +7798,7 @@ static int check_reshape(struct mddev *mddev)
  {
  	struct r5conf *conf = mddev->private;
  
@@ -1012,9 +1024,11 @@ Acked-by: NeilBrown <neilb@suse.com>
  		return -EINVAL;
  	if (mddev->delta_disks == 0 &&
  	    mddev->new_layout == mddev->layout &&
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index 6dd295a80ee1..ba5b7a3790af 100644
 --- a/drivers/md/raid5.h
 +++ b/drivers/md/raid5.h
-@@ -224,8 +224,14 @@ struct stripe_head {
+@@ -224,10 +224,16 @@ struct stripe_head {
  	spinlock_t		batch_lock; /* only header's lock is useful */
  	struct list_head	batch_list; /* protected by head's batch lock*/
  
@@ -1025,11 +1039,13 @@ Acked-by: NeilBrown <neilb@suse.com>
 +	};
 +
  	struct list_head	log_list;
-+
-+	struct page		*ppl_page; /* partial parity of this stripe */
  	sector_t		log_start; /* first meta block on the journal */
  	struct list_head	r5c; /* for r5c_cache->stripe_in_journal */
++
++	struct page		*ppl_page; /* partial parity of this stripe */
  	/**
+ 	 * struct stripe_operations
+ 	 * @target - STRIPE_OP_COMPUTE_BLK target
 @@ -400,6 +406,7 @@ enum {
  	STRIPE_OP_BIODRAIN,
  	STRIPE_OP_RECONSTRUCT,
@@ -1038,20 +1054,7 @@ Acked-by: NeilBrown <neilb@suse.com>
  };
  
  /*
-@@ -525,6 +532,12 @@ static inline void raid5_set_bi_stripes(
- 	atomic_set(segments, cnt);
- }
- 
-+#define NR_STRIPES		256
-+#define STRIPE_SIZE		PAGE_SIZE
-+#define STRIPE_SHIFT		(PAGE_SHIFT - 9)
-+#define STRIPE_SECTORS		(STRIPE_SIZE>>9)
-+
-+
- /* NOTE NR_STRIPE_HASH_LOCKS must remain below 64.
-  * This is because we sometimes take all the spinlocks
-  * and creating that much locking depth can cause
-@@ -696,6 +709,7 @@ struct r5conf {
+@@ -696,6 +703,7 @@ struct r5conf {
  	int			group_cnt;
  	int			worker_cnt_per_group;
  	struct r5l_log		*log;
@@ -1059,6 +1062,8 @@ Acked-by: NeilBrown <neilb@suse.com>
  
  	spinlock_t		pending_bios_lock;
  	bool			batch_bio_dispatch;
+diff --git a/include/uapi/linux/raid/md_p.h b/include/uapi/linux/raid/md_p.h
+index fe2112810c43..d9a1ead867b9 100644
 --- a/include/uapi/linux/raid/md_p.h
 +++ b/include/uapi/linux/raid/md_p.h
 @@ -398,4 +398,31 @@ struct r5l_meta_block {
@@ -1093,3 +1098,6 @@ Acked-by: NeilBrown <neilb@suse.com>
 +} __attribute__ ((__packed__));
 +
  #endif
+-- 
+2.12.0
+
