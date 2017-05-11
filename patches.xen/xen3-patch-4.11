@@ -1,0 +1,4148 @@
+From: Linux Kernel Mailing List <linux-kernel@vger.kernel.org>
+Subject: Linux: 4.11
+Patch-mainline: Never, SUSE-Xen specific
+References: none
+
+ This patch contains the differences between 4.10 and 4.11.
+
+Automatically created from "patch-4.11" by xen-port-patches.py
+Acked-by: jbeulich@suse.com
+
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -109,7 +109,7 @@ config X86
+ 	select HAVE_ARCH_SECCOMP_FILTER
+ 	select HAVE_ARCH_TRACEHOOK
+ 	select HAVE_ARCH_TRANSPARENT_HUGEPAGE	if !XEN
+-	select HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD if X86_64
++	select HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD if X86_64 && !XEN
+ 	select HAVE_ARCH_VMAP_STACK		if X86_64
+ 	select HAVE_ARCH_WITHIN_STACK_FRAMES
+ 	select HAVE_CC_STACKPROTECTOR
+--- a/arch/x86/entry/vdso/vdso32-setup-xen.c
++++ b/arch/x86/entry/vdso/vdso32-setup-xen.c
+@@ -32,8 +32,10 @@ static int __init vdso32_setup(char *s)
+ {
+ 	vdso32_enabled = simple_strtoul(s, NULL, 0);
+ 
+-	if (vdso32_enabled > 1)
++	if (vdso32_enabled > 1) {
+ 		pr_warn("vdso32 values other than 0 and 1 are no longer allowed; vdso disabled\n");
++		vdso32_enabled = 0;
++	}
+ 
+ 	return 1;
+ }
+@@ -85,13 +87,18 @@ subsys_initcall(sysenter_setup);
+ /* Register vsyscall32 into the ABI table */
+ #include <linux/sysctl.h>
+ 
++static const int zero;
++static const int one = 1;
++
+ static struct ctl_table abi_table2[] = {
+ 	{
+ 		.procname	= "vsyscall32",
+ 		.data		= &vdso32_enabled,
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+-		.proc_handler	= proc_dointvec
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= (int *)&zero,
++		.extra2		= (int *)&one,
+ 	},
+ 	{}
+ };
+--- a/arch/x86/events/Makefile
++++ b/arch/x86/events/Makefile
+@@ -4,3 +4,4 @@ obj-$(CONFIG_X86_LOCAL_APIC)
+ obj-$(CONFIG_CPU_SUP_INTEL)		+= intel/
+ 
+ obj-$(CONFIG_XEN)	:=
++obj-			:= dummy.o
+--- a/arch/x86/include/mach-xen/asm/desc.h
++++ b/arch/x86/include/mach-xen/asm/desc.h
+@@ -184,16 +184,8 @@ static inline void __set_tss_desc(unsign
+ 	struct desc_struct *d = get_cpu_gdt_table(cpu);
+ 	tss_desc tss;
+ 
+-	/*
+-	 * sizeof(unsigned long) coming from an extra "long" at the end
+-	 * of the iobitmap. See tss_struct definition in processor.h
+-	 *
+-	 * -1? seg base+limit should be pointing to the address of the
+-	 * last valid byte
+-	 */
+ 	set_tssldt_descriptor(&tss, (unsigned long)addr, DESC_TSS,
+-			      IO_BITMAP_OFFSET + IO_BITMAP_BYTES +
+-			      sizeof(unsigned long) - 1);
++			      __KERNEL_TSS_LIMIT);
+ 	write_gdt_entry(d, entry, &tss, DESC_TSS);
+ }
+ 
+@@ -220,6 +212,58 @@ static inline void native_load_tr_desc(v
+ 	asm volatile("ltr %w0"::"q" (GDT_ENTRY_TSS*8));
+ }
+ 
++DECLARE_PER_CPU(bool, __tss_limit_invalid);
++
++static inline void force_reload_TR(void)
++{
++	struct desc_struct *d = get_cpu_gdt_table(smp_processor_id());
++	tss_desc tss;
++
++	memcpy(&tss, &d[GDT_ENTRY_TSS], sizeof(tss_desc));
++
++	/*
++	 * LTR requires an available TSS, and the TSS is currently
++	 * busy.  Make it be available so that LTR will work.
++	 */
++	tss.type = DESC_TSS;
++	write_gdt_entry(d, GDT_ENTRY_TSS, &tss, DESC_TSS);
++
++	load_TR_desc();
++	this_cpu_write(__tss_limit_invalid, false);
++}
++
++/*
++ * Call this if you need the TSS limit to be correct, which should be the case
++ * if and only if you have TIF_IO_BITMAP set or you're switching to a task
++ * with TIF_IO_BITMAP set.
++ */
++static inline void refresh_tss_limit(void)
++{
++	DEBUG_LOCKS_WARN_ON(preemptible());
++
++	if (unlikely(this_cpu_read(__tss_limit_invalid)))
++		force_reload_TR();
++}
++
++/*
++ * If you do something evil that corrupts the cached TSS limit (I'm looking
++ * at you, VMX exits), call this function.
++ *
++ * The optimization here is that the TSS limit only matters for Linux if the
++ * IO bitmap is in use.  If the TSS limit gets forced to its minimum value,
++ * everything works except that IO bitmap will be ignored and all CPL 3 IO
++ * instructions will #GP, which is exactly what we want for normal tasks.
++ */
++static inline void invalidate_tss_limit(void)
++{
++	DEBUG_LOCKS_WARN_ON(preemptible());
++
++	if (unlikely(test_thread_flag(TIF_IO_BITMAP)))
++		force_reload_TR();
++	else
++		this_cpu_write(__tss_limit_invalid, true);
++}
++
+ static inline void native_load_gdt(const struct desc_ptr *dtr)
+ {
+ 	asm volatile("lgdt %0"::"m" (*dtr));
+--- a/arch/x86/include/mach-xen/asm/io.h
++++ b/arch/x86/include/mach-xen/asm/io.h
+@@ -170,6 +170,17 @@ static inline void *phys_to_virt(phys_ad
+ #define virt_to_bus(_x) phys_to_machine(__pa(_x))
+ #define bus_to_virt(_x) __va(machine_to_phys(_x))
+ 
++/*
++ * The default ioremap() behavior is non-cached; if you need something
++ * else, you probably want one of the following.
++ */
++extern void __iomem *ioremap_nocache(resource_size_t offset, unsigned long size);
++extern void __iomem *ioremap_uc(resource_size_t offset, unsigned long size);
++#define ioremap_uc ioremap_uc
++
++extern void __iomem *ioremap_cache(resource_size_t offset, unsigned long size);
++extern void __iomem *ioremap_prot(resource_size_t offset, unsigned long size, unsigned long prot_val);
++
+ /**
+  * ioremap     -   map bus memory into CPU space
+  * @offset:    bus address of the memory
+@@ -184,17 +195,6 @@ static inline void *phys_to_virt(phys_ad
+  * If the area you are trying to map is a PCI BAR you should have a
+  * look at pci_iomap().
+  */
+-extern void __iomem *ioremap_nocache(resource_size_t offset, unsigned long size);
+-extern void __iomem *ioremap_uc(resource_size_t offset, unsigned long size);
+-#define ioremap_uc ioremap_uc
+-
+-extern void __iomem *ioremap_cache(resource_size_t offset, unsigned long size);
+-extern void __iomem *ioremap_prot(resource_size_t offset, unsigned long size,
+-				unsigned long prot_val);
+-
+-/*
+- * The default ioremap() behavior is non-cached:
+- */
+ static inline void __iomem *ioremap(resource_size_t offset, unsigned long size)
+ {
+ 	return ioremap_nocache(offset, size);
+@@ -213,18 +213,42 @@ extern void set_iounmap_nonlazy(void);
+  */
+ #define xlate_dev_kmem_ptr(p)	p
+ 
++/**
++ * memset_io	Set a range of I/O memory to a constant value
++ * @addr:	The beginning of the I/O-memory range to set
++ * @val:	The value to set the memory to
++ * @count:	The number of bytes to set
++ *
++ * Set a range of I/O memory to a given value.
++ */
+ static inline void
+ memset_io(volatile void __iomem *addr, unsigned char val, size_t count)
+ {
+ 	memset((void __force *)addr, val, count);
+ }
+ 
++/**
++ * memcpy_fromio	Copy a block of data from I/O memory
++ * @dst:		The (RAM) destination for the copy
++ * @src:		The (I/O memory) source for the data
++ * @count:		The number of bytes to copy
++ *
++ * Copy a block of data from I/O memory.
++ */
+ static inline void
+ memcpy_fromio(void *dst, const volatile void __iomem *src, size_t count)
+ {
+ 	memcpy(dst, (const void __force *)src, count);
+ }
+ 
++/**
++ * memcpy_toio		Copy a block of data into I/O memory
++ * @dst:		The (I/O memory) destination for the copy
++ * @src:		The (RAM) source for the data
++ * @count:		The number of bytes to copy
++ *
++ * Copy a block of data to I/O memory.
++ */
+ static inline void
+ memcpy_toio(volatile void __iomem *dst, const void *src, size_t count)
+ {
+--- a/arch/x86/include/mach-xen/asm/pgtable.h
++++ b/arch/x86/include/mach-xen/asm/pgtable.h
+@@ -43,6 +43,7 @@ extern struct mm_struct *pgd_page_get_mm
+ #define set_pte(ptep, pte)		xen_set_pte(ptep, pte)
+ #define set_pte_at(mm, addr, ptep, pte)	xen_set_pte_at(mm, addr, ptep, pte)
+ #define set_pmd_at(mm, addr, pmdp, pmd)	xen_set_pmd_at(mm, addr, pmdp, pmd)
++#define set_pud_at(mm, addr, pudp, pud)	xen_set_pud_at(mm, addr, pudp, pud)
+ 
+ #define set_pmd(pmdp, pmd)		xen_set_pmd(pmdp, pmd)
+ 
+@@ -55,7 +56,7 @@ extern struct mm_struct *pgd_page_get_mm
+ # define set_pud(pudp, pud)		xen_set_pud(pudp, pud)
+ #endif
+ 
+-#ifndef __PAGETABLE_PMD_FOLDED
++#ifndef __PAGETABLE_PUD_FOLDED
+ #define pud_clear(pud)			xen_pud_clear(pud)
+ #endif
+ 
+@@ -120,6 +121,16 @@ static inline int pmd_young(pmd_t pmd)
+ 	return pmd_flags(pmd) & _PAGE_ACCESSED;
+ }
+ 
++static inline int pud_dirty(pud_t pud)
++{
++	return pud_flags(pud) & _PAGE_DIRTY;
++}
++
++static inline int pud_young(pud_t pud)
++{
++	return pud_flags(pud) & _PAGE_ACCESSED;
++}
++
+ static inline int pte_write(pte_t pte)
+ {
+ 	return pte_flags(pte) & _PAGE_RW;
+@@ -175,6 +186,13 @@ static inline int pmd_trans_huge(pmd_t p
+ 	return (pmd_val(pmd) & (_PAGE_PSE|_PAGE_DEVMAP)) == _PAGE_PSE;
+ }
+ 
++#ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
++static inline int pud_trans_huge(pud_t pud)
++{
++	return (pud_val(pud) & (_PAGE_PSE|_PAGE_DEVMAP)) == _PAGE_PSE;
++}
++#endif
++
+ #define has_transparent_hugepage has_transparent_hugepage
+ static inline int has_transparent_hugepage(void)
+ {
+@@ -186,6 +204,18 @@ static inline int pmd_devmap(pmd_t pmd)
+ {
+ 	return !!(pmd_val(pmd) & _PAGE_DEVMAP);
+ }
++
++#ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
++static inline int pud_devmap(pud_t pud)
++{
++	return !!(pud_val(pud) & _PAGE_DEVMAP);
++}
++#else
++static inline int pud_devmap(pud_t pud)
++{
++	return 0;
++}
++#endif
+ #endif
+ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+@@ -329,6 +359,65 @@ static inline pmd_t pmd_mknotpresent(pmd
+ }
+ #endif
+ 
++static inline pud_t pud_set_flags(pud_t pud, pudval_t set)
++{
++	pudval_t v = xen_pud_val(pud);
++
++	return __pud(v | set);
++}
++
++static inline pud_t pud_clear_flags(pud_t pud, pudval_t clear)
++{
++	pudval_t v = xen_pud_val(pud);
++
++	return __pud(v & ~clear);
++}
++
++static inline pud_t pud_mkold(pud_t pud)
++{
++	return pud_clear_flags(pud, _PAGE_ACCESSED);
++}
++
++static inline pud_t pud_mkclean(pud_t pud)
++{
++	return pud_clear_flags(pud, _PAGE_DIRTY);
++}
++
++static inline pud_t pud_wrprotect(pud_t pud)
++{
++	return pud_clear_flags(pud, _PAGE_RW);
++}
++
++static inline pud_t pud_mkdirty(pud_t pud)
++{
++	return pud_set_flags(pud, _PAGE_DIRTY | _PAGE_SOFT_DIRTY);
++}
++
++static inline pud_t pud_mkdevmap(pud_t pud)
++{
++	return pud_set_flags(pud, _PAGE_DEVMAP);
++}
++
++static inline pud_t pud_mkhuge(pud_t pud)
++{
++	return pud_set_flags(pud, _PAGE_PSE);
++}
++
++static inline pud_t pud_mkyoung(pud_t pud)
++{
++	return pud_set_flags(pud, _PAGE_ACCESSED);
++}
++
++static inline pud_t pud_mkwrite(pud_t pud)
++{
++	return pud_set_flags(pud, _PAGE_RW);
++}
++
++static inline pud_t pud_mknotpresent(pud_t pud)
++{
++	return pud_clear_flags(pud, _PAGE_PRESENT | _PAGE_PROTNONE);
++}
++
+ #ifdef CONFIG_HAVE_ARCH_SOFT_DIRTY
+ static inline int pte_soft_dirty(pte_t pte)
+ {
+@@ -340,6 +429,11 @@ static inline int pmd_soft_dirty(pmd_t p
+ 	return pmd_flags(pmd) & _PAGE_SOFT_DIRTY;
+ }
+ 
++static inline int pud_soft_dirty(pud_t pud)
++{
++	return pud_flags(pud) & _PAGE_SOFT_DIRTY;
++}
++
+ static inline pte_t pte_mksoft_dirty(pte_t pte)
+ {
+ 	return pte_set_flags(pte, _PAGE_SOFT_DIRTY);
+@@ -350,6 +444,11 @@ static inline pmd_t pmd_mksoft_dirty(pmd
+ {
+ 	return pmd_set_flags(pmd, _PAGE_SOFT_DIRTY);
+ }
++
++static inline pud_t pud_mksoft_dirty(pud_t pud)
++{
++	return pud_set_flags(pud, _PAGE_SOFT_DIRTY);
++}
+ #endif
+ 
+ static inline pte_t pte_clear_soft_dirty(pte_t pte)
+@@ -362,6 +461,11 @@ static inline pmd_t pmd_clear_soft_dirty
+ {
+ 	return pmd_clear_flags(pmd, _PAGE_SOFT_DIRTY);
+ }
++
++static inline pud_t pud_clear_soft_dirty(pud_t pud)
++{
++	return pud_clear_flags(pud, _PAGE_SOFT_DIRTY);
++}
+ #endif
+ 
+ #endif /* CONFIG_HAVE_ARCH_SOFT_DIRTY */
+@@ -397,6 +501,12 @@ static inline pmd_t pfn_pmd(unsigned lon
+ 		     massage_pgprot(pgprot));
+ }
+ 
++static inline pud_t pfn_pud(unsigned long page_nr, pgprot_t pgprot)
++{
++	return __pud(((phys_addr_t)page_nr << PAGE_SHIFT) |
++		     massage_pgprot(pgprot));
++}
++
+ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
+ {
+ 	pteval_t val = pte_val(pte) & _PAGE_CHG_MASK;
+@@ -785,6 +895,14 @@ static inline pmd_t xen_local_pmdp_get_a
+ 	return res;
+ }
+ 
++static inline pud_t xen_local_pudp_get_and_clear(pud_t *pudp)
++{
++	pud_t res = *pudp;
++
++	xen_pud_clear(pudp);
++	return res;
++}
++
+ static inline void xen_set_pte_at(struct mm_struct *mm, unsigned long addr,
+ 				  pte_t *ptep , pte_t pte)
+ {
+@@ -805,6 +923,12 @@ static inline void xen_set_pmd_at(struct
+ 	xen_set_pmd(pmdp, pmd);
+ }
+ 
++static inline void xen_set_pud_at(struct mm_struct *mm, unsigned long addr,
++				   pud_t *pudp, pud_t pud)
++{
++	xen_set_pud(pudp, pud);
++}
++
+ static inline void xen_pte_clear(struct mm_struct *mm, unsigned long addr,
+ 				 pte_t *ptep)
+ {
+@@ -910,10 +1034,15 @@ static inline void ptep_set_wrprotect(st
+ extern int pmdp_set_access_flags(struct vm_area_struct *vma,
+ 				 unsigned long address, pmd_t *pmdp,
+ 				 pmd_t entry, int dirty);
++extern int pudp_set_access_flags(struct vm_area_struct *vma,
++				 unsigned long address, pud_t *pudp,
++				 pud_t entry, int dirty);
+ 
+ #define __HAVE_ARCH_PMDP_TEST_AND_CLEAR_YOUNG
+ extern int pmdp_test_and_clear_young(struct vm_area_struct *vma,
+ 				     unsigned long addr, pmd_t *pmdp);
++extern int pudp_test_and_clear_young(struct vm_area_struct *vma,
++				     unsigned long addr, pud_t *pudp);
+ 
+ #define __HAVE_ARCH_PMDP_CLEAR_YOUNG_FLUSH
+ extern int pmdp_clear_flush_young(struct vm_area_struct *vma,
+@@ -935,6 +1064,15 @@ static inline pmd_t pmdp_huge_get_and_cl
+ }
+ #endif
+ 
++#define __HAVE_ARCH_PUDP_HUGE_GET_AND_CLEAR
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++static inline pud_t pudp_huge_get_and_clear(struct mm_struct *mm,
++					unsigned long addr, pud_t *pudp)
++{
++	return xen_pudp_get_and_clear(pudp);
++}
++#endif
++
+ #define __HAVE_ARCH_PMDP_SET_WRPROTECT
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ static inline void pmdp_set_wrprotect(struct mm_struct *mm,
+@@ -985,6 +1123,10 @@ static inline void update_mmu_cache_pmd(
+ 		unsigned long addr, pmd_t *pmd)
+ {
+ }
++static inline void update_mmu_cache_pud(struct vm_area_struct *vma,
++		unsigned long addr, pud_t *pud)
++{
++}
+ 
+ #define arbitrary_virt_to_mfn(va)					\
+ ({									\
+--- a/arch/x86/include/mach-xen/asm/pgtable-3level.h
++++ b/arch/x86/include/mach-xen/asm/pgtable-3level.h
+@@ -115,6 +115,10 @@ static inline void xen_pmd_clear(pmd_t *
+ 	xen_l2_entry_update(pmd, __pmd(0));
+ }
+ 
++static inline void xen_pud_clear(pud_t *pudp)
++{
++}
++
+ static inline void pud_clear(pud_t *pudp)
+ {
+ 	set_pud(pudp, __pud(0));
+@@ -175,6 +179,32 @@ static inline pmd_t xen_pmdp_get_and_cle
+ #endif
+ #endif
+ 
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++#ifdef CONFIG_SMP
++union split_pud {
++	struct {
++		u32 pud_low;
++		u32 pud_high;
++	};
++	pud_t pud;
++};
++
++static inline pud_t xen_pudp_get_and_clear(pud_t *pudp)
++{
++	union split_pud res, *orig = (union split_pud *)pudp;
++
++	/* xchg acts as a barrier before setting of the high bits */
++	res.pud_low = xchg(&orig->pud_low, 0);
++	res.pud_high = orig->pud_high;
++	orig->pud_high = 0;
++
++	return res.pud;
++}
++#else
++#define xen_pudp_get_and_clear(xp) xen_local_pudp_get_and_clear(xp)
++#endif
++#endif
++
+ /* Encode and de-code a swap entry */
+ #define MAX_SWAPFILES_CHECK() BUILD_BUG_ON(MAX_SWAPFILES_SHIFT > 5)
+ #define __swp_type(x)			(((x).val) & 0x1f)
+--- a/arch/x86/include/mach-xen/asm/pgtable_32.h
++++ b/arch/x86/include/mach-xen/asm/pgtable_32.h
+@@ -26,6 +26,7 @@ struct vm_area_struct;
+ 
+ extern pgd_t *swapper_pg_dir;
+ extern pgd_t initial_page_table[1024];
++extern pmd_t initial_pg_pmd[];
+ 
+ static inline void pgtable_cache_init(void) { }
+ static inline void check_pgt_cache(void) { }
+@@ -77,4 +78,35 @@ void make_lowmem_page_writable(const voi
+ #define kern_addr_valid(kaddr)	(0)
+ #endif
+ 
++/*
++ * This is how much memory in addition to the memory covered up to
++ * and including _end we need mapped initially.
++ * We need:
++ *     (KERNEL_IMAGE_SIZE/4096) / 1024 pages (worst case, non PAE)
++ *     (KERNEL_IMAGE_SIZE/4096) / 512 + 4 pages (worst case for PAE)
++ *
++ * Modulo rounding, each megabyte assigned here requires a kilobyte of
++ * memory, which is currently unreclaimed.
++ *
++ * This should be a multiple of a page.
++ *
++ * KERNEL_IMAGE_SIZE should be greater than pa(_end)
++ * and small than max_low_pfn, otherwise will waste some page table entries
++ */
++#if PTRS_PER_PMD > 1
++#define PAGE_TABLE_SIZE(pages) (((pages) / PTRS_PER_PMD) + PTRS_PER_PGD)
++#else
++#define PAGE_TABLE_SIZE(pages) ((pages) / PTRS_PER_PGD)
++#endif
++
++/*
++ * Number of possible pages in the lowmem region.
++ *
++ * We shift 2 by 31 instead of 1 by 32 to the left in order to avoid a
++ * gas warning about overflowing shift count when gas has been compiled
++ * with only a host target support using a 32-bit type for internal
++ * representation.
++ */
++#define LOWMEM_PAGES ((((2<<31) - __PAGE_OFFSET) >> PAGE_SHIFT))
++
+ #endif /* _ASM_X86_PGTABLE_32_H */
+--- a/arch/x86/include/mach-xen/asm/pgtable_64.h
++++ b/arch/x86/include/mach-xen/asm/pgtable_64.h
+@@ -101,6 +101,23 @@ static inline void xen_pud_clear(pud_t *
+ 	xen_set_pud(pud, xen_make_pud(0));
+ }
+ 
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++static inline pud_t xen_pudp_get_and_clear(pud_t *xp)
++{
++#ifdef CONFIG_SMP
++	return xen_make_pud(xchg(&xp->pud, 0));
++#else
++	/* xen_local_pudp_get_and_clear,
++	 * but duplicated because of cyclic dependency
++	 */
++	pud_t ret = *xp;
++
++	xen_pud_clear(xp);
++	return ret;
++#endif
++}
++#endif
++
+ #define __user_pgd(pgd) ((pgd) + PTRS_PER_PGD)
+ 
+ static inline void xen_set_pgd(pgd_t *pgdp, pgd_t pgd)
+--- a/arch/x86/include/mach-xen/asm/pgtable_types.h
++++ b/arch/x86/include/mach-xen/asm/pgtable_types.h
+@@ -296,6 +296,8 @@ static inline pgdval_t pgd_flags(pgd_t p
+ }
+ 
+ #if CONFIG_PGTABLE_LEVELS > 3
++#include <asm-generic/5level-fixup.h>
++
+ typedef struct { pudval_t pud; } pud_t;
+ 
+ #define __pud_ma(x) ((pud_t) { (x) } )
+@@ -315,6 +317,7 @@ static inline pudval_t xen_pud_val(pud_t
+ 	return ret;
+ }
+ #else
++#define __ARCH_USE_5LEVEL_HACK
+ #include <asm-generic/pgtable-nopud.h>
+ 
+ #define __pud_val(x) __pgd_val((x).pgd)
+@@ -349,6 +352,7 @@ static inline pmdval_t xen_pmd_val(pmd_t
+ 	return ret;
+ }
+ #else
++#define __ARCH_USE_5LEVEL_HACK
+ #include <asm-generic/pgtable-nopmd.h>
+ 
+ #define __pmd_ma(x) ((pmd_t) { .pud.pgd = __pgd_ma(x) } )
+--- a/arch/x86/include/mach-xen/asm/processor.h
++++ b/arch/x86/include/mach-xen/asm/processor.h
+@@ -317,7 +317,7 @@ struct x86_hw_tss {
+ 	u16			reserved5;
+ 	u16			io_bitmap_base;
+ 
+-} __attribute__((packed)) ____cacheline_aligned;
++} __attribute__((packed));
+ #endif
+ #endif /* CONFIG_X86_NO_TSS */
+ 
+@@ -358,6 +358,16 @@ struct tss_struct {
+ DECLARE_PER_CPU_SHARED_ALIGNED(struct tss_struct, cpu_tss);
+ 
+ /*
++ * sizeof(unsigned long) coming from an extra "long" at the end
++ * of the iobitmap.
++ *
++ * -1? seg base+limit should be pointing to the address of the
++ * last valid byte
++ */
++#define __KERNEL_TSS_LIMIT	\
++	(IO_BITMAP_OFFSET + IO_BITMAP_BYTES + sizeof(unsigned long) - 1)
++
++/*
+  * Save the original ist values for checking stack pointers during debugging
+  */
+ struct orig_ist {
+--- a/arch/x86/kernel/apic/io_apic-xen.c
++++ b/arch/x86/kernel/apic/io_apic-xen.c
+@@ -1179,12 +1179,12 @@ int mp_map_gsi_to_irq(u32 gsi, unsigned
+ 
+ 	ioapic = mp_find_ioapic(gsi);
+ 	if (ioapic < 0)
+-		return -1;
++		return -ENODEV;
+ 
+ 	pin = mp_find_ioapic_pin(ioapic, gsi);
+ 	idx = find_irq_entry(ioapic, pin, mp_INT);
+ 	if ((flags & IOAPIC_MAP_CHECK) && idx < 0)
+-		return -1;
++		return -ENODEV;
+ 
+ 	return mp_map_pin_to_irq(gsi, idx, ioapic, pin, flags, info);
+ }
+@@ -1950,6 +1950,7 @@ static struct irq_chip ioapic_chip __rea
+ 	.irq_ack		= irq_chip_ack_parent,
+ 	.irq_eoi		= ioapic_ack_level,
+ 	.irq_set_affinity	= ioapic_set_affinity,
++	.irq_retrigger		= irq_chip_retrigger_hierarchy,
+ 	.flags			= IRQCHIP_SKIP_SET_WAKE,
+ };
+ 
+@@ -1961,6 +1962,7 @@ static struct irq_chip ioapic_ir_chip __
+ 	.irq_ack		= irq_chip_ack_parent,
+ 	.irq_eoi		= ioapic_ir_ack_level,
+ 	.irq_set_affinity	= ioapic_set_affinity,
++	.irq_retrigger		= irq_chip_retrigger_hierarchy,
+ 	.flags			= IRQCHIP_SKIP_SET_WAKE,
+ };
+ #endif /* !CONFIG_XEN */
+--- a/arch/x86/kernel/apic/vector-xen.c
++++ b/arch/x86/kernel/apic/vector-xen.c
+@@ -568,7 +568,7 @@ void send_cleanup_vector(struct irq_cfg
+ 		__send_cleanup_vector(data);
+ }
+ 
+-asmlinkage __visible void smp_irq_move_cleanup_interrupt(void)
++asmlinkage __visible void __irq_entry smp_irq_move_cleanup_interrupt(void)
+ {
+ 	unsigned vector, me;
+ 
+--- a/arch/x86/kernel/cpu/common-xen.c
++++ b/arch/x86/kernel/cpu/common-xen.c
+@@ -7,7 +7,9 @@
+ #include <linux/string.h>
+ #include <linux/ctype.h>
+ #include <linux/delay.h>
+-#include <linux/sched.h>
++#include <linux/sched/mm.h>
++#include <linux/sched/clock.h>
++#include <linux/sched/task.h>
+ #include <linux/init.h>
+ #include <linux/kprobes.h>
+ #include <linux/kgdb.h>
+@@ -35,6 +37,7 @@
+ #include <asm/desc.h>
+ #include <asm/fpu/internal.h>
+ #include <asm/mtrr.h>
++#include <asm/hwcap2.h>
+ #include <linux/numa.h>
+ #include <asm/asm.h>
+ #include <asm/bugs.h>
+@@ -55,6 +58,8 @@
+ 
+ #include "cpu.h"
+ 
++u32 elf_hwcap2 __read_mostly;
++
+ /* all of these masks are initialized in setup_cpu_local_masks() */
+ cpumask_var_t cpu_initialized_mask;
+ #ifndef CONFIG_XEN
+@@ -699,6 +704,16 @@ void cpu_detect(struct cpuinfo_x86 *c)
+ 	}
+ }
+ 
++static void apply_forced_caps(struct cpuinfo_x86 *c)
++{
++	int i;
++
++	for (i = 0; i < NCAPINTS; i++) {
++		c->x86_capability[i] &= ~cpu_caps_cleared[i];
++		c->x86_capability[i] |= cpu_caps_set[i];
++	}
++}
++
+ void get_cpu_cap(struct cpuinfo_x86 *c)
+ {
+ 	u32 eax, ebx, ecx, edx;
+@@ -797,6 +812,13 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
+ #endif
+ 
+ 	init_scattered_cpuid_features(c);
++
++	/*
++	 * Clear/Set all flags overridden by options, after probe.
++	 * This needs to happen each time we re-probe, which may happen
++	 * several times during CPU initialization.
++	 */
++	apply_forced_caps(c);
+ }
+ 
+ static void identify_cpu_without_cpuid(struct cpuinfo_x86 *c)
+@@ -850,14 +872,12 @@ static void __init early_identify_cpu(st
+ 	memset(&c->x86_capability, 0, sizeof c->x86_capability);
+ 	c->extended_cpuid_level = 0;
+ 
+-	if (!have_cpuid_p())
+-		identify_cpu_without_cpuid(c);
+-
+ 	/* cyrix could have cpuid enabled via c_identify()*/
+ 	if (have_cpuid_p()) {
+ 		cpu_detect(c);
+ 		get_cpu_vendor(c);
+ 		get_cpu_cap(c);
++		setup_force_cpu_cap(X86_FEATURE_CPUID);
+ 
+ 		if (this_cpu->c_early_init)
+ 			this_cpu->c_early_init(c);
+@@ -867,6 +887,9 @@ static void __init early_identify_cpu(st
+ 
+ 		if (this_cpu->c_bsp_init)
+ 			this_cpu->c_bsp_init(c);
++	} else {
++		identify_cpu_without_cpuid(c);
++		setup_clear_cpu_cap(X86_FEATURE_CPUID);
+ 	}
+ 
+ 	setup_force_cpu_cap(X86_FEATURE_ALWAYS);
+@@ -1092,10 +1115,7 @@ static void identify_cpu(struct cpuinfo_
+ 		this_cpu->c_identify(c);
+ 
+ 	/* Clear/Set all flags overridden by options, after probe */
+-	for (i = 0; i < NCAPINTS; i++) {
+-		c->x86_capability[i] &= ~cpu_caps_cleared[i];
+-		c->x86_capability[i] |= cpu_caps_set[i];
+-	}
++	apply_forced_caps(c);
+ 
+ #if defined(CONFIG_X86_64) && !defined(CONFIG_XEN)
+ 	c->apicid = apic->phys_pkg_id(c->initial_apicid, 0);
+@@ -1154,10 +1174,7 @@ static void identify_cpu(struct cpuinfo_
+ 	 * Clear/Set all flags overridden by options, need do it
+ 	 * before following smp all cpus cap AND.
+ 	 */
+-	for (i = 0; i < NCAPINTS; i++) {
+-		c->x86_capability[i] &= ~cpu_caps_cleared[i];
+-		c->x86_capability[i] |= cpu_caps_set[i];
+-	}
++	apply_forced_caps(c);
+ 
+ 	/*
+ 	 * On SMP, boot_cpu_data holds the common feature set between
+@@ -1630,7 +1647,7 @@ void cpu_init(void)
+ 		t->io_bitmap[i] = ~0UL;
+ #endif
+ 
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	me->active_mm = &init_mm;
+ 	BUG_ON(me->mm);
+ 	enter_lazy_tlb(&init_mm, me);
+@@ -1685,7 +1702,7 @@ void cpu_init(void)
+ 	/*
+ 	 * Set up and load the per-CPU TSS and LDT
+ 	 */
+-	atomic_inc(&init_mm.mm_count);
++	mmgrab(&init_mm);
+ 	curr->active_mm = &init_mm;
+ 	BUG_ON(curr->mm);
+ 	enter_lazy_tlb(&init_mm, curr);
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@ -76,6 +76,7 @@ __setup("ring3mwait=disable", ring3mwait
+ 
+ static void probe_xeon_phi_r3mwait(struct cpuinfo_x86 *c)
+ {
++#ifndef CONFIG_XEN
+ 	/*
+ 	 * Ring 3 MONITOR/MWAIT feature cannot be detected without
+ 	 * cpu model and family comparison.
+@@ -103,6 +104,7 @@ static void probe_xeon_phi_r3mwait(struc
+ 
+ 	if (c == &boot_cpu_data)
+ 		ELF_HWCAP2 |= HWCAP2_RING3MWAIT;
++#endif /* CONFIG_XEN */
+ }
+ 
+ static void early_init_intel(struct cpuinfo_x86 *c)
+--- a/arch/x86/kernel/e820-xen.c
++++ b/arch/x86/kernel/e820-xen.c
+@@ -629,7 +629,7 @@ static void __init update_e820_saved(voi
+ /*
+  * Search for a gap in the e820 memory space from start_addr to end_addr.
+  */
+-__init int e820_search_gap(unsigned long *gapstart, unsigned long *gapsize,
++static int __init e820_search_gap(unsigned long *gapstart, unsigned long *gapsize,
+ 		unsigned long start_addr, unsigned long long end_addr)
+ {
+ 	unsigned long long last;
+--- a/arch/x86/kernel/fixup.c
++++ b/arch/x86/kernel/fixup.c
+@@ -28,6 +28,7 @@
+  */
+ 
+ #include <linux/init.h>
++#include <linux/nmi.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/kernel.h>
+--- a/arch/x86/kernel/head32-xen.c
++++ b/arch/x86/kernel/head32-xen.c
+@@ -82,3 +82,66 @@ asmlinkage __visible void __init i386_st
+ 
+ 	start_kernel();
+ }
++
++#ifndef CONFIG_XEN
++/*
++ * Initialize page tables.  This creates a PDE and a set of page
++ * tables, which are located immediately beyond __brk_base.  The variable
++ * _brk_end is set up to point to the first "safe" location.
++ * Mappings are created both at virtual address 0 (identity mapping)
++ * and PAGE_OFFSET for up to _end.
++ *
++ * In PAE mode initial_page_table is statically defined to contain
++ * enough entries to cover the VMSPLIT option (that is the top 1, 2 or 3
++ * entries). The identity mapping is handled by pointing two PGD entries
++ * to the first kernel PMD. Note the upper half of each PMD or PTE are
++ * always zero at this stage.
++ */
++void __init mk_early_pgtbl_32(void)
++{
++#ifdef __pa
++#undef __pa
++#endif
++#define __pa(x)  ((unsigned long)(x) - PAGE_OFFSET)
++	pte_t pte, *ptep;
++	int i;
++	unsigned long *ptr;
++	/* Enough space to fit pagetables for the low memory linear map */
++	const unsigned long limit = __pa(_end) +
++		(PAGE_TABLE_SIZE(LOWMEM_PAGES) << PAGE_SHIFT);
++#ifdef CONFIG_X86_PAE
++	pmd_t pl2, *pl2p = (pmd_t *)__pa(initial_pg_pmd);
++#define SET_PL2(pl2, val)    { (pl2).pmd = (val); }
++#else
++	pgd_t pl2, *pl2p = (pgd_t *)__pa(initial_page_table);
++#define SET_PL2(pl2, val)   { (pl2).pgd = (val); }
++#endif
++
++	ptep = (pte_t *)__pa(__brk_base);
++	pte.pte = PTE_IDENT_ATTR;
++
++	while ((pte.pte & PTE_PFN_MASK) < limit) {
++
++		SET_PL2(pl2, (unsigned long)ptep | PDE_IDENT_ATTR);
++		*pl2p = pl2;
++#ifndef CONFIG_X86_PAE
++		/* Kernel PDE entry */
++		*(pl2p +  ((PAGE_OFFSET >> PGDIR_SHIFT))) = pl2;
++#endif
++		for (i = 0; i < PTRS_PER_PTE; i++) {
++			*ptep = pte;
++			pte.pte += PAGE_SIZE;
++			ptep++;
++		}
++
++		pl2p++;
++	}
++
++	ptr = (unsigned long *)__pa(&max_pfn_mapped);
++	/* Can't use pte_pfn() since it's a call with CONFIG_PARAVIRT */
++	*ptr = (pte.pte & PTE_PFN_MASK) >> PAGE_SHIFT;
++
++	ptr = (unsigned long *)__pa(&_brk_end);
++	*ptr = (unsigned long)ptep + PAGE_OFFSET;
++}
++#endif
+--- a/arch/x86/kernel/head64-xen.c
++++ b/arch/x86/kernel/head64-xen.c
+@@ -7,6 +7,7 @@
+  *	Modified for Xen.
+  */
+ 
++#define DISABLE_BRANCH_PROFILING
+ #include <linux/init.h>
+ #include <linux/linkage.h>
+ #include <linux/types.h>
+--- a/arch/x86/kernel/ioport-xen.c
++++ b/arch/x86/kernel/ioport-xen.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/sched.h>
++#include <linux/sched/task_stack.h>
+ #include <linux/kernel.h>
+ #include <linux/capability.h>
+ #include <linux/errno.h>
+--- a/arch/x86/kernel/irq-xen.c
++++ b/arch/x86/kernel/irq-xen.c
+@@ -284,7 +284,7 @@ void __smp_x86_platform_ipi(void)
+ 		x86_platform_ipi_callback();
+ }
+ 
+-__visible void smp_x86_platform_ipi(struct pt_regs *regs)
++__visible void __irq_entry smp_x86_platform_ipi(struct pt_regs *regs)
+ {
+ 	struct pt_regs *old_regs = set_irq_regs(regs);
+ 
+@@ -335,7 +335,7 @@ __visible void smp_kvm_posted_intr_wakeu
+ }
+ #endif
+ 
+-__visible void smp_trace_x86_platform_ipi(struct pt_regs *regs)
++__visible void __irq_entry smp_trace_x86_platform_ipi(struct pt_regs *regs)
+ {
+ 	struct pt_regs *old_regs = set_irq_regs(regs);
+ 
+--- a/arch/x86/kernel/pci-dma-xen.c
++++ b/arch/x86/kernel/pci-dma-xen.c
+@@ -16,7 +16,7 @@
+ 
+ static int forbid_dac __read_mostly;
+ 
+-struct dma_map_ops *dma_ops = &nommu_dma_ops;
++const struct dma_map_ops *dma_ops = &nommu_dma_ops;
+ EXPORT_SYMBOL(dma_ops);
+ 
+ static int iommu_sac_force __read_mostly;
+@@ -59,7 +59,7 @@ EXPORT_SYMBOL(x86_dma_fallback_dev);
+ /* Number of entries preallocated for DMA-API debugging */
+ #define PREALLOC_DMA_DEBUG_ENTRIES       65536
+ 
+-static struct dma_map_ops swiotlb_dma_ops = {
++static const struct dma_map_ops swiotlb_dma_ops = {
+ 	.alloc = dma_generic_alloc_coherent,
+ 	.free = dma_generic_free_coherent,
+ 	.mapping_error = swiotlb_dma_mapping_error,
+@@ -132,7 +132,7 @@ again:
+ 	page = NULL;
+ 	/* CMA can be used only in the context which permits sleeping */
+ 	if (gfpflags_allow_blocking(flag)) {
+-		page = dma_alloc_from_contiguous(dev, count, order);
++		page = dma_alloc_from_contiguous(dev, count, order, flag);
+ 		if (page && page_to_phys(page) + size > dma_mask) {
+ 			dma_release_from_contiguous(dev, page, count);
+ 			page = NULL;
+@@ -310,7 +310,7 @@ int range_straddles_page_boundary(paddr_
+ 
+ int dma_supported(struct device *dev, u64 mask)
+ {
+-	struct dma_map_ops *ops = get_dma_ops(dev);
++	const struct dma_map_ops *ops = get_dma_ops(dev);
+ 
+ #ifdef CONFIG_PCI
+ 	if (mask > 0xffffffff && forbid_dac > 0) {
+--- a/arch/x86/kernel/pci-nommu-xen.c
++++ b/arch/x86/kernel/pci-nommu-xen.c
+@@ -95,7 +95,7 @@ static int nommu_dma_supported(struct de
+ 	return 1;
+ }
+ 
+-struct dma_map_ops nommu_dma_ops = {
++const struct dma_map_ops nommu_dma_ops = {
+ 	.alloc			= dma_generic_alloc_coherent,
+ 	.free			= dma_generic_free_coherent,
+ 	.map_page		= gnttab_map_page,
+--- a/arch/x86/kernel/process-xen.c
++++ b/arch/x86/kernel/process-xen.c
+@@ -7,6 +7,10 @@
+ #include <linux/prctl.h>
+ #include <linux/slab.h>
+ #include <linux/sched.h>
++#include <linux/sched/idle.h>
++#include <linux/sched/debug.h>
++#include <linux/sched/task.h>
++#include <linux/sched/task_stack.h>
+ #include <linux/init.h>
+ #include <linux/export.h>
+ #include <linux/pm.h>
+@@ -32,6 +36,7 @@
+ #include <asm/mce.h>
+ #include <asm/vm86.h>
+ #include <asm/switch_to.h>
++#include <asm/desc.h>
+ #include <xen/evtchn.h>
+ 
+ #ifndef CONFIG_X86_NO_TSS
+@@ -65,6 +70,9 @@ __visible DEFINE_PER_CPU_SHARED_ALIGNED(
+ #endif
+ };
+ EXPORT_PER_CPU_SYMBOL(cpu_tss);
++
++DEFINE_PER_CPU(bool, __tss_limit_invalid);
++EXPORT_PER_CPU_SYMBOL_GPL(__tss_limit_invalid);
+ #elif defined(CONFIG_X86_64_XEN)
+ __visible DEFINE_PER_CPU(unsigned long, cpu_sp0) = TOP_OF_INIT_STACK;
+ EXPORT_PER_CPU_SYMBOL(cpu_sp0);
+--- a/arch/x86/kernel/process_32-xen.c
++++ b/arch/x86/kernel/process_32-xen.c
+@@ -12,6 +12,8 @@
+ #include <linux/cpu.h>
+ #include <linux/errno.h>
+ #include <linux/sched.h>
++#include <linux/sched/task.h>
++#include <linux/sched/task_stack.h>
+ #include <linux/fs.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+--- a/arch/x86/kernel/process_64-xen.c
++++ b/arch/x86/kernel/process_64-xen.c
+@@ -20,6 +20,8 @@
+ #include <linux/cpu.h>
+ #include <linux/errno.h>
+ #include <linux/sched.h>
++#include <linux/sched/task.h>
++#include <linux/sched/task_stack.h>
+ #include <linux/fs.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+--- a/arch/x86/kernel/setup-xen.c
++++ b/arch/x86/kernel/setup-xen.c
+@@ -643,7 +643,9 @@ static void __init reserve_crashkernel(v
+ 	/* 0 means: find the address automatically */
+ 	if (crash_base <= 0) {
+ 		/*
+-		 *  kexec want bzImage is below CRASH_KERNEL_ADDR_MAX
++		 * Set CRASH_ADDR_LOW_MAX upper bound for crash memory,
++		 * as old kexec-tools loads bzImage below that, unless
++		 * "crashkernel=size[KMG],high" is specified.
+ 		 */
+ 		crash_base = memblock_find_in_range(CRASH_ALIGN,
+ 						    high ? CRASH_ADDR_HIGH_MAX
+@@ -1321,6 +1323,22 @@ void __init setup_arch(char **cmdline_p)
+ 	/* Allocate bigger log buffer */
+ 	setup_log_buf(1);
+ 
++	if (efi_enabled(EFI_BOOT)) {
++#ifndef CONFIG_XEN
++		switch (boot_params.secure_boot) {
++		case efi_secureboot_mode_disabled:
++			pr_info("Secure boot disabled\n");
++			break;
++		case efi_secureboot_mode_enabled:
++			pr_info("Secure boot enabled\n");
++			break;
++		default:
++			pr_info("Secure boot could not be determined\n");
++			break;
++		}
++#endif
++	}
++
+ 	reserve_initrd();
+ 
+ 	acpi_table_upgrade();
+--- a/arch/x86/kernel/traps-xen.c
++++ b/arch/x86/kernel/traps-xen.c
+@@ -29,6 +29,7 @@
+ #include <linux/errno.h>
+ #include <linux/kexec.h>
+ #include <linux/sched.h>
++#include <linux/sched/task_stack.h>
+ #include <linux/timer.h>
+ #include <linux/init.h>
+ #include <linux/bug.h>
+@@ -260,7 +261,7 @@ do_trap(int trapnr, int signr, char *str
+ 		pr_info("%s[%d] trap %s ip:%lx sp:%lx error:%lx",
+ 			tsk->comm, tsk->pid, str,
+ 			regs->ip, regs->sp, error_code);
+-		print_vma_addr(" in ", regs->ip);
++		print_vma_addr(KERN_CONT " in ", regs->ip);
+ 		pr_cont("\n");
+ 	}
+ 
+@@ -524,7 +525,7 @@ do_general_protection(struct pt_regs *re
+ 		pr_info("%s[%d] general protection ip:%lx sp:%lx error:%lx",
+ 			tsk->comm, task_pid_nr(tsk),
+ 			regs->ip, regs->sp, error_code);
+-		print_vma_addr(" in ", regs->ip);
++		print_vma_addr(KERN_CONT " in ", regs->ip);
+ 		pr_cont("\n");
+ 	}
+ 
+@@ -569,11 +570,9 @@ dotraplinkage void notrace do_int3(struc
+ 	 * as we may switch to the interrupt stack.
+ 	 */
+ 	debug_stack_usage_inc();
+-	preempt_disable();
+ 	cond_local_irq_enable(regs);
+ 	do_trap(X86_TRAP_BP, SIGTRAP, "int3", regs, error_code, NULL);
+ 	cond_local_irq_disable(regs);
+-	preempt_enable_no_resched();
+ 	debug_stack_usage_dec();
+ exit:
+ 	ist_exit(regs);
+@@ -748,14 +747,12 @@ dotraplinkage void do_debug(struct pt_re
+ 	debug_stack_usage_inc();
+ 
+ 	/* It's safe to allow irq's after DR6 has been saved */
+-	preempt_disable();
+ 	cond_local_irq_enable(regs);
+ 
+ 	if (v8086_mode(regs)) {
+ 		handle_vm86_trap((struct kernel_vm86_regs *) regs, error_code,
+ 					X86_TRAP_DB);
+ 		cond_local_irq_disable(regs);
+-		preempt_enable_no_resched();
+ 		debug_stack_usage_dec();
+ 		goto exit;
+ 	}
+@@ -775,7 +772,6 @@ dotraplinkage void do_debug(struct pt_re
+ 	if (tsk->thread.debugreg6 & (DR_STEP | DR_TRAP_BITS) || user_icebp)
+ 		send_sigtrap(tsk, regs, error_code, si_code);
+ 	cond_local_irq_disable(regs);
+-	preempt_enable_no_resched();
+ 	debug_stack_usage_dec();
+ 
+ exit:
+--- a/arch/x86/mm/dump_pagetables-xen.c
++++ b/arch/x86/mm/dump_pagetables-xen.c
+@@ -20,6 +20,7 @@
+ 
+ #include <xen/interface/xen.h>
+ 
++#include <asm/kasan.h>
+ #include <asm/pgtable.h>
+ 
+ /*
+@@ -53,6 +54,10 @@ enum address_markers_idx {
+ 	LOW_KERNEL_NR,
+ 	VMALLOC_START_NR,
+ 	VMEMMAP_START_NR,
++#ifdef CONFIG_KASAN
++	KASAN_SHADOW_START_NR,
++	KASAN_SHADOW_END_NR,
++#endif
+ # ifdef CONFIG_X86_ESPFIX64
+ 	ESPFIX_START_NR,
+ # endif
+@@ -79,6 +84,10 @@ static struct addr_marker address_marker
+ 	{ 0/* PAGE_OFFSET */,         "Low Kernel Mapping" },
+ 	{ 0/* VMALLOC_START */,       "vmalloc() Area" },
+ 	{ 0/* VMEMMAP_START */,       "Vmemmap" },
++#ifdef CONFIG_KASAN
++	{ KASAN_SHADOW_START,         "KASAN shadow" },
++	{ KASAN_SHADOW_END,           "KASAN shadow end" },
++#endif
+ # ifdef CONFIG_X86_ESPFIX64
+ 	{ ESPFIX_BASE_ADDR,           "ESPfix Area", 16 },
+ # endif
+@@ -340,19 +349,32 @@ static void walk_pmd_level(struct seq_fi
+ 
+ #if PTRS_PER_PUD > 1
+ 
++/*
++ * This is an optimization for CONFIG_DEBUG_WX=y + CONFIG_KASAN=y
++ * KASAN fills page tables with the same values. Since there is no
++ * point in checking page table more than once we just skip repeated
++ * entries. This saves us dozens of seconds during boot.
++ */
++static bool pud_already_checked(pud_t *prev_pud, pud_t *pud, bool checkwx)
++{
++	return checkwx && prev_pud && (pud_val(*prev_pud) == pud_val(*pud));
++}
++
+ static void walk_pud_level(struct seq_file *m, struct pg_state *st, pgd_t addr,
+ 							unsigned long P)
+ {
+ 	int i;
+ 	pud_t *start;
+ 	pgprotval_t prot;
++	pud_t *prev_pud = NULL;
+ 
+ 	start = (pud_t *) pgd_page_vaddr(addr);
+ 
+ 	for (i = 0; i < PTRS_PER_PUD; i++) {
+ 		st->current_address = normalize_addr(P + i * PUD_LEVEL_MULT);
+-		if (!hypervisor_space(st->current_address)
+-		    && !pud_none(*start)) {
++		if (!hypervisor_space(st->current_address) &&
++		    !pud_none(*start) &&
++		    !pud_already_checked(prev_pud, start, st->check_wx)) {
+ 			if (pud_large(*start) || !pud_present(*start)) {
+ 				prot = pud_flags(*start);
+ 				note_page(m, st, __pgprot(prot), 2);
+@@ -363,6 +385,7 @@ static void walk_pud_level(struct seq_fi
+ 		} else
+ 			note_page(m, st, __pgprot(0), 2);
+ 
++		prev_pud = start;
+ 		start++;
+ 	}
+ }
+--- a/arch/x86/mm/fault-xen.c
++++ b/arch/x86/mm/fault-xen.c
+@@ -4,6 +4,7 @@
+  *  Copyright (C) 2008-2009, Red Hat Inc., Ingo Molnar
+  */
+ #include <linux/sched.h>		/* test_thread_flag(), ...	*/
++#include <linux/sched/task_stack.h>	/* task_stack_*(), ...		*/
+ #include <linux/kdebug.h>		/* oops_begin/end, ...		*/
+ #include <linux/extable.h>		/* search_exception_tables	*/
+ #include <linux/bootmem.h>		/* max_low_pfn			*/
+--- a/arch/x86/mm/init-xen.c
++++ b/arch/x86/mm/init-xen.c
+@@ -662,21 +662,40 @@ void __init init_mem_mapping(void)
+  * devmem_is_allowed() checks to see if /dev/mem access to a certain address
+  * is valid. The argument is a physical page number.
+  *
+- *
+- * On x86, access has to be given to the first megabyte of ram because that area
+- * contains BIOS code and data regions used by X and dosemu and similar apps.
+- * Access has to be given to non-kernel-ram areas as well, these contain the PCI
+- * mmio resources as well as potential bios/acpi data regions.
++ * On x86, access has to be given to the first megabyte of RAM because that
++ * area traditionally contains BIOS code and data regions used by X, dosemu,
++ * and similar apps. Since they map the entire memory range, the whole range
++ * must be allowed (for mapping), but any areas that would otherwise be
++ * disallowed are flagged as being "zero filled" instead of rejected.
++ * Access has to be given to non-kernel-ram areas as well, these contain the
++ * PCI mmio resources as well as potential bios/acpi data regions.
+  */
+ int devmem_is_allowed(unsigned long pagenr)
+ {
+-	if (pagenr < 256)
+-		return is_initial_xendomain();
+-	if (iomem_is_exclusive(pagenr << PAGE_SHIFT))
++	if (mfn_to_local_pfn(pagenr) < max_pfn) {
++		/*
++		 * For disallowed memory regions in the low 1MB range,
++		 * request that the page be shown as all zeros.
++		 */
++		if (pagenr < 256 && is_initial_xendomain())
++			return 2;
++
++		return 0;
++	}
++
++	/*
++	 * This must follow RAM test, since System RAM is considered a
++	 * restricted resource under CONFIG_STRICT_IOMEM.
++	 */
++	if (iomem_is_exclusive(pagenr << PAGE_SHIFT)) {
++		/* Low 1MB bypasses iomem restrictions. */
++		if (pagenr < 256)
++			return is_initial_xendomain();
++
+ 		return 0;
+-	if (mfn_to_local_pfn(pagenr) >= max_pfn)
+-		return 1;
+-	return 0;
++	}
++
++	return 1;
+ }
+ 
+ void free_init_pages(char *what, unsigned long begin, unsigned long end)
+--- a/arch/x86/mm/init_32-xen.c
++++ b/arch/x86/mm/init_32-xen.c
+@@ -872,9 +872,6 @@ static noinline int do_test_wp_bit(void)
+ 	return flag;
+ }
+ 
+-const int rodata_test_data = 0xC3;
+-EXPORT_SYMBOL_GPL(rodata_test_data);
+-
+ int kernel_set_to_readonly __read_mostly;
+ 
+ void set_kernel_text_rw(void)
+@@ -947,7 +944,6 @@ void mark_rodata_ro(void)
+ 	set_pages_ro(virt_to_page(start), size >> PAGE_SHIFT);
+ 	printk(KERN_INFO "Write protecting the kernel read-only data: %luk\n",
+ 		size >> 10);
+-	rodata_test();
+ 
+ #ifdef CONFIG_CPA_DEBUG
+ 	printk(KERN_INFO "Testing CPA: undo %lx-%lx\n", start, start + size);
+--- a/arch/x86/mm/init_64-xen.c
++++ b/arch/x86/mm/init_64-xen.c
+@@ -989,7 +989,7 @@ static void __meminit free_pagetable(str
+ 	if (PageReserved(page)) {
+ 		__ClearPageReserved(page);
+ 
+-		magic = (unsigned long)page->lru.next;
++		magic = (unsigned long)page->freelist;
+ 		if (magic == SECTION_INFO || magic == MIX_SECTION_INFO) {
+ 			while (nr_pages--)
+ 				put_page_bootmem(page++);
+@@ -1319,9 +1319,6 @@ void __init mem_init(void)
+ 	mem_init_print_info(NULL);
+ }
+ 
+-const int rodata_test_data = 0xC3;
+-EXPORT_SYMBOL_GPL(rodata_test_data);
+-
+ int kernel_set_to_readonly;
+ 
+ void set_kernel_text_rw(void)
+@@ -1405,8 +1402,6 @@ void mark_rodata_ro(void)
+ 	set_memory_nx(text_end, (all_end - text_end) >> PAGE_SHIFT);
+ #endif
+ 
+-	rodata_test();
+-
+ #ifdef CONFIG_CPA_DEBUG
+ 	printk(KERN_INFO "Testing CPA: undo %lx-%lx\n", start, end);
+ 	set_memory_rw(start, (end-start) >> PAGE_SHIFT);
+--- a/arch/x86/mm/pageattr-xen.c
++++ b/arch/x86/mm/pageattr-xen.c
+@@ -214,7 +214,20 @@ static void cpa_flush_array(unsigned lon
+ 			    int in_flags, struct page **pages)
+ {
+ 	unsigned int i, level;
++#ifdef CONFIG_PREEMPT
++	/*
++	 * Avoid wbinvd() because it causes latencies on all CPUs,
++	 * regardless of any CPU isolation that may be in effect.
++	 *
++	 * This should be extended for CAT enabled systems independent of
++	 * PREEMPT because wbinvd() does not respect the CAT partitions and
++	 * this is exposed to unpriviledged users through the graphics
++	 * subsystem.
++	 */
++	unsigned long do_wbinvd = 0;
++#else
+ 	unsigned long do_wbinvd = cache && numpages >= 1024; /* 4M threshold */
++#endif
+ 
+ 	BUG_ON(irqs_disabled());
+ 
+--- a/arch/x86/mm/pgtable-xen.c
++++ b/arch/x86/mm/pgtable-xen.c
+@@ -1,6 +1,7 @@
+ #include <linux/mm.h>
+ #include <linux/gfp.h>
+ #include <linux/export.h>
++#include <linux/sched/task.h>
+ #include <xen/features.h>
+ #include <asm/pgalloc.h>
+ #include <asm/pgtable.h>
+@@ -858,6 +859,26 @@ int pmdp_set_access_flags(struct vm_area
+ 
+ 	return changed;
+ }
++
++int pudp_set_access_flags(struct vm_area_struct *vma, unsigned long address,
++			  pud_t *pudp, pud_t entry, int dirty)
++{
++	int changed = !pud_same(*pudp, entry);
++
++	VM_BUG_ON(address & ~HPAGE_PUD_MASK);
++
++	if (changed && dirty) {
++		*pudp = entry;
++		/*
++		 * We had a write-protection fault here and changed the pud
++		 * to to more permissive. No need to flush the TLB for that,
++		 * #PF is architecturally guaranteed to do that and in the
++		 * worst-case we'll generate a spurious fault.
++		 */
++	}
++
++	return changed;
++}
+ #endif
+ 
+ int ptep_test_and_clear_young(struct vm_area_struct *vma,
+@@ -887,6 +908,17 @@ int pmdp_test_and_clear_young(struct vm_
+ 
+ 	return ret;
+ }
++int pudp_test_and_clear_young(struct vm_area_struct *vma,
++			      unsigned long addr, pud_t *pudp)
++{
++	int ret = 0;
++
++	if (pud_young(*pudp))
++		ret = test_and_clear_bit(_PAGE_BIT_ACCESSED,
++					 (unsigned long *)pudp);
++
++	return ret;
++}
+ #endif
+ 
+ int ptep_clear_flush_young(struct vm_area_struct *vma,
+--- a/drivers/hwmon/via-cputemp-xen.c
++++ b/drivers/hwmon/via-cputemp-xen.c
+@@ -92,8 +92,8 @@ static ssize_t show_temp(struct device *
+ 	return sprintf(buf, "%lu\n", ((unsigned long)eax & 0xffffff) * 1000);
+ }
+ 
+-static ssize_t show_cpu_vid(struct device *dev,
+-			    struct device_attribute *devattr, char *buf)
++static ssize_t cpu0_vid_show(struct device *dev,
++			     struct device_attribute *devattr, char *buf)
+ {
+ 	struct via_cputemp_data *data = dev_get_drvdata(dev);
+ 	u32 eax, edx;
+@@ -123,7 +123,7 @@ static const struct attribute_group via_
+ };
+ 
+ /* Optional attributes */
+-static DEVICE_ATTR(cpu0_vid, S_IRUGO, show_cpu_vid, NULL);
++static DEVICE_ATTR_RO(cpu0_vid);
+ 
+ static int via_cputemp_probe(struct platform_device *pdev)
+ {
+--- a/drivers/pci/msi-xen.c
++++ b/drivers/pci/msi-xen.c
+@@ -539,7 +539,7 @@ static void cleanup_msi_sysfs(struct pci
+  * msi_capability_init - configure device's MSI capability structure
+  * @dev: pointer to the pci_dev data structure of MSI device function
+  * @nvec: number of interrupts to allocate
+- * @affinity: flag to indicate cpu irq affinity mask should be set
++ * @affd: description of automatic irq affinity assignments (may be %NULL)
+  *
+  * Setup the MSI capability structure of the device with the requested
+  * number of interrupts.  A return value of zero indicates the successful
+@@ -1033,7 +1033,7 @@ static int __pci_enable_msi_range(struct
+ 	if (nvec < 0)
+ 		return nvec;
+ 	if (nvec < minvec)
+-		return -EINVAL;
++		return -ENOSPC;
+ 
+ 	if (nvec > maxvec)
+ 		nvec = maxvec;
+@@ -1080,23 +1080,15 @@ static int __pci_enable_msi_range(struct
+ 	return nvec;
+ }
+ 
+-/**
+- * pci_enable_msi_range - configure device's MSI capability structure
+- * @dev: device to configure
+- * @minvec: minimal number of interrupts to configure
+- * @maxvec: maximum number of interrupts to configure
+- *
+- * This function tries to allocate a maximum possible number of interrupts in a
+- * range between @minvec and @maxvec. It returns a negative errno if an error
+- * occurs. If it succeeds, it returns the actual number of interrupts allocated
+- * and updates the @dev's irq member to the lowest new interrupt number;
+- * the other interrupt numbers allocated to this device are consecutive.
+- **/
+-int pci_enable_msi_range(struct pci_dev *dev, int minvec, int maxvec)
++/* deprecated, don't use */
++int pci_enable_msi(struct pci_dev *dev)
+ {
+-	return __pci_enable_msi_range(dev, minvec, maxvec, NULL);
++	int rc = __pci_enable_msi_range(dev, 1, 1, NULL);
++	if (rc < 0)
++		return rc;
++	return 0;
+ }
+-EXPORT_SYMBOL(pci_enable_msi_range);
++EXPORT_SYMBOL(pci_enable_msi);
+ 
+ static int __pci_enable_msix_range(struct pci_dev *dev,
+ 				   struct msix_entry *entries, int minvec,
+@@ -1206,9 +1198,11 @@ int pci_alloc_irq_vectors_affinity(struc
+ 	}
+ 
+ 	/* use legacy irq if allowed */
+-	if ((flags & PCI_IRQ_LEGACY) && min_vecs == 1) {
+-		pci_intx(dev, 1);
+-		return 1;
++	if (flags & PCI_IRQ_LEGACY) {
++		if (min_vecs == 1 && dev->irq) {
++			pci_intx(dev, 1);
++			return 1;
++		}
+ 	}
+ 
+ 	return vecs;
+@@ -1290,3 +1284,19 @@ const struct cpumask *pci_irq_get_affini
+ 	}
+ }
+ EXPORT_SYMBOL(pci_irq_get_affinity);
++
++/**
++ * pci_irq_get_node - return the numa node of a particular msi vector
++ * @pdev:	PCI device to operate on
++ * @vec:	device-relative interrupt vector index (0-based).
++ */
++int pci_irq_get_node(struct pci_dev *pdev, int vec)
++{
++	const struct cpumask *mask;
++
++	mask = pci_irq_get_affinity(pdev, vec);
++	if (mask)
++		return local_memory_node(cpu_to_node(cpumask_first(mask)));
++	return dev_to_node(&pdev->dev);
++}
++EXPORT_SYMBOL(pci_irq_get_node);
+--- a/drivers/xen/balloon/balloon.c
++++ b/drivers/xen/balloon/balloon.c
+@@ -426,14 +426,9 @@ void balloon_set_new_target(unsigned lon
+ 	schedule_work(&balloon_worker);
+ }
+ 
+-static struct xenbus_watch target_watch =
+-{
+-	.node = "memory/target"
+-};
+-
+ /* React to a change in the target key */
+ static void watch_target(struct xenbus_watch *watch,
+-			 const char **vec, unsigned int len)
++			 const char *path, const char *token)
+ {
+ 	unsigned long long new_target;
+ 	int err;
+@@ -454,6 +449,11 @@ static int balloon_init_watcher(struct n
+ 				unsigned long event,
+ 				void *data)
+ {
++	static struct xenbus_watch target_watch =
++	{
++		.node = "memory/target",
++		.callback = watch_target,
++	};
+ 	int err;
+ 
+ 	err = register_xenbus_watch(&target_watch);
+@@ -588,7 +588,6 @@ static int __init balloon_init(void)
+ 	}
+ #endif
+ 
+-	target_watch.callback = watch_target;
+ 	xenstore_notifier.notifier_call = balloon_init_watcher;
+ 
+ 	register_xenstore_notifier(&xenstore_notifier);
+--- a/drivers/xen/blkback/xenbus.c
++++ b/drivers/xen/blkback/xenbus.c
+@@ -28,8 +28,7 @@
+ 
+ static void connect(struct backend_info *);
+ static int connect_ring(struct backend_info *);
+-static void backend_changed(struct xenbus_watch *, const char **,
+-			    unsigned int);
++static void backend_changed(struct xenbus_watch *, const char *, const char *);
+ 
+ static char *blkback_name(const struct xenbus_device *dev)
+ {
+@@ -314,7 +313,7 @@ fail:
+  * ready, connect.
+  */
+ static void backend_changed(struct xenbus_watch *watch,
+-			    const char **vec, unsigned int len)
++			    const char *path, const char *token)
+ {
+ 	int err;
+ 	unsigned major;
+--- a/drivers/xen/blkfront/blkfront.c
++++ b/drivers/xen/blkfront/blkfront.c
+@@ -925,7 +925,7 @@ void do_blkif_request(struct request_que
+ 
+ 		blk_start_request(req);
+ 
+-		if ((req->cmd_type != REQ_TYPE_FS) ||
++		if (blk_rq_is_passthrough(req) ||
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,8,0)
+ 		    (((req_op(req) == REQ_OP_FLUSH ? REQ_PREFLUSH : 0) |
+ 		      (req->cmd_flags & REQ_FUA)) >
+@@ -939,8 +939,8 @@ void do_blkif_request(struct request_que
+ 			continue;
+ 		}
+ 
+-		DPRINTK("do_blk_req %p: cmd %p, sec %llx, (%u/%u) [%s]\n",
+-			req, req->cmd, (long long)blk_rq_pos(req),
++		DPRINTK("do_blk_req %p: sec %llx, (%u/%u) [%s]\n",
++			req, (long long)blk_rq_pos(req),
+ 			blk_rq_cur_sectors(req), blk_rq_sectors(req),
+ 			rq_data_dir(req) ? "write" : "read");
+ 
+--- a/drivers/xen/blktap/blktap.c
++++ b/drivers/xen/blktap/blktap.c
+@@ -290,7 +290,7 @@ static struct device_type blktap_type =
+  * BLKTAP VM OPS
+  */
+ 
+-static int blktap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++static int blktap_fault(struct vm_fault *vmf)
+ {
+ 	/*
+ 	 * if the page has not been mapped in by the driver then return
+@@ -776,8 +776,7 @@ static int blktap_mmap(struct file *filp
+ 	return 0;
+  fail:
+ 	/* Clear any active mappings. */
+-	zap_page_range(vma, vma->vm_start, 
+-		       vma->vm_end - vma->vm_start, NULL);
++	zap_page_range(vma, vma->vm_start, vma->vm_end - vma->vm_start);
+ 	info->rings_vstart = 0;
+ 	info->rings_total = 0;
+ 
+@@ -1058,7 +1057,7 @@ static void blktap_zap_page_range(struct
+ 		unsigned long s = max(uvaddr, vma->vm_start);
+ 		unsigned long e = min(end, vma->vm_end);
+ 
+-		zap_page_range(vma, s, e - s, NULL);
++		zap_page_range(vma, s, e - s);
+ 
+ 		uvaddr = e;
+ 		vma = vma->vm_next;
+--- a/drivers/xen/blktap/xenbus.c
++++ b/drivers/xen/blktap/xenbus.c
+@@ -54,8 +54,8 @@ static int connect_ring(struct backend_i
+ static int blktap_remove(struct xenbus_device *dev);
+ static int blktap_probe(struct xenbus_device *dev,
+ 			 const struct xenbus_device_id *id);
+-static void tap_backend_changed(struct xenbus_watch *, const char **,
+-			    unsigned int);
++static void tap_backend_changed(struct xenbus_watch *, const char *,
++				const char *);
+ static void tap_frontend_changed(struct xenbus_device *dev,
+ 			     enum xenbus_state frontend_state);
+ 
+@@ -294,7 +294,7 @@ fail:
+  * information in xenstore. 
+  */
+ static void tap_backend_changed(struct xenbus_watch *watch,
+-			    const char **vec, unsigned int len)
++				const char *path, const char *token)
+ {
+ 	int err;
+ 	unsigned long info;
+--- a/drivers/xen/blktap2/device.c
++++ b/drivers/xen/blktap2/device.c
+@@ -206,7 +206,7 @@ blktap_device_fast_flush(struct blktap *
+ 	if (xen_feature(XENFEAT_auto_translated_physmap))
+ 		zap_page_range(ring->vma, 
+ 			       MMAP_VADDR(ring->user_vstart, usr_idx, 0),
+-			       request->nr_pages << PAGE_SHIFT, NULL);
++			       request->nr_pages << PAGE_SHIFT);
+ 
+ 	for (i = 0; i < request->nr_pages; i++) {
+ 		kvaddr = request_to_kaddr(request, i);
+@@ -272,7 +272,7 @@ blktap_device_fast_flush(struct blktap *
+ 	if (!xen_feature(XENFEAT_auto_translated_physmap))
+ 		zap_page_range(ring->vma, 
+ 			       MMAP_VADDR(ring->user_vstart, usr_idx, 0), 
+-			       request->nr_pages << PAGE_SHIFT, NULL);
++			       request->nr_pages << PAGE_SHIFT);
+ 	else {
+ 		for (i = 0; i < self_gref_nr; i++) {
+ 			gnttab_end_foreign_access_ref(self_gref[i]);
+@@ -814,7 +814,7 @@ blktap_device_run_queue(struct blktap *t
+ 	BTDBG("running queue for %d\n", tap->minor);
+ 
+ 	while ((req = blk_peek_request(rq)) != NULL) {
+-		if (req->cmd_type != REQ_TYPE_FS) {
++		if (blk_rq_is_passthrough(req)) {
+ 			blk_start_request(req);
+ 			req->errors = (DID_ERROR << 16) |
+ 				      (DRIVER_INVALID << 24);
+@@ -851,8 +851,8 @@ blktap_device_run_queue(struct blktap *t
+ 			goto wait;
+ 		}
+ 
+-		BTDBG("req %p: dev %d cmd %p, sec %#llx, (%#x/%#x) [%s], pending: %p\n",
+-		      req, tap->minor, req->cmd,
++		BTDBG("req %p: dev %d, sec %#llx, (%#x/%#x) [%s], pending: %p\n",
++		      req, tap->minor,
+ 		      (unsigned long long)blk_rq_pos(req),
+ 		      blk_rq_cur_sectors(req), blk_rq_sectors(req),
+ 		      rq_data_dir(req) ? "write" : "read", request);
+@@ -907,7 +907,7 @@ blktap_device_do_request(struct request_
+ 
+ fail:
+ 	while ((req = blk_fetch_request(rq))) {
+-		if (req->cmd_type != REQ_TYPE_FS) {
++		if (blk_rq_is_passthrough(req)) {
+ 			unsigned long long sec = blk_rq_pos(req);
+ 
+ 			BTERR("device closed: failing secs %#Lx-%#Lx\n",
+--- a/drivers/xen/blktap2/ring.c
++++ b/drivers/xen/blktap2/ring.c
+@@ -79,7 +79,7 @@ blktap_read_ring(struct blktap *tap)
+ }
+ 
+ static int
+-blktap_ring_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++blktap_ring_fault(struct vm_fault *vmf)
+ {
+ 	/*
+ 	 * if the page has not been mapped in by the driver then return
+@@ -192,7 +192,7 @@ blktap_ring_vm_close(struct vm_area_stru
+ 
+ 	down_write(&tap->tap_sem);
+ 
+-	zap_page_range(vma, vma->vm_start, vma->vm_end - vma->vm_start, NULL);
++	zap_page_range(vma, vma->vm_start, vma->vm_end - vma->vm_start);
+ 
+ 	kfree(ring->foreign_map.map);
+ 	ring->foreign_map.map = NULL;
+@@ -352,8 +352,7 @@ blktap_ring_mmap(struct file *filp, stru
+ 
+  fail:
+ 	/* Clear any active mappings. */
+-	zap_page_range(vma, vma->vm_start, 
+-		       vma->vm_end - vma->vm_start, NULL);
++	zap_page_range(vma, vma->vm_start, vma->vm_end - vma->vm_start);
+ 	ClearPageReserved(virt_to_page(sring));
+  fail_mem:
+ 	free_page((unsigned long)sring);
+--- a/drivers/xen/blktap2-new/device.c
++++ b/drivers/xen/blktap2-new/device.c
+@@ -239,7 +239,7 @@ blktap_device_run_queue(struct blktap *t
+ 		if (!rq)
+ 			break;
+ 
+-		if (rq->cmd_type != REQ_TYPE_FS) {
++		if (blk_rq_is_passthrough(rq)) {
+ 			rq->errors = (DID_ERROR << 16) |
+ 				     (DRIVER_INVALID << 24);
+ 			__blktap_end_queued_rq(rq, -EOPNOTSUPP);
+--- a/drivers/xen/blktap2-new/ring.c
++++ b/drivers/xen/blktap2-new/ring.c
+@@ -88,7 +88,7 @@ blktap_read_ring(struct blktap *tap)
+ 	up_read(&current->mm->mmap_sem);
+ }
+ 
+-static int blktap_ring_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++static int blktap_ring_fault(struct vm_fault *vmf)
+ {
+ 	return VM_FAULT_SIGBUS;
+ }
+@@ -118,7 +118,7 @@ blktap_ring_vm_close(struct vm_area_stru
+ 
+ 	blktap_ring_fail_pending(tap);
+ 
+-	zap_page_range(vma, vma->vm_start, PAGE_SIZE, NULL);
++	zap_page_range(vma, vma->vm_start, PAGE_SIZE);
+ 	ClearPageReserved(page);
+ 	__free_page(page);
+ 
+@@ -186,7 +186,7 @@ blktap_ring_unmap_request(struct blktap
+ 		for (seg = 0; seg < request->nr_pages; seg++)
+ 			blktap_request_bounce(tap, request, seg, !read);
+ 
+-	zap_page_range(ring->vma, uaddr, size, NULL);
++	zap_page_range(ring->vma, uaddr, size);
+ }
+ 
+ void
+@@ -360,7 +360,7 @@ blktap_ring_mmap(struct file *filp, stru
+ 
+ fail:
+ 	if (page) {
+-		zap_page_range(vma, vma->vm_start, PAGE_SIZE, NULL);
++		zap_page_range(vma, vma->vm_start, PAGE_SIZE);
+ 		ClearPageReserved(page);
+ 		__free_page(page);
+ 	}
+--- a/drivers/xen/char/mem.c
++++ b/drivers/xen/char/mem.c
+@@ -35,6 +35,14 @@ static inline int uncached_access(struct
+ 	return 0;
+ }
+ 
++static inline int page_is_allowed(unsigned long pfn)
++{
++#ifdef CONFIG_STRICT_DEVMEM
++	return devmem_is_allowed(pfn);
++#else
++	return 1;
++#endif
++}
+ static inline int range_is_allowed(unsigned long pfn, unsigned long size)
+ {
+ #ifdef CONFIG_STRICT_DEVMEM
+@@ -68,14 +76,19 @@ static ssize_t read_mem(struct file *fil
+ 
+ 	while (count > 0) {
+ 		unsigned long remaining;
++		int allowed;
+ 
+ 		sz = size_inside_page(p, count);
+ 
+-		if (!range_is_allowed(p >> PAGE_SHIFT, count))
++		allowed = page_is_allowed(p >> PAGE_SHIFT);
++		if (!allowed)
+ 			return -EPERM;
+ 
+-		v = ioremap(p, sz);
+-		if (IS_ERR_OR_NULL(v)) {
++		if (allowed == 2) {
++			/* Show zeros for restricted memory. */
++			remaining = clear_user(buf, sz);
++		} else {
++			v = ioremap(p, sz);
+ 			/*
+ 			 * Some programs (e.g., dmidecode) groove off into
+ 			 * weird RAM areas where no tables can possibly exist
+@@ -84,14 +97,17 @@ static ssize_t read_mem(struct file *fil
+ 			 * Xen failed their access, so we fake out a read of
+ 			 * all zeroes.
+ 			 */
+-			if (clear_user(buf, count))
+-				return -EFAULT;
+-			read += count;
+-			break;
++			if (IS_ERR_OR_NULL(v)) {
++				if (clear_user(buf, count))
++					return -EFAULT;
++				read += count;
++				break;
++			}
++
++			remaining = copy_to_user(buf, v, sz);
++			iounmap(v);
+ 		}
+ 
+-		remaining = copy_to_user(buf, v, sz);
+-		iounmap(v);
+ 		if (remaining)
+ 			return -EFAULT;
+ 
+@@ -116,27 +132,33 @@ static ssize_t write_mem(struct file *fi
+ 		return -EFBIG;
+ 
+ 	while (count > 0) {
++		int allowed;
++
+ 		sz = size_inside_page(p, count);
+ 
+-		if (!range_is_allowed(p >> PAGE_SHIFT, sz))
++		allowed = page_is_allowed(p >> PAGE_SHIFT);
++		if (!allowed)
+ 			return -EPERM;
+ 
+-		v = ioremap(p, sz);
+-		if (v == NULL)
+-			break;
+-		if (IS_ERR(v)) {
+-			if (written == 0)
+-				return PTR_ERR(v);
+-			break;
+-		}
+-
+-		ignored = copy_from_user(v, buf, sz);
+-		iounmap(v);
+-		if (ignored) {
+-			written += sz - ignored;
+-			if (written)
++		/* Skip actual writing when a page is marked as restricted. */
++		if (allowed == 1) {
++			v = ioremap(p, sz);
++			if (v == NULL)
+ 				break;
+-			return -EFAULT;
++			if (IS_ERR(v)) {
++				if (written == 0)
++					return PTR_ERR(v);
++				break;
++			}
++
++			ignored = copy_from_user(v, buf, sz);
++			iounmap(v);
++			if (ignored) {
++				written += sz - ignored;
++				if (written)
++					break;
++				return -EFAULT;
++			}
+ 		}
+ 		buf += sz;
+ 		p += sz;
+--- a/drivers/xen/console/console.c
++++ b/drivers/xen/console/console.c
+@@ -32,7 +32,7 @@
+ 
+ #include <linux/errno.h>
+ #include <linux/signal.h>
+-#include <linux/sched.h>
++#include <linux/sched/signal.h>
+ #include <linux/interrupt.h>
+ #include <linux/tty.h>
+ #include <linux/tty_flip.h>
+--- a/drivers/xen/core/cpu_hotplug.c
++++ b/drivers/xen/core/cpu_hotplug.c
+@@ -55,13 +55,12 @@ static void vcpu_hotplug(unsigned int cp
+ }
+ 
+ static void handle_vcpu_hotplug_event(
+-	struct xenbus_watch *watch, const char **vec, unsigned int len)
++	struct xenbus_watch *watch, const char *path, const char *token)
+ {
+ 	unsigned int cpu;
+ 	char *cpustr;
+-	const char *node = vec[XS_WATCH_PATH];
+ 
+-	if ((cpustr = strstr(node, "cpu/")) != NULL) {
++	if ((cpustr = strstr(path, "cpu/")) != NULL) {
+ 		sscanf(cpustr, "cpu/%u", &cpu);
+ 		vcpu_hotplug(cpu, get_cpu_device(cpu));
+ 	}
+--- a/drivers/xen/core/reboot.c
++++ b/drivers/xen/core/reboot.c
+@@ -161,7 +161,7 @@ static void __shutdown_handler(struct wo
+ }
+ 
+ static void shutdown_handler(struct xenbus_watch *watch,
+-			     const char **vec, unsigned int len)
++			     const char *path, const char *token)
+ {
+ 	extern void ctrl_alt_del(void);
+ 	char *str;
+@@ -210,8 +210,8 @@ static void shutdown_handler(struct xenb
+ 	kfree(str);
+ }
+ 
+-static void sysrq_handler(struct xenbus_watch *watch, const char **vec,
+-			  unsigned int len)
++static void sysrq_handler(struct xenbus_watch *watch,
++			  const char *path, const char *token)
+ {
+ 	char sysrq_key = '\0';
+ 	struct xenbus_transaction xbt;
+--- a/drivers/xen/core/smpboot.c
++++ b/drivers/xen/core/smpboot.c
+@@ -8,7 +8,9 @@
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+-#include <linux/sched.h>
++#include <linux/nmi.h>
++#include <linux/sched/hotplug.h>
++#include <linux/sched/task_stack.h>
+ #include <linux/kernel_stat.h>
+ #include <linux/irq.h>
+ #include <linux/notifier.h>
+--- a/drivers/xen/fbfront/xenfb.c
++++ b/drivers/xen/fbfront/xenfb.c
+@@ -235,7 +235,7 @@ static void xenfb_update_screen(struct x
+ 		if (!map->faults)
+ 			continue;
+ 		zap_page_range(map->vma, map->vma->vm_start,
+-			       map->vma->vm_end - map->vma->vm_start, NULL);
++			       map->vma->vm_end - map->vma->vm_start);
+ 		map->faults = 0;
+ 	}
+ 
+@@ -389,11 +389,11 @@ static void xenfb_vm_close(struct vm_are
+ 	mutex_unlock(&info->mm_lock);
+ }
+ 
+-static int xenfb_vm_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++static int xenfb_vm_fault(struct vm_fault *vmf)
+ {
+-	struct xenfb_mapping *map = vma->vm_private_data;
++	struct xenfb_mapping *map = vmf->vma->vm_private_data;
+ 	struct xenfb_info *info = map->info;
+-	int pgnr = PFN_DOWN(vmf->address - vma->vm_start);
++	int pgnr = PFN_DOWN(vmf->address - vmf->vma->vm_start);
+ 	unsigned long flags;
+ 	struct page *page;
+ 	int y1, y2;
+--- a/drivers/xen/netback/xenbus.c
++++ b/drivers/xen/netback/xenbus.c
+@@ -364,8 +364,7 @@ static void unregister_hotplug_status_wa
+ }
+ 
+ static void hotplug_status_changed(struct xenbus_watch *watch,
+-				   const char **vec,
+-				   unsigned int vec_size)
++				   const char *path, const char *token)
+ {
+ 	struct backend_info *be = container_of(watch,
+ 					       struct backend_info,
+--- a/drivers/xen/netfront/accel.c
++++ b/drivers/xen/netfront/accel.c
+@@ -151,7 +151,7 @@ static void accel_watch_work(void *conte
+ 
+ 
+ static void accel_watch_changed(struct xenbus_watch *watch,
+-				const char **vec, unsigned int len)
++				const char *path, const char *token)
+ {
+ 	struct netfront_accel_vif_state *vif_state = 
+ 		container_of(watch, struct netfront_accel_vif_state,
+--- a/drivers/xen/netfront/netfront.c
++++ b/drivers/xen/netfront/netfront.c
+@@ -1751,8 +1751,8 @@ static int xennet_change_mtu(struct net_
+ 	return 0;
+ }
+ 
+-static struct rtnl_link_stats64 *xennet_get_stats64(struct net_device *dev,
+-						    struct rtnl_link_stats64 *tot)
++static void xennet_get_stats64(struct net_device *dev,
++			       struct rtnl_link_stats64 *tot)
+ {
+ 	struct netfront_info *np = netdev_priv(dev);
+ 	int cpu;
+@@ -1787,8 +1787,6 @@ static struct rtnl_link_stats64 *xennet_
+ 
+ 	tot->rx_errors  = dev->stats.rx_errors;
+ 	tot->tx_dropped = dev->stats.tx_dropped;
+-
+-	return tot;
+ }
+ 
+ static const struct xennet_stat {
+--- a/drivers/xen/privcmd/privcmd.c
++++ b/drivers/xen/privcmd/privcmd.c
+@@ -432,7 +432,7 @@ static long privcmd_ioctl(struct file *f
+ }
+ 
+ #ifndef HAVE_ARCH_PRIVCMD_MMAP
+-static int privcmd_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
++static int privcmd_fault(struct vm_fault *vmf)
+ {
+ 	return VM_FAULT_SIGBUS;
+ }
+--- a/drivers/xen/scsiback/scsiback.c
++++ b/drivers/xen/scsiback/scsiback.c
+@@ -213,7 +213,7 @@ static void scsiback_cmd_done(struct req
+ 	unsigned int resid;
+ 	int errors;
+ 
+-	sense_buffer = req->sense;
++	sense_buffer = scsi_req(req)->sense;
+ 	resid        = blk_rq_bytes(req);
+ 	errors       = req->errors;
+ 
+@@ -444,13 +444,13 @@ int scsiback_cmd_exec(pending_req_t *pen
+ 		return err;
+ 	}
+ 
+-	rq->cmd_type = REQ_TYPE_BLOCK_PC;
+-	rq->cmd_len = cmd_len;
+-	memcpy(rq->cmd, pending_req->cmnd, cmd_len);
++	scsi_req_init(rq);
++	scsi_req(rq)->cmd_len = cmd_len;
++	memcpy(scsi_req(rq)->cmd, pending_req->cmnd, cmd_len);
+ 
+ 	memset(pending_req->sense_buffer, 0, VSCSIIF_SENSE_BUFFERSIZE);
+-	rq->sense       = pending_req->sense_buffer;
+-	rq->sense_len = 0;
++	scsi_req(rq)->sense = pending_req->sense_buffer;
++	scsi_req(rq)->sense_len = 0;
+ 
+ 	/* not allowed to retry in backend.                   */
+ 	rq->retries   = 0;
+--- a/drivers/xen/sfc_netback/accel_xenbus.c
++++ b/drivers/xen/sfc_netback/accel_xenbus.c
+@@ -121,7 +121,7 @@ void cfg_hw_quotas(struct xenbus_device
+ 
+ 
+ static void bend_config_accel_change(struct xenbus_watch *watch,
+-				     const char **vec, unsigned int len)
++				     const char *path, const char *token)
+ {
+ 	struct netback_accel *bend;
+ 
+@@ -538,7 +538,7 @@ static void netback_accel_frontend_chang
+ 
+ /* accelstate on the frontend's xenbus node has changed */
+ static void bend_domu_accel_change(struct xenbus_watch *watch,
+-				   const char **vec, unsigned int len)
++				   const char *path, const char *token)
+ {
+ 	int state;
+ 	struct netback_accel *bend;
+--- a/drivers/xen/sfc_netfront/accel_xenbus.c
++++ b/drivers/xen/sfc_netfront/accel_xenbus.c
+@@ -46,7 +46,7 @@ void netfront_accel_set_closing(netfront
+ 	
+ 
+ static void mac_address_change(struct xenbus_watch *watch,
+-			       const char **vec, unsigned int len)
++			       const char *path, const char *token)
+ {
+ 	netfront_accel_vnic *vnic;
+ 	struct xenbus_device *dev;
+@@ -640,7 +640,7 @@ static void netfront_accel_backend_accel
+ 
+ 
+ static void backend_accel_state_change(struct xenbus_watch *watch,
+-				       const char **vec, unsigned int len)
++				       const char *path, const char *token)
+ {
+ 	int state;
+ 	netfront_accel_vnic *vnic;
+--- a/drivers/xen/sys-hypervisor.c
++++ b/drivers/xen/sys-hypervisor.c
+@@ -28,7 +28,7 @@
+ #include <xen/interface/xenpmu.h>
+ #endif
+ 
+-#include "xenbus/xenbus_comms.h"
++#include "xenbus/xenbus.h"
+ 
+ #define HYPERVISOR_ATTR_RO(_name) \
+ static struct hyp_sysfs_attr  _name##_attr = __ATTR_RO(_name)
+--- a/drivers/xen/tpmback/xenbus.c
++++ b/drivers/xen/tpmback/xenbus.c
+@@ -24,7 +24,7 @@ static void maybe_connect(struct backend
+ static void connect(struct backend_info *be);
+ static int connect_ring(struct backend_info *be);
+ static void backend_changed(struct xenbus_watch *watch,
+-			    const char **vec, unsigned int len);
++			    const char *path, const char *token);
+ static void frontend_changed(struct xenbus_device *dev,
+ 			     enum xenbus_state frontend_state);
+ 
+@@ -94,7 +94,7 @@ fail:
+ 
+ 
+ static void backend_changed(struct xenbus_watch *watch,
+-			    const char **vec, unsigned int len)
++			    const char *path, const char *token)
+ {
+ 	int err;
+ 	long instance;
+--- a/drivers/xen/usbback/xenbus.c
++++ b/drivers/xen/usbback/xenbus.c
+@@ -62,7 +62,7 @@ static int start_xenusbd(usbif_t *usbif)
+ }
+ 
+ static void backend_changed(struct xenbus_watch *watch,
+-			const char **vec, unsigned int len)
++			    const char *path, const char *token)
+ {
+ 	struct xenbus_transaction xbt;
+ 	int err;
+--- a/drivers/xen/xen-pciback/pciback_ops.c
++++ b/drivers/xen/xen-pciback/pciback_ops.c
+@@ -170,7 +170,7 @@ int xen_pcibk_enable_msi(struct xen_pcib
+ 	else if (dev->msix_enabled)
+ 		status = -ENXIO;
+ 	else
+-		status = pci_enable_msi_range(dev, 1, nvec);
++		status = pci_alloc_irq_vectors(dev, 1, nvec, PCI_IRQ_MSI);
+ 
+ 	if (status < 0 || status > nvec) {
+ 		pr_warn_ratelimited("%s: error %d enabling %u-vector MSI for Dom%u\n",
+--- a/drivers/xen/xenbus/xenbus.h
++++ b/drivers/xen/xenbus/xenbus.h
+@@ -36,7 +36,11 @@
+ #include <linux/uio.h>
+ #include <xen/xenbus.h>
+ 
++#ifndef BUS_ID_SIZE
+ #define XEN_BUS_ID_SIZE			20
++#else
++#define XEN_BUS_ID_SIZE			BUS_ID_SIZE
++#endif
+ 
+ #ifdef CONFIG_PARAVIRT_XEN
+ #define is_running_on_xen() xen_domain()
+@@ -47,6 +51,7 @@
+ 
+ struct xen_bus_type {
+ 	char *root;
++	int error;
+ 	unsigned int levels;
+ 	int (*get_bus_id)(char bus_id[XEN_BUS_ID_SIZE], const char *nodename);
+ 	int (*probe)(struct xen_bus_type *bus, const char *type,
+@@ -60,12 +65,22 @@ struct xen_bus_type {
+ 	struct bus_type bus;
+ };
+ 
++#if !defined(CONFIG_XEN) && !defined(MODULE)
+ enum xenstore_init {
+ 	XS_UNKNOWN,
+ 	XS_PV,
+ 	XS_HVM,
+ 	XS_LOCAL,
+ };
++#endif
++
++enum {
++	XENBUS_XSD_UNCOMMITTED = 0,
++	XENBUS_XSD_FOREIGN_INIT,
++	XENBUS_XSD_FOREIGN_READY,
++	XENBUS_XSD_LOCAL_INIT,
++	XENBUS_XSD_LOCAL_READY,
++};
+ 
+ struct xs_watch_event {
+ 	struct list_head list;
+@@ -98,6 +113,7 @@ struct xb_req_data {
+ };
+ 
+ extern enum xenstore_init xen_store_domain_type;
++extern atomic_t xenbus_xsd_state;
+ extern const struct attribute_group *xenbus_dev_groups[];
+ extern struct mutex xs_response_mutex;
+ extern struct list_head xs_reply_list;
+@@ -147,4 +163,31 @@ void xenbus_ring_ops_init(void);
+ int xenbus_dev_request_and_reply(struct xsd_sockmsg *msg, void *par);
+ void xenbus_dev_queue_reply(struct xb_req_data *req);
+ 
++static inline int is_xenstored_ready(void)
++{
++	int s = atomic_read(&xenbus_xsd_state);
++	return s == XENBUS_XSD_FOREIGN_READY || s == XENBUS_XSD_LOCAL_READY;
++}
++
++#if defined(CONFIG_XEN_XENBUS_DEV) && defined(CONFIG_XEN_PRIVILEGED_GUEST)
++#include <xen/interface/event_channel.h>
++#include <xen/interface/grant_table.h>
++
++int xenbus_conn(domid_t, grant_ref_t *, evtchn_port_t *);
++#endif
++
++#if IS_ENABLED(CONFIG_XEN_BACKEND)
++extern void xenbus_backend_suspend(int (*fn)(struct device *, void *));
++extern void xenbus_backend_resume(int (*fn)(struct device *, void *));
++extern void xenbus_backend_probe_and_watch(void);
++extern void xenbus_backend_bus_register(void);
++extern void xenbus_backend_device_register(void);
++#else
++static inline void xenbus_backend_suspend(int (*fn)(struct device *, void *)) {}
++static inline void xenbus_backend_resume(int (*fn)(struct device *, void *)) {}
++static inline void xenbus_backend_probe_and_watch(void) {}
++static inline void xenbus_backend_bus_register(void) {}
++static inline void xenbus_backend_device_register(void) {}
++#endif
++
+ #endif
+--- a/drivers/xen/xenbus/xenbus_client.c
++++ b/drivers/xen/xenbus/xenbus_client.c
+@@ -53,7 +53,7 @@
+ #include <xen/features.h>
+ 
+ #if defined(CONFIG_PARAVIRT_XEN)
+-#include "xenbus_probe.h"
++#include "xenbus.h"
+ 
+ #define XENBUS_PAGES(_grants)	(DIV_ROUND_UP(_grants, XEN_PFN_PER_PAGE))
+ 
+@@ -124,7 +124,7 @@ EXPORT_SYMBOL_GPL(xenbus_strstate);
+ int xenbus_watch_path(struct xenbus_device *dev, const char *path,
+ 		      struct xenbus_watch *watch,
+ 		      void (*callback)(struct xenbus_watch *,
+-				       const char **, unsigned int))
++				       const char *, const char *))
+ {
+ 	int err;
+ 
+@@ -148,7 +148,7 @@ EXPORT_SYMBOL_GPL(xenbus_watch_path);
+ int xenbus_watch_path2(struct xenbus_device *dev, const char *path,
+ 		       const char *path2, struct xenbus_watch *watch,
+ 		       void (*callback)(struct xenbus_watch *,
+-					const char **, unsigned int))
++					const char *, const char *))
+ {
+ 	int err;
+ 	char *state = kasprintf(GFP_NOIO | __GFP_HIGH, "%s/%s", path, path2);
+@@ -182,7 +182,7 @@ EXPORT_SYMBOL_GPL(xenbus_watch_path2);
+ int xenbus_watch_pathfmt(struct xenbus_device *dev,
+ 			 struct xenbus_watch *watch,
+ 			 void (*callback)(struct xenbus_watch *,
+-					const char **, unsigned int),
++					  const char *, const char *),
+ 			 const char *pathfmt, ...)
+ {
+ 	int err;
+@@ -288,16 +288,6 @@ int xenbus_frontend_closed(struct xenbus
+ }
+ EXPORT_SYMBOL_GPL(xenbus_frontend_closed);
+ 
+-/**
+- * Return the path to the error node for the given device, or NULL on failure.
+- * If the value returned is non-NULL, then it is the caller's to kfree.
+- */
+-static char *error_path(struct xenbus_device *dev)
+-{
+-	return kasprintf(GFP_KERNEL, "error/%s", dev->nodename);
+-}
+-
+-
+ static void _dev_error(struct xenbus_device *dev, int err,
+ 			const char *fmt, va_list *ap)
+ {
+@@ -308,7 +298,7 @@ static void _dev_error(struct xenbus_dev
+ 	if (printf_buffer)
+ 		dev_err(&dev->dev, "%s\n", printf_buffer);
+ 
+-	path_buffer = error_path(dev);
++	path_buffer = kasprintf(GFP_KERNEL, "error/%s", dev->nodename);
+ 	if (!printf_buffer || !path_buffer
+ 	    || xenbus_write(XBT_NIL, path_buffer, "error", printf_buffer))
+ 		dev_err(&dev->dev,
+@@ -319,7 +309,6 @@ static void _dev_error(struct xenbus_dev
+ 	kfree(path_buffer);
+ }
+ 
+-
+ /**
+  * xenbus_dev_error
+  * @dev: xenbus device
+--- a/drivers/xen/xenbus/xenbus_comms.c
++++ b/drivers/xen/xenbus/xenbus_comms.c
+@@ -34,6 +34,7 @@
+ 
+ #include <linux/wait.h>
+ #include <linux/interrupt.h>
++#include <linux/kthread.h>
+ #include <linux/sched.h>
+ #include <linux/err.h>
+ #include <xen/xenbus.h>
+@@ -46,17 +47,28 @@
+ #include <xen/page.h>
+ #endif
+ 
+-#include "xenbus_comms.h"
++#include "xenbus.h"
+ 
+ #ifdef HAVE_XEN_PLATFORM_COMPAT_H
+ #include <xen/platform-compat.h>
+ #endif
+ 
++/* A list of replies. Currently only one will ever be outstanding. */
++LIST_HEAD(xs_reply_list);
++
++/* A list of write requests. */
++LIST_HEAD(xb_write_list);
++DECLARE_WAIT_QUEUE_HEAD(xb_waitq);
++DEFINE_MUTEX(xb_write_mutex);
++
++/* Protect xenbus reader thread against save/restore. */
++DEFINE_MUTEX(xs_response_mutex);
++
+ static int xenbus_irq;
++static struct task_struct *xenbus_task;
+ 
+ static DECLARE_WORK(probe_work, xenbus_probe);
+ 
+-static DECLARE_WAIT_QUEUE_HEAD(xb_waitq);
+ 
+ static irqreturn_t wake_waiting(int irq, void *unused)
+ {
+@@ -116,30 +128,31 @@ static const void *get_input_chunk(XENST
+ 	return buf + MASK_XENSTORE_IDX(cons);
+ }
+ 
++static int xb_data_to_write(void)
++{
++	struct xenstore_domain_interface *intf = xen_store_interface;
++
++	return (intf->req_prod - intf->req_cons) != XENSTORE_RING_SIZE &&
++		!list_empty(&xb_write_list);
++}
++
+ /**
+  * xb_write - low level write
+  * @data: buffer to send
+  * @len: length of buffer
+  *
+- * Returns 0 on success, error otherwise.
++ * Returns number of bytes written or -err.
+  */
+-int xb_write(const void *data, unsigned len)
++static int xb_write(const void *data, unsigned int len)
+ {
+ 	struct xenstore_domain_interface *intf = xen_store_interface;
+ 	XENSTORE_RING_IDX cons, prod;
+-	int rc;
++	unsigned int bytes = 0;
+ 
+ 	while (len != 0) {
+ 		void *dst;
+ 		unsigned int avail;
+ 
+-		rc = wait_event_interruptible(
+-			xb_waitq,
+-			(intf->req_prod - intf->req_cons) !=
+-			XENSTORE_RING_SIZE);
+-		if (rc < 0)
+-			return rc;
+-
+ 		/* Read indexes, then verify. */
+ 		cons = intf->req_cons;
+ 		prod = intf->req_prod;
+@@ -147,6 +160,11 @@ int xb_write(const void *data, unsigned
+ 			intf->req_cons = intf->req_prod = 0;
+ 			return -EIO;
+ 		}
++		if (!xb_data_to_write())
++			return bytes;
++
++		/* Must write data /after/ reading the consumer index. */
++		virt_mb();
+ 
+ 		dst = get_output_chunk(cons, prod, intf->req, &avail);
+ 		if (avail == 0)
+@@ -154,52 +172,45 @@ int xb_write(const void *data, unsigned
+ 		if (avail > len)
+ 			avail = len;
+ 
+-		/* Must write data /after/ reading the consumer index. */
+-		virt_mb();
+-
+ 		memcpy(dst, data, avail);
+ 		data += avail;
+ 		len -= avail;
++		bytes += avail;
+ 
+ 		/* Other side must not see new producer until data is there. */
+ 		virt_wmb();
+ 		intf->req_prod += avail;
+ 
+ 		/* Implies mb(): other side will see the updated producer. */
+-		notify_remote_via_evtchn(xen_store_evtchn);
++		if (prod <= intf->req_cons)
++			notify_remote_via_evtchn(xen_store_evtchn);
+ 	}
+ 
+-	return 0;
++	return bytes;
+ }
+ 
+-int xb_data_to_read(void)
++static int xb_data_to_read(void)
+ {
+ 	struct xenstore_domain_interface *intf = xen_store_interface;
+ 	return (intf->rsp_cons != intf->rsp_prod);
+ }
+ 
+-int xb_wait_for_data_to_read(void)
+-{
+-	return wait_event_interruptible(xb_waitq, xb_data_to_read());
+-}
+-
+-int xb_read(void *data, unsigned len)
++static int xb_read(void *data, unsigned int len)
+ {
+ 	struct xenstore_domain_interface *intf = xen_store_interface;
+ 	XENSTORE_RING_IDX cons, prod;
+-	int rc;
++	unsigned int bytes = 0;
+ 
+ 	while (len != 0) {
+ 		unsigned int avail;
+ 		const char *src;
+ 
+-		rc = xb_wait_for_data_to_read();
+-		if (rc < 0)
+-			return rc;
+-
+ 		/* Read indexes, then verify. */
+ 		cons = intf->rsp_cons;
+ 		prod = intf->rsp_prod;
++		if (cons == prod)
++			return bytes;
++
+ 		if (!check_indexes(cons, prod)) {
+ 			intf->rsp_cons = intf->rsp_prod = 0;
+ 			return -EIO;
+@@ -217,17 +228,244 @@ int xb_read(void *data, unsigned len)
+ 		memcpy(data, src, avail);
+ 		data += avail;
+ 		len -= avail;
++		bytes += avail;
+ 
+ 		/* Other side must not see free space until we've copied out */
+ 		virt_mb();
+ 		intf->rsp_cons += avail;
+ 
+-		pr_debug("Finished read of %i bytes (%i to go)\n", avail, len);
+-
+ 		/* Implies mb(): other side will see the updated consumer. */
+-		notify_remote_via_evtchn(xen_store_evtchn);
++		if (intf->rsp_prod - cons >= XENSTORE_RING_SIZE)
++			notify_remote_via_evtchn(xen_store_evtchn);
++	}
++
++	return bytes;
++}
++
++static int process_msg(void)
++{
++	static struct {
++		struct xsd_sockmsg msg;
++		char *body;
++		union {
++			void *alloc;
++			struct xs_watch_event *watch;
++		};
++		bool in_msg;
++		bool in_hdr;
++		unsigned int read;
++	} state;
++	struct xb_req_data *req;
++	int err;
++	unsigned int len;
++
++	if (!state.in_msg) {
++		state.in_msg = true;
++		state.in_hdr = true;
++		state.read = 0;
++
++		/*
++		 * We must disallow save/restore while reading a message.
++		 * A partial read across s/r leaves us out of sync with
++		 * xenstored.
++		 * xs_response_mutex is locked as long as we are processing one
++		 * message. state.in_msg will be true as long as we are holding
++		 * the lock here.
++		 */
++		mutex_lock(&xs_response_mutex);
++
++		if (!xb_data_to_read()) {
++			/* We raced with save/restore: pending data 'gone'. */
++			mutex_unlock(&xs_response_mutex);
++			state.in_msg = false;
++			return 0;
++		}
+ 	}
+ 
++	if (state.in_hdr) {
++		if (state.read != sizeof(state.msg)) {
++			err = xb_read((void *)&state.msg + state.read,
++				      sizeof(state.msg) - state.read);
++			if (err < 0)
++				goto out;
++			state.read += err;
++			if (state.read != sizeof(state.msg))
++				return 0;
++			if (state.msg.len > XENSTORE_PAYLOAD_MAX) {
++				err = -EINVAL;
++				goto out;
++			}
++		}
++
++		len = state.msg.len + 1;
++		if (state.msg.type == XS_WATCH_EVENT)
++			len += sizeof(*state.watch);
++
++		state.alloc = kmalloc(len, GFP_NOIO | __GFP_HIGH);
++		if (!state.alloc)
++			return -ENOMEM;
++
++		if (state.msg.type == XS_WATCH_EVENT)
++			state.body = state.watch->body;
++		else
++			state.body = state.alloc;
++		state.in_hdr = false;
++		state.read = 0;
++	}
++
++	err = xb_read(state.body + state.read, state.msg.len - state.read);
++	if (err < 0)
++		goto out;
++
++	state.read += err;
++	if (state.read != state.msg.len)
++		return 0;
++
++	state.body[state.msg.len] = '\0';
++
++	if (state.msg.type == XS_WATCH_EVENT) {
++		state.watch->len = state.msg.len;
++		err = xs_watch_msg(state.watch);
++	} else {
++		err = -ENOENT;
++		mutex_lock(&xb_write_mutex);
++		list_for_each_entry(req, &xs_reply_list, list) {
++			if (req->msg.req_id == state.msg.req_id) {
++				if (req->state == xb_req_state_wait_reply) {
++					req->msg.type = state.msg.type;
++					req->msg.len = state.msg.len;
++					req->body = state.body;
++					req->state = xb_req_state_got_reply;
++					list_del(&req->list);
++					req->cb(req);
++				} else {
++					list_del(&req->list);
++					kfree(req);
++				}
++				err = 0;
++				break;
++			}
++		}
++		mutex_unlock(&xb_write_mutex);
++		if (err)
++			goto out;
++	}
++
++	mutex_unlock(&xs_response_mutex);
++
++	state.in_msg = false;
++	state.alloc = NULL;
++	return err;
++
++ out:
++	mutex_unlock(&xs_response_mutex);
++	state.in_msg = false;
++	kfree(state.alloc);
++	state.alloc = NULL;
++	return err;
++}
++
++static int process_writes(void)
++{
++	static struct {
++		struct xb_req_data *req;
++		int idx;
++		unsigned int written;
++	} state;
++	void *base;
++	unsigned int len;
++	int err = 0;
++
++	if (!xb_data_to_write())
++		return 0;
++
++	mutex_lock(&xb_write_mutex);
++
++	if (!state.req) {
++		state.req = list_first_entry(&xb_write_list,
++					     struct xb_req_data, list);
++		state.idx = -1;
++		state.written = 0;
++	}
++
++	if (state.req->state == xb_req_state_aborted)
++		goto out_err;
++
++	while (state.idx < state.req->num_vecs) {
++		if (state.idx < 0) {
++			base = &state.req->msg;
++			len = sizeof(state.req->msg);
++		} else {
++			base = state.req->vec[state.idx].iov_base;
++			len = state.req->vec[state.idx].iov_len;
++		}
++		err = xb_write(base + state.written, len - state.written);
++		if (err < 0)
++			goto out_err;
++		state.written += err;
++		if (state.written != len)
++			goto out;
++
++		state.idx++;
++		state.written = 0;
++	}
++
++	list_del(&state.req->list);
++	state.req->state = xb_req_state_wait_reply;
++	list_add_tail(&state.req->list, &xs_reply_list);
++	state.req = NULL;
++
++ out:
++	mutex_unlock(&xb_write_mutex);
++
++	return 0;
++
++ out_err:
++	state.req->msg.type = XS_ERROR;
++	state.req->err = err;
++	list_del(&state.req->list);
++	if (state.req->state == xb_req_state_aborted)
++		kfree(state.req);
++	else {
++		state.req->state = xb_req_state_got_reply;
++		wake_up(&state.req->wq);
++	}
++
++	mutex_unlock(&xb_write_mutex);
++
++	state.req = NULL;
++
++	return err;
++}
++
++static int xb_thread_work(void)
++{
++	return xb_data_to_read() || xb_data_to_write();
++}
++
++static int xenbus_thread(void *unused)
++{
++	int err;
++
++	current->flags |= PF_NOFREEZE;
++	while (!kthread_should_stop()) {
++		if (wait_event_interruptible(xb_waitq, xb_thread_work()))
++			continue;
++
++		err = process_msg();
++		if (err == -ENOMEM)
++			schedule();
++		else if (err)
++			pr_warn_ratelimited("error %d while reading message\n",
++					    err);
++
++		err = process_writes();
++		if (err)
++			pr_warn_ratelimited("error %d while writing message\n",
++					    err);
++	}
++
++	xenbus_task = NULL;
+ 	return 0;
+ }
+ 
+@@ -264,6 +502,12 @@ int xb_init_comms(void)
+ 	}
+ 
+ 	xenbus_irq = err;
++
++	if (!xenbus_task) {
++		xenbus_task = kthread_run(xenbus_thread, NULL, "xenbus");
++		if (IS_ERR(xenbus_task))
++			return PTR_ERR(xenbus_task);
++	}
+ #else
+ 	if (xenbus_irq) {
+ 		/* Already have an irq; assume we're resuming */
+@@ -276,6 +520,13 @@ int xb_init_comms(void)
+ 			return err;
+ 		}
+ 		xenbus_irq = err;
++
++		if (!xenbus_task) {
++			xenbus_task = kthread_run(xenbus_thread, NULL,
++						  "xenbus");
++			if (IS_ERR(xenbus_task))
++				return PTR_ERR(xenbus_task);
++		}
+ 	}
+ #endif
+ 
+--- a/drivers/xen/xenbus/xenbus_dev.c
++++ b/drivers/xen/xenbus/xenbus_dev.c
+@@ -44,7 +44,7 @@
+ #include <linux/mutex.h>
+ #include <linux/uaccess.h>
+ 
+-#include "xenbus_comms.h"
++#include "xenbus.h"
+ 
+ #include <asm/hypervisor.h>
+ #include <xen/xenbus.h>
+@@ -88,6 +88,7 @@ struct xenbus_dev_data {
+ 	wait_queue_head_t read_waitq;
+ 
+ 	struct mutex reply_mutex;
++	struct kref kref;
+ };
+ 
+ static ssize_t xenbus_dev_read(struct file *filp,
+@@ -186,24 +187,17 @@ static void free_watch_adapter (struct w
+ }
+ 
+ static void watch_fired(struct xenbus_watch *watch,
+-			const char **vec,
+-			unsigned int len)
++			const char *path, const char *token)
+ {
+ 	struct watch_adapter *adap =
+             container_of(watch, struct watch_adapter, watch);
+ 	struct xsd_sockmsg hdr;
+-	const char *path, *token;
+-	int err, path_len, tok_len, body_len, data_len = 0;
++	int err, path_len, tok_len, body_len;
+ 	LIST_HEAD(queue);
+ 
+-	path = vec[XS_WATCH_PATH];
+-	token = adap->token;
+-
+ 	path_len = strlen(path) + 1;
+-	tok_len = strlen(token) + 1;
+-	if (len > 2)
+-		data_len = vec[len] - vec[2] + 1;
+-	body_len = path_len + tok_len + data_len;
++	tok_len = strlen(adap->token) + 1;
++	body_len = path_len + tok_len;
+ 
+ 	hdr.type = XS_WATCH_EVENT;
+ 	hdr.len = body_len;
+@@ -213,13 +207,104 @@ static void watch_fired(struct xenbus_wa
+ 	if (!err)
+ 		err = queue_reply(&queue, path, path_len);
+ 	if (!err)
+-		err = queue_reply(&queue, token, tok_len);
+-	if (!err && len > 2)
+-		err = queue_reply(&queue, vec[2], data_len);
++		err = queue_reply(&queue, adap->token, tok_len);
+ 	queue_flush(adap->dev_data, &queue, err);
+ 	mutex_unlock(&adap->dev_data->reply_mutex);
+ }
+ 
++static void xenbus_file_free(struct kref *kref)
++{
++	struct xenbus_dev_data *u;
++	struct xenbus_dev_transaction *trans, *tmp;
++	struct watch_adapter *watch, *tmp_watch;
++	struct read_buffer *rb, *tmp_rb;
++
++	u = container_of(kref, struct xenbus_dev_data, kref);
++
++	/*
++	 * No need for locking here because there are no other users,
++	 * by definition.
++	 */
++
++	list_for_each_entry_safe(trans, tmp, &u->transactions, list) {
++		xenbus_transaction_end(trans->handle, 1);
++		list_del(&trans->list);
++		kfree(trans);
++	}
++
++	list_for_each_entry_safe(watch, tmp_watch, &u->watches, list) {
++		unregister_xenbus_watch(&watch->watch);
++		list_del(&watch->list);
++		free_watch_adapter(watch);
++	}
++
++	list_for_each_entry_safe(rb, tmp_rb, &u->read_buffers, list) {
++		list_del(&rb->list);
++		kfree(rb);
++	}
++	kfree(u);
++}
++
++static struct xenbus_dev_transaction *xenbus_get_transaction(
++	struct xenbus_dev_data *u, uint32_t tx_id)
++{
++	struct xenbus_dev_transaction *trans;
++
++	list_for_each_entry(trans, &u->transactions, list)
++		if (trans->handle.id == tx_id)
++			return trans;
++
++	return NULL;
++}
++
++void xenbus_dev_queue_reply(struct xb_req_data *req)
++{
++	struct xenbus_dev_data *u = req->par;
++	struct xenbus_dev_transaction *trans = NULL;
++	int rc;
++	LIST_HEAD(staging_q);
++
++	xs_request_exit(req);
++
++	mutex_lock(&u->reply_mutex);
++
++	if (req->type == XS_TRANSACTION_START) {
++		trans = xenbus_get_transaction(u, 0);
++		if (WARN_ON(!trans))
++			goto out;
++		if (req->msg.type == XS_ERROR) {
++			list_del(&trans->list);
++			kfree(trans);
++		} else {
++			rc = kstrtou32(req->body, 10, &trans->handle.id);
++			if (WARN_ON(rc))
++				goto out;
++		}
++	} else if (req->msg.type == XS_TRANSACTION_END) {
++		trans = xenbus_get_transaction(u, req->msg.tx_id);
++		if (WARN_ON(!trans))
++			goto out;
++		list_del(&trans->list);
++		kfree(trans);
++	}
++
++	rc = queue_reply(&staging_q, &req->msg, sizeof(req->msg));
++	if (!rc)
++		rc = queue_reply(&staging_q, req->body, req->msg.len);
++	queue_flush(u, &staging_q, rc);
++	mutex_unlock(&u->reply_mutex);
++
++	kfree(req->body);
++	kfree(req);
++
++	kref_put(&u->kref, xenbus_file_free);
++
++	return;
++
++ out:
++	mutex_unlock(&u->reply_mutex);
++}
++
+ static LIST_HEAD(watch_list);
+ 
+ static ssize_t xenbus_dev_write(struct file *filp,
+@@ -229,8 +314,6 @@ static ssize_t xenbus_dev_write(struct f
+ 	struct xenbus_dev_data *u = filp->private_data;
+ 	struct xenbus_dev_transaction *trans = NULL;
+ 	uint32_t msg_type;
+-	void *reply = NULL;
+-	LIST_HEAD(queue);
+ 	char *path, *token;
+ 	struct watch_adapter *watch;
+ 	int err, rc = len;
+@@ -253,6 +336,8 @@ static ssize_t xenbus_dev_write(struct f
+ 	    (u->len < (sizeof(u->u.msg) + u->u.msg.len)))
+ 		return rc;
+ 
++	kref_get(&u->kref);
++
+ 	msg_type = u->u.msg.type;
+ 
+ 	switch (msg_type) {
+@@ -260,24 +345,25 @@ static ssize_t xenbus_dev_write(struct f
+ 	case XS_UNWATCH: {
+ 		static const char XS_RESP[] = "OK";
+ 		struct xsd_sockmsg hdr;
++		LIST_HEAD(queue);
+ 
+ 		path = u->u.buffer + sizeof(u->u.msg);
+ 		token = memchr(path, 0, u->u.msg.len);
+ 		if (token == NULL) {
+ 			rc = -EILSEQ;
+-			goto out;
++			goto putref;
+ 		}
+ 		token++;
+ 		if (memchr(token, 0, u->u.msg.len - (token - path)) == NULL) {
+ 			rc = -EILSEQ;
+-			goto out;
++			goto putref;
+ 		}
+ 
+ 		if (msg_type == XS_WATCH) {
+ 			watch = kzalloc(sizeof(*watch), GFP_KERNEL);
+ 			if (watch == NULL) {
+ 				rc = -ENOMEM;
+-				goto out;
++				goto putref;
+ 			}
+ 			watch->watch.node = kstrdup(path, GFP_KERNEL);
+ 			watch->watch.callback = watch_fired;
+@@ -288,8 +374,7 @@ static ssize_t xenbus_dev_write(struct f
+ 			      ? register_xenbus_watch(&watch->watch) : -ENOMEM;
+ 			if (err) {
+ 				free_watch_adapter(watch);
+-				rc = err;
+-				goto out;
++				break;
+ 			}
+ 			
+ 			list_add(&watch->list, &u->watches);
+@@ -311,58 +396,44 @@ static ssize_t xenbus_dev_write(struct f
+ 		mutex_lock(&u->reply_mutex);
+ 		err = queue_reply(&queue, &hdr, sizeof(hdr))
+ 		      ?: queue_reply(&queue, XS_RESP, hdr.len);
++		queue_flush(u, &queue, err);
++		mutex_unlock(&u->reply_mutex);
++
++		if (!err)
++			goto putref;
++
+ 		break;
+ 	}
+ 
+ 	case XS_TRANSACTION_START:
+-		trans = kmalloc(sizeof(*trans), GFP_KERNEL);
++		trans = kzalloc(sizeof(*trans), GFP_KERNEL);
+ 		if (!trans) {
+-			rc = -ENOMEM;
+-			goto out;
++			err = -ENOMEM;
++			break;
+ 		}
++		list_add(&trans->list, &u->transactions);
+ 		goto common;
+ 
+ 	default:
+-		if (!u->u.msg.tx_id)
+-			goto common;
+-		list_for_each_entry(trans, &u->transactions, list)
+-			if (trans->handle.id == u->u.msg.tx_id)
+-				break;
+-		if (&trans->list == &u->transactions) {
+-			rc = -ESRCH;
+-			goto out;
++		if (u->u.msg.tx_id &&
++		    !xenbus_get_transaction(u, u->u.msg.tx_id)) {
++			err = -ESRCH;
++			break;
+ 		}
+ 	common:
+-		reply = xenbus_dev_request_and_reply(&u->u.msg);
+-		if (IS_ERR(reply)) {
+-			if (msg_type == XS_TRANSACTION_START)
+-				kfree(trans);
+-			rc = PTR_ERR(reply);
+-			goto out;
+-		}
+-
+-		if (msg_type == XS_TRANSACTION_START) {
+-			if (u->u.msg.type == XS_ERROR)
+-				kfree(trans);
+-			else {
+-				trans->handle.id = simple_strtoul(reply, NULL, 0);
+-				list_add(&trans->list, &u->transactions);
+-			}
+-		} else if (u->u.msg.type == XS_TRANSACTION_END) {
++		err = xenbus_dev_request_and_reply(&u->u.msg, u);
++		if (err && trans) {
+ 			list_del(&trans->list);
+ 			kfree(trans);
+ 		}
+-		mutex_lock(&u->reply_mutex);
+-		err = queue_reply(&queue, &u->u.msg, sizeof(u->u.msg))
+-		      ?: queue_reply(&queue, reply, u->u.msg.len);
+ 		break;
+ 	}
+ 
+-	queue_flush(u, &queue, err);
+-	mutex_unlock(&u->reply_mutex);
+-	kfree(reply);
+-	if (err)
++	if (err) {
+ 		rc = err;
++ putref:
++		kref_put(&u->kref, xenbus_file_free);
++	}
+ 
+  out:
+ 	u->len = 0;
+@@ -383,6 +454,8 @@ static int xenbus_dev_open(struct inode
+ 	if (u == NULL)
+ 		return -ENOMEM;
+ 
++	kref_init(&u->kref);
++
+ 	INIT_LIST_HEAD(&u->transactions);
+ 	INIT_LIST_HEAD(&u->watches);
+ 	INIT_LIST_HEAD(&u->read_buffers);
+@@ -398,27 +471,8 @@ static int xenbus_dev_open(struct inode
+ static int xenbus_dev_release(struct inode *inode, struct file *filp)
+ {
+ 	struct xenbus_dev_data *u = filp->private_data;
+-	struct xenbus_dev_transaction *trans, *tmp;
+-	struct watch_adapter *watch, *tmp_watch;
+-	struct read_buffer *rb, *tmp_rb;
+ 
+-	list_for_each_entry_safe(trans, tmp, &u->transactions, list) {
+-		xenbus_transaction_end(trans->handle, 1);
+-		list_del(&trans->list);
+-		kfree(trans);
+-	}
+-
+-	list_for_each_entry_safe(watch, tmp_watch, &u->watches, list) {
+-		unregister_xenbus_watch(&watch->watch);
+-		list_del(&watch->list);
+-		free_watch_adapter(watch);
+-	}
+-
+-	list_for_each_entry_safe(rb, tmp_rb, &u->read_buffers, list) {
+-		list_del(&rb->list);
+-		kfree(rb);
+-	}
+-	kfree(u);
++	kref_put(&u->kref, xenbus_file_free);
+ 
+ 	return 0;
+ }
+--- a/drivers/xen/xenbus/xenbus_probe.c
++++ b/drivers/xen/xenbus/xenbus_probe.c
+@@ -80,8 +80,7 @@
+ #include <xen/hvm.h>
+ #endif
+ 
+-#include "xenbus_comms.h"
+-#include "xenbus_probe.h"
++#include "xenbus.h"
+ 
+ #ifdef HAVE_XEN_PLATFORM_COMPAT_H
+ #include <xen/platform-compat.h>
+@@ -183,10 +182,10 @@ static int read_backend_details(struct x
+ }
+ 
+ static void otherend_changed(struct xenbus_watch *watch,
+-			     const char **vec, unsigned int len)
++			     const char *path, const char *token)
+ #else /* !CONFIG_XEN && !MODULE */
+ void xenbus_otherend_changed(struct xenbus_watch *watch,
+-			     const char **vec, unsigned int len,
++			     const char *path, const char *token,
+ 			     int ignore_on_shutdown)
+ #endif /* CONFIG_XEN || MODULE */
+ {
+@@ -198,17 +197,15 @@ void xenbus_otherend_changed(struct xenb
+ 	/* Protect us against watches firing on old details when the otherend
+ 	   details change, say immediately after a resume. */
+ 	if (!dev->otherend ||
+-	    strncmp(dev->otherend, vec[XS_WATCH_PATH],
+-		    strlen(dev->otherend))) {
+-		dev_dbg(&dev->dev, "Ignoring watch at %s", vec[XS_WATCH_PATH]);
++	    strncmp(dev->otherend, path, strlen(dev->otherend))) {
++		dev_dbg(&dev->dev, "Ignoring watch at %s\n", path);
+ 		return;
+ 	}
+ 
+ 	state = xenbus_read_driver_state(dev->otherend);
+ 
+-	dev_dbg(&dev->dev, "state is %d (%s), %s, %s",
+-		state, xenbus_strstate(state), dev->otherend_watch.node,
+-		vec[XS_WATCH_PATH]);
++ 	dev_dbg(&dev->dev, "state is %d (%s), %s, %s\n",
++		state, xenbus_strstate(state), dev->otherend_watch.node, path);
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,16)
+ 	/*
+@@ -821,11 +818,11 @@ PARAVIRT_EXPORT_SYMBOL(xenbus_dev_change
+ 
+ #if defined(CONFIG_XEN) || defined(MODULE)
+ static void frontend_changed(struct xenbus_watch *watch,
+-			     const char **vec, unsigned int len)
++			     const char *path, const char *token)
+ {
+ 	DPRINTK("");
+ 
+-	xenbus_dev_changed(vec[XS_WATCH_PATH], &xenbus_frontend);
++	xenbus_dev_changed(path, &xenbus_frontend);
+ }
+ 
+ /* We watch for devices appearing and vanishing. */
+@@ -992,12 +989,13 @@ static DECLARE_WAIT_QUEUE_HEAD(backend_s
+ static int backend_state;
+ 
+ static void xenbus_reset_backend_state_changed(struct xenbus_watch *w,
+-					const char **v, unsigned int l)
++					       const char *path,
++					       const char *token)
+ {
+-	if (xenbus_scanf(XBT_NIL, v[XS_WATCH_PATH], "", "%i", &backend_state) != 1)
++	if (xenbus_scanf(XBT_NIL, path, "", "%i", &backend_state) != 1)
+ 		backend_state = XenbusStateUnknown;
+ 	printk(KERN_DEBUG "XENBUS: backend %s %s\n",
+-			v[XS_WATCH_PATH], xenbus_strstate(backend_state));
++	       path, xenbus_strstate(backend_state));
+ 	wake_up(&backend_state_wq);
+ }
+ 
+--- a/drivers/xen/xenbus/xenbus_probe_backend.c
++++ b/drivers/xen/xenbus/xenbus_probe_backend.c
+@@ -61,8 +61,7 @@
+ #endif
+ #include <xen/features.h>
+ 
+-#include "xenbus_comms.h"
+-#include "xenbus_probe.h"
++#include "xenbus.h"
+ 
+ #ifdef HAVE_XEN_PLATFORM_COMPAT_H
+ #include <xen/platform-compat.h>
+@@ -195,9 +194,9 @@ static int xenbus_probe_backend(struct x
+ 
+ #ifndef CONFIG_XEN
+ static void frontend_changed(struct xenbus_watch *watch,
+-			    const char **vec, unsigned int len)
++			     const char *path, const char *token)
+ {
+-	xenbus_otherend_changed(watch, vec, len, 0);
++	xenbus_otherend_changed(watch, path, token, 0);
+ }
+ #endif
+ 
+@@ -228,11 +227,11 @@ static struct xen_bus_type xenbus_backen
+ };
+ 
+ static void backend_changed(struct xenbus_watch *watch,
+-			    const char **vec, unsigned int len)
++			    const char *path, const char *token)
+ {
+ 	DPRINTK("");
+ 
+-	xenbus_dev_changed(vec[XS_WATCH_PATH], &xenbus_backend);
++	xenbus_dev_changed(path, &xenbus_backend);
+ }
+ 
+ static struct xenbus_watch be_watch = {
+--- a/drivers/xen/xenbus/xenbus_xs.c
++++ b/drivers/xen/xenbus/xenbus_xs.c
+@@ -43,6 +43,7 @@
+ #include <linux/slab.h>
+ #include <linux/fcntl.h>
+ #include <linux/kthread.h>
++#include <linux/reboot.h>
+ #include <linux/rwsem.h>
+ #include <linux/mutex.h>
+ #ifndef CONFIG_XEN
+@@ -50,8 +51,7 @@
+ #endif
+ #include <xen/xenbus.h>
+ #include <xen/xen.h>
+-#include "xenbus_comms.h"
+-#include "xenbus_probe.h"
++#include "xenbus.h"
+ 
+ #ifdef HAVE_XEN_PLATFORM_COMPAT_H
+ #include <xen/platform-compat.h>
+@@ -61,61 +61,28 @@
+ #define PF_NOFREEZE	0
+ #endif
+ 
+-struct xs_stored_msg {
+-	struct list_head list;
+-
+-	struct xsd_sockmsg hdr;
+-
+-	union {
+-		/* Queued replies. */
+-		struct {
+-			char *body;
+-		} reply;
+-
+-		/* Queued watch events. */
+-		struct {
+-			struct xenbus_watch *handle;
+-			char **vec;
+-			unsigned int vec_size;
+-		} watch;
+-	} u;
+-};
+-
+-struct xs_handle {
+-	/* A list of replies. Currently only one will ever be outstanding. */
+-	struct list_head reply_list;
+-	spinlock_t reply_lock;
+-	wait_queue_head_t reply_waitq;
+-
+-	/*
+-	 * Mutex ordering: transaction_mutex -> watch_mutex -> request_mutex.
+-	 * response_mutex is never taken simultaneously with the other three.
+-	 *
+-	 * transaction_mutex must be held before incrementing
+-	 * transaction_count. The mutex is held when a suspend is in
+-	 * progress to prevent new transactions starting.
+-	 *
+-	 * When decrementing transaction_count to zero the wait queue
+-	 * should be woken up, the suspend code waits for count to
+-	 * reach zero.
+-	 */
+-
+-	/* One request at a time. */
+-	struct mutex request_mutex;
+-
+-	/* Protect xenbus reader thread against save/restore. */
+-	struct mutex response_mutex;
+-
+-	/* Protect transactions against save/restore. */
+-	struct mutex transaction_mutex;
+-	atomic_t transaction_count;
+-	wait_queue_head_t transaction_wq;
+-
+-	/* Protect watch (de)register against save/restore. */
+-	struct rw_semaphore watch_mutex;
+-};
++/*
++ * Framework to protect suspend/resume handling against normal Xenstore
++ * message handling:
++ * During suspend/resume there must be no open transaction and no pending
++ * Xenstore request.
++ * New watch events happening in this time can be ignored by firing all watches
++ * after resume.
++ */
+ 
+-static struct xs_handle xs_state;
++/* Lock protecting enter/exit critical region. */
++static DEFINE_SPINLOCK(xs_state_lock);
++/* Number of users in critical region (protected by xs_state_lock). */
++static unsigned int xs_state_users;
++/* Suspend handler waiting or already active (protected by xs_state_lock)? */
++static int xs_suspend_active;
++/* Unique Xenstore request id (protected by xs_state_lock). */
++static uint32_t xs_request_id;
++
++/* Wait queue for all callers waiting for critical region to become usable. */
++static DECLARE_WAIT_QUEUE_HEAD(xs_state_enter_wq);
++/* Wait queue for suspend handling waiting for critical region being empty. */
++static DECLARE_WAIT_QUEUE_HEAD(xs_state_exit_wq);
+ 
+ /* List of registered watches, and a lock to protect it. */
+ static LIST_HEAD(watches);
+@@ -125,6 +92,9 @@ static DEFINE_SPINLOCK(watches_lock);
+ static LIST_HEAD(watch_events);
+ static DEFINE_SPINLOCK(watch_events_lock);
+ 
++/* Protect watch (de)register against save/restore. */
++static DECLARE_RWSEM(xs_watch_rwsem);
++
+ /*
+  * Details of the xenwatch callback kernel thread. The thread waits on the
+  * watch_events_waitq for work to do (queued on watch_events list). When it
+@@ -135,6 +105,61 @@ static pid_t xenwatch_pid;
+ /* static */ DEFINE_MUTEX(xenwatch_mutex);
+ static DECLARE_WAIT_QUEUE_HEAD(watch_events_waitq);
+ 
++#if !defined(CONFIG_XEN) || defined(CONFIG_PM_SLEEP)
++static void xs_suspend_enter(void)
++{
++	spin_lock(&xs_state_lock);
++	xs_suspend_active++;
++	spin_unlock(&xs_state_lock);
++	wait_event(xs_state_exit_wq, xs_state_users == 0);
++}
++
++static void xs_suspend_exit(void)
++{
++	spin_lock(&xs_state_lock);
++	xs_suspend_active--;
++	spin_unlock(&xs_state_lock);
++	wake_up_all(&xs_state_enter_wq);
++}
++#endif
++
++static uint32_t xs_request_enter(struct xb_req_data *req)
++{
++	uint32_t rq_id;
++
++	req->type = req->msg.type;
++
++	spin_lock(&xs_state_lock);
++
++	while (!xs_state_users && xs_suspend_active) {
++		spin_unlock(&xs_state_lock);
++		wait_event(xs_state_enter_wq, xs_suspend_active == 0);
++		spin_lock(&xs_state_lock);
++	}
++
++	if (req->type == XS_TRANSACTION_START)
++		xs_state_users++;
++	xs_state_users++;
++	rq_id = xs_request_id++;
++
++	spin_unlock(&xs_state_lock);
++
++	return rq_id;
++}
++
++void xs_request_exit(struct xb_req_data *req)
++{
++	spin_lock(&xs_state_lock);
++	xs_state_users--;
++	if ((req->type == XS_TRANSACTION_START && req->msg.type == XS_ERROR) ||
++	    req->type == XS_TRANSACTION_END)
++		xs_state_users--;
++	spin_unlock(&xs_state_lock);
++
++	if (xs_suspend_active && !xs_state_users)
++		wake_up(&xs_state_exit_wq);
++}
++
+ static int get_error(const char *errorstring)
+ {
+ 	unsigned int i;
+@@ -178,21 +203,24 @@ static bool xenbus_ok(void)
+ 	return false;
+ #endif
+ }
+-static void *read_reply(enum xsd_sockmsg_type *type, unsigned int *len)
++
++static bool test_reply(struct xb_req_data *req)
+ {
+-	struct xs_stored_msg *msg;
+-	char *body;
++	if (req->state == xb_req_state_got_reply || !xenbus_ok())
++		return true;
++
++	/* Make sure to reread req->state each time. */
++	barrier();
+ 
+-	spin_lock(&xs_state.reply_lock);
++	return false;
++}
+ 
+-	while (list_empty(&xs_state.reply_list)) {
+-		spin_unlock(&xs_state.reply_lock);
+-		if (xenbus_ok())
+-			/* XXX FIXME: Avoid synchronous wait for response here. */
+-			wait_event_timeout(xs_state.reply_waitq,
+-					   !list_empty(&xs_state.reply_list),
+-					   msecs_to_jiffies(500));
+-		else {
++static void *read_reply(struct xb_req_data *req)
++{
++	while (req->state != xb_req_state_got_reply) {
++		wait_event(req->wq, test_reply(req));
++
++		if (!xenbus_ok())
+ 			/*
+ 			 * If we are in the process of being shut-down there is
+ 			 * no point of trying to contact XenBus - it is either
+@@ -200,78 +228,82 @@ static void *read_reply(enum xsd_sockmsg
+ 			 * has been killed or is unreachable.
+ 			 */
+ 			return ERR_PTR(-EIO);
+-		}
+-		spin_lock(&xs_state.reply_lock);
++		if (req->err)
++			return ERR_PTR(req->err);
++
+ 	}
+ 
+-	msg = list_entry(xs_state.reply_list.next,
+-			 struct xs_stored_msg, list);
+-	list_del(&msg->list);
++	return req->body;
++}
+ 
+-	spin_unlock(&xs_state.reply_lock);
++static void xs_send(struct xb_req_data *req, struct xsd_sockmsg *msg)
++{
++	bool notify;
+ 
+-	*type = msg->hdr.type;
+-	if (len)
+-		*len = msg->hdr.len;
+-	body = msg->u.reply.body;
++	req->msg = *msg;
++	req->err = 0;
++	req->state = xb_req_state_queued;
++	init_waitqueue_head(&req->wq);
+ 
+-	kfree(msg);
++	req->msg.req_id = xs_request_enter(req);
+ 
+-	return body;
+-}
++	mutex_lock(&xb_write_mutex);
++	list_add_tail(&req->list, &xb_write_list);
++	notify = list_is_singular(&xb_write_list);
++	mutex_unlock(&xb_write_mutex);
+ 
+-static void transaction_start(void)
+-{
+-	mutex_lock(&xs_state.transaction_mutex);
+-	atomic_inc(&xs_state.transaction_count);
+-	mutex_unlock(&xs_state.transaction_mutex);
++	if (notify)
++		wake_up(&xb_waitq);
+ }
+ 
+-static void transaction_end(void)
++static void *xs_wait_for_reply(struct xb_req_data *req, struct xsd_sockmsg *msg)
+ {
+-	if (atomic_dec_and_test(&xs_state.transaction_count))
+-		wake_up(&xs_state.transaction_wq);
+-}
++	void *ret;
+ 
+-#if !defined(CONFIG_XEN) || defined(CONFIG_PM_SLEEP)
+-static void transaction_suspend(void)
+-{
+-	mutex_lock(&xs_state.transaction_mutex);
+-	wait_event(xs_state.transaction_wq,
+-		   atomic_read(&xs_state.transaction_count) == 0);
++	ret = read_reply(req);
++
++	xs_request_exit(req);
++
++	msg->type = req->msg.type;
++	msg->len = req->msg.len;
++
++	mutex_lock(&xb_write_mutex);
++	if (req->state == xb_req_state_queued ||
++	    req->state == xb_req_state_wait_reply)
++		req->state = xb_req_state_aborted;
++	else
++		kfree(req);
++	mutex_unlock(&xb_write_mutex);
++
++	return ret;
+ }
+ 
+-static void transaction_resume(void)
++static void xs_wake_up(struct xb_req_data *req)
+ {
+-	mutex_unlock(&xs_state.transaction_mutex);
++	wake_up(&req->wq);
+ }
+-#endif
+ 
+-void *xenbus_dev_request_and_reply(struct xsd_sockmsg *msg)
++int xenbus_dev_request_and_reply(struct xsd_sockmsg *msg, void *par)
+ {
+-	void *ret;
+-	enum xsd_sockmsg_type type = msg->type;
+-	int err;
+-
+-	if (type == XS_TRANSACTION_START)
+-		transaction_start();
++	struct xb_req_data *req;
++	struct kvec *vec;
+ 
+-	mutex_lock(&xs_state.request_mutex);
+-
+-	err = xb_write(msg, sizeof(*msg) + msg->len);
+-	if (err) {
+-		msg->type = XS_ERROR;
+-		ret = ERR_PTR(err);
+-	} else
+-		ret = read_reply(&msg->type, &msg->len);
++	req = kmalloc(sizeof(*req) + sizeof(*vec), GFP_KERNEL);
++	if (!req)
++		return -ENOMEM;
+ 
+-	mutex_unlock(&xs_state.request_mutex);
++	vec = (struct kvec *)(req + 1);
++	vec->iov_len = msg->len;
++	vec->iov_base = msg + 1;
++
++	req->vec = vec;
++	req->num_vecs = 1;
++	req->cb = xenbus_dev_queue_reply;
++	req->par = par;
+ 
+-	if ((msg->type == XS_TRANSACTION_END) ||
+-	    ((type == XS_TRANSACTION_START) && (msg->type == XS_ERROR)))
+-		transaction_end();
++	xs_send(req, msg);
+ 
+-	return ret;
++	return 0;
+ }
+ #if !defined(CONFIG_XEN) && !defined(MODULE)
+ EXPORT_SYMBOL(xenbus_dev_request_and_reply);
+@@ -284,37 +316,31 @@ static void *xs_talkv(struct xenbus_tran
+ 		      unsigned int num_vecs,
+ 		      unsigned int *len)
+ {
++	struct xb_req_data *req;
+ 	struct xsd_sockmsg msg;
+ 	void *ret = NULL;
+ 	unsigned int i;
+ 	int err;
+ 
++	req = kmalloc(sizeof(*req), GFP_NOIO | __GFP_HIGH);
++	if (!req)
++		return ERR_PTR(-ENOMEM);
++
++	req->vec = iovec;
++	req->num_vecs = num_vecs;
++	req->cb = xs_wake_up;
++
+ 	msg.tx_id = t.id;
+-	msg.req_id = 0;
+ 	msg.type = type;
+ 	msg.len = 0;
+ 	for (i = 0; i < num_vecs; i++)
+ 		msg.len += iovec[i].iov_len;
+ 
+-	mutex_lock(&xs_state.request_mutex);
+-
+-	err = xb_write(&msg, sizeof(msg));
+-	if (err) {
+-		mutex_unlock(&xs_state.request_mutex);
+-		return ERR_PTR(err);
+-	}
++	xs_send(req, &msg);
+ 
+-	for (i = 0; i < num_vecs; i++) {
+-		err = xb_write(iovec[i].iov_base, iovec[i].iov_len);
+-		if (err) {
+-			mutex_unlock(&xs_state.request_mutex);
+-			return ERR_PTR(err);
+-		}
+-	}
+-
+-	ret = read_reply(&msg.type, len);
+-
+-	mutex_unlock(&xs_state.request_mutex);
++	ret = xs_wait_for_reply(req, &msg);
++	if (len)
++		*len = msg.len;
+ 
+ 	if (IS_ERR(ret))
+ 		return ret;
+@@ -522,13 +548,9 @@ int xenbus_transaction_start(struct xenb
+ {
+ 	char *id_str;
+ 
+-	transaction_start();
+-
+ 	id_str = xs_single(XBT_NIL, XS_TRANSACTION_START, "", NULL);
+-	if (IS_ERR(id_str)) {
+-		transaction_end();
++	if (IS_ERR(id_str))
+ 		return PTR_ERR(id_str);
+-	}
+ 
+ 	t->id = simple_strtoul(id_str, NULL, 0);
+ 	kfree(id_str);
+@@ -542,18 +564,13 @@ EXPORT_SYMBOL_GPL(xenbus_transaction_sta
+ int xenbus_transaction_end(struct xenbus_transaction t, int abort)
+ {
+ 	char abortstr[2];
+-	int err;
+ 
+ 	if (abort)
+ 		strcpy(abortstr, "F");
+ 	else
+ 		strcpy(abortstr, "T");
+ 
+-	err = xs_error(xs_single(t, XS_TRANSACTION_END, abortstr, NULL));
+-
+-	transaction_end();
+-
+-	return err;
++	return xs_error(xs_single(t, XS_TRANSACTION_END, abortstr, NULL));
+ }
+ EXPORT_SYMBOL_GPL(xenbus_transaction_end);
+ 
+@@ -687,6 +704,29 @@ static struct xenbus_watch *find_watch(c
+ 	return NULL;
+ }
+ 
++int xs_watch_msg(struct xs_watch_event *event)
++{
++	if (count_strings(event->body, event->len) != 2) {
++		kfree(event);
++		return -EINVAL;
++	}
++	event->path = (const char *)event->body;
++	event->token = (const char *)strchr(event->body, '\0') + 1;
++
++	spin_lock(&watches_lock);
++	event->handle = find_watch(event->token);
++	if (event->handle != NULL) {
++		spin_lock(&watch_events_lock);
++		list_add_tail(&event->list, &watch_events);
++		wake_up(&watch_events_waitq);
++		spin_unlock(&watch_events_lock);
++	} else
++		kfree(event);
++	spin_unlock(&watches_lock);
++
++	return 0;
++}
++
+ /*
+  * Certain older XenBus toolstack cannot handle reading values that are
+  * not populated. Some Xen 3.4 installation are incapable of doing this
+@@ -740,7 +780,7 @@ int register_xenbus_watch(struct xenbus_
+ 
+ 	sprintf(token, "%lX", (long)watch);
+ 
+-	down_read(&xs_state.watch_mutex);
++	down_read(&xs_watch_rwsem);
+ 
+ 	spin_lock(&watches_lock);
+ 	BUG_ON(find_watch(token));
+@@ -755,7 +795,7 @@ int register_xenbus_watch(struct xenbus_
+ 		spin_unlock(&watches_lock);
+ 	}
+ 
+-	up_read(&xs_state.watch_mutex);
++	up_read(&xs_watch_rwsem);
+ 
+ 	return err;
+ }
+@@ -763,7 +803,7 @@ EXPORT_SYMBOL_GPL(register_xenbus_watch)
+ 
+ void unregister_xenbus_watch(struct xenbus_watch *watch)
+ {
+-	struct xs_stored_msg *msg, *tmp;
++	struct xs_watch_event *event, *tmp;
+ 	char token[sizeof(watch) * 2 + 1];
+ 	int err;
+ 
+@@ -773,7 +813,7 @@ void unregister_xenbus_watch(struct xenb
+ 
+ 	sprintf(token, "%lX", (long)watch);
+ 
+-	down_read(&xs_state.watch_mutex);
++	down_read(&xs_watch_rwsem);
+ 
+ 	spin_lock(&watches_lock);
+ 	BUG_ON(!find_watch(token));
+@@ -784,7 +824,7 @@ void unregister_xenbus_watch(struct xenb
+ 	if (err)
+ 		pr_warn("Failed to release watch %s: %i\n", watch->node, err);
+ 
+-	up_read(&xs_state.watch_mutex);
++	up_read(&xs_watch_rwsem);
+ 
+ 	/* Make sure there are no callbacks running currently (unless
+ 	   its us) */
+@@ -793,12 +833,11 @@ void unregister_xenbus_watch(struct xenb
+ 
+ 	/* Cancel pending watch events. */
+ 	spin_lock(&watch_events_lock);
+-	list_for_each_entry_safe(msg, tmp, &watch_events, list) {
+-		if (msg->u.watch.handle != watch)
++	list_for_each_entry_safe(event, tmp, &watch_events, list) {
++		if (event->handle != watch)
+ 			continue;
+-		list_del(&msg->list);
+-		kfree(msg->u.watch.vec);
+-		kfree(msg);
++		list_del(&event->list);
++		kfree(event);
+ 	}
+ 	spin_unlock(&watch_events_lock);
+ 
+@@ -810,10 +849,10 @@ EXPORT_SYMBOL_GPL(unregister_xenbus_watc
+ #if !defined(CONFIG_XEN) || defined(CONFIG_PM_SLEEP)
+ void xs_suspend(void)
+ {
+-	transaction_suspend();
+-	down_write(&xs_state.watch_mutex);
+-	mutex_lock(&xs_state.request_mutex);
+-	mutex_lock(&xs_state.response_mutex);
++	xs_suspend_enter();
++
++	down_write(&xs_watch_rwsem);
++	mutex_lock(&xs_response_mutex);
+ }
+ 
+ void xs_resume(void)
+@@ -825,39 +864,36 @@ void xs_resume(void)
+ 	xb_init_comms();
+ #endif
+ 
+-	mutex_unlock(&xs_state.response_mutex);
+-	mutex_unlock(&xs_state.request_mutex);
+-	transaction_resume();
++	mutex_unlock(&xs_response_mutex);
++
++	xs_suspend_exit();
+ 
+-	/* No need for watches_lock: the watch_mutex is sufficient. */
++	/* No need for watches_lock: the xs_watch_rwsem is sufficient. */
+ 	list_for_each_entry(watch, &watches, list) {
+ 		sprintf(token, "%lX", (long)watch);
+ 		xs_watch(watch->node, token);
+ 	}
+ 
+-	up_write(&xs_state.watch_mutex);
++	up_write(&xs_watch_rwsem);
+ }
+ 
+ void xs_suspend_cancel(void)
+ {
+-	mutex_unlock(&xs_state.response_mutex);
+-	mutex_unlock(&xs_state.request_mutex);
+-	up_write(&xs_state.watch_mutex);
+-	mutex_unlock(&xs_state.transaction_mutex);
++	mutex_unlock(&xs_response_mutex);
++	up_write(&xs_watch_rwsem);
++
++	xs_suspend_exit();
+ }
+ #endif
+ 
+ #if defined(CONFIG_XEN) || defined(MODULE)
+ static int xenwatch_handle_callback(void *data)
+ {
+-	struct xs_stored_msg *msg = data;
++	struct xs_watch_event *event = data;
+ 
+-	msg->u.watch.handle->callback(msg->u.watch.handle,
+-				      (const char **)msg->u.watch.vec,
+-				      msg->u.watch.vec_size);
++	event->handle->callback(event->handle, event->path, event->token);
+ 
+-	kfree(msg->u.watch.vec);
+-	kfree(msg);
++	kfree(event);
+ 
+ 	/* Kill this kthread if we were spawned just for this callback. */
+ 	if (current->pid != xenwatch_pid)
+@@ -870,7 +906,7 @@ static int xenwatch_handle_callback(void
+ static int xenwatch_thread(void *unused)
+ {
+ 	struct list_head *ent;
+-	struct xs_stored_msg *msg;
++	struct xs_watch_event *event;
+ 
+ 	current->flags |= PF_NOFREEZE;
+ 	for (;;) {
+@@ -893,7 +929,7 @@ static int xenwatch_thread(void *unused)
+ 			continue;
+ 		}
+ 
+-		msg = list_entry(ent, struct xs_stored_msg, list);
++		event = list_entry(ent, struct xs_watch_event, list);
+ 
+ #if defined(CONFIG_XEN) || defined(MODULE)
+ 		/*
+@@ -904,149 +940,56 @@ static int xenwatch_thread(void *unused)
+ 		 * progress. This can occur on resume before the swap
+ 		 * device is attached.
+ 		 */
+-		if (msg->u.watch.handle->flags & XBWF_new_thread) {
++		if (event->handle->flags & XBWF_new_thread) {
+ 			mutex_unlock(&xenwatch_mutex);
+ 			kthread_run(xenwatch_handle_callback,
+-				    msg, "xenwatch_cb");
++				    event, "xenwatch_cb");
+ 		} else {
+-			xenwatch_handle_callback(msg);
++			xenwatch_handle_callback(event);
+ 			mutex_unlock(&xenwatch_mutex);
+ 		}
+ #else
+-		msg->u.watch.handle->callback(
+-			msg->u.watch.handle,
+-			(const char **)msg->u.watch.vec,
+-			msg->u.watch.vec_size);
++		event->handle->callback(event->handle, event->path,
++					event->token);
+ 		mutex_unlock(&xenwatch_mutex);
+-		kfree(msg->u.watch.vec);
+-		kfree(msg);
++		kfree(event);
+ #endif
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static int process_msg(void)
++/*
++ * Wake up all threads waiting for a xenstore reply. In case of shutdown all
++ * pending replies will be marked as "aborted" in order to let the waiters
++ * return in spite of xenstore possibly no longer being able to reply. This
++ * will avoid blocking shutdown by a thread waiting for xenstore but being
++ * necessary for shutdown processing to proceed.
++ */
++static int xs_reboot_notify(struct notifier_block *nb,
++			    unsigned long code, void *unused)
+ {
+-	struct xs_stored_msg *msg;
+-	char *body;
+-	int err;
+-
+-	/*
+-	 * We must disallow save/restore while reading a xenstore message.
+-	 * A partial read across s/r leaves us out of sync with xenstored.
+-	 */
+-	for (;;) {
+-		err = xb_wait_for_data_to_read();
+-		if (err)
+-			return err;
+-		mutex_lock(&xs_state.response_mutex);
+-		if (xb_data_to_read())
+-			break;
+-		/* We raced with save/restore: pending data 'disappeared'. */
+-		mutex_unlock(&xs_state.response_mutex);
+-	}
+-
+-
+-	msg = kmalloc(sizeof(*msg), GFP_NOIO | __GFP_HIGH);
+-	if (msg == NULL) {
+-		err = -ENOMEM;
+-		goto out;
+-	}
+-
+-	err = xb_read(&msg->hdr, sizeof(msg->hdr));
+-	if (err) {
+-		kfree(msg);
+-		goto out;
+-	}
+-
+-	if (msg->hdr.len > XENSTORE_PAYLOAD_MAX) {
+-		kfree(msg);
+-		err = -EINVAL;
+-		goto out;
+-	}
+-
+-	body = kmalloc(msg->hdr.len + 1, GFP_NOIO | __GFP_HIGH);
+-	if (body == NULL) {
+-		kfree(msg);
+-		err = -ENOMEM;
+-		goto out;
+-	}
+-
+-	err = xb_read(body, msg->hdr.len);
+-	if (err) {
+-		kfree(body);
+-		kfree(msg);
+-		goto out;
+-	}
+-	body[msg->hdr.len] = '\0';
++	struct xb_req_data *req;
+ 
+-	if (msg->hdr.type == XS_WATCH_EVENT) {
+-		msg->u.watch.vec = split(body, msg->hdr.len,
+-					 &msg->u.watch.vec_size);
+-		if (IS_ERR(msg->u.watch.vec)) {
+-			err = PTR_ERR(msg->u.watch.vec);
+-			kfree(msg);
+-			goto out;
+-		}
+-
+-		spin_lock(&watches_lock);
+-		msg->u.watch.handle = find_watch(
+-			msg->u.watch.vec[XS_WATCH_TOKEN]);
+-		if (msg->u.watch.handle != NULL) {
+-			spin_lock(&watch_events_lock);
+-			list_add_tail(&msg->list, &watch_events);
+-			wake_up(&watch_events_waitq);
+-			spin_unlock(&watch_events_lock);
+-		} else {
+-			kfree(msg->u.watch.vec);
+-			kfree(msg);
+-		}
+-		spin_unlock(&watches_lock);
+-	} else {
+-		msg->u.reply.body = body;
+-		spin_lock(&xs_state.reply_lock);
+-		list_add_tail(&msg->list, &xs_state.reply_list);
+-		spin_unlock(&xs_state.reply_lock);
+-		wake_up(&xs_state.reply_waitq);
+-	}
+-
+- out:
+-	mutex_unlock(&xs_state.response_mutex);
+-	return err;
++	mutex_lock(&xb_write_mutex);
++	list_for_each_entry(req, &xs_reply_list, list)
++		wake_up(&req->wq);
++	list_for_each_entry(req, &xb_write_list, list)
++		wake_up(&req->wq);
++	mutex_unlock(&xb_write_mutex);
++	return NOTIFY_DONE;
+ }
+ 
+-static int xenbus_thread(void *unused)
+-{
+-	int err;
+-
+-	current->flags |= PF_NOFREEZE;
+-	for (;;) {
+-		err = process_msg();
+-		if (err)
+-			pr_warn("error %d while reading message\n", err);
+-		if (kthread_should_stop())
+-			break;
+-	}
+-
+-	return 0;
+-}
++static struct notifier_block xs_reboot_nb = {
++	.notifier_call = xs_reboot_notify,
++};
+ 
+ int xs_init(void)
+ {
+ 	int err = 0;
+ 	struct task_struct *task;
+ 
+-	INIT_LIST_HEAD(&xs_state.reply_list);
+-	spin_lock_init(&xs_state.reply_lock);
+-	init_waitqueue_head(&xs_state.reply_waitq);
+-
+-	mutex_init(&xs_state.request_mutex);
+-	mutex_init(&xs_state.response_mutex);
+-	mutex_init(&xs_state.transaction_mutex);
+-	init_rwsem(&xs_state.watch_mutex);
+-	atomic_set(&xs_state.transaction_count, 0);
+-	init_waitqueue_head(&xs_state.transaction_wq);
++	register_reboot_notifier(&xs_reboot_nb);
+ 
+ #if !defined(CONFIG_XEN) && !defined(MODULE)
+ 	/* Initialize the shared memory rings to talk to xenstored */
+@@ -1060,10 +1003,6 @@ int xs_init(void)
+ 		return PTR_ERR(task);
+ 	xenwatch_pid = task->pid;
+ 
+-	task = kthread_run(xenbus_thread, NULL, "xenbus");
+-	if (IS_ERR(task))
+-		return PTR_ERR(task);
+-
+ 	/* shutdown watches for kexec boot */
+ 	xs_reset_watches();
+ 
+--- a/include/uapi/xen/public/privcmd.h
++++ b/include/uapi/xen/public/privcmd.h
+@@ -78,6 +78,17 @@ typedef struct privcmd_mmapbatch_v2 {
+ 	int __user *err;  /* array of error codes */
+ } privcmd_mmapbatch_v2_t;
+ 
++struct privcmd_dm_op_buf {
++	void __user *uptr;
++	size_t size;
++};
++
++struct privcmd_dm_op {
++	domid_t dom;
++	__u16 num;
++	const struct privcmd_dm_op_buf __user *ubufs;
++};
++
+ /*
+  * @cmd: IOCTL_PRIVCMD_HYPERCALL
+  * @arg: &privcmd_hypercall_t
+@@ -100,5 +111,9 @@ typedef struct privcmd_mmapbatch_v2 {
+  */
+ #define IOCTL_PRIVCMD_MMAPBATCH_V2				\
+ 	_IOC(_IOC_NONE, 'P', 4, sizeof(privcmd_mmapbatch_v2_t))
++#define IOCTL_PRIVCMD_DM_OP					\
++	_IOC(_IOC_NONE, 'P', 5, sizeof(struct privcmd_dm_op))
++#define IOCTL_PRIVCMD_RESTRICT					\
++	_IOC(_IOC_NONE, 'P', 6, sizeof(domid_t))
+ 
+ #endif /* __LINUX_PUBLIC_PRIVCMD_H__ */
+--- a/include/xen/interface/hvm/dm_op.h
++++ b/include/xen/interface/hvm/dm_op.h
+@@ -24,7 +24,7 @@
+ #define __XEN_PUBLIC_HVM_DM_OP_H__
+ 
+ struct xen_dm_op_buf {
+-	GUEST_HANDLE(void) h;
++	XEN_GUEST_HANDLE(void) h;
+ 	xen_ulong_t size;
+ };
+ DEFINE_GUEST_HANDLE_STRUCT(xen_dm_op_buf);
+--- a/include/xen/interface/xen.h
++++ b/include/xen/interface/xen.h
+@@ -124,6 +124,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_ulong_t);
+ #define __HYPERVISOR_tmem_op              38
+ #define __HYPERVISOR_xc_reserved_op       39 /* reserved for XenClient */
+ #define __HYPERVISOR_xenpmu_op            40
++#define __HYPERVISOR_dm_op                41
+ 
+ /* Architecture-specific hypercall definitions. */
+ #define __HYPERVISOR_arch_0               48
+--- a/include/xen/xenbus.h
++++ b/include/xen/xenbus.h
+@@ -38,6 +38,7 @@
+ #include <linux/notifier.h>
+ #include <linux/mutex.h>
+ #include <linux/export.h>
++#include <linux/fs.h>
+ #include <linux/completion.h>
+ #include <linux/init.h>
+ #include <linux/slab.h>
+@@ -62,7 +63,7 @@ struct xenbus_watch
+ 
+ 	/* Callback (executed in a process context with no locks held). */
+ 	void (*callback)(struct xenbus_watch *,
+-			 const char **vec, unsigned int len);
++			 const char *path, const char *token);
+ 
+ #if defined(CONFIG_XEN) || defined(HAVE_XEN_PLATFORM_COMPAT_H)
+ 	/* See XBWF_ definitions below. */
+@@ -214,16 +215,15 @@ void xs_suspend(void);
+ void xs_resume(void);
+ void xs_suspend_cancel(void);
+ 
+-/* Used by xenbus_dev to borrow kernel's store connection. */
+-void *xenbus_dev_request_and_reply(struct xsd_sockmsg *msg);
+-
+ struct work_struct;
+ void xenbus_probe(struct work_struct *);
+ 
++#if defined(CONFIG_XEN) || defined(HAVE_XEN_PLATFORM_COMPAT_H)
+ /* Prepare for domain suspend: then resume or cancel the suspend. */
+ void xenbus_suspend(void);
+ void xenbus_resume(void);
+ void xenbus_suspend_cancel(void);
++#endif
+ 
+ #define XENBUS_IS_ERR_READ(str) ({			\
+ 	if (!IS_ERR(str) && strlen(str) == 0) {		\
+@@ -247,7 +247,7 @@ void xenbus_suspend_cancel(void);
+ int xenbus_watch_path(struct xenbus_device *dev, const char *path,
+ 		      struct xenbus_watch *watch,
+ 		      void (*callback)(struct xenbus_watch *,
+-				       const char **, unsigned int));
++				       const char *, const char *));
+ 
+ 
+ #if defined(CONFIG_XEN) || defined(HAVE_XEN_PLATFORM_COMPAT_H)
+@@ -263,12 +263,12 @@ int xenbus_watch_path(struct xenbus_devi
+ int xenbus_watch_path2(struct xenbus_device *dev, const char *path,
+ 		       const char *path2, struct xenbus_watch *watch,
+ 		       void (*callback)(struct xenbus_watch *,
+-					const char **, unsigned int));
++					const char *, const char *));
+ #else
+ __printf(4, 5)
+ int xenbus_watch_pathfmt(struct xenbus_device *dev, struct xenbus_watch *watch,
+ 			 void (*callback)(struct xenbus_watch *,
+-					  const char **, unsigned int),
++					  const char *, const char *),
+ 			 const char *pathfmt, ...);
+ #endif
+ 
+@@ -371,6 +371,10 @@ const char *xenbus_strstate(enum xenbus_
+ int xenbus_dev_is_online(struct xenbus_device *dev);
+ int xenbus_frontend_closed(struct xenbus_device *dev);
+ 
++extern const struct file_operations xen_xenbus_fops;
++extern struct xenstore_domain_interface *xen_store_interface;
++extern int xen_store_evtchn;
++
+ int xenbus_for_each_backend(void *arg, int (*fn)(struct device *, void *));
+ int xenbus_for_each_frontend(void *arg, int (*fn)(struct device *, void *));
+ 
