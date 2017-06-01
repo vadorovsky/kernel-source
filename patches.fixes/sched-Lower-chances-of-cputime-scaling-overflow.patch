@@ -1,0 +1,149 @@
+From: Frederic Weisbecker <fweisbec@gmail.com>
+Date: Wed, 20 Feb 2013 18:54:55 +0100
+Subject: sched: Lower chances of cputime scaling overflow
+Git-commit: d9a3c9823a2e6a543eb7807fb3d15d8233817ec5
+Patch-mainline: v3.10-rc1
+References: bnc#938352
+
+Some users have reported that after running a process with
+hundreds of threads on intensive CPU-bound loads, the cputime
+of the group started to freeze after a few days.
+
+This is due to how we scale the tick-based cputime against
+the scheduler precise execution time value.
+
+We add the values of all threads in the group and we multiply
+that against the sum of the scheduler exec runtime of the whole
+group.
+
+This easily overflows after a few days/weeks of execution.
+
+A proposed solution to solve this was to compute that multiplication
+on stime instead of utime:
+   62188451f0d63add7ad0cd2a1ae269d600c1663d
+   ("cputime: Avoid multiplication overflow on utime scaling")
+
+The rationale behind that was that it's easy for a thread to
+spend most of its time in userspace under intensive CPU-bound workload
+but it's much harder to do CPU-bound intensive long run in the kernel.
+
+This postulate got defeated when a user recently reported he was still
+seeing cputime freezes after the above patch. The workload that
+triggers this issue relates to intensive networking workloads where
+most of the cputime is consumed in the kernel.
+
+To reduce much more the opportunities for multiplication overflow,
+lets reduce the multiplication factors to the remainders of the division
+between sched exec runtime and cputime. Assuming the difference between
+these shouldn't ever be that large, it could work on many situations.
+
+This gets the same results as in the upstream scaling code except for
+a small difference: the upstream code always rounds the results to
+the nearest integer not greater to what would be the precise result.
+The new code rounds to the nearest integer either greater or not
+greater. In practice this difference probably shouldn't matter but
+it's worth mentioning.
+
+If this solution appears not to be enough in the end, we'll
+need to partly revert back to the behaviour prior to commit
+     0cf55e1ec08bb5a22e068309e2d8ba1180ab4239
+     ("sched, cputime: Introduce thread_group_times()")
+
+Back then, the scaling was done on exit() time before adding the cputime
+of an exiting thread to the signal struct. And then we'll need to
+scale one-by-one the live threads cputime in thread_group_cputime(). The
+drawback may be a slightly slower code on exit time.
+
+Signed-off-by: Frederic Weisbecker <fweisbec@gmail.com>
+Cc: Stanislaw Gruszka <sgruszka@redhat.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Mike Galbraith <mgalbraith@suse.de>
+---
+ kernel/sched.c |   54 +++++++++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 39 insertions(+), 15 deletions(-)
+
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -4261,18 +4261,36 @@ void thread_group_times(struct task_stru
+ # define nsecs_to_cputime(__nsecs)	nsecs_to_jiffies(__nsecs)
+ #endif
+ 
+-static cputime_t scale_stime(cputime_t stime, cputime_t rtime, cputime_t total)
++/*
++ * Perform (stime * rtime) / total with reduced chances
++ * of multiplication overflows by using smaller factors
++ * like quotient and remainders of divisions between
++ * rtime and total.
++ */
++static cputime_t scale_stime(u64 stime, u64 rtime, u64 total)
+ {
+-	u64 temp = rtime;
++	u64 rem, res, scaled;
+ 
+-	temp *= stime;
++	if (rtime >= total) {
++		/*
++		 * Scale up to rtime / total then add
++		 * the remainder scaled to stime / total.
++		 */
++		res = div64_u64_rem(rtime, total, &rem);
++		scaled = stime * res;
++		scaled += div64_u64(stime * rem, total);
++	} else {
++		/*
++		 * Same in reverse: scale down to total / rtime
++		 * then substract that result scaled to
++		 * to the remaining part.
++		 */
++		res = div64_u64_rem(total, rtime, &rem);
++		scaled = div64_u64(stime, res);
++		scaled -= div64_u64(scaled * rem, total);
++	}
+ 
+-	if (sizeof(cputime_t) == 4)
+-		temp = div_u64(temp, total);
+-	else
+-		temp = div64_u64(temp, total);
+-
+-	return (cputime_t)temp;
++	return (cputime_t)scaled;
+ }
+ 
+ void task_times(struct task_struct *p, cputime_t *ut, cputime_t *st)
+@@ -4284,10 +4302,13 @@ void task_times(struct task_struct *p, c
+ 	 */
+ 	rtime = nsecs_to_cputime(p->se.sum_exec_runtime);
+ 
+-	if (total)
+-		stime = scale_stime(stime, rtime, total);
+-	else
++	if (!rtime) {
++		stime = 0;
++	} else if (!total) {
+ 		stime = rtime;
++	} else {
++		stime = scale_stime(stime, rtime, total);
++	}
+ 
+ 	/*
+ 	 * Compare with previous values, to keep monotonicity:
+@@ -4313,10 +4334,13 @@ void thread_group_times(struct task_stru
+ 	total = cputime_add(cputime.utime, cputime.stime);
+ 	rtime = nsecs_to_cputime(cputime.sum_exec_runtime);
+ 
+-	if (total)
+-		stime = scale_stime(cputime.stime, rtime, total);
+-	else
++	if (!rtime) {
++		stime = 0;
++	} else if (!total) {
+ 		stime = rtime;
++	} else {
++		stime = scale_stime(cputime.stime, rtime, total);
++	}
+ 
+ 	sig->prev_stime = max(sig->prev_stime, stime);
+ 	sig->prev_utime = max(sig->prev_utime,
