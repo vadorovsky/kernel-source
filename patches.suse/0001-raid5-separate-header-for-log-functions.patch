@@ -1,0 +1,317 @@
+From ff875738edd44e3bc892d378deacc50bccc9d70c Mon Sep 17 00:00:00 2001
+From: Artur Paszkiewicz <artur.paszkiewicz@intel.com>
+Date: Thu, 9 Mar 2017 09:59:58 +0100
+Subject: [PATCH] raid5: separate header for log functions
+Git-commit: ff875738edd44e3bc892d378deacc50bccc9d70c
+Patch-mainline: v4.12
+References: fate#321488, bsc#1042359
+
+Move raid5-cache declarations from raid5.h to raid5-log.h, add inline
+wrappers for functions which will be shared with ppl and use them in
+raid5 core instead of direct calls to raid5-cache.
+
+Remove unused parameter from r5c_cache_data(), move two duplicated
+pr_debug() calls to r5l_init_log().
+
+Signed-off-by: Artur Paszkiewicz <artur.paszkiewicz@intel.com>
+Signed-off-by: Shaohua Li <shli@fb.com>
+Signed-off-by: Coly Li <colyli@suse.de>
+---
+ drivers/md/raid5-cache.c |   17 +++++++--
+ drivers/md/raid5-log.h   |   81 +++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/md/raid5.c       |   48 +++++++--------------------
+ drivers/md/raid5.h       |   19 -----------
+ 4 files changed, 107 insertions(+), 58 deletions(-)
+ create mode 100644 drivers/md/raid5-log.h
+
+--- a/drivers/md/raid5-cache.c
++++ b/drivers/md/raid5-cache.c
+@@ -344,6 +344,8 @@ void r5c_handle_cached_data_endio(struct
+ 	}
+ }
+ 
++void r5l_wake_reclaim(struct r5l_log *log, sector_t space);
++
+ /* Check whether we should flush some stripes to free up stripe cache */
+ void r5c_check_stripe_cache_usage(struct r5conf *conf)
+ {
+@@ -2621,9 +2623,7 @@ void r5c_finish_stripe_write_out(struct
+ 	}
+ }
+ 
+-int
+-r5c_cache_data(struct r5l_log *log, struct stripe_head *sh,
+-	       struct stripe_head_state *s)
++int r5c_cache_data(struct r5l_log *log, struct stripe_head *sh)
+ {
+ 	struct r5conf *conf = sh->raid_conf;
+ 	int pages = 0;
+@@ -2786,6 +2786,10 @@ int r5l_init_log(struct r5conf *conf, st
+ {
+ 	struct request_queue *q = bdev_get_queue(rdev->bdev);
+ 	struct r5l_log *log;
++	char b[BDEVNAME_SIZE];
++
++	pr_debug("md/raid:%s: using device %s as journal\n",
++		 mdname(conf->mddev), bdevname(rdev->bdev, b));
+ 
+ 	if (PAGE_SIZE != 4096)
+ 		return -EINVAL;
+@@ -2888,8 +2892,13 @@ io_kc:
+ 	return -EINVAL;
+ }
+ 
+-void r5l_exit_log(struct r5l_log *log)
++void r5l_exit_log(struct r5conf *conf)
+ {
++	struct r5l_log *log = conf->log;
++
++	conf->log = NULL;
++	synchronize_rcu();
++
+ 	flush_work(&log->disable_writeback_work);
+ 	md_unregister_thread(&log->reclaim_thread);
+ 	mempool_destroy(log->meta_pool);
+--- /dev/null
++++ b/drivers/md/raid5-log.h
+@@ -0,0 +1,81 @@
++#ifndef _RAID5_LOG_H
++#define _RAID5_LOG_H
++
++extern int r5l_init_log(struct r5conf *conf, struct md_rdev *rdev);
++extern void r5l_exit_log(struct r5conf *conf);
++extern int r5l_write_stripe(struct r5l_log *log, struct stripe_head *head_sh);
++extern void r5l_write_stripe_run(struct r5l_log *log);
++extern void r5l_flush_stripe_to_raid(struct r5l_log *log);
++extern void r5l_stripe_write_finished(struct stripe_head *sh);
++extern int r5l_handle_flush_request(struct r5l_log *log, struct bio *bio);
++extern void r5l_quiesce(struct r5l_log *log, int state);
++extern bool r5l_log_disk_error(struct r5conf *conf);
++extern bool r5c_is_writeback(struct r5l_log *log);
++extern int
++r5c_try_caching_write(struct r5conf *conf, struct stripe_head *sh,
++		      struct stripe_head_state *s, int disks);
++extern void
++r5c_finish_stripe_write_out(struct r5conf *conf, struct stripe_head *sh,
++			    struct stripe_head_state *s);
++extern void r5c_release_extra_page(struct stripe_head *sh);
++extern void r5c_use_extra_page(struct stripe_head *sh);
++extern void r5l_wake_reclaim(struct r5l_log *log, sector_t space);
++extern void r5c_handle_cached_data_endio(struct r5conf *conf,
++	struct stripe_head *sh, int disks, struct bio_list *return_bi);
++extern int r5c_cache_data(struct r5l_log *log, struct stripe_head *sh);
++extern void r5c_make_stripe_write_out(struct stripe_head *sh);
++extern void r5c_flush_cache(struct r5conf *conf, int num);
++extern void r5c_check_stripe_cache_usage(struct r5conf *conf);
++extern void r5c_check_cached_full_stripe(struct r5conf *conf);
++extern struct md_sysfs_entry r5c_journal_mode;
++extern void r5c_update_on_rdev_error(struct mddev *mddev);
++extern bool r5c_big_stripe_cached(struct r5conf *conf, sector_t sect);
++
++static inline int log_stripe(struct stripe_head *sh, struct stripe_head_state *s)
++{
++	struct r5conf *conf = sh->raid_conf;
++
++	if (conf->log) {
++		if (!test_bit(STRIPE_R5C_CACHING, &sh->state)) {
++			/* writing out phase */
++			if (s->waiting_extra_page)
++				return 0;
++			return r5l_write_stripe(conf->log, sh);
++		} else if (test_bit(STRIPE_LOG_TRAPPED, &sh->state)) {
++			/* caching phase */
++			return r5c_cache_data(conf->log, sh);
++		}
++	}
++
++	return -EAGAIN;
++}
++
++static inline void log_stripe_write_finished(struct stripe_head *sh)
++{
++	struct r5conf *conf = sh->raid_conf;
++
++	if (conf->log)
++		r5l_stripe_write_finished(sh);
++}
++
++static inline void log_write_stripe_run(struct r5conf *conf)
++{
++	if (conf->log)
++		r5l_write_stripe_run(conf->log);
++}
++
++static inline void log_exit(struct r5conf *conf)
++{
++	if (conf->log)
++		r5l_exit_log(conf);
++}
++
++static inline int log_init(struct r5conf *conf, struct md_rdev *journal_dev)
++{
++	if (journal_dev)
++		return r5l_init_log(conf, journal_dev);
++
++	return 0;
++}
++
++#endif
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -61,6 +61,7 @@
+ #include "raid5.h"
+ #include "raid0.h"
+ #include "bitmap.h"
++#include "raid5-log.h"
+ 
+ #define UNSUPPORTED_MDDEV_FLAGS	(1L << MD_FAILFAST_SUPPORTED)
+ 
+@@ -911,18 +912,8 @@ static void ops_run_io(struct stripe_hea
+ 
+ 	might_sleep();
+ 
+-	if (!test_bit(STRIPE_R5C_CACHING, &sh->state)) {
+-		/* writing out phase */
+-		if (s->waiting_extra_page)
+-			return;
+-		if (r5l_write_stripe(conf->log, sh) == 0)
+-			return;
+-	} else {  /* caching phase */
+-		if (test_bit(STRIPE_LOG_TRAPPED, &sh->state)) {
+-			r5c_cache_data(conf->log, sh, s);
+-			return;
+-		}
+-	}
++	if (log_stripe(sh, s) == 0)
++		return;
+ 
+ 	for (i = disks; i--; ) {
+ 		int op, op_flags = 0;
+@@ -3250,7 +3241,7 @@ handle_failed_stripe(struct r5conf *conf
+ 		if (bi)
+ 			bitmap_end = 1;
+ 
+-		r5l_stripe_write_finished(sh);
++		log_stripe_write_finished(sh);
+ 
+ 		if (test_and_clear_bit(R5_Overlap, &sh->dev[i].flags))
+ 			wake_up(&conf->wait_for_overlap);
+@@ -3669,7 +3660,7 @@ returnbi:
+ 				discard_pending = 1;
+ 		}
+ 
+-	r5l_stripe_write_finished(sh);
++	log_stripe_write_finished(sh);
+ 
+ 	if (!discard_pending &&
+ 	    test_bit(R5_Discard, &sh->dev[sh->pd_idx].flags)) {
+@@ -4659,7 +4650,7 @@ static void handle_stripe(struct stripe_
+ 
+ 	if (s.just_cached)
+ 		r5c_handle_cached_data_endio(conf, sh, disks, &s.return_bi);
+-	r5l_stripe_write_finished(sh);
++	log_stripe_write_finished(sh);
+ 
+ 	/* Now we might consider reading some blocks, either to check/generate
+ 	 * parity, or to satisfy requests
+@@ -6060,7 +6051,7 @@ static int handle_active_stripes(struct
+ 
+ 	for (i = 0; i < batch_size; i++)
+ 		handle_stripe(batch[i]);
+-	r5l_write_stripe_run(conf->log);
++	log_write_stripe_run(conf);
+ 
+ 	cond_resched();
+ 
+@@ -6638,8 +6629,8 @@ static void free_conf(struct r5conf *con
+ {
+ 	int i;
+ 
+-	if (conf->log)
+-		r5l_exit_log(conf->log);
++	log_exit(conf);
++
+ 	if (conf->shrinker.nr_deferred)
+ 		unregister_shrinker(&conf->shrinker);
+ 
+@@ -7356,14 +7347,8 @@ static int raid5_run(struct mddev *mddev
+ 		blk_queue_max_hw_sectors(mddev->queue, UINT_MAX);
+ 	}
+ 
+-	if (journal_dev) {
+-		char b[BDEVNAME_SIZE];
+-
+-		pr_debug("md/raid:%s: using device %s as journal\n",
+-			 mdname(mddev), bdevname(journal_dev->bdev, b));
+-		if (r5l_init_log(conf, journal_dev))
+-			goto abort;
+-	}
++	if (log_init(conf, journal_dev))
++		goto abort;
+ 
+ 	return 0;
+ abort:
+@@ -7477,17 +7462,13 @@ static int raid5_remove_disk(struct mdde
+ 
+ 	print_raid5_conf(conf);
+ 	if (test_bit(Journal, &rdev->flags) && conf->log) {
+-		struct r5l_log *log;
+ 		/*
+ 		 * we can't wait pending write here, as this is called in
+ 		 * raid5d, wait will deadlock.
+ 		 */
+ 		if (atomic_read(&mddev->writes_pending))
+ 			return -EBUSY;
+-		log = conf->log;
+-		conf->log = NULL;
+-		synchronize_rcu();
+-		r5l_exit_log(log);
++		log_exit(conf);
+ 		return 0;
+ 	}
+ 	if (rdev == p->rdev)
+@@ -7556,7 +7537,6 @@ static int raid5_add_disk(struct mddev *
+ 	int last = conf->raid_disks - 1;
+ 
+ 	if (test_bit(Journal, &rdev->flags)) {
+-		char b[BDEVNAME_SIZE];
+ 		if (conf->log)
+ 			return -EBUSY;
+ 
+@@ -7565,9 +7545,7 @@ static int raid5_add_disk(struct mddev *
+ 		 * The array is in readonly mode if journal is missing, so no
+ 		 * write requests running. We should be safe
+ 		 */
+-		r5l_init_log(conf, rdev);
+-		pr_debug("md/raid:%s: using device %s as journal\n",
+-			 mdname(mddev), bdevname(rdev->bdev, b));
++		log_init(conf, rdev);
+ 		return 0;
+ 	}
+ 	if (mddev->recovery_disabled == conf->recovery_disabled)
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -767,23 +767,4 @@ extern struct stripe_head *
+ raid5_get_active_stripe(struct r5conf *conf, sector_t sector,
+ 			int previous, int noblock, int noquiesce);
+ extern int raid5_calc_degraded(struct r5conf *conf);
+-extern int r5l_init_log(struct r5conf *conf, struct md_rdev *rdev);
+-extern void r5l_exit_log(struct r5l_log *log);
+-extern int r5l_write_stripe(struct r5l_log *log, struct stripe_head *head_sh);
+-extern void r5l_write_stripe_run(struct r5l_log *log);
+-extern void r5l_flush_stripe_to_raid(struct r5l_log *log);
+-extern void r5l_stripe_write_finished(struct stripe_head *sh);
+-extern void r5c_use_extra_page(struct stripe_head *sh);
+-extern void r5l_wake_reclaim(struct r5l_log *log, sector_t space);
+-extern int r5l_handle_flush_request(struct r5l_log *log, struct bio *bio);
+-extern void r5l_quiesce(struct r5l_log *log, int state);
+-extern bool r5l_log_disk_error(struct r5conf *conf);
+-extern void r5c_release_extra_page(struct stripe_head *sh);
+-extern void r5c_handle_cached_data_endio(struct r5conf *conf,
+-	struct stripe_head *sh, int disks, struct bio_list *return_bi);
+-extern int r5c_cache_data(struct r5l_log *log, struct stripe_head *sh,
+-			struct stripe_head_state *s);
+-extern struct md_sysfs_entry r5c_journal_mode;
+-extern void r5c_update_on_rdev_error(struct mddev *mddev);
+-extern bool r5c_big_stripe_cached(struct r5conf *conf, sector_t sect);
+ #endif
