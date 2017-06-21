@@ -1,0 +1,126 @@
+From: NeilBrown <neilb@suse.com>
+Subject: [PATCH] md: use a separate bio_set for synchronous IO.
+References: bsc#1040351
+Patch-mainline: Submitted, linux-raid 21jun2017
+
+md devices allocate a bio_set and use it for two
+distinct purposes.
+mddev->bio_set is used to clone bios as part of sending
+upper level requests down to lower level devices,
+and it is also use for synchronous IO such as superblock
+and bitmap updates, and for correcting read errors.
+
+This multiple usage can lead to deadlocks.  It is likely
+that cloned bios might be queued for write and to be
+waiting for a metadata update before the write can be permitted.
+If the cloning exhausted mddev->bio_set, the metadata update
+may not be able to proceed.
+
+This scenario has been seen during heavy testing, with lots of IO and
+lots of memory pressure.
+
+Address this by adding a new bio_set specifically for synchronous IO.
+All synchronous IO goes directly to the underlying device and is not
+queued at the md level, so request using entries from the new
+mddev->sync_set will complete in a timely fashion.
+Requests that use mddev->bio_set will sometimes need to wait
+for synchronous IO, but will no longer risk deadlocking that iO.
+
+Also: small simplification in mddev_put(): there is no need to
+wait until the spinlock is released before calling bioset_free().
+
+Signed-off-by: NeilBrown <neilb@suse.com>
+
+---
+ drivers/md/md.c |   39 ++++++++++++++++++++++++++++++++++++---
+ drivers/md/md.h |    3 +++
+ 2 files changed, 39 insertions(+), 3 deletions(-)
+
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -188,6 +188,34 @@ struct bio *bio_alloc_mddev(gfp_t gfp_ma
+ }
+ EXPORT_SYMBOL_GPL(bio_alloc_mddev);
+ 
++static void mddev_bio_destructor2(struct bio *bio)
++{
++	mddev_t *mddev, **mddevp;
++
++	mddevp = (void*)bio;
++	mddev = mddevp[-1];
++
++	bio_free(bio, mddev->sync_set);
++}
++
++struct bio *md_bio_alloc_sync(mddev_t *mddev)
++{
++	struct bio *b;
++	mddev_t **mddevp;
++
++	if (!mddev->sync_set)
++		return bio_alloc(GFP_NOIO, 1);
++
++	b = bio_alloc_bioset(GFP_NOIO, 1,
++			     mddev->sync_set);
++	if (!b)
++		return NULL;
++	mddevp = (void*)b;
++	mddevp[-1] = mddev;
++	b->bi_destructor = mddev_bio_destructor2;
++	return b;
++}
++
+ struct bio *bio_clone_mddev(struct bio *bio, gfp_t gfp_mask,
+ 			    mddev_t *mddev)
+ {
+@@ -550,6 +578,9 @@ static void mddev_put(mddev_t *mddev)
+ 		list_del_init(&mddev->all_mddevs);
+ 		bs = mddev->bio_set;
+ 		mddev->bio_set = NULL;
++		if (mddev->sync_set)
++			bioset_free(mddev->sync_set);
++		mddev->sync_set = NULL;
+ 		if (mddev->gendisk) {
+ 			/* We did a probe so need to clean up.  Call
+ 			 * queue_work inside the spinlock so that
+@@ -846,7 +877,7 @@ void md_super_write(mddev_t *mddev, mdk_
+ 	if (test_bit(Faulty, &rdev->flags))
+ 		return;
+ 
+-	bio = bio_alloc_mddev(GFP_NOIO, 1, mddev);
++	bio = md_bio_alloc_sync(mddev);
+ 
+ 	bio->bi_bdev = rdev->meta_bdev ? rdev->meta_bdev : rdev->bdev;
+ 	bio->bi_sector = sector;
+@@ -886,7 +917,7 @@ static void bi_complete(struct bio *bio,
+ int sync_page_io(mdk_rdev_t *rdev, sector_t sector, int size,
+ 		 struct page *page, int rw, bool metadata_op)
+ {
+-	struct bio *bio = bio_alloc_mddev(GFP_NOIO, 1, rdev->mddev);
++	struct bio *bio = md_bio_alloc_sync(rdev->mddev);
+ 	struct completion event;
+ 	int ret;
+ 
+@@ -4897,7 +4928,9 @@ int md_run(mddev_t *mddev)
+ 	}
+ 
+ 	if (mddev->bio_set == NULL)
+-		mddev->bio_set = bioset_create(BIO_POOL_SIZE, sizeof(mddev));
++		mddev->bio_set = bioset_create(BIO_POOL_SIZE, sizeof(*mddev));
++	if (mddev->sync_set == NULL)
++		mddev->sync_set = bioset_create(BIO_POOL_SIZE, sizeof(*mddev));
+ 
+ 	spin_lock(&pers_lock);
+ 	pers = find_pers(mddev->level, mddev->clevel);
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -362,6 +362,9 @@ struct mddev_s
+ 	struct work_struct flush_work;
+ 	struct work_struct event_work;	/* used by dm to report failure event */
+ 	void (*sync_super)(mddev_t *mddev, mdk_rdev_t *rdev);
++#ifndef __GENKSYMS__
++	struct bio_set			*sync_set;
++#endif
+ };
+ 
+ 
