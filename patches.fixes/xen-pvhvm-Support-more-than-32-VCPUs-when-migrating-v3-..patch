@@ -1,0 +1,129 @@
+From: Ankur Arora <ankur.a.arora@oracle.com>
+Date: Fri, 2 Jun 2017 17:05:59 -0700
+Subject: xen/pvh*: Support > 32 VCPUs at domain restore
+Patch-mainline: 4.13-rc1
+Git-commit: 0b64ffb8db4e310f77a01079ca752d946a8526b5
+References: bnc#1045563
+
+When Xen restores a PVHVM or PVH guest, its shared_info only holds
+up to 32 CPUs. The hypercall VCPUOP_register_vcpu_info allows
+us to setup per-page areas for VCPUs. This means we can boot
+PVH* guests with more than 32 VCPUs. During restore the per-cpu
+structure is allocated freshly by the hypervisor (vcpu_info_mfn is
+set to INVALID_MFN) so that the newly restored guest can make a
+VCPUOP_register_vcpu_info hypercall.
+
+However, we end up triggering this condition in Xen:
+/* Run this command on yourself or on other offline VCPUS. */
+ if ( (v != current) && !test_bit(_VPF_down, &v->pause_flags) )
+
+which means we are unable to setup the per-cpu VCPU structures
+for running VCPUS. The Linux PV code paths makes this work by
+iterating over cpu_possible in xen_vcpu_restore() with:
+
+ 1) is target CPU up (VCPUOP_is_up hypercall?)
+ 2) if yes, then VCPUOP_down to pause it
+ 3) VCPUOP_register_vcpu_info
+ 4) if it was down, then VCPUOP_up to bring it back up
+
+With Xen commit 192df6f9122d ("xen/x86: allow HVM guests to use
+hypercalls to bring up vCPUs") this is available for non-PV guests.
+As such first check if VCPUOP_is_up is actually possible before
+trying this dance.
+
+As most of this dance code is done already in xen_vcpu_restore()
+let's make it callable on PV, PVH and PVHVM.
+
+Based-on-patch-by: Konrad Wilk <konrad.wilk@oracle.com>
+Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Signed-off-by: Ankur Arora <ankur.a.arora@oracle.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+---
+diff --git a/arch/x86/xen/enlighten.c b/arch/x86/xen/enlighten.c
+index ffa41591bff9..b59d05edbd01 100644
+--- a/arch/x86/xen/enlighten.c
++++ b/arch/x86/xen/enlighten.c
+@@ -243,12 +243,23 @@ static void xen_vcpu_setup(int cpu)
+ void xen_vcpu_restore(void)
+ {
+ 	int cpu;
++	bool vcpuops = true;
++	const struct cpumask *mask;
+ 
+-	for_each_possible_cpu(cpu) {
++	mask = xen_pv_domain() ? cpu_possible_mask : cpu_online_mask;
++
++	/* Only Xen 4.5 and higher supports this. */
++	if (HYPERVISOR_vcpu_op(VCPUOP_is_up, smp_processor_id(), NULL) == -ENOSYS)
++		vcpuops = false;
++
++	for_each_cpu(cpu, mask) {
+ 		bool other_cpu = (cpu != smp_processor_id());
+-		bool is_up = HYPERVISOR_vcpu_op(VCPUOP_is_up, cpu, NULL);
++		bool is_up = false;
+ 
+-		if (other_cpu && is_up &&
++		if (vcpuops)
++			is_up = HYPERVISOR_vcpu_op(VCPUOP_is_up, cpu, NULL);
++
++		if (vcpuops && other_cpu && is_up &&
+ 		    HYPERVISOR_vcpu_op(VCPUOP_down, cpu, NULL))
+ 			BUG();
+ 
+@@ -257,7 +268,7 @@ void xen_vcpu_restore(void)
+ 		if (have_vcpu_info_placement)
+ 			xen_vcpu_setup(cpu);
+ 
+-		if (other_cpu && is_up &&
++		if (vcpuops && other_cpu && is_up &&
+ 		    HYPERVISOR_vcpu_op(VCPUOP_up, cpu, NULL))
+ 			BUG();
+ 	}
+@@ -1752,8 +1763,8 @@ void __ref xen_hvm_init_shared_info(void)
+ 	 * in that case multiple vcpus might be online. */
+ 	for_each_online_cpu(cpu) {
+ 		/* Leave it to be NULL. */
+-		if (cpu >= MAX_VIRT_CPUS)
+-			continue;
++		if (cpu >= MAX_VIRT_CPUS && cpu <= NR_CPUS)
++			per_cpu(xen_vcpu, cpu) = NULL; /* Triggers xen_vcpu_setup.*/
+ 		per_cpu(xen_vcpu, cpu) = &HYPERVISOR_shared_info->vcpu_info[cpu];
+ 	}
+ }
+diff --git a/arch/x86/xen/suspend.c b/arch/x86/xen/suspend.c
+index 7f664c416faf..0458a2b3050f 100644
+--- a/arch/x86/xen/suspend.c
++++ b/arch/x86/xen/suspend.c
+@@ -33,16 +33,11 @@ static void xen_pv_pre_suspend(void)
+ static void xen_hvm_post_suspend(int suspend_cancelled)
+ {
+ #ifdef CONFIG_XEN_PVHVM
+-	int cpu;
+ 	if (!suspend_cancelled)
+-	    xen_hvm_init_shared_info();
++		xen_hvm_init_shared_info();
+ 	xen_callback_vector();
+ 	xen_unplug_emulated_devices();
+-	if (xen_feature(XENFEAT_hvm_safe_pvclock)) {
+-		for_each_online_cpu(cpu) {
+-			xen_setup_runstate_info(cpu);
+-		}
+-	}
++	xen_vcpu_restore();
+ #endif
+ }
+ 
+diff --git a/arch/x86/xen/time.c b/arch/x86/xen/time.c
+index 8846257d8792..02dce7c95ce4 100644
+--- a/arch/x86/xen/time.c
++++ b/arch/x86/xen/time.c
+@@ -105,6 +105,9 @@ void xen_setup_runstate_info(int cpu)
+ {
+ 	struct vcpu_register_runstate_memory_area area;
+ 
++	if (xen_hvm_domain() && !(xen_feature(XENFEAT_hvm_safe_pvclock)))
++		return;
++
+ 	area.addr.v = &per_cpu(xen_runstate, cpu);
+ 
+ 	if (HYPERVISOR_vcpu_op(VCPUOP_register_runstate_memory_area,
