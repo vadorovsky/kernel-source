@@ -1,0 +1,204 @@
+From: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Date: Thu, 31 May 2012 14:47:33 +0200
+Subject: sched: Fix domain iteration
+Git-commit: c1174876874dcf8986806e4dad3d7d07af20b439
+Patch-mainline: v3.5-rc2
+References: bnc#1013018
+
+Weird topologies can lead to asymmetric domain setups. This needs
+further consideration since these setups are typically non-minimal
+too.
+
+For now, make it work by adding an extra mask selecting which CPUs
+are allowed to iterate up.
+
+The topology that triggered it is the one from David Rientjes:
+
+	10 20 20 30
+	20 10 20 20
+	20 20 10 20
+	30 20 20 10
+
+resulting in boxes that wouldn't even boot.
+
+Reported-by: David Rientjes <rientjes@google.com>
+Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/n/tip-3p86l9cuaqnxz7uxsojmz5rm@git.kernel.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Mike Galbraith <mgalbraith@suse.de>
+---
+ include/linux/sched.h |    4 +++
+ kernel/sched.c        |   64 +++++++++++++++++++++++++++++++++++++++++++-------
+ kernel/sched_fair.c   |   16 ++++++++++--
+ 3 files changed, 74 insertions(+), 10 deletions(-)
+
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -911,6 +911,10 @@ struct sched_group_power {
+ 	 * single CPU.
+ 	 */
+ 	unsigned int power, power_orig;
++
++#ifndef __GENKSYMS__
++	unsigned long cpumask[0]; /* iteration mask */
++#endif
+ };
+ 
+ struct sched_group {
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -7524,6 +7524,44 @@ struct sched_domain_topology_level {
+ 	struct sd_data      data;
+ };
+ 
++/*
++ * Build an iteration mask that can exclude certain CPUs from the upwards
++ * domain traversal.
++ *
++ * Asymmetric node setups can result in situations where the domain tree is of
++ * unequal depth, make sure to skip domains that already cover the entire
++ * range.
++ *
++ * In that case build_sched_domains() will have terminated the iteration early
++ * and our sibling sd spans will be empty. Domains should always include the
++ * cpu they're built on, so check that.
++ *
++ */
++static void build_group_mask(struct sched_domain *sd, struct sched_group *sg)
++{
++	const struct cpumask *span = sched_domain_span(sd);
++	struct sd_data *sdd = sd->private;
++	struct sched_domain *sibling;
++	int i;
++
++	for_each_cpu(i, span) {
++		sibling = *per_cpu_ptr(sdd->sd, i);
++		if (!cpumask_test_cpu(i, sched_domain_span(sibling)))
++			continue;
++
++		cpumask_set_cpu(i, sched_group_mask(sg));
++	}
++}
++
++/*
++ * Return the canonical balance cpu for this group, this is the first cpu
++ * of this group that's also in the iteration mask.
++ */
++int group_balance_cpu(struct sched_group *sg)
++{
++	return cpumask_first_and(sched_group_cpus(sg), sched_group_mask(sg));
++}
++
+ static int
+ build_overlap_sched_groups(struct sched_domain *sd, int cpu)
+ {
+@@ -7542,6 +7580,12 @@ build_overlap_sched_groups(struct sched_
+ 		if (cpumask_test_cpu(i, covered))
+ 			continue;
+ 
++		child = *per_cpu_ptr(sdd->sd, i);
++
++		/* See the comment near build_group_mask(). */
++		if (!cpumask_test_cpu(i, sched_domain_span(child)))
++			continue;
++
+ 		sg = kzalloc_node(sizeof(struct sched_group) + cpumask_size(),
+ 				GFP_KERNEL, cpu_to_node(cpu));
+ 
+@@ -7549,8 +7593,6 @@ build_overlap_sched_groups(struct sched_
+ 			goto fail;
+ 
+ 		sg_span = sched_group_cpus(sg);
+-
+-		child = *per_cpu_ptr(sdd->sd, i);
+ 		if (child->child) {
+ 			child = child->child;
+ 			cpumask_copy(sg_span, sched_domain_span(child));
+@@ -7560,13 +7602,18 @@ build_overlap_sched_groups(struct sched_
+ 		cpumask_or(covered, covered, sg_span);
+ 
+ 		sg->sgp = *per_cpu_ptr(sdd->sgp, i);
+-		atomic_inc(&sg->sgp->ref);
++		if (atomic_inc_return(&sg->sgp->ref) == 1)
++			build_group_mask(sd, sg);
++
+ 
++		/*
++		 * Make sure the first group of this domain contains the
++		 * canonical balance cpu. Otherwise the sched_domain iteration
++		 * breaks. See update_sg_lb_stats().
++		 */
+ 		if ((!groups && cpumask_test_cpu(cpu, sg_span)) ||
+-			       cpumask_first(sg_span) == cpu) {
+-			WARN_ON_ONCE(!cpumask_test_cpu(cpu, sg_span));
++		    group_balance_cpu(sg) == cpu)
+ 			groups = sg;
+-		}
+ 
+ 		if (!first)
+ 			first = sg;
+@@ -7639,6 +7686,7 @@ build_sched_groups(struct sched_domain *
+ 
+ 		cpumask_clear(sched_group_cpus(sg));
+ 		sg->sgp->power = 0;
++		cpumask_setall(sched_group_mask(sg));
+ 
+ 		for_each_cpu(j, span) {
+ 			if (get_group(j, sdd, NULL) != group)
+@@ -7680,7 +7728,7 @@ static void init_sched_groups_power(int
+ 		sg = sg->next;
+ 	} while (sg != sd->groups);
+ 
+-	if (cpu != group_first_cpu(sg))
++	if (cpu != group_balance_cpu(sg))
+ 		return;
+ 
+ 	update_group_power(sd, cpu);
+@@ -7879,7 +7927,7 @@ static int __sdt_alloc(const struct cpum
+ 
+ 			*per_cpu_ptr(sdd->sg, j) = sg;
+ 
+-			sgp = kzalloc_node(sizeof(struct sched_group_power),
++			sgp = kzalloc_node(sizeof(struct sched_group_power) + cpumask_size(),
+ 					GFP_KERNEL, cpu_to_node(j));
+ 			if (!sgp)
+ 				return -ENOMEM;
+--- a/kernel/sched_fair.c
++++ b/kernel/sched_fair.c
+@@ -3142,6 +3142,17 @@ struct sg_lb_stats {
+ 	int group_has_capacity; /* Is there extra capacity in the group? */
+ };
+ 
++extern int group_balance_cpu(struct sched_group *sg);
++
++/*
++ * cpumask masking which cpus in the group are allowed to iterate up the domain
++ * tree.
++ */
++static inline struct cpumask *sched_group_mask(struct sched_group *sg)
++{
++	return to_cpumask(sg->sgp->cpumask);
++}
++
+ /**
+  * group_first_cpu - Returns the first cpu in the cpumask of a sched_group.
+  * @group: The group whose first cpu is to be returned.
+@@ -3498,7 +3509,7 @@ static inline void update_sg_lb_stats(st
+ 	unsigned long avg_load_per_task = 0;
+ 
+ 	if (local_group)
+-		balance_cpu = group_first_cpu(group);
++		balance_cpu = group_balance_cpu(group);
+ 
+ 	/* Tally up the load of all CPUs in the group */
+ 	max_cpu_load = 0;
+@@ -3510,7 +3521,8 @@ static inline void update_sg_lb_stats(st
+ 
+ 		/* Bias balancing toward cpus of our domain */
+ 		if (local_group) {
+-			if (idle_cpu(i) && !first_idle_cpu) {
++			if (idle_cpu(i) && !first_idle_cpu &&
++					cpumask_test_cpu(i, sched_group_mask(group))) {
+ 				first_idle_cpu = 1;
+ 				balance_cpu = i;
+ 			}
