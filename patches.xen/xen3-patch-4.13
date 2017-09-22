@@ -1,0 +1,2855 @@
+From: Linux Kernel Mailing List <linux-kernel@vger.kernel.org>
+Subject: Linux: 4.13
+Patch-mainline: Never, SUSE-Xen specific
+References: none
+
+ This patch contains the differences between 4.12 and 4.13.
+
+Automatically created from "patch-4.13" by xen-port-patches.py
+Acked-by: jbeulich@suse.com
+
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -74,7 +74,7 @@ config X86
+ 	select ARCH_USE_QUEUED_SPINLOCKS
+ 	select ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+ 	select ARCH_WANTS_DYNAMIC_TASK_STRUCT
+-	select ARCH_WANTS_THP_SWAP		if X86_64
++	select ARCH_WANTS_THP_SWAP		if X86_64 && !XEN
+ 	select BUILDTIME_EXTABLE_SORT
+ 	select CLKEVT_I8253			if !XEN
+ 	select CLOCKSOURCE_VALIDATE_LAST_CYCLE
+@@ -1121,7 +1121,7 @@ config X86_MCE_THRESHOLD
+ 	def_bool y
+ 
+ config X86_MCE_INJECT
+-	depends on X86_MCE && X86_LOCAL_APIC && DEBUG_FS
++	depends on X86_MCE && X86_LOCAL_APIC && !XEN && DEBUG_FS
+ 	tristate "Machine check injector support"
+ 	---help---
+ 	  Provide support for injecting machine checks for testing purposes.
+--- a/arch/x86/include/mach-xen/asm/hypervisor.h
++++ b/arch/x86/include/mach-xen/asm/hypervisor.h
+@@ -68,6 +68,7 @@ extern start_info_t *xen_start_info;
+ #endif
+ 
+ #define init_hypervisor_platform() ((void)0)
++#define hypervisor_init_mem_mapping() ((void)0)
+ 
+ #ifdef CONFIG_XEN
+ DECLARE_PER_CPU(struct vcpu_runstate_info, runstate);
+--- a/arch/x86/include/mach-xen/asm/io.h
++++ b/arch/x86/include/mach-xen/asm/io.h
+@@ -318,13 +318,13 @@ static inline unsigned type in##bwl##_p(
+ static inline void outs##bwl(int port, const void *addr, unsigned long count) \
+ {									\
+ 	asm volatile("rep; outs" #bwl					\
+-		     : "+S"(addr), "+c"(count) : "d"(port));		\
++		     : "+S"(addr), "+c"(count) : "d"(port) : "memory");	\
+ }									\
+ 									\
+ static inline void ins##bwl(int port, void *addr, unsigned long count)	\
+ {									\
+ 	asm volatile("rep; ins" #bwl					\
+-		     : "+D"(addr), "+c"(count) : "d"(port));		\
++		     : "+D"(addr), "+c"(count) : "d"(port) : "memory");	\
+ }
+ 
+ BUILDIO(b, b, char)
+--- a/arch/x86/include/mach-xen/asm/mmu_context.h
++++ b/arch/x86/include/mach-xen/asm/mmu_context.h
+@@ -54,7 +54,7 @@ struct ldt_struct {
+ 	 * allocations, but it's not worth trying to optimize.
+ 	 */
+ 	struct desc_struct *entries;
+-	unsigned int size;
++	unsigned int nr_entries;
+ };
+ 
+ /*
+@@ -94,19 +94,65 @@ static inline void load_mm_ldt(struct mm
+ 	 */
+ 
+ 	if (unlikely(ldt))
+-		set_ldt(ldt->entries, ldt->size);
++		set_ldt(ldt->entries, ldt->nr_entries);
+ 	else
+ 		clear_LDT();
+ #else
+ 	clear_LDT();
+ #endif
++}
++
++static inline unsigned int switch_ldt(struct mm_struct *prev,
++				      struct mm_struct *next,
++				      struct mmuext_op *op)
++{
++	unsigned int used = 0;
++
++#ifdef CONFIG_MODIFY_LDT_SYSCALL
++	/*
++	 * Load the LDT if either the old or new mm had an LDT.
++	 *
++	 * An mm will never go from having an LDT to not having an LDT.  Two
++	 * mms never share an LDT, so we don't gain anything by checking to
++	 * see whether the LDT changed.  There's also no guarantee that
++	 * prev->context.ldt actually matches LDTR, but, if LDTR is non-NULL,
++	 * then prev->context.ldt will also be non-NULL.
++	 *
++	 * If we really cared, we could optimize the case where prev == next
++	 * and we're exiting lazy mode.  Most of the time, if this happens,
++	 * we don't actually need to reload LDTR, but modify_ldt() is mostly
++	 * used by legacy code and emulators where we don't need this level of
++	 * performance.
++	 *
++	 * This uses | instead of || because it generates better code.
++	 */
++	if (unlikely((unsigned long)prev->context.ldt |
++		     (unsigned long)next->context.ldt)) {
++		/* load_mm_ldt(next) */
++		const struct ldt_struct *ldt;
++
++		/* lockless_dereference synchronizes with smp_store_release */
++		ldt = lockless_dereference(next->context.ldt);
++		op->cmd = MMUEXT_SET_LDT;
++		if (unlikely(ldt)) {
++			op->arg1.linear_addr = (long)ldt->entries;
++			op->arg2.nr_ents     = ldt->nr_entries;
++		} else {
++			op->arg1.linear_addr = 0;
++			op->arg2.nr_ents     = 0;
++		}
++		++used;
++	}
++#endif
+ 
+ 	DEBUG_LOCKS_WARN_ON(preemptible());
++
++	return used;
+ }
+ 
+ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ {
+-#if defined(CONFIG_SMP) && !defined(CONFIG_XEN) /* XEN: no lazy tlb */
++#ifndef CONFIG_XEN /* XEN: no lazy tlb */
+ 	if (this_cpu_read(cpu_tlbstate.state) == TLBSTATE_OK)
+ 		this_cpu_write(cpu_tlbstate.state, TLBSTATE_LAZY);
+ #endif
+@@ -166,9 +212,7 @@ static inline int init_new_context(struc
+ 		mm->context.execute_only_pkey = -1;
+ 	}
+ 	#endif
+-	init_new_context_ldt(tsk, mm);
+-
+-	return 0;
++	return init_new_context_ldt(tsk, mm);
+ }
+ static inline void destroy_context(struct mm_struct *mm)
+ {
+@@ -272,18 +316,6 @@ static inline int vma_pkey(struct vm_are
+ }
+ #endif
+ 
+-static inline bool __pkru_allows_pkey(u16 pkey, bool write)
+-{
+-	u32 pkru = read_pkru();
+-
+-	if (!__pkru_allows_read(pkru, pkey))
+-		return false;
+-	if (write && !__pkru_allows_write(pkru, pkey))
+-		return false;
+-
+-	return true;
+-}
+-
+ /*
+  * We only want to enforce protection keys on the current process
+  * because we effectively have no access to PKRU for other
+@@ -320,4 +352,24 @@ static inline bool arch_vma_access_permi
+ 	return __pkru_allows_pkey(vma_pkey(vma), write);
+ }
+ 
++#ifndef CONFIG_XEN /* XEN: no lazy tlb */
++/*
++ * This can be used from process context to figure out what the value of
++ * CR3 is without needing to do a (slow) __read_cr3().
++ *
++ * It's intended to be used for code like KVM that sneakily changes CR3
++ * and needs to restore it.  It needs to be used very carefully.
++ */
++static inline unsigned long __get_current_cr3_fast(void)
++{
++	unsigned long cr3 = __pa(this_cpu_read(cpu_tlbstate.loaded_mm)->pgd);
++
++	/* For now, be very restrictive about when this can be called. */
++	VM_WARN_ON(in_nmi() || preemptible());
++
++	VM_BUG_ON(cr3 != __read_cr3());
++	return cr3;
++}
++#endif /* CONFIG_XEN */
++
+ #endif /* _ASM_X86_MMU_CONTEXT_H */
+--- a/arch/x86/include/mach-xen/asm/pci.h
++++ b/arch/x86/include/mach-xen/asm/pci.h
+@@ -80,14 +80,8 @@ static inline bool is_vmd(struct pci_bus
+ 
+ extern unsigned int pcibios_assign_all_busses(void);
+ extern int pci_legacy_init(void);
+-# ifdef CONFIG_ACPI
+-#  define x86_default_pci_init pci_acpi_init
+-# else
+-#  define x86_default_pci_init pci_legacy_init
+-# endif
+ #else
+-# define pcibios_assign_all_busses()	0
+-# define x86_default_pci_init		NULL
++static inline int pcibios_assign_all_busses(void) { return 0; }
+ #endif
+ 
+ #include <asm/hypervisor.h>
+--- a/arch/x86/include/mach-xen/asm/pgtable-3level.h
++++ b/arch/x86/include/mach-xen/asm/pgtable-3level.h
+@@ -213,4 +213,51 @@ static inline pud_t xen_pudp_get_and_cle
+ #define __pte_to_swp_entry(pte)		((swp_entry_t){ (pte).pte_high })
+ #define __swp_entry_to_pte(x)		((pte_t){ { .pte_high = (x).val } })
+ 
++#define gup_get_pte gup_get_pte
++/*
++ * WARNING: only to be used in the get_user_pages_fast() implementation.
++ *
++ * With get_user_pages_fast(), we walk down the pagetables without taking
++ * any locks.  For this we would like to load the pointers atomically,
++ * but that is not possible (without expensive cmpxchg8b) on PAE.  What
++ * we do have is the guarantee that a PTE will only either go from not
++ * present to present, or present to not present or both -- it will not
++ * switch to a completely different present page without a TLB flush in
++ * between; something that we are blocking by holding interrupts off.
++ *
++ * Setting ptes from not present to present goes:
++ *
++ *   ptep->pte_high = h;
++ *   smp_wmb();
++ *   ptep->pte_low = l;
++ *
++ * And present to not present goes:
++ *
++ *   ptep->pte_low = 0;
++ *   smp_wmb();
++ *   ptep->pte_high = 0;
++ *
++ * We must ensure here that the load of pte_low sees 'l' iff pte_high
++ * sees 'h'. We load pte_high *after* loading pte_low, which ensures we
++ * don't see an older value of pte_high.  *Then* we recheck pte_low,
++ * which ensures that we haven't picked up a changed pte high. We might
++ * have gotten rubbish values from pte_low and pte_high, but we are
++ * guaranteed that pte_low will not have the present bit set *unless*
++ * it is 'l'. Because get_user_pages_fast() only operates on present ptes
++ * we're safe.
++ */
++static inline pte_t gup_get_pte(pte_t *ptep)
++{
++	pte_t pte;
++
++	do {
++		pte.pte_low = ptep->pte_low;
++		smp_rmb();
++		pte.pte_high = ptep->pte_high;
++		smp_rmb();
++	} while (unlikely(pte.pte_low != ptep->pte_low));
++
++	return pte;
++}
++
+ #endif /* _ASM_X86_PGTABLE_3LEVEL_H */
+--- a/arch/x86/include/mach-xen/asm/pgtable.h
++++ b/arch/x86/include/mach-xen/asm/pgtable.h
+@@ -238,6 +238,11 @@ static inline int pud_devmap(pud_t pud)
+ 	return 0;
+ }
+ #endif
++
++static inline int pgd_devmap(pgd_t pgd)
++{
++	return 0;
++}
+ #endif
+ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+@@ -921,7 +926,8 @@ static inline int pgd_none(pgd_t pgd)
+ #define KERNEL_PGD_PTRS		(PTRS_PER_PGD - KERNEL_PGD_BOUNDARY)
+ 
+ #ifndef __ASSEMBLY__
+-#include <asm/tlbflush.h>
++#include <linux/mmzone.h>
++#include <linux/page-flags.h>
+ 
+ #define direct_gbpages 0
+ void init_mem_mapping(void);
+@@ -934,7 +940,7 @@ extern pgd_t trampoline_pgd_entry;
+ static inline void __meminit init_trampoline_default(void)
+ {
+ 	/* Default trampoline pgd value */
+-	trampoline_pgd_entry = init_level4_pgt[pgd_index(__PAGE_OFFSET)];
++	trampoline_pgd_entry = init_top_pgt[pgd_index(__PAGE_OFFSET)];
+ }
+ # ifdef CONFIG_RANDOMIZE_MEMORY
+ void __meminit init_trampoline(void);
+@@ -1048,7 +1054,7 @@ extern int ptep_clear_flush_young(struct
+ 			uvm_multi(mm_cpumask((vma)->vm_mm)) |	\
+ 				UVMF_INVLPG))) {		\
+ 		__xen_pte_clear(__ptep);			\
+-		flush_tlb_page(vma, addr);			\
++		xen_invlpg_mask(mm_cpumask((vma)->vm_mm), addr);\
+ 	}							\
+ 	__res;							\
+ })
+@@ -1293,6 +1299,54 @@ static inline u16 pte_flags_pkey(unsigne
+ #endif
+ }
+ 
++static inline bool __pkru_allows_pkey(u16 pkey, bool write)
++{
++	u32 pkru = read_pkru();
++
++	if (!__pkru_allows_read(pkru, pkey))
++		return false;
++	if (write && !__pkru_allows_write(pkru, pkey))
++		return false;
++
++	return true;
++}
++
++/*
++ * 'pteval' can come from a PTE, PMD or PUD.  We only check
++ * _PAGE_PRESENT, _PAGE_USER, and _PAGE_RW in here which are the
++ * same value on all 3 types.
++ */
++static inline bool __pte_access_permitted(unsigned long pteval, bool write)
++{
++	unsigned long need_pte_bits = _PAGE_PRESENT|_PAGE_USER;
++
++	if (write)
++		need_pte_bits |= _PAGE_RW;
++
++	if ((pteval & need_pte_bits) != need_pte_bits)
++		return 0;
++
++	return __pkru_allows_pkey(pte_flags_pkey(pteval), write);
++}
++
++#define pte_access_permitted pte_access_permitted
++static inline bool pte_access_permitted(pte_t pte, bool write)
++{
++	return __pte_access_permitted(pte_val(pte), write);
++}
++
++#define pmd_access_permitted pmd_access_permitted
++static inline bool pmd_access_permitted(pmd_t pmd, bool write)
++{
++	return __pte_access_permitted(pmd_val(pmd), write);
++}
++
++#define pud_access_permitted pud_access_permitted
++static inline bool pud_access_permitted(pud_t pud, bool write)
++{
++	return __pte_access_permitted(pud_val(pud), write);
++}
++
+ #include <asm-generic/pgtable.h>
+ 
+ struct vm_area_struct;
+--- a/arch/x86/include/mach-xen/asm/pgtable_64.h
++++ b/arch/x86/include/mach-xen/asm/pgtable_64.h
+@@ -22,15 +22,17 @@ extern void xen_init_pt(void);
+ extern void xen_switch_pt(void);
+ #endif
+ 
++extern p4d_t level4_kernel_pgt[512];
++extern p4d_t level4_ident_pgt[512];
+ extern pud_t level3_kernel_pgt[512];
+ extern pud_t level3_ident_pgt[512];
+ extern pmd_t level2_kernel_pgt[512];
+ extern pmd_t level2_fixmap_pgt[512];
+ extern pmd_t level2_ident_pgt[512];
+ extern pte_t level1_fixmap_pgt[512];
+-extern pgd_t init_level4_pgt[];
++extern pgd_t init_top_pgt[];
+ 
+-#define swapper_pg_dir init_level4_pgt
++#define swapper_pg_dir init_top_pgt
+ 
+ extern void paging_init(void);
+ 
+@@ -234,6 +236,20 @@ extern int kern_addr_valid(unsigned long
+ extern void init_extra_mapping_uc(unsigned long phys, unsigned long size);
+ extern void init_extra_mapping_wb(unsigned long phys, unsigned long size);
+ 
+-#endif /* !__ASSEMBLY__ */
++#define gup_fast_permitted gup_fast_permitted
++static inline bool gup_fast_permitted(unsigned long start, int nr_pages,
++		int write)
++{
++	unsigned long len, end;
++
++	len = (unsigned long)nr_pages << PAGE_SHIFT;
++	end = start + len;
++	if (end < start)
++		return false;
++	if (end >> __VIRTUAL_MASK_SHIFT)
++		return false;
++	return true;
++}
+ 
++#endif /* !__ASSEMBLY__ */
+ #endif /* _ASM_X86_PGTABLE_64_H */
+--- a/arch/x86/include/mach-xen/asm/processor.h
++++ b/arch/x86/include/mach-xen/asm/processor.h
+@@ -139,7 +139,7 @@ struct cpuinfo_x86 {
+ #ifndef CONFIG_XEN
+ 	u32			microcode;
+ #endif
+-};
++} __randomize_layout;
+ 
+ struct cpuid_regs {
+ 	u32 eax, ebx, ecx, edx;
+@@ -240,6 +240,14 @@ xen_cpuid_reg(ebx)
+ xen_cpuid_reg(ecx)
+ xen_cpuid_reg(edx)
+ 
++/*
++ * Friendlier CR3 helpers.
++ */
++static inline unsigned long read_cr3_pa(void)
++{
++	return __read_cr3() & CR3_ADDR_MASK;
++}
++
+ static inline void load_cr3(pgd_t *pgdir)
+ {
+ 	write_cr3(__pa(pgdir));
+@@ -900,8 +908,13 @@ static inline int mpx_disable_management
+ }
+ #endif /* CONFIG_X86_INTEL_MPX */
+ 
++#ifdef CONFIG_CPU_SUP_AMD
+ extern u16 amd_get_nb_id(int cpu);
+ extern u32 amd_get_nodes_per_socket(void);
++#else
++static inline u16 amd_get_nb_id(int cpu)		{ return 0; }
++static inline u32 amd_get_nodes_per_socket(void)	{ return 0; }
++#endif
+ 
+ static inline uint32_t hypervisor_cpuid_base(const char *sig, uint32_t leaves)
+ {
+--- a/arch/x86/include/mach-xen/asm/special_insns.h
++++ b/arch/x86/include/mach-xen/asm/special_insns.h
+@@ -72,7 +72,7 @@ static inline void xen_write_cr0(unsigne
+ #define xen_read_cr2() (current_vcpu_info()->arch.cr2)
+ #define xen_write_cr2(val) ((void)(current_vcpu_info()->arch.cr2 = (val)))
+ 
+-static inline unsigned long xen_read_cr3(void)
++static inline unsigned long __xen_read_cr3(void)
+ {
+ 	unsigned long val;
+ 	asm volatile("mov %%cr3,%0\n\t" : "=r" (val), "=m" (__force_order));
+@@ -183,9 +183,13 @@ static inline void write_cr2(unsigned lo
+ 	xen_write_cr2(x);
+ }
+ 
+-static inline unsigned long read_cr3(void)
++/*
++ * Careful!  CR3 contains more than just an address.  You probably want
++ * read_cr3_pa() instead.
++ */
++static inline unsigned long __read_cr3(void)
+ {
+-	return xen_read_cr3();
++	return __xen_read_cr3();
+ }
+ 
+ static inline void write_cr3(unsigned long x)
+--- a/arch/x86/include/mach-xen/asm/tlbflush.h
++++ b/arch/x86/include/mach-xen/asm/tlbflush.h
+@@ -7,14 +7,21 @@
+ 
+ #include <asm/processor.h>
+ #include <asm/special_insns.h>
++#include <asm/smp.h>
+ 
+ #define __flush_tlb() xen_tlb_flush()
+ #define __flush_tlb_global() xen_tlb_flush()
+ #define __flush_tlb_single(addr) xen_invlpg(addr)
+ 
+ struct tlb_state {
+-#if defined(CONFIG_SMP) && !defined(CONFIG_XEN)
+-	struct mm_struct *active_mm;
++#ifndef CONFIG_XEN
++	/*
++	 * cpu_tlbstate.loaded_mm should match CR3 whenever interrupts
++	 * are on.  This means that it may not match current->active_mm,
++	 * which will contain the previous user mm when we're in lazy TLB
++	 * mode even if we've already switched back to swapper_pg_dir.
++	 */
++	struct mm_struct *loaded_mm;
+ 	int state;
+ #endif
+ 
+@@ -116,72 +123,11 @@ static inline void __flush_tlb_one(unsig
+  * ..but the i386 has somewhat limited tlb flushing capabilities,
+  * and page-granular flushes are available only on i486 and up.
+  */
+-
+-#ifndef CONFIG_SMP
+-
+-/* "_up" is for UniProcessor.
+- *
+- * This is a helper for other header functions.  *Not* intended to be called
+- * directly.  All global TLB flushes need to either call this, or to bump the
+- * vm statistics themselves.
+- */
+-static inline void __flush_tlb_up(void)
+-{
+-	count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
+-	__flush_tlb();
+-}
+-
+-static inline void flush_tlb_all(void)
+-{
+-	count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
+-	__flush_tlb_all();
+-}
+-
+-static inline void local_flush_tlb(void)
+-{
+-	__flush_tlb_up();
+-}
+-
+-static inline void flush_tlb_mm(struct mm_struct *mm)
+-{
+-	if (mm == current->active_mm)
+-		__flush_tlb_up();
+-}
+-
+-static inline void flush_tlb_page(struct vm_area_struct *vma,
+-				  unsigned long addr)
+-{
+-	if (vma->vm_mm == current->active_mm)
+-		__flush_tlb_one(addr);
+-}
+-
+-static inline void flush_tlb_range(struct vm_area_struct *vma,
+-				   unsigned long start, unsigned long end)
+-{
+-	if (vma->vm_mm == current->active_mm)
+-		__flush_tlb_up();
+-}
+-
+-static inline void flush_tlb_mm_range(struct mm_struct *mm,
+-	   unsigned long start, unsigned long end, unsigned long vmflag)
+-{
+-	if (mm == current->active_mm)
+-		__flush_tlb_up();
+-}
+-
+-static inline void reset_lazy_tlbstate(void)
+-{
+-}
+-
+-static inline void flush_tlb_kernel_range(unsigned long start,
+-					  unsigned long end)
+-{
+-	flush_tlb_all();
+-}
+-
+-#else  /* SMP */
+-
+-#include <asm/smp.h>
++struct flush_tlb_info {
++	struct mm_struct *mm;
++	unsigned long start;
++	unsigned long end;
++};
+ 
+ #define local_flush_tlb() __flush_tlb()
+ 
+@@ -191,26 +137,24 @@ static inline void flush_tlb_kernel_rang
+ 		flush_tlb_mm_range((vma)->vm_mm, start, end, (vma)->vm_flags)
+ 
+ #define flush_tlb_all xen_tlb_flush_all
+-#define flush_tlb_page(vma, va) xen_invlpg_mask(mm_cpumask((vma)->vm_mm), va)
+ extern void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 				unsigned long end, unsigned long vmflag);
+ extern void flush_tlb_kernel_range(unsigned long start, unsigned long end);
+ 
+-extern void flush_tlb_others(const struct cpumask *cpumask,
+-			     struct mm_struct *mm,
+-			     unsigned long start, unsigned long end);
++static inline void flush_tlb_page(struct vm_area_struct *vma, unsigned long a)
++{
++	flush_tlb_mm_range(vma->vm_mm, a, a + PAGE_SIZE, VM_NONE);
++}
+ 
+-#ifndef CONFIG_XEN
+-#define TLBSTATE_OK	1
+-#define TLBSTATE_LAZY	2
++extern void flush_tlb_others(const struct cpumask *cpumask,
++			     const struct flush_tlb_info *info);
+ 
+-static inline void reset_lazy_tlbstate(void)
++static inline void arch_tlbbatch_add_mm(struct arch_tlbflush_unmap_batch *batch,
++					struct mm_struct *mm)
+ {
+-	this_cpu_write(cpu_tlbstate.state, 0);
+-	this_cpu_write(cpu_tlbstate.active_mm, &init_mm);
++	cpumask_or(&batch->cpumask, &batch->cpumask, mm_cpumask(mm));
+ }
+-#endif
+ 
+-#endif	/* SMP */
++extern void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch);
+ 
+ #endif /* _ASM_X86_TLBFLUSH_H */
+--- a/arch/x86/kernel/apic/io_apic-xen.c
++++ b/arch/x86/kernel/apic/io_apic-xen.c
+@@ -1273,28 +1273,6 @@ EXPORT_SYMBOL(IO_APIC_get_PCI_irq_vector
+ 
+ #ifndef CONFIG_XEN
+ static struct irq_chip ioapic_chip, ioapic_ir_chip;
+-
+-#ifdef CONFIG_X86_32
+-static inline int IO_APIC_irq_trigger(int irq)
+-{
+-	int apic, idx, pin;
+-
+-	for_each_ioapic_pin(apic, pin) {
+-		idx = find_irq_entry(apic, pin, mp_INT);
+-		if ((idx != -1) && (irq == pin_2_irq(idx, apic, pin, 0)))
+-			return irq_trigger(idx);
+-	}
+-	/*
+-         * nonexistent IRQs are edge default
+-         */
+-	return 0;
+-}
+-#else
+-static inline int IO_APIC_irq_trigger(int irq)
+-{
+-	return 1;
+-}
+-#endif
+ #endif
+ 
+ static void __init setup_IO_APIC_irqs(void)
+@@ -2197,7 +2175,7 @@ static inline void __init check_timer(vo
+ 			int idx;
+ 			idx = find_irq_entry(apic1, pin1, mp_INT);
+ 			if (idx != -1 && irq_trigger(idx))
+-				unmask_ioapic_irq(irq_get_chip_data(0));
++				unmask_ioapic_irq(irq_get_irq_data(0));
+ 		}
+ 		irq_domain_deactivate_irq(irq_data);
+ 		irq_domain_activate_irq(irq_data);
+@@ -2308,6 +2286,8 @@ static int mp_irqdomain_create(int ioapi
+ 	struct ioapic *ip = &ioapics[ioapic];
+ 	struct ioapic_domain_cfg *cfg = &ip->irqdomain_cfg;
+ 	struct mp_ioapic_gsi *gsi_cfg = mp_ioapic_gsi_routing(ioapic);
++	struct fwnode_handle *fn;
++	char *name = "IO-APIC";
+ 
+ 	if (cfg->type == IOAPIC_DOMAIN_INVALID)
+ 		return 0;
+@@ -2318,9 +2298,25 @@ static int mp_irqdomain_create(int ioapi
+ 	parent = irq_remapping_get_ir_irq_domain(&info);
+ 	if (!parent)
+ 		parent = x86_vector_domain;
++	else
++		name = "IO-APIC-IR";
++
++	/* Handle device tree enumerated APICs proper */
++	if (cfg->dev) {
++		fn = of_node_to_fwnode(cfg->dev);
++	} else {
++		fn = irq_domain_alloc_named_id_fwnode(name, ioapic);
++		if (!fn)
++			return -ENOMEM;
++	}
++
++	ip->irqdomain = irq_domain_create_linear(fn, hwirqs, cfg->ops,
++						 (void *)(long)ioapic);
++
++	/* Release fw handle if it was allocated above */
++	if (!cfg->dev)
++		irq_domain_free_fwnode(fn);
+ 
+-	ip->irqdomain = irq_domain_add_linear(cfg->dev, hwirqs, cfg->ops,
+-					      (void *)(long)ioapic);
+ 	if (!ip->irqdomain)
+ 		return -ENOMEM;
+ 
+--- a/arch/x86/kernel/apic/vector-xen.c
++++ b/arch/x86/kernel/apic/vector-xen.c
+@@ -110,7 +110,8 @@ static void free_apic_chip_data(struct a
+ }
+ 
+ static int __assign_irq_vector(int irq, struct apic_chip_data *d,
+-			       const struct cpumask *mask)
++			       const struct cpumask *mask,
++			       struct irq_data *irqdata)
+ {
+ 	/*
+ 	 * NOTE! The local APIC isn't very good at handling
+@@ -148,7 +149,7 @@ static int __assign_irq_vector(int irq,
+ 		/*
+ 		 * Clear the offline cpus from @vector_cpumask for searching
+ 		 * and verify whether the result overlaps with @mask. If true,
+-		 * then the call to apic->cpu_mask_to_apicid_and() will
++		 * then the call to apic->cpu_mask_to_apicid() will
+ 		 * succeed as well. If not, no point in trying to find a
+ 		 * vector in this mask.
+ 		 */
+@@ -228,34 +229,40 @@ success:
+ 	 * Cache destination APIC IDs into cfg->dest_apicid. This cannot fail
+ 	 * as we already established, that mask & d->domain & cpu_online_mask
+ 	 * is not empty.
++	 *
++	 * vector_searchmask is a subset of d->domain and has the offline
++	 * cpus masked out.
+ 	 */
+-	BUG_ON(apic->cpu_mask_to_apicid_and(mask, d->domain,
+-					    &d->cfg.dest_apicid));
++	cpumask_and(vector_searchmask, vector_searchmask, mask);
++	BUG_ON(apic->cpu_mask_to_apicid(vector_searchmask, irqdata,
++					&d->cfg.dest_apicid));
+ 	return 0;
+ }
+ 
+ static int assign_irq_vector(int irq, struct apic_chip_data *data,
+-			     const struct cpumask *mask)
++			     const struct cpumask *mask,
++			     struct irq_data *irqdata)
+ {
+ 	int err;
+ 	unsigned long flags;
+ 
+ 	raw_spin_lock_irqsave(&vector_lock, flags);
+-	err = __assign_irq_vector(irq, data, mask);
++	err = __assign_irq_vector(irq, data, mask, irqdata);
+ 	raw_spin_unlock_irqrestore(&vector_lock, flags);
+ 	return err;
+ }
+ 
+ static int assign_irq_vector_policy(int irq, int node,
+ 				    struct apic_chip_data *data,
+-				    struct irq_alloc_info *info)
++				    struct irq_alloc_info *info,
++				    struct irq_data *irqdata)
+ {
+ 	if (info && info->mask)
+-		return assign_irq_vector(irq, data, info->mask);
++		return assign_irq_vector(irq, data, info->mask, irqdata);
+ 	if (node != NUMA_NO_NODE &&
+-	    assign_irq_vector(irq, data, cpumask_of_node(node)) == 0)
++	    assign_irq_vector(irq, data, cpumask_of_node(node), irqdata) == 0)
+ 		return 0;
+-	return assign_irq_vector(irq, data, apic->target_cpus());
++	return assign_irq_vector(irq, data, apic->target_cpus(), irqdata);
+ }
+ 
+ static void clear_irq_vector(int irq, struct apic_chip_data *data)
+@@ -369,9 +376,17 @@ static int x86_vector_alloc_irqs(struct
+ 		irq_data->chip = &lapic_controller;
+ 		irq_data->chip_data = data;
+ 		irq_data->hwirq = virq + i;
+-		err = assign_irq_vector_policy(virq + i, node, data, info);
++		err = assign_irq_vector_policy(virq + i, node, data, info,
++					       irq_data);
+ 		if (err)
+ 			goto error;
++		/*
++		 * If the apic destination mode is physical, then the
++		 * effective affinity is restricted to a single target
++		 * CPU. Mark the interrupt accordingly.
++		 */
++		if (!apic->irq_dest_mode)
++			irqd_set_single_target(irq_data);
+ 	}
+ 
+ 	return 0;
+@@ -414,7 +429,7 @@ int __init arch_probe_nr_irqs(void)
+ }
+ 
+ #ifdef	CONFIG_X86_IO_APIC
+-static void init_legacy_irqs(void)
++static void __init init_legacy_irqs(void)
+ {
+ 	int i, node = cpu_to_node(0);
+ 	struct apic_chip_data *data;
+@@ -433,16 +448,21 @@ static void init_legacy_irqs(void)
+ 	}
+ }
+ #else
+-static void init_legacy_irqs(void) { }
++static inline void init_legacy_irqs(void) { }
+ #endif
+ 
+ int __init arch_early_irq_init(void)
+ {
++	struct fwnode_handle *fn;
++
+ 	init_legacy_irqs();
+ 
+-	x86_vector_domain = irq_domain_add_tree(NULL, &x86_vector_domain_ops,
+-						NULL);
++	fn = irq_domain_alloc_named_fwnode("VECTOR");
++	BUG_ON(!fn);
++	x86_vector_domain = irq_domain_create_tree(fn, &x86_vector_domain_ops,
++						   NULL);
+ 	BUG_ON(x86_vector_domain == NULL);
++	irq_domain_free_fwnode(fn);
+ 	irq_set_default_host(x86_vector_domain);
+ 
+ 	arch_init_msi_domain(x86_vector_domain);
+@@ -538,11 +558,12 @@ static int apic_set_affinity(struct irq_
+ 	if (!cpumask_intersects(dest, cpu_online_mask))
+ 		return -EINVAL;
+ 
+-	err = assign_irq_vector(irq, data, dest);
++	err = assign_irq_vector(irq, data, dest, irq_data);
+ 	return err ? err : IRQ_SET_MASK_OK;
+ }
+ 
+ static struct irq_chip lapic_controller = {
++	.name			= "APIC",
+ 	.irq_ack		= apic_ack_edge,
+ 	.irq_set_affinity	= apic_set_affinity,
+ 	.irq_retrigger		= apic_retrigger_irq,
+--- a/arch/x86/kernel/cpu/common-xen.c
++++ b/arch/x86/kernel/cpu/common-xen.c
+@@ -1384,8 +1384,8 @@ DEFINE_PER_CPU_FIRST(union irq_stack_uni
+ void xen_switch_pt(void)
+ {
+ #ifdef CONFIG_XEN
+-	xen_pt_switch(__pa_symbol(init_level4_pgt));
+-	xen_new_user_pt(__pa_symbol(__user_pgd(init_level4_pgt)));
++	xen_pt_switch(__pa_symbol(init_top_pgt));
++	xen_new_user_pt(__pa_symbol(__user_pgd(init_top_pgt)));
+ #endif
+ }
+ 
+--- a/arch/x86/kernel/e820-xen.c
++++ b/arch/x86/kernel/e820-xen.c
+@@ -21,10 +21,12 @@
+ #include <xen/interface/memory.h>
+ 
+ /*
+- * We organize the E820 table into two main data structures:
++ * We organize the E820 table into three main data structures:
+  *
+  * - 'e820_table_firmware': the original firmware version passed to us by the
+- *   bootloader - not modified by the kernel. We use this to:
++ *   bootloader - not modified by the kernel. It is composed of two parts:
++ *   the first 128 E820 memory entries in boot_params.e820_table and the remaining
++ *   (if any) entries of the SETUP_E820_EXT nodes. We use this to:
+  *
+  *       - inform the user about the firmware's notion of memory layout
+  *         via /sys/firmware/memmap
+@@ -32,6 +34,14 @@
+  *       - the hibernation code uses it to generate a kernel-independent MD5
+  *         fingerprint of the physical memory layout of a system.
+  *
++ * - 'e820_table_kexec': a slightly modified (by the kernel) firmware version
++ *   passed to us by the bootloader - the major difference between
++ *   e820_table_firmware[] and this one is that, the latter marks the setup_data
++ *   list created by the EFI boot stub as reserved, so that kexec can reuse the
++ *   setup_data information in the second kernel. Besides, e820_table_kexec[]
++ *   might also be modified by the kexec itself to fake a mptable.
++ *   We use this to:
++ *
+  *       - kexec, which is a bootloader in disguise, uses the original E820
+  *         layout to pass to the kexec-ed kernel. This way the original kernel
+  *         can have a restricted E820 map while the kexec()-ed kexec-kernel
+@@ -49,8 +59,10 @@
+ static struct e820_table e820_table_init		__initdata;
+ struct e820_table *e820_table __refdata			= &e820_table_init;
+ #if !defined(CONFIG_XEN)
++static struct e820_table e820_table_kexec_init		__initdata;
+ static struct e820_table e820_table_firmware_init	__initdata;
+ 
++struct e820_table *e820_table_kexec __refdata		= &e820_table_kexec_init;
+ struct e820_table *e820_table_firmware __refdata	= &e820_table_firmware_init;
+ #elif defined(CONFIG_XEN_PRIVILEGED_GUEST)
+ struct e820_table e820_machine;
+@@ -502,17 +514,10 @@ u64 __init e820__range_update(u64 start,
+ 	return __e820__range_update(e820_table, start, size, old_type, new_type);
+ }
+ 
+-#ifndef CONFIG_XEN_UNPRIVILEGED_GUEST
+-static u64 __init e820__range_update_firmware(u64 start, u64 size, enum e820_type old_type, enum e820_type  new_type)
++#ifndef CONFIG_XEN
++static u64 __init e820__range_update_kexec(u64 start, u64 size, enum e820_type old_type, enum e820_type  new_type)
+ {
+-#ifdef CONFIG_XEN
+-	if (!is_initial_xendomain())
+-		return 0;
+-	return __e820__range_update(&e820_machine, phys_to_machine(start),
+-				    size, old_type, new_type);
+-#else
+-	return __e820__range_update(e820_table_firmware, start, size, old_type, new_type);
+-#endif
++	return __e820__range_update(e820_table_kexec, start, size, old_type, new_type);
+ }
+ #endif
+ 
+@@ -587,10 +592,10 @@ void __init e820__update_table_print(voi
+ 	_e820__print_table(e820_table, "modified");
+ }
+ 
+-#ifndef CONFIG_XEN_UNPRIVILEGED_GUEST
+-static void __init e820__update_table_firmware(void)
++#ifndef CONFIG_XEN
++static void __init e820__update_table_kexec(void)
+ {
+-	e820__update_table(e820_table_firmware);
++	e820__update_table(e820_table_kexec);
+ }
+ #endif
+ 
+@@ -682,7 +687,7 @@ __init void e820__setup_pci_gap(void)
+ /*
+  * Called late during init, in free_initmem().
+  *
+- * Initial e820_table and e820_table_firmware are largish __initdata arrays.
++ * Initial e820_table and e820_table_kexec are largish __initdata arrays.
+  *
+  * Copy them to a (usually much smaller) dynamically allocated area that is
+  * sized precisely after the number of e820 entries.
+@@ -702,6 +707,14 @@ __init void e820__reallocate_tables(void
+ 	memcpy(n, e820_table, size);
+ 	e820_table = n;
+ 
++#ifndef CONFIG_XEN
++	size = offsetof(struct e820_table, entries) + sizeof(struct e820_entry)*e820_table_kexec->nr_entries;
++	n = kmalloc(size, GFP_KERNEL);
++	BUG_ON(!n);
++	memcpy(n, e820_table_kexec, size);
++	e820_table_kexec = n;
++#endif
++
+ #ifndef e820_table_firmware
+ 	size = offsetof(struct e820_table, entries) + sizeof(struct e820_entry)*e820_table_firmware->nr_entries;
+ 	n = kmalloc(size, GFP_KERNEL);
+@@ -731,6 +744,9 @@ void __init e820__memory_setup_extended(
+ 	__append_e820_table(extmap, entries);
+ 	e820__update_table(e820_table);
+ 
++	memcpy(e820_table_kexec, e820_table, sizeof(*e820_table_kexec));
++	memcpy(e820_table_firmware, e820_table, sizeof(*e820_table_firmware));
++
+ 	early_memunmap(sdata, data_len);
+ 	pr_info("e820: extended physical RAM map:\n");
+ 	_e820__print_table(e820_table, "extended");
+@@ -791,7 +807,7 @@ core_initcall(e820__register_nvs_regions
+ /*
+  * Allocate the requested number of bytes with the requsted alignment
+  * and return (the physical address) to the caller. Also register this
+- * range in the 'firmware' E820 table as a reserved range.
++ * range in the 'kexec' E820 table as a reserved range.
+  *
+  * This allows kexec to fake a new mptable, as if it came from the real
+  * system.
+@@ -811,13 +827,14 @@ u64 __init e820__memblock_alloc_reserved
+ 		align = PAGE_SIZE;
+ #endif
+ 	addr = __memblock_alloc_base(size, align, MEMBLOCK_ALLOC_ACCESSIBLE);
++#ifndef CONFIG_XEN
+ 	if (addr) {
+-		e820__range_update_firmware(addr, size, E820_TYPE_RAM, E820_TYPE_RESERVED);
+-		pr_info("e820: update e820_table_firmware for e820__memblock_alloc_reserved()\n");
+-		e820__update_table_firmware();
++		e820__range_update_kexec(addr, size, E820_TYPE_RAM, E820_TYPE_RESERVED);
++		pr_info("e820: update e820_table_kexec for e820__memblock_alloc_reserved()\n");
++		e820__update_table_kexec();
+ 	}
+-#ifdef CONFIG_XEN
+-	else
++#else
++	if (!addr)
+ 		return 0;
+ 	max_initmap_pfn = ALIGN(PFN_UP(__pa(xen_start_info->pt_base))
+ 				       + xen_start_info->nr_pt_frames
+@@ -1043,13 +1060,13 @@ void __init e820__reserve_setup_data(voi
+ 	while (pa_data) {
+ 		data = early_memremap(pa_data, sizeof(*data));
+ 		e820__range_update(pa_data, sizeof(*data)+data->len, E820_TYPE_RAM, E820_TYPE_RESERVED_KERN);
++		e820__range_update_kexec(pa_data, sizeof(*data)+data->len, E820_TYPE_RAM, E820_TYPE_RESERVED_KERN);
+ 		pa_data = data->next;
+ 		early_memunmap(data, sizeof(*data));
+ 	}
+ 
+ 	e820__update_table(e820_table);
+-
+-	memcpy(e820_table_firmware, e820_table, sizeof(*e820_table_firmware));
++	e820__update_table(e820_table_kexec);
+ 
+ 	pr_info("extended physical RAM map:\n");
+ 	e820__print_table("reserve setup_data");
+@@ -1187,6 +1204,7 @@ void __init e820__reserve_resources(void
+ 		res++;
+ 	}
+ 
++	/* Expose the bootloader-provided memory layout to the sysfs. */
+ 	for (i = 0; i < e820_table_firmware->nr_entries; i++) {
+ 		struct e820_entry *entry = e820_table_firmware->entries + i;
+ 
+--- a/arch/x86/kernel/head64-xen.c
++++ b/arch/x86/kernel/head64-xen.c
+@@ -34,17 +34,121 @@
+ /*
+  * Manage page tables very early on.
+  */
+-extern pgd_t early_level4_pgt[PTRS_PER_PGD];
++extern pgd_t early_top_pgt[PTRS_PER_PGD];
+ extern pmd_t early_dynamic_pgts[EARLY_DYNAMIC_PAGE_TABLES][PTRS_PER_PMD];
+-static unsigned int __initdata next_early_pgt = 2;
++static unsigned int __initdata next_early_pgt;
+ pmdval_t early_pmd_flags = __PAGE_KERNEL_LARGE & ~(_PAGE_GLOBAL | _PAGE_NX);
+ 
++#define __head	__section(.head.text)
++
++static void __head *fixup_pointer(void *ptr, unsigned long physaddr)
++{
++	return ptr - (void *)_text + (void *)physaddr;
++}
++
++void __head __startup_64(unsigned long physaddr)
++{
++	unsigned long load_delta, *p;
++	pgdval_t *pgd;
++	p4dval_t *p4d;
++	pudval_t *pud;
++	pmdval_t *pmd, pmd_entry;
++	int i;
++	unsigned int *next_pgt_ptr;
++
++	/* Is the address too large? */
++	if (physaddr >> MAX_PHYSMEM_BITS)
++		for (;;);
++
++	/*
++	 * Compute the delta between the address I am compiled to run at
++	 * and the address I am actually running at.
++	 */
++	load_delta = physaddr - (unsigned long)(_text - __START_KERNEL_map);
++
++	/* Is the address not 2M aligned? */
++	if (load_delta & ~PMD_PAGE_MASK)
++		for (;;);
++
++	/* Fixup the physical addresses in the page table */
++
++	pgd = fixup_pointer(&early_top_pgt, physaddr);
++	pgd[pgd_index(__START_KERNEL_map)] += load_delta;
++
++	if (IS_ENABLED(CONFIG_X86_5LEVEL)) {
++		p4d = fixup_pointer(&level4_kernel_pgt, physaddr);
++		p4d[511] += load_delta;
++	}
++
++	pud = fixup_pointer(&level3_kernel_pgt, physaddr);
++	pud[510] += load_delta;
++	pud[511] += load_delta;
++
++	pmd = fixup_pointer(level2_fixmap_pgt, physaddr);
++	pmd[506] += load_delta;
++
++	/*
++	 * Set up the identity mapping for the switchover.  These
++	 * entries should *NOT* have the global bit set!  This also
++	 * creates a bunch of nonsense entries but that is fine --
++	 * it avoids problems around wraparound.
++	 */
++	next_pgt_ptr = fixup_pointer(&next_early_pgt, physaddr);
++	pud = fixup_pointer(early_dynamic_pgts[(*next_pgt_ptr)++], physaddr);
++	pmd = fixup_pointer(early_dynamic_pgts[(*next_pgt_ptr)++], physaddr);
++
++	if (IS_ENABLED(CONFIG_X86_5LEVEL)) {
++		p4d = fixup_pointer(early_dynamic_pgts[next_early_pgt++], physaddr);
++
++		i = (physaddr >> PGDIR_SHIFT) % PTRS_PER_PGD;
++		pgd[i + 0] = (pgdval_t)p4d + _KERNPG_TABLE;
++		pgd[i + 1] = (pgdval_t)p4d + _KERNPG_TABLE;
++
++		i = (physaddr >> P4D_SHIFT) % PTRS_PER_P4D;
++		p4d[i + 0] = (pgdval_t)pud + _KERNPG_TABLE;
++		p4d[i + 1] = (pgdval_t)pud + _KERNPG_TABLE;
++	} else {
++		i = (physaddr >> PGDIR_SHIFT) % PTRS_PER_PGD;
++		pgd[i + 0] = (pgdval_t)pud + _KERNPG_TABLE;
++		pgd[i + 1] = (pgdval_t)pud + _KERNPG_TABLE;
++	}
++
++	i = (physaddr >> PUD_SHIFT) % PTRS_PER_PUD;
++	pud[i + 0] = (pudval_t)pmd + _KERNPG_TABLE;
++	pud[i + 1] = (pudval_t)pmd + _KERNPG_TABLE;
++
++	pmd_entry = __PAGE_KERNEL_LARGE_EXEC & ~_PAGE_GLOBAL;
++	pmd_entry +=  physaddr;
++
++	for (i = 0; i < DIV_ROUND_UP(_end - _text, PMD_SIZE); i++) {
++		int idx = i + (physaddr >> PMD_SHIFT) % PTRS_PER_PMD;
++		pmd[idx] = pmd_entry + i * PMD_SIZE;
++	}
++
++	/*
++	 * Fixup the kernel text+data virtual addresses. Note that
++	 * we might write invalid pmds, when the kernel is relocated
++	 * cleanup_highmap() fixes this up along with the mappings
++	 * beyond _end.
++	 */
++
++	pmd = fixup_pointer(level2_kernel_pgt, physaddr);
++	for (i = 0; i < PTRS_PER_PMD; i++) {
++		if (pmd[i] & _PAGE_PRESENT)
++			pmd[i] += load_delta;
++	}
++
++	/* Fixup phys_base */
++	p = fixup_pointer(&phys_base, physaddr);
++	*p += load_delta;
++}
++
+ /* Wipe all early page tables except for the kernel symbol map */
+ static void __init reset_early_page_tables(void)
+ {
+-	memset(early_level4_pgt, 0, sizeof(pgd_t)*(PTRS_PER_PGD-1));
++	memset(early_top_pgt, 0, sizeof(pgd_t)*(PTRS_PER_PGD-1));
+ 	next_early_pgt = 0;
+-	write_cr3(__pa_nodebug(early_level4_pgt));
++	write_cr3(__pa_nodebug(early_top_pgt));
+ }
+ 
+ /* Create a new PMD entry */
+@@ -52,15 +156,16 @@ int __init early_make_pgtable(unsigned l
+ {
+ 	unsigned long physaddr = address - __PAGE_OFFSET;
+ 	pgdval_t pgd, *pgd_p;
++	p4dval_t p4d, *p4d_p;
+ 	pudval_t pud, *pud_p;
+ 	pmdval_t pmd, *pmd_p;
+ 
+ 	/* Invalid address or early pgt is done ?  */
+-	if (physaddr >= MAXMEM || read_cr3() != __pa_nodebug(early_level4_pgt))
++	if (physaddr >= MAXMEM || read_cr3_pa() != __pa_nodebug(early_top_pgt))
+ 		return -1;
+ 
+ again:
+-	pgd_p = &early_level4_pgt[pgd_index(address)].pgd;
++	pgd_p = &early_top_pgt[pgd_index(address)].pgd;
+ 	pgd = *pgd_p;
+ 
+ 	/*
+@@ -68,8 +173,25 @@ again:
+ 	 * critical -- __PAGE_OFFSET would point us back into the dynamic
+ 	 * range and we might end up looping forever...
+ 	 */
+-	if (pgd)
+-		pud_p = (pudval_t *)((pgd & PTE_PFN_MASK) + __START_KERNEL_map - phys_base);
++	if (!IS_ENABLED(CONFIG_X86_5LEVEL))
++		p4d_p = pgd_p;
++	else if (pgd)
++		p4d_p = (p4dval_t *)((pgd & PTE_PFN_MASK) + __START_KERNEL_map - phys_base);
++	else {
++		if (next_early_pgt >= EARLY_DYNAMIC_PAGE_TABLES) {
++			reset_early_page_tables();
++			goto again;
++		}
++
++		p4d_p = (p4dval_t *)early_dynamic_pgts[next_early_pgt++];
++		memset(p4d_p, 0, sizeof(*p4d_p) * PTRS_PER_P4D);
++		*pgd_p = (pgdval_t)p4d_p - __START_KERNEL_map + phys_base + _KERNPG_TABLE;
++	}
++	p4d_p += p4d_index(address);
++	p4d = *p4d_p;
++
++	if (p4d)
++		pud_p = (pudval_t *)((p4d & PTE_PFN_MASK) + __START_KERNEL_map - phys_base);
+ 	else {
+ 		if (next_early_pgt >= EARLY_DYNAMIC_PAGE_TABLES) {
+ 			reset_early_page_tables();
+@@ -78,7 +200,7 @@ again:
+ 
+ 		pud_p = (pudval_t *)early_dynamic_pgts[next_early_pgt++];
+ 		memset(pud_p, 0, sizeof(*pud_p) * PTRS_PER_PUD);
+-		*pgd_p = (pgdval_t)pud_p - __START_KERNEL_map + phys_base + _KERNPG_TABLE;
++		*p4d_p = (p4dval_t)pud_p - __START_KERNEL_map + phys_base + _KERNPG_TABLE;
+ 	}
+ 	pud_p += pud_index(address);
+ 	pud = *pud_p;
+@@ -174,7 +296,7 @@ asmlinkage __visible void __init x86_64_
+ 
+ 	clear_bss();
+ 
+-	clear_page(init_level4_pgt);
++	clear_page(init_top_pgt);
+ 
+ 	kasan_early_init();
+ 
+@@ -191,8 +313,8 @@ asmlinkage __visible void __init x86_64_
+ #endif
+ 
+ #ifndef CONFIG_XEN
+-	/* set init_level4_pgt kernel high mapping*/
+-	init_level4_pgt[511] = early_level4_pgt[511];
++	/* set init_top_pgt kernel high mapping*/
++	init_top_pgt[511] = early_top_pgt[511];
+ 
+ #else
+ 	xen_switch_pt();
+--- a/arch/x86/kernel/head_64-xen.S
++++ b/arch/x86/kernel/head_64-xen.S
+@@ -61,7 +61,7 @@ startup_64:
+ GLOBAL(name)
+ 
+ 	__PAGE_ALIGNED_BSS
+-NEXT_PAGE(init_level4_pgt)
++NEXT_PAGE(init_top_pgt)
+ 	.fill	512,8,0
+         /*
+          * We update two pgd entries to make kernel and user pgd consistent
+@@ -72,6 +72,11 @@ NEXT_PAGE(init_level4_pgt)
+          */
+ 	.fill	512,8,0
+ 
++#ifdef CONFIG_X86_5LEVEL
++NEXT_PAGE(level4_kernel_pgt)
++	.fill	512,8,0
++#endif
++
+ NEXT_PAGE(level3_kernel_pgt)
+ 	.fill	512,8,0
+ 
+--- a/arch/x86/kernel/irq-xen.c
++++ b/arch/x86/kernel/irq-xen.c
+@@ -170,6 +170,12 @@ int arch_show_interrupts(struct seq_file
+ 		seq_printf(p, "%10u ", irq_stats(j)->kvm_posted_intr_ipis);
+ 	seq_puts(p, "  Posted-interrupt notification event\n");
+ 
++	seq_printf(p, "%*s: ", prec, "NPI");
++	for_each_online_cpu(j)
++		seq_printf(p, "%10u ",
++			   irq_stats(j)->kvm_posted_intr_nested_ipis);
++	seq_puts(p, "  Nested posted-interrupt event\n");
++
+ 	seq_printf(p, "%*s: ", prec, "PIW");
+ 	for_each_online_cpu(j)
+ 		seq_printf(p, "%10u ",
+@@ -333,6 +339,19 @@ __visible void smp_kvm_posted_intr_wakeu
+ 	exiting_irq();
+ 	set_irq_regs(old_regs);
+ }
++
++/*
++ * Handler for POSTED_INTERRUPT_NESTED_VECTOR.
++ */
++__visible void smp_kvm_posted_intr_nested_ipi(struct pt_regs *regs)
++{
++	struct pt_regs *old_regs = set_irq_regs(regs);
++
++	entering_ack_irq();
++	inc_irq_stat(kvm_posted_intr_nested_ipis);
++	exiting_irq();
++	set_irq_regs(old_regs);
++}
+ #endif
+ 
+ __visible void __irq_entry smp_trace_x86_platform_ipi(struct pt_regs *regs)
+@@ -457,78 +476,11 @@ int check_irq_vectors_for_cpu_disable(vo
+ void fixup_irqs(void)
+ {
+ 	unsigned int irq;
+-	static int warned;
+ 	struct irq_desc *desc;
+ 	struct irq_data *data;
+ 	struct irq_chip *chip;
+-	int ret;
+-	static DECLARE_BITMAP(irqs_used, NR_IRQS);
+-
+-	for_each_irq_desc(irq, desc) {
+-		int break_affinity = 0;
+-		int set_affinity = 1;
+-		const struct cpumask *affinity;
+-
+-		if (!desc)
+-			continue;
+-		if (irq == 2)
+-			continue;
+-
+-		/* interrupt's are disabled at this point */
+-		raw_spin_lock(&desc->lock);
+-
+-		data = irq_desc_get_irq_data(desc);
+-		affinity = irq_data_get_affinity_mask(data);
+-		if (!irq_has_action(irq) || irqd_is_per_cpu(data) ||
+-		    cpumask_subset(affinity, cpu_online_mask)) {
+-			raw_spin_unlock(&desc->lock);
+-			continue;
+-		}
+ 
+-		if (cpumask_test_cpu(smp_processor_id(), affinity))
+-			__set_bit(irq, irqs_used);
+-
+-		if (cpumask_any_and(affinity, cpu_online_mask) >= nr_cpu_ids) {
+-			break_affinity = 1;
+-			affinity = cpu_online_mask;
+-		}
+-
+-		chip = irq_data_get_irq_chip(data);
+-		/*
+-		 * The interrupt descriptor might have been cleaned up
+-		 * already, but it is not yet removed from the radix tree
+-		 */
+-		if (!chip) {
+-			raw_spin_unlock(&desc->lock);
+-			continue;
+-		}
+-
+-		if (!irqd_can_move_in_process_context(data) && chip->irq_mask)
+-			chip->irq_mask(data);
+-
+-		if (chip->irq_set_affinity) {
+-			ret = chip->irq_set_affinity(data, affinity, true);
+-			if (ret == -ENOSPC)
+-				pr_crit("IRQ %d set affinity failed because there are no available vectors.  The device assigned to this IRQ is unstable.\n", irq);
+-		} else if (data->chip != &no_irq_chip && !(warned++))
+-			set_affinity = 0;
+-
+-		/*
+-		 * We unmask if the irq was not marked masked by the
+-		 * core code. That respects the lazy irq disable
+-		 * behaviour.
+-		 */
+-		if (!irqd_can_move_in_process_context(data) &&
+-		    !irqd_irq_masked(data) && chip->irq_unmask)
+-			chip->irq_unmask(data);
+-
+-		raw_spin_unlock(&desc->lock);
+-
+-		if (break_affinity && set_affinity)
+-			/*pr_notice("Broke affinity for irq %i\n", irq)*/;
+-		else if (!set_affinity)
+-			pr_notice("Cannot set affinity for irq %i\n", irq);
+-	}
++	irq_migrate_all_off_this_cpu();
+ 
+ 	/*
+ 	 * We can remove mdelay() and then send spuriuous interrupts to
+@@ -547,18 +499,25 @@ void fixup_irqs(void)
+ 	 * nothing else will touch it.
+ 	 */
+ 	for_each_irq_desc(irq, desc) {
+-		if (!__test_and_clear_bit(irq, irqs_used))
++		const struct cpumask *affinity;
++
++		if (irq == 2)
+ 			continue;
+ 
+-		if (xen_test_irq_pending(irq)) {
+-			desc = irq_to_desc(irq);
+-			raw_spin_lock(&desc->lock);
+-			data = irq_desc_get_irq_data(desc);
++		/* interrupt's are disabled at this point */
++		raw_spin_lock(&desc->lock);
++
++		data = irq_desc_get_irq_data(desc);
++		affinity = irq_data_get_affinity_mask(data);
++		if (irq_has_action(irq) && !irqd_is_per_cpu(data) &&
++		    cpumask_test_cpu(smp_processor_id(), affinity) &&
++		    xen_test_irq_pending(irq)) {
+ 			chip = irq_data_get_irq_chip(data);
+ 			if (chip->irq_retrigger)
+ 				chip->irq_retrigger(data);
+-			raw_spin_unlock(&desc->lock);
+ 		}
++
++		raw_spin_unlock(&desc->lock);
+ 	}
+ }
+ #endif
+--- a/arch/x86/kernel/ldt.c
++++ b/arch/x86/kernel/ldt.c
+@@ -27,7 +27,11 @@ static void flush_ldt(void *__mm)
+ 	struct mm_struct *mm = __mm;
+ 	mm_context_t *pc;
+ 
++#ifndef CONFIG_XEN
+ 	if (this_cpu_read(cpu_tlbstate.loaded_mm) != mm)
++#else /* XEN: no lazy tlb */
++	if (current->active_mm != mm)
++#endif
+ 		return;
+ 
+ 	pc = &mm->context;
+--- a/arch/x86/kernel/pci-dma-xen.c
++++ b/arch/x86/kernel/pci-dma-xen.c
+@@ -308,10 +308,8 @@ int range_straddles_page_boundary(paddr_
+ 		!check_pages_physically_contiguous(pfn, offset, size));
+ }
+ 
+-int dma_supported(struct device *dev, u64 mask)
++int x86_dma_supported(struct device *dev, u64 mask)
+ {
+-	const struct dma_map_ops *ops = get_dma_ops(dev);
+-
+ #ifdef CONFIG_PCI
+ 	if (mask > 0xffffffff && forbid_dac > 0) {
+ 		dev_info(dev, "PCI: Disallowing DAC for device\n");
+@@ -319,9 +317,6 @@ int dma_supported(struct device *dev, u6
+ 	}
+ #endif
+ 
+-	if (ops->dma_supported)
+-		return ops->dma_supported(dev, mask);
+-
+ 	/* Copied from i386. Doesn't make much sense, because it will
+ 	   only work for pci_alloc_coherent.
+ 	   The caller just has to use GFP_DMA in this case. */
+@@ -347,7 +342,6 @@ int dma_supported(struct device *dev, u6
+ 
+ 	return 1;
+ }
+-EXPORT_SYMBOL(dma_supported);
+ 
+ static int __init pci_iommu_init(void)
+ {
+--- a/arch/x86/kernel/pci-nommu-xen.c
++++ b/arch/x86/kernel/pci-nommu-xen.c
+@@ -11,6 +11,8 @@
+ #include <asm/gnttab_dma.h>
+ #include <asm/bug.h>
+ 
++#define NOMMU_MAPPING_ERROR		0
++
+ #define IOMMU_BUG_ON(test)				\
+ do {							\
+ 	if (unlikely(test)) {				\
+@@ -90,6 +92,11 @@ static void nommu_sync_sg_for_device(str
+ 	flush_write_buffers();
+ }
+ 
++static int nommu_mapping_error(struct device *dev, dma_addr_t dma_addr)
++{
++	return dma_addr == NOMMU_MAPPING_ERROR;
++}
++
+ static int nommu_dma_supported(struct device *hwdev, u64 mask)
+ {
+ 	return 1;
+@@ -104,5 +111,6 @@ const struct dma_map_ops nommu_dma_ops =
+ 	.unmap_sg		= gnttab_unmap_sg,
+ 	.sync_single_for_device = nommu_sync_single_for_device,
+ 	.sync_sg_for_device	= nommu_sync_sg_for_device,
++	.mapping_error		= nommu_mapping_error,
+ 	.dma_supported		= nommu_dma_supported,
+ };
+--- a/arch/x86/kernel/process_32-xen.c
++++ b/arch/x86/kernel/process_32-xen.c
+@@ -94,7 +94,7 @@ void __show_regs(struct pt_regs *regs, i
+ 
+ 	cr0 = read_cr0();
+ 	cr2 = read_cr2();
+-	cr3 = read_cr3();
++	cr3 = __read_cr3();
+ 	cr4 = __read_cr4();
+ 	printk(KERN_DEFAULT "CR0: %08lx CR2: %08lx CR3: %08lx CR4: %08lx\n",
+ 			cr0, cr2, cr3, cr4);
+--- a/arch/x86/kernel/process_64-xen.c
++++ b/arch/x86/kernel/process_64-xen.c
+@@ -107,7 +107,7 @@ void __show_regs(struct pt_regs *regs, i
+ 
+ 	cr0 = read_cr0();
+ 	cr2 = read_cr2();
+-	cr3 = read_cr3();
++	cr3 = __read_cr3();
+ 	cr4 = __read_cr4();
+ 
+ 	printk(KERN_DEFAULT "FS:  %016lx(%04x) GS:%016lx(%04x) knlGS:%016lx\n",
+@@ -151,7 +151,7 @@ void release_thread(struct task_struct *
+ 			pr_warn("WARNING: dead process %s still has LDT? <%p/%d>\n",
+ 				dead_task->comm,
+ 				dead_task->mm->context.ldt->entries,
+-				dead_task->mm->context.ldt->size);
++				dead_task->mm->context.ldt->nr_entries);
+ 			BUG();
+ 		}
+ #endif
+--- a/arch/x86/kernel/setup-xen.c
++++ b/arch/x86/kernel/setup-xen.c
+@@ -569,7 +569,7 @@ static int __init reserve_crashkernel_lo
+ 			return 0;
+ 	}
+ 
+-	low_base = memblock_find_in_range(low_size, 1ULL << 32, low_size, CRASH_ALIGN);
++	low_base = memblock_find_in_range(0, 1ULL << 32, low_size, CRASH_ALIGN);
+ 	if (!low_base) {
+ 		pr_err("Cannot reserve %ldMB crashkernel low memory, please try smaller size.\n",
+ 		       (unsigned long)(low_size >> 20));
+@@ -1217,6 +1217,13 @@ void __init setup_arch(char **cmdline_p)
+ 	max_possible_pfn = max_pfn;
+ 
+ 	/*
++	 * This call is required when the CPU does not support PAT. If
++	 * mtrr_bp_init() invoked it already via pat_init() the call has no
++	 * effect.
++	 */
++	init_cache_modes();
++
++	/*
+ 	 * Define random base addresses for memory sections after max_pfn is
+ 	 * defined and before each memory section base is used.
+ 	 */
+--- a/arch/x86/mm/dump_pagetables-xen.c
++++ b/arch/x86/mm/dump_pagetables-xen.c
+@@ -447,7 +447,7 @@ static void ptdump_walk_pgd_level_core(s
+ 				       bool checkwx)
+ {
+ #ifdef CONFIG_X86_64
+-	pgd_t *start = (pgd_t *) &init_level4_pgt;
++	pgd_t *start = (pgd_t *) &init_top_pgt;
+ #else
+ 	pgd_t *start = swapper_pg_dir;
+ #endif
+--- a/arch/x86/mm/fault-xen.c
++++ b/arch/x86/mm/fault-xen.c
+@@ -354,7 +354,7 @@ static noinline int vmalloc_fault(unsign
+ 	 * Do _not_ use "current" here. We might be inside
+ 	 * an interrupt in the middle of a task switch..
+ 	 */
+-	pgd_paddr = read_cr3();
++	pgd_paddr = read_cr3_pa();
+ 	pmd_k = vmalloc_sync_one(__va(pgd_paddr), address);
+ 	if (!pmd_k)
+ 		return -1;
+@@ -396,7 +396,7 @@ static bool low_pfn(unsigned long pfn)
+ 
+ static void dump_pagetable(unsigned long address)
+ {
+-	pgd_t *base = __va(read_cr3());
++	pgd_t *base = __va(read_cr3_pa());
+ 	pgd_t *pgd = &base[pgd_index(address)];
+ 	p4d_t *p4d;
+ 	pud_t *pud;
+@@ -463,7 +463,7 @@ static noinline int vmalloc_fault(unsign
+ 	 * happen within a race in page table update. In the later
+ 	 * case just flush:
+ 	 */
+-	pgd = (pgd_t *)__va(read_cr3()) + pgd_index(address);
++	pgd = (pgd_t *)__va(read_cr3_pa()) + pgd_index(address);
+ 	pgd_ref = pgd_offset_k(address);
+ 	if (pgd_none(*pgd_ref))
+ 		return -1;
+@@ -567,7 +567,7 @@ static int bad_address(void *p)
+ 
+ static void dump_pagetable(unsigned long address)
+ {
+-	pgd_t *base = __va(read_cr3() & PHYSICAL_PAGE_MASK);
++	pgd_t *base = __va(read_cr3_pa());
+ 	pgd_t *pgd = base + pgd_index(address);
+ 	p4d_t *p4d;
+ 	pud_t *pud;
+@@ -713,7 +713,7 @@ show_fault_oops(struct pt_regs *regs, un
+ 		pgd_t *pgd;
+ 		pte_t *pte;
+ 
+-		pgd = __va(read_cr3() & PHYSICAL_PAGE_MASK);
++		pgd = __va(read_cr3_pa());
+ 		pgd += pgd_index(address);
+ 
+ 		pte = lookup_address_in_pgd(pgd, address, &level);
+--- a/arch/x86/mm/init-xen.c
++++ b/arch/x86/mm/init-xen.c
+@@ -18,6 +18,7 @@
+ #include <asm/dma.h>		/* for MAX_DMA_PFN */
+ #include <asm/microcode.h>
+ #include <asm/kaslr.h>
++#include <asm/hypervisor.h>
+ 
+ /*
+  * We need to define the tracepoints somewhere, and tlb.c
+@@ -657,6 +658,8 @@ void __init init_mem_mapping(void)
+ 	load_cr3(swapper_pg_dir);
+ 	__flush_tlb_all();
+ 
++	hypervisor_init_mem_mapping();
++
+ 	early_memtest(0, max_pfn_mapped << PAGE_SHIFT);
+ }
+ 
+@@ -844,8 +847,8 @@ void __init zone_sizes_init(void)
+ }
+ 
+ DEFINE_PER_CPU_SHARED_ALIGNED(struct tlb_state, cpu_tlbstate) = {
+-#if defined(CONFIG_SMP) && !defined(CONFIG_XEN)
+-	.active_mm = &init_mm,
++#ifndef CONFIG_XEN
++	.loaded_mm = &init_mm,
+ 	.state = 0,
+ #endif
+ 	.cr4 = ~0UL,	/* fail hard if we screw up cr4 shadow initialization */
+--- a/arch/x86/mm/init_32-xen.c
++++ b/arch/x86/mm/init_32-xen.c
+@@ -831,15 +831,12 @@ void __init mem_init(void)
+ }
+ 
+ #ifdef CONFIG_MEMORY_HOTPLUG
+-int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
++int arch_add_memory(int nid, u64 start, u64 size, bool want_memblock)
+ {
+-	struct pglist_data *pgdata = NODE_DATA(nid);
+-	struct zone *zone = pgdata->node_zones +
+-		zone_for_memory(nid, start, size, ZONE_HIGHMEM, for_device);
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 
+-	return __add_pages(nid, zone, start_pfn, nr_pages);
++	return __add_pages(nid, start_pfn, nr_pages, want_memblock);
+ }
+ 
+ #ifdef CONFIG_MEMORY_HOTREMOVE
+--- a/arch/x86/mm/init_64-xen.c
++++ b/arch/x86/mm/init_64-xen.c
+@@ -83,11 +83,16 @@ extern pte_t level1_fixmap_pgt[PTRS_PER_
+ pmd_t *__init early_get_pmd(unsigned long va)
+ {
+ 	unsigned long addr;
+-	unsigned long *page = (unsigned long *)init_level4_pgt;
++	unsigned long *page = (unsigned long *)init_top_pgt;
+ 
+ 	addr = page[pgd_index(va)];
+ 	addr_to_page(addr, page);
+ 
++#ifdef CONFIG_X86_5LEVEL
++	addr = page[p4d_index(va)];
++	addr_to_page(addr, page);
++#endif
++
+ 	addr = page[pud_index(va)];
+ 	addr_to_page(addr, page);
+ 
+@@ -98,7 +103,7 @@ void __init early_make_page_readonly(con
+ {
+ 	unsigned long addr, _va = (unsigned long)va;
+ 	pte_t pte, *ptep;
+-	unsigned long *page = (unsigned long *) init_level4_pgt;
++	unsigned long *page = (unsigned long *)init_top_pgt;
+ 
+ 	BUG_ON(after_bootmem);
+ 
+@@ -108,6 +113,11 @@ void __init early_make_page_readonly(con
+ 	addr = (unsigned long) page[pgd_index(_va)];
+ 	addr_to_page(addr, page);
+ 
++#ifdef CONFIG_X86_5LEVEL
++	addr = page[p4d_index(_va)];
++	addr_to_page(addr, page);
++#endif
++
+ 	addr = page[pud_index(_va)];
+ 	addr_to_page(addr, page);
+ 
+@@ -156,6 +166,44 @@ __setup("noexec32=", nonx32_setup);
+  * When memory was added make sure all the processes MM have
+  * suitable PGD entries in the local PGD level page.
+  */
++#ifdef CONFIG_X86_5LEVEL
++void sync_global_pgds(unsigned long start, unsigned long end)
++{
++	unsigned long addr;
++
++	for (addr = start; addr <= end; addr = ALIGN(addr + 1, PGDIR_SIZE)) {
++		const pgd_t *pgd_ref = pgd_offset_k(addr);
++		struct page *page;
++
++		/* Check for overflow */
++		if (addr < start)
++			break;
++
++		if (pgd_none(*pgd_ref))
++			continue;
++
++		spin_lock(&pgd_lock);
++		list_for_each_entry(page, &pgd_list, lru) {
++			pgd_t *pgd;
++			spinlock_t *pgt_lock;
++
++			pgd = (pgd_t *)page_address(page) + pgd_index(addr);
++			/* the pgt_lock only for Xen */
++			pgt_lock = &pgd_page_get_mm(page)->page_table_lock;
++			spin_lock(pgt_lock);
++
++			if (!pgd_none(*pgd_ref) && !pgd_none(*pgd))
++				BUG_ON(pgd_page_vaddr(*pgd) != pgd_page_vaddr(*pgd_ref));
++
++			if (pgd_none(*pgd))
++				set_pgd(pgd, *pgd_ref);
++
++			spin_unlock(pgt_lock);
++		}
++		spin_unlock(&pgd_lock);
++	}
++}
++#else
+ void sync_global_pgds(unsigned long start, unsigned long end)
+ {
+ 	unsigned long addr;
+@@ -199,6 +247,7 @@ void sync_global_pgds(unsigned long star
+ 		spin_unlock(&pgd_lock);
+ 	}
+ }
++#endif
+ 
+ /*
+  * NOTE: This function is marked __ref because it calls __init function
+@@ -702,6 +751,64 @@ phys_pud_init(pud_t *pud_page, unsigned
+ 	return paddr_last;
+ }
+ 
++static unsigned long __meminit
++phys_p4d_init(p4d_t *p4d_page, unsigned long paddr, unsigned long paddr_end,
++	      unsigned long page_size_mask)
++{
++	unsigned long paddr_next, paddr_last = paddr_end;
++	unsigned long vaddr = (unsigned long)__va(paddr);
++	int i = p4d_index(vaddr);
++
++	if (!IS_ENABLED(CONFIG_X86_5LEVEL))
++		return phys_pud_init((pud_t *) p4d_page, paddr, paddr_end, page_size_mask);
++
++	for (; i < PTRS_PER_P4D; i++, paddr = paddr_next) {
++		p4d_t *p4d;
++		pud_t *pud;
++
++		vaddr = (unsigned long)__va(paddr);
++		p4d = p4d_page + p4d_index(vaddr);
++		paddr_next = (paddr & P4D_MASK) + P4D_SIZE;
++
++		if (paddr >= paddr_end)
++			continue;
++
++		if (!p4d_none(*p4d)) {
++			pud = pud_offset(p4d, 0);
++			paddr_last = phys_pud_init(pud, paddr,
++					paddr_end,
++					page_size_mask);
++			__flush_tlb_all();
++			continue;
++		}
++
++		pud = alloc_low_page();
++		paddr_last = phys_pud_init(pud, paddr, paddr_end,
++					   page_size_mask & ~(1 << PG_LEVEL_NUM));
++
++		make_page_readonly(pud, XENFEAT_writable_page_tables);
++		if (!after_bootmem) {
++			if (page_size_mask & (1 << PG_LEVEL_NUM)) {
++				mmu_update_t u;
++
++				u.ptr = arbitrary_virt_to_machine(p4d);
++				u.val = phys_to_machine(__pa(pud)) | _PAGE_TABLE;
++				if (HYPERVISOR_mmu_update(&u, 1, NULL,
++							  DOMID_SELF) < 0)
++					BUG();
++			} else
++				*p4d = __p4d(__pa(pud) | _PAGE_TABLE);
++		} else {
++			spin_lock(&init_mm.page_table_lock);
++			p4d_populate(&init_mm, p4d, pud);
++			spin_unlock(&init_mm.page_table_lock);
++		}
++	}
++	__flush_tlb_all();
++
++	return paddr_last;
++}
++
+ RESERVE_BRK(kernel_pgt_alloc,
+ 	    (1
+ 	     + (PUD_SIZE - 1 - __START_KERNEL_map) / PUD_SIZE
+@@ -749,7 +856,7 @@ void __init xen_init_pt(void)
+ #endif
+ 
+ 	/* Construct mapping of initial pte page in our own directories. */
+-	init_level4_pgt[pgd_index(__START_KERNEL_map)] = 
++	init_top_pgt[pgd_index(__START_KERNEL_map)] =
+ 		__pgd(__pa_symbol(level3_kernel_pgt) | _PAGE_TABLE);
+ 	memcpy(level3_kernel_pgt + pud_index(__START_KERNEL_map),
+ 	       page + pud_index(__START_KERNEL_map),
+@@ -757,11 +864,10 @@ void __init xen_init_pt(void)
+ 	       * sizeof(*level3_kernel_pgt));
+ 
+ #ifdef CONFIG_X86_VSYSCALL_EMULATION
++	__user_pgd(init_top_pgt)[pgd_index(VSYSCALL_ADDR)] =
+ # ifdef CONFIG_X86_5LEVEL
+-	__user_pgd(init_level5_pgt)[pgd_index(VSYSCALL_ADDR)] =
+ 		__pgd(__pa_symbol(level4_user_pgt) | _PAGE_TABLE);
+ # else
+-	__user_pgd(init_level4_pgt)[pgd_index(VSYSCALL_ADDR)] =
+ 		__pgd(__pa_symbol(level3_user_pgt) | _PAGE_TABLE);
+ # endif
+ #endif
+@@ -784,7 +890,7 @@ void __init xen_init_pt(void)
+ 	addr = __pa_symbol(pud);
+ 	printk(KERN_DEBUG "BRK [%#010lx, %#010lx] PUD\n",
+ 	       addr, addr + PAGE_SIZE - 1);
+-	init_level4_pgt[pgd_index(PAGE_OFFSET)] = __pgd(addr | _PAGE_TABLE);
++	init_top_pgt[pgd_index(PAGE_OFFSET)] = __pgd(addr | _PAGE_TABLE);
+ 
+ 	BUILD_BUG_ON(pgd_index(PAGE_OFFSET)
+ 		     != pgd_index(PAGE_OFFSET - __START_KERNEL_map - 1));
+@@ -838,9 +944,9 @@ void __init xen_init_pt(void)
+ #ifdef CONFIG_X86_5LEVEL
+ # error Not implemented yet.
+ #else
+-	early_make_page_readonly(init_level4_pgt,
++	early_make_page_readonly(init_top_pgt,
+ 				 XENFEAT_writable_page_tables);
+-	early_make_page_readonly(__user_pgd(init_level4_pgt),
++	early_make_page_readonly(__user_pgd(init_top_pgt),
+ 				 XENFEAT_writable_page_tables);
+ 	early_make_page_readonly(level3_kernel_pgt,
+ 				 XENFEAT_writable_page_tables);
+@@ -854,8 +960,8 @@ void __init xen_init_pt(void)
+ 				 XENFEAT_writable_page_tables);
+ 
+ 	if (!xen_feature(XENFEAT_writable_page_tables)) {
+-		xen_pgd_pin(__pa_symbol(init_level4_pgt));
+-		xen_pgd_pin(__pa_symbol(__user_pgd(init_level4_pgt)));
++		xen_pgd_pin(__pa_symbol(init_top_pgt));
++		xen_pgd_pin(__pa_symbol(__user_pgd(init_top_pgt)));
+ 	}
+ #endif
+ }
+@@ -921,30 +1027,34 @@ kernel_physical_mapping_init(unsigned lo
+ 	for (; vaddr < vaddr_end; vaddr = vaddr_next) {
+ 		pgd_t *pgd = pgd_offset_k(vaddr);
+ 		p4d_t *p4d;
+-		pud_t *pud;
+ 
+ 		vaddr_next = (vaddr & PGDIR_MASK) + PGDIR_SIZE;
+ 
+-		BUILD_BUG_ON(pgd_none(*pgd));
+-		p4d = p4d_offset(pgd, vaddr);
+-		if (__p4d_val(*p4d)) {
+-			pud = (pud_t *)p4d_page_vaddr(*p4d);
+-			paddr_last = phys_pud_init(pud, __pa(vaddr),
++		if (__pgd_val(*pgd)) {
++			p4d = (p4d_t *)pgd_page_vaddr(*pgd);
++			paddr_last = phys_p4d_init(p4d, __pa(vaddr),
+ 						   __pa(vaddr_end),
+ 						   page_size_mask | (1 << PG_LEVEL_NUM));
+ 			continue;
+ 		}
+ 
+-		pud = alloc_low_page();
+-		paddr_last = phys_pud_init(pud, __pa(vaddr), __pa(vaddr_end),
++		p4d = alloc_low_page();
++		paddr_last = phys_p4d_init(p4d, __pa(vaddr), __pa(vaddr_end),
+ 					   page_size_mask);
+ 
+-		make_page_readonly(pud, XENFEAT_writable_page_tables);
+-		if (!after_bootmem)
+-			xen_l4_entry_update(p4d, __p4d(__pa(pud) | _PAGE_TABLE));
+-		else {
++		make_page_readonly(p4d, XENFEAT_writable_page_tables);
++		if (!after_bootmem) {
++			if (IS_ENABLED(CONFIG_X86_5LEVEL))
++				xen_l5_entry_update(pgd, __pgd(__pa(p4d) | _PAGE_TABLE));
++			else
++				xen_l4_entry_update(p4d_offset(pgd, vaddr),
++						    __p4d(__pa(p4d) | _PAGE_TABLE));
++		} else {
+ 			spin_lock(&init_mm.page_table_lock);
+-			p4d_populate(&init_mm, p4d, pud);
++			if (IS_ENABLED(CONFIG_X86_5LEVEL))
++				pgd_populate(&init_mm, pgd, p4d);
++			else
++				p4d_populate(&init_mm, p4d_offset(pgd, vaddr), (pud_t *) p4d);
+ 			spin_unlock(&init_mm.page_table_lock);
+ 			pgd_changed = true;
+ 		}
+@@ -1002,22 +1112,15 @@ static void  update_end_of_memory_vars(u
+ 	}
+ }
+ 
+-/*
+- * Memory is added always to NORMAL zone. This means you will never get
+- * additional DMA/DMA32 memory.
+- */
+-int arch_add_memory(int nid, u64 start, u64 size, bool for_device)
++int arch_add_memory(int nid, u64 start, u64 size, bool want_memblock)
+ {
+-	struct pglist_data *pgdat = NODE_DATA(nid);
+-	struct zone *zone = pgdat->node_zones +
+-		zone_for_memory(nid, start, size, ZONE_NORMAL, for_device);
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 	int ret;
+ 
+ 	init_memory_mapping(start, start + size);
+ 
+-	ret = __add_pages(nid, zone, start_pfn, nr_pages);
++	ret = __add_pages(nid, start_pfn, nr_pages, want_memblock);
+ 	WARN_ON_ONCE(ret);
+ 
+ 	/* update max_pfn, max_low_pfn and high_memory */
+--- a/arch/x86/mm/ioremap-xen.c
++++ b/arch/x86/mm/ioremap-xen.c
+@@ -52,7 +52,7 @@ static int __direct_remap_pfn_range(stru
+ 	unsigned long i, start_address;
+ 	mmu_update_t *u, *v, *w;
+ 
+-	u = v = w = (mmu_update_t *)__get_free_page(GFP_KERNEL|__GFP_REPEAT);
++	u = v = w = (mmu_update_t *)__get_free_page(GFP_KERNEL|__GFP_RETRY_MAYFAIL);
+ 	if (u == NULL)
+ 		return -ENOMEM;
+ 
+@@ -601,7 +601,7 @@ static pte_t bm_pte[PAGE_SIZE/sizeof(pte
+ static inline pmd_t * __init early_ioremap_pmd(unsigned long addr)
+ {
+ 	/* Don't assume we're using swapper_pg_dir at this point */
+-	pgd_t *base = __va(read_cr3());
++	pgd_t *base = __va(read_cr3_pa());
+ 	pgd_t *pgd = &base[pgd_index(addr)];
+ 	p4d_t *p4d = p4d_offset(pgd, addr);
+ 	pud_t *pud = pud_offset(p4d, addr);
+--- a/arch/x86/mm/pageattr-xen.c
++++ b/arch/x86/mm/pageattr-xen.c
+@@ -150,6 +150,12 @@ void clflush_cache_range(void *vaddr, un
+ }
+ EXPORT_SYMBOL_GPL(clflush_cache_range);
+ 
++void arch_invalidate_pmem(void *addr, size_t size)
++{
++	clflush_cache_range(addr, size);
++}
++EXPORT_SYMBOL_GPL(arch_invalidate_pmem);
++
+ static void __cpa_flush_all(void *arg)
+ {
+ 	unsigned long cache = (unsigned long)arg;
+--- a/arch/x86/mm/pat-xen.c
++++ b/arch/x86/mm/pat-xen.c
+@@ -37,14 +37,14 @@
+ #undef pr_fmt
+ #define pr_fmt(fmt) "" fmt
+ 
+-static bool boot_cpu_done;
+-
+-static int __read_mostly __pat_enabled = IS_ENABLED(CONFIG_X86_PAT);
+-static void init_cache_modes(void);
++static bool __read_mostly boot_cpu_done;
++static bool __read_mostly pat_disabled = !IS_ENABLED(CONFIG_X86_PAT);
++static bool __read_mostly pat_initialized;
++static bool __read_mostly init_cm_done;
+ 
+ void pat_disable(const char *reason)
+ {
+-	if (!__pat_enabled)
++	if (pat_disabled)
+ 		return;
+ 
+ 	if (boot_cpu_done) {
+@@ -52,10 +52,8 @@ void pat_disable(const char *reason)
+ 		return;
+ 	}
+ 
+-	__pat_enabled = 0;
++	pat_disabled = true;
+ 	pr_info("x86/PAT: %s\n", reason);
+-
+-	init_cache_modes();
+ }
+ 
+ static int __init nopat(char *str)
+@@ -67,7 +65,7 @@ early_param("nopat", nopat);
+ 
+ bool pat_enabled(void)
+ {
+-	return !!__pat_enabled;
++	return pat_initialized;
+ }
+ EXPORT_SYMBOL_GPL(pat_enabled);
+ 
+@@ -205,6 +203,8 @@ static void __init_cache_modes(u64 pat)
+ 		update_cache_mode_entry(i, cache);
+ 	}
+ 	pr_info("x86/PAT: Configuration [0-7]: %s\n", pat_msg);
++
++	init_cm_done = true;
+ }
+ 
+ #define PAT(x, y)	((u64)PAT_ ## y << ((x)*8))
+@@ -233,6 +233,7 @@ static void pat_bsp_init(u64 pat)
+ 	 */
+ 	pat = tmp_pat;
+ #endif
++	pat_initialized = true;
+ 
+ 	__init_cache_modes(pat);
+ }
+@@ -252,10 +253,9 @@ static void pat_ap_init(u64 pat)
+ #endif
+ }
+ 
+-static void init_cache_modes(void)
++void init_cache_modes(void)
+ {
+ 	u64 pat = 0;
+-	static int init_cm_done;
+ 
+ 	if (init_cm_done)
+ 		return;
+@@ -297,8 +297,6 @@ static void init_cache_modes(void)
+ 	}
+ 
+ 	__init_cache_modes(pat);
+-
+-	init_cm_done = 1;
+ }
+ 
+ /**
+@@ -316,10 +314,8 @@ void pat_init(void)
+ 	u64 pat;
+ 	struct cpuinfo_x86 *c = &boot_cpu_data;
+ 
+-	if (!pat_enabled()) {
+-		init_cache_modes();
++	if (pat_disabled)
+ 		return;
+-	}
+ 
+ 	if ((c->x86_vendor == X86_VENDOR_INTEL) &&
+ 	    (((c->x86 == 0x6) && (c->x86_model <= 0xd)) ||
+--- a/arch/x86/mm/tlb-xen.c
++++ b/arch/x86/mm/tlb-xen.c
+@@ -23,161 +23,127 @@ void switch_mm_irqs_off(struct mm_struct
+ 			struct task_struct *tsk)
+ {
+ 	unsigned cpu = smp_processor_id();
++#ifndef CONFIG_XEN /* XEN: no lazy tlb */
++	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
++#else
+ 	struct mmuext_op _op[2 + (sizeof(long) > 4)], *op = _op;
++#endif
+ 
+-	if (likely(prev != next)) {
+-		BUG_ON(!xen_feature(XENFEAT_writable_page_tables) &&
+-		       !PagePinned(virt_to_page(next->pgd)));
+-
+-		if (IS_ENABLED(CONFIG_VMAP_STACK)) {
+-			/*
+-			 * If our current stack is in vmalloc space and isn't
+-			 * mapped in the new pgd, we'll double-fault.  Forcibly
+-			 * map it.
+-			 */
+-			unsigned int stack_pgd_index = pgd_index(current_stack_pointer());
+-
+-			pgd_t *pgd = next->pgd + stack_pgd_index;
++	/*
++	 * NB: The scheduler will call us with prev == next when
++	 * switching from lazy TLB mode to normal mode if active_mm
++	 * isn't changing.  When this happens, there is no guarantee
++	 * that CR3 (and hence cpu_tlbstate.loaded_mm) matches next.
++	 *
++	 * NB: leave_mm() calls us with prev == NULL and tsk == NULL.
++	 */
+ 
+-			if (unlikely(pgd_none(*pgd)))
+-				set_pgd(pgd, init_mm.pgd[stack_pgd_index]);
+-		}
++	BUG_ON(!xen_feature(XENFEAT_writable_page_tables) &&
++	       !PagePinned(virt_to_page(next->pgd)));
+ 
+-#if defined(CONFIG_SMP) && !defined(CONFIG_XEN) /* XEN: no lazy tlb */
+-		this_cpu_write(cpu_tlbstate.state, TLBSTATE_OK);
+-		this_cpu_write(cpu_tlbstate.active_mm, next);
++#ifndef CONFIG_XEN /* XEN: no lazy tlb */
++	this_cpu_write(cpu_tlbstate.state, TLBSTATE_OK);
+ #endif
+ 
+-		cpumask_set_cpu(cpu, mm_cpumask(next));
+-
++	if (prev == next) {
+ 		/*
+-		 * Re-load page tables: load_cr3(next->pgd).
+-		 *
+-		 * This logic has an ordering constraint:
+-		 *
+-		 *  CPU 0: Write to a PTE for 'next'
+-		 *  CPU 0: load bit 1 in mm_cpumask.  if nonzero, send IPI.
+-		 *  CPU 1: set bit 1 in next's mm_cpumask
+-		 *  CPU 1: load from the PTE that CPU 0 writes (implicit)
+-		 *
+-		 * We need to prevent an outcome in which CPU 1 observes
+-		 * the new PTE value and CPU 0 observes bit 1 clear in
+-		 * mm_cpumask.  (If that occurs, then the IPI will never
+-		 * be sent, and CPU 0's TLB will contain a stale entry.)
+-		 *
+-		 * The bad outcome can occur if either CPU's load is
+-		 * reordered before that CPU's store, so both CPUs must
+-		 * execute full barriers to prevent this from happening.
+-		 *
+-		 * Thus, switch_mm needs a full barrier between the
+-		 * store to mm_cpumask and any operation that could load
+-		 * from next->pgd.  TLB fills are special and can happen
+-		 * due to instruction fetches or for no reason at all,
+-		 * and neither LOCK nor MFENCE orders them.
+-		 * Fortunately, load_cr3() is serializing and gives the
+-		 * ordering guarantee we need.
+-		 *
++		 * There's nothing to do: we always keep the per-mm control
++		 * regs in sync with cpu_tlbstate.loaded_mm.  Just
++		 * sanity-check mm_cpumask.
+ 		 */
+-		op->cmd = MMUEXT_NEW_BASEPTR;
+-		op->arg1.mfn = virt_to_mfn(next->pgd);
+-		op++;
++		if (WARN_ON_ONCE(!cpumask_test_cpu(cpu, mm_cpumask(next))))
++			cpumask_set_cpu(cpu, mm_cpumask(next));
++		return;
++	}
+ 
+-		trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
++	if (IS_ENABLED(CONFIG_VMAP_STACK)) {
++		/*
++		 * If our current stack is in vmalloc space and isn't
++		 * mapped in the new pgd, we'll double-fault.  Forcibly
++		 * map it.
++		 */
++		unsigned int stack_pgd_index = pgd_index(current_stack_pointer());
+ 
+-#ifdef CONFIG_X86_64_XEN
+-		/* xen_new_user_pt(__pa(__user_pgd(next->pgd))) */
+-		op->cmd = MMUEXT_NEW_USER_BASEPTR;
+-		op->arg1.mfn = virt_to_mfn(__user_pgd(next->pgd));
+-		op++;
+-#endif
++		pgd_t *pgd = next->pgd + stack_pgd_index;
+ 
+-		/* Load per-mm CR4 state */
+-		load_mm_cr4(next);
++		if (unlikely(pgd_none(*pgd)))
++			set_pgd(pgd, init_mm.pgd[stack_pgd_index]);
++	}
+ 
+-#ifdef CONFIG_MODIFY_LDT_SYSCALL
+-		/*
+-		 * Load the LDT, if the LDT is different.
+-		 *
+-		 * It's possible that prev->context.ldt doesn't match
+-		 * the LDT register.  This can happen if leave_mm(prev)
+-		 * was called and then modify_ldt changed
+-		 * prev->context.ldt but suppressed an IPI to this CPU.
+-		 * In this case, prev->context.ldt != NULL, because we
+-		 * never set context.ldt to NULL while the mm still
+-		 * exists.  That means that next->context.ldt !=
+-		 * prev->context.ldt, because mms never share an LDT.
+-		 */
+-		if (unlikely(prev->context.ldt != next->context.ldt)) {
+-			/* load_mm_ldt(next) */
+-			const struct ldt_struct *ldt;
+-
+-			/* lockless_dereference synchronizes with smp_store_release */
+-			ldt = lockless_dereference(next->context.ldt);
+-			op->cmd = MMUEXT_SET_LDT;
+-			if (unlikely(ldt)) {
+-				op->arg1.linear_addr = (long)ldt->entries;
+-				op->arg2.nr_ents     = ldt->size;
+-			} else {
+-				op->arg1.linear_addr = 0;
+-				op->arg2.nr_ents     = 0;
+-			}
+-			op++;
+-		}
++#ifndef CONFIG_XEN /* XEN: no lazy tlb */
++	this_cpu_write(cpu_tlbstate.loaded_mm, next);
+ #endif
+ 
+-		BUG_ON(HYPERVISOR_mmuext_op(_op, op-_op, NULL, DOMID_SELF));
++	WARN_ON_ONCE(cpumask_test_cpu(cpu, mm_cpumask(next)));
++	cpumask_set_cpu(cpu, mm_cpumask(next));
+ 
+-		/* Stop TLB flushes for the previous mm */
+-		cpumask_clear_cpu(cpu, mm_cpumask(prev));
+-	}
+-#if defined(CONFIG_SMP) && !defined(CONFIG_XEN) /* XEN: no lazy tlb */
+-	  else {
+-		this_cpu_write(cpu_tlbstate.state, TLBSTATE_OK);
+-		BUG_ON(this_cpu_read(cpu_tlbstate.active_mm) != next);
+-
+-		if (!cpumask_test_cpu(cpu, mm_cpumask(next))) {
+-			/*
+-			 * On established mms, the mm_cpumask is only changed
+-			 * from irq context, from ptep_clear_flush() while in
+-			 * lazy tlb mode, and here. Irqs are blocked during
+-			 * schedule, protecting us from simultaneous changes.
+-			 */
+-			cpumask_set_cpu(cpu, mm_cpumask(next));
++	/*
++	 * Re-load page tables: load_cr3(next->pgd).
++	 *
++	 * This logic has an ordering constraint:
++	 *
++	 *  CPU 0: Write to a PTE for 'next'
++	 *  CPU 0: load bit 1 in mm_cpumask.  if nonzero, send IPI.
++	 *  CPU 1: set bit 1 in next's mm_cpumask
++	 *  CPU 1: load from the PTE that CPU 0 writes (implicit)
++	 *
++	 * We need to prevent an outcome in which CPU 1 observes
++	 * the new PTE value and CPU 0 observes bit 1 clear in
++	 * mm_cpumask.  (If that occurs, then the IPI will never
++	 * be sent, and CPU 0's TLB will contain a stale entry.)
++	 *
++	 * The bad outcome can occur if either CPU's load is
++	 * reordered before that CPU's store, so both CPUs must
++	 * execute full barriers to prevent this from happening.
++	 *
++	 * Thus, switch_mm needs a full barrier between the
++	 * store to mm_cpumask and any operation that could load
++	 * from next->pgd.  TLB fills are special and can happen
++	 * due to instruction fetches or for no reason at all,
++	 * and neither LOCK nor MFENCE orders them.
++	 * Fortunately, load_cr3() is serializing and gives the
++	 * ordering guarantee we need.
++	 */
++	op->cmd = MMUEXT_NEW_BASEPTR;
++	op->arg1.mfn = virt_to_mfn(next->pgd);
++	op++;
+ 
+-			/*
+-			 * We were in lazy tlb mode and leave_mm disabled
+-			 * tlb flush IPI delivery. We must reload CR3
+-			 * to make sure to use no freed page tables.
+-			 *
+-			 * As above, load_cr3() is serializing and orders TLB
+-			 * fills with respect to the mm_cpumask write.
+-			 */
+-			load_cr3(next->pgd);
+-			trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
+-			load_mm_cr4(next);
+-			xen_new_user_pt(__pa(__user_pgd(next->pgd)));
+-			load_mm_ldt(next);
+-		}
+-	}
++#ifdef CONFIG_X86_64_XEN
++	/* xen_new_user_pt(__pa(__user_pgd(next->pgd))) */
++	op->cmd = MMUEXT_NEW_USER_BASEPTR;
++	op->arg1.mfn = virt_to_mfn(__user_pgd(next->pgd));
++	op++;
+ #endif
+-}
+ 
+-#ifdef CONFIG_SMP
++	trace_tlb_flush(TLB_FLUSH_ON_TASK_SWITCH, TLB_FLUSH_ALL);
++
++	/* Load per-mm CR4 and LDTR state */
++	load_mm_cr4(next);
++	op += switch_ldt(prev, next, op);
++
++	BUG_ON(HYPERVISOR_mmuext_op(_op, op - _op, NULL, DOMID_SELF));
++
++	/* Stop TLB flushes for the previous mm */
++	WARN_ON_ONCE(!cpumask_test_cpu(cpu, mm_cpumask(prev)) &&
++		     prev != &init_mm);
++	cpumask_clear_cpu(cpu, mm_cpumask(prev));
++}
+ 
+-void flush_tlb_others(const struct cpumask *cpumask, struct mm_struct *mm,
+-		      unsigned long start, unsigned long end)
++void flush_tlb_others(const struct cpumask *cpumask,
++		      const struct flush_tlb_info *info)
+ {
+ 	count_vm_tlb_event(NR_TLB_REMOTE_FLUSH);
+-	if (end == TLB_FLUSH_ALL) {
++	if (info->end == TLB_FLUSH_ALL) {
+ 		xen_tlb_flush_mask(cpumask);
+ 		trace_tlb_flush(TLB_REMOTE_SHOOTDOWN, TLB_FLUSH_ALL);
+ 	} else {
+ 		/* flush range by one by one 'invlpg' */
+ 		unsigned long addr;
+ 
+-		for (addr = start; addr < end; addr += PAGE_SIZE)
++		for (addr = info->start; addr < info->end; addr += PAGE_SIZE)
+ 			xen_invlpg_mask(cpumask, addr);
+-		trace_tlb_flush(TLB_REMOTE_SHOOTDOWN, PFN_DOWN(end - start));
++		trace_tlb_flush(TLB_REMOTE_SHOOTDOWN,
++				PFN_DOWN(info->end - info->start));
+ 	}
+ }
+ 
+@@ -196,52 +162,45 @@ static unsigned long tlb_single_page_flu
+ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+ 				unsigned long end, unsigned long vmflag)
+ {
+-	unsigned long addr;
+-	/* do a global flush by default */
+-	unsigned long base_pages_to_flush = TLB_FLUSH_ALL;
++	int cpu;
+ 	const cpumask_t *mask = mm_cpumask(mm);
+ 	cpumask_var_t temp;
+-
+-	preempt_disable();
+-
+-	if ((end != TLB_FLUSH_ALL) && !(vmflag & VM_HUGETLB))
+-		base_pages_to_flush = (end - start) >> PAGE_SHIFT;
+-	if (base_pages_to_flush > tlb_single_page_flush_ceiling)
+-		base_pages_to_flush = TLB_FLUSH_ALL;
++	struct flush_tlb_info info = {
++		.mm = mm,
++	};
++
++	cpu = get_cpu();
++
++	/* Synchronize with switch_mm. */
++	smp_mb();
++
++	/* Should we flush just the requested range? */
++	if ((end != TLB_FLUSH_ALL) &&
++	    !(vmflag & VM_HUGETLB) &&
++	    ((end - start) >> PAGE_SHIFT) <= tlb_single_page_flush_ceiling) {
++		info.start = start;
++		info.end = end;
++	} else {
++		info.start = 0UL;
++		info.end = TLB_FLUSH_ALL;
++	}
+ 
+ 	if (current->active_mm != mm || !current->mm) {
+-		/* Synchronize with switch_mm. */
+-		smp_mb();
+-
+-		if (cpumask_any_but(mask, smp_processor_id()) >= nr_cpu_ids) {
+-			preempt_enable();
++		if (cpumask_any_but(mask, cpu) >= nr_cpu_ids) {
++			put_cpu();
+ 			return;
+ 		}
+ 		if (alloc_cpumask_var(&temp, GFP_ATOMIC)) {
+-			cpumask_andnot(temp, mask,
+-				       cpumask_of(smp_processor_id()));
++			cpumask_andnot(temp, mask, cpumask_of(cpu));
+ 			mask = temp;
+ 		}
+ 	}
+ 
+-	/*
+-	 * Both branches below are implicit full barriers (MOV to CR or
+-	 * INVLPG) that synchronize with switch_mm.
+-	 */
+-	if (base_pages_to_flush == TLB_FLUSH_ALL) {
+-		count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ALL);
+-		xen_tlb_flush_mask(mask);
+-	} else {
+-		/* flush range by one by one 'invlpg' */
+-		for (addr = start; addr < end; addr += PAGE_SIZE) {
+-			count_vm_tlb_event(NR_TLB_LOCAL_FLUSH_ONE);
+-			xen_invlpg_mask(mask, addr);
+-		}
+-	}
+-	trace_tlb_flush(TLB_LOCAL_MM_SHOOTDOWN, base_pages_to_flush);
++	flush_tlb_others(mask, &info);
++	put_cpu();
++
+ 	if (mask != mm_cpumask(mm))
+ 		free_cpumask_var(temp);
+-	preempt_enable();
+ }
+ 
+ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+@@ -249,7 +208,7 @@ void flush_tlb_kernel_range(unsigned lon
+ 
+ 	/* Balance as user space task's flush, a bit conservative */
+ 	if (end == TLB_FLUSH_ALL ||
+-	    (end - start) > tlb_single_page_flush_ceiling * PAGE_SIZE) {
++	    (end - start) > tlb_single_page_flush_ceiling << PAGE_SHIFT) {
+ 		xen_tlb_flush_all();
+ 	} else {
+ 		unsigned long addr;
+@@ -260,6 +219,18 @@ void flush_tlb_kernel_range(unsigned lon
+ 	}
+ }
+ 
++void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
++{
++	struct flush_tlb_info info = {
++		.mm = NULL,
++		.start = 0UL,
++		.end = TLB_FLUSH_ALL,
++	};
++
++	flush_tlb_others(&batch->cpumask, &info);
++	cpumask_clear(&batch->cpumask);
++}
++
+ static ssize_t tlbflush_read_file(struct file *file, char __user *user_buf,
+ 			     size_t count, loff_t *ppos)
+ {
+@@ -305,5 +276,3 @@ static int __init create_tlb_single_page
+ 	return 0;
+ }
+ late_initcall(create_tlb_single_page_flush_ceiling);
+-
+-#endif /* CONFIG_SMP */
+--- a/drivers/pci/msi-xen.c
++++ b/drivers/pci/msi-xen.c
+@@ -1028,7 +1028,7 @@ static int __pci_enable_msi_range(struct
+ 
+ 	for (;;) {
+ 		if (affd) {
+-			nvec = irq_calc_affinity_vectors(nvec, affd);
++			nvec = irq_calc_affinity_vectors(minvec, nvec, affd);
+ 			if (nvec < minvec)
+ 				return -ENOSPC;
+ 		}
+@@ -1087,7 +1087,7 @@ static int __pci_enable_msix_range(struc
+ 
+ 	for (;;) {
+ 		if (affd) {
+-			nvec = irq_calc_affinity_vectors(nvec, affd);
++			nvec = irq_calc_affinity_vectors(minvec, nvec, affd);
+ 			if (nvec < minvec)
+ 				return -ENOSPC;
+ 		}
+@@ -1155,16 +1155,6 @@ int pci_alloc_irq_vectors_affinity(struc
+ 	if (flags & PCI_IRQ_AFFINITY) {
+ 		if (!affd)
+ 			affd = &msi_default_affd;
+-
+-		if (affd->pre_vectors + affd->post_vectors > min_vecs)
+-			return -EINVAL;
+-
+-		/*
+-		 * If there aren't any vectors left after applying the pre/post
+-		 * vectors don't bother with assigning affinity.
+-		 */
+-		if (affd->pre_vectors + affd->post_vectors == min_vecs)
+-			affd = NULL;
+ 	} else {
+ 		if (WARN_ON(affd))
+ 			affd = NULL;
+--- a/drivers/xen/Makefile
++++ b/drivers/xen/Makefile
+@@ -23,8 +23,6 @@ nostackp := $(call cc-option, -fno-stack
+ ifeq ($(CONFIG_PARAVIRT_XEN),y)
+ CFLAGS_features.o			:= $(nostackp)
+ endif
+-CFLAGS_efi.o				+= -fshort-wchar
+-LDFLAGS					+= $(call ld-option, --no-wchar-size-warning)
+ 
+ priv-$(CONFIG_USB_SUPPORT)		:= dbgp.o
+ priv-$(CONFIG_PCI)			+= pci.o
+--- a/drivers/xen/blkback/blkback.c
++++ b/drivers/xen/blkback/blkback.c
+@@ -262,22 +262,22 @@ static void drain_io(blkif_t *blkif)
+ }
+ 
+ /******************************************************************
+- * COMPLETION CALLBACK -- Called as bh->b_end_io()
++ * COMPLETION CALLBACK
+  */
+ 
+-static void __end_block_io_op(pending_req_t *pending_req, int error)
++static void __end_block_io_op(pending_req_t *pending_req, blk_status_t error)
+ {
+ 	blkif_t *blkif = pending_req->blkif;
+ 	int status = BLKIF_RSP_OKAY;
+ 
+ 	/* An error fails the entire request. */
+ 	if ((pending_req->operation == BLKIF_OP_WRITE_BARRIER) &&
+-	    (error == -EOPNOTSUPP)) {
++	    (error == BLK_STS_NOTSUPP)) {
+ 		DPRINTK("blkback: write barrier op failed, not supported\n");
+ 		blkback_barrier(XBT_NIL, blkif->be, 0);
+ 		status = BLKIF_RSP_EOPNOTSUPP;
+ 	} else if ((pending_req->operation == BLKIF_OP_FLUSH_DISKCACHE) &&
+-		   (error == -EOPNOTSUPP)) {
++		   (error == BLK_STS_NOTSUPP)) {
+ 		DPRINTK("blkback: flush diskcache op failed, not supported\n");
+ 		blkback_flush_diskcache(XBT_NIL, blkif->be, 0);
+ 		status = BLKIF_RSP_EOPNOTSUPP;
+@@ -301,7 +301,7 @@ static void __end_block_io_op(pending_re
+ 
+ static void end_block_io_op(struct bio *bio)
+ {
+-	__end_block_io_op(bio->bi_private, bio->bi_error);
++	__end_block_io_op(bio->bi_private, bio->bi_status);
+ 	bio_put(bio);
+ }
+ 
+@@ -663,7 +663,7 @@ static void dispatch_rw_block_io(blkif_t
+ 	for (i = 0; i < nbio; ++i)
+ 		bio_put(seg[i].bio);
+ 	atomic_set(&pending_req->pendcnt, 1);
+-	__end_block_io_op(pending_req, -EINVAL);
++	__end_block_io_op(pending_req, BLK_STS_RESOURCE);
+ 	msleep(1); /* back off a bit */
+ 	return;
+ }
+--- a/drivers/xen/blkfront/blkfront.c
++++ b/drivers/xen/blkfront/blkfront.c
+@@ -939,7 +939,7 @@ void do_blkif_request(struct request_que
+ 			if (blk_rq_is_scsi(req))
+ 				scsi_req(req)->result = (DID_ERROR << 16) |
+ 				                        (DRIVER_INVALID << 24);
+-			__blk_end_request_all(req, -EOPNOTSUPP);
++			__blk_end_request_all(req, BLK_STS_NOTSUPP);
+ 			continue;
+ 		}
+ 
+@@ -1013,7 +1013,8 @@ static irqreturn_t blkif_int(int irq, vo
+ 			continue;
+ 		}
+ 
+-		ret = bret->status == BLKIF_RSP_OKAY ? 0 : -EIO;
++		ret = bret->status == BLKIF_RSP_OKAY
++		      ? BLK_STS_OK : BLK_STS_IOERR;
+ 		switch (bret->operation) {
+ 			const char *kind;
+ 
+@@ -1021,18 +1022,18 @@ static irqreturn_t blkif_int(int irq, vo
+ 		case BLKIF_OP_WRITE_BARRIER:
+ 			kind = "";
+ 			if (unlikely(bret->status == BLKIF_RSP_EOPNOTSUPP))
+-				ret = -EOPNOTSUPP;
++				ret = BLK_STS_NOTSUPP;
+ 			if (unlikely(bret->status == BLKIF_RSP_ERROR &&
+ 				     info->shadow[id].req.nr_segments == 0)) {
+ 				kind = "empty ";
+-				ret = -EOPNOTSUPP;
++				ret = BLK_STS_NOTSUPP;
+ 			}
+ 			if (unlikely(ret)) {
+-				if (ret == -EOPNOTSUPP) {
++				if (ret == BLK_STS_NOTSUPP) {
+ 					pr_warn("blkfront: %s: %s%s op failed\n",
+ 					        info->gd->disk_name, kind,
+ 						op_name(bret->operation));
+-					ret = 0;
++					ret = BLK_STS_OK;
+ 				}
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,37)
+ 				info->feature_flush = 0;
+@@ -1057,7 +1058,7 @@ static irqreturn_t blkif_int(int irq, vo
+ 
+ 				pr_warn("blkfront: %s: discard op failed\n",
+ 					info->gd->disk_name);
+-				ret = -EOPNOTSUPP;
++				ret = BLK_STS_NOTSUPP;
+ 				info->feature_discard = 0;
+ 				info->feature_secdiscard = 0;
+ 				queue_flag_clear(QUEUE_FLAG_DISCARD, rq);
+--- a/drivers/xen/blktap2-new/sysfs.c
++++ b/drivers/xen/blktap2-new/sysfs.c
+@@ -212,15 +212,14 @@ blktap_sysfs_destroy(struct blktap *tap)
+ }
+ 
+ static ssize_t
+-blktap_sysfs_show_verbosity(struct class *class, struct class_attribute *attr,
+-			    char *buf)
++verbosity_show(struct class *class, struct class_attribute *attr, char *buf)
+ {
+ 	return sprintf(buf, "%d\n", blktap_debug_level);
+ }
+ 
+ static ssize_t
+-blktap_sysfs_set_verbosity(struct class *class, struct class_attribute *attr,
+-			   const char *buf, size_t size)
++verbosity_store(struct class *class, struct class_attribute *attr,
++		const char *buf, size_t size)
+ {
+ 	int level;
+ 
+@@ -231,12 +230,10 @@ blktap_sysfs_set_verbosity(struct class
+ 
+ 	return -EINVAL;
+ }
+-static CLASS_ATTR(verbosity, S_IRUGO|S_IWUSR,
+-		  blktap_sysfs_show_verbosity, blktap_sysfs_set_verbosity);
++static CLASS_ATTR_RW(verbosity);
+ 
+ static ssize_t
+-blktap_sysfs_show_devices(struct class *class, struct class_attribute *attr,
+-			  char *buf)
++devices_show(struct class *class, struct class_attribute *attr, char *buf)
+ {
+ 	int i, ret;
+ 	struct blktap *tap;
+@@ -259,7 +256,7 @@ blktap_sysfs_show_devices(struct class *
+ 
+ 	return ret;
+ }
+-static CLASS_ATTR(devices, S_IRUGO, blktap_sysfs_show_devices, NULL);
++static CLASS_ATTR_RO(devices);
+ 
+ static char *blktap_devnode(struct device *dev, umode_t *mode)
+ {
+--- a/drivers/xen/blktap2/device.c
++++ b/drivers/xen/blktap2/device.c
+@@ -179,6 +179,16 @@ flush_tlb_kernel_page(unsigned long kvad
+ #endif
+ }
+ 
++static inline void
++flush_tlb_user_page(struct vm_area_struct *vma, unsigned long uvaddr)
++{
++#ifdef CONFIG_X86
++	xen_invlpg_mask(mm_cpumask(vma->vm_mm), uvaddr);
++#else
++	flush_tlb_page(vma, uvaddr);
++#endif
++}
++
+ /*
+  * tap->tap_sem held on entry
+  */
+@@ -539,7 +549,7 @@ blktap_map(struct blktap *tap,
+ 		pte = mk_pte(page, ring->vma->vm_page_prot);
+ 		blktap_map_uaddr(ring->vma, uvaddr,
+ 				 pte_mkspecial(pte_mkwrite(pte)));
+-		flush_tlb_page(ring->vma, uvaddr);
++		flush_tlb_user_page(ring->vma, uvaddr);
+ 		blktap_map_uaddr(NULL, kvaddr, mk_pte(page, PAGE_KERNEL));
+ 		flush_tlb_kernel_page(kvaddr);
+ 
+@@ -820,14 +830,14 @@ blktap_device_run_queue(struct blktap *t
+ 			if (blk_rq_is_scsi(req))
+ 				scsi_req(req)->result = (DID_ERROR << 16) |
+ 				                        (DRIVER_INVALID << 24);
+-			__blk_end_request_all(req, -EIO);
++			__blk_end_request_all(req, BLK_STS_IOERR);
+ 			continue;
+ 		}
+ 
+ 		if (req_op(req) == REQ_OP_FLUSH ||
+ 		    (req->cmd_flags & (REQ_PREFLUSH|REQ_FUA))) {
+ 			blk_start_request(req);
+-			__blk_end_request_all(req, -EOPNOTSUPP);
++			__blk_end_request_all(req, BLK_STS_NOTSUPP);
+ 			continue;
+ 		}
+ 
+@@ -915,7 +925,7 @@ fail:
+ 			BTERR("device closed: failing secs %#Lx-%#Lx\n",
+ 			      sec, sec + blk_rq_sectors(req) - 1);
+ 		}
+-		__blk_end_request_all(req, -EIO);
++		__blk_end_request_all(req, BLK_STS_IOERR);
+ 	}
+ }
+ 
+--- a/drivers/xen/blktap2/sysfs.c
++++ b/drivers/xen/blktap2/sysfs.c
+@@ -374,15 +374,14 @@ blktap_sysfs_destroy(struct blktap *tap,
+ }
+ 
+ static ssize_t
+-blktap_sysfs_show_verbosity(struct class *class, struct class_attribute *attr,
+-			    char *buf)
++verbosity_show(struct class *class, struct class_attribute *attr, char *buf)
+ {
+ 	return sprintf(buf, "%d\n", blktap_debug_level);
+ }
+ 
+ static ssize_t
+-blktap_sysfs_set_verbosity(struct class *class, struct class_attribute *attr,
+-			   const char *buf, size_t size)
++verbosity_store(struct class *class, struct class_attribute *attr,
++		const char *buf, size_t size)
+ {
+ 	int level;
+ 
+@@ -393,12 +392,10 @@ blktap_sysfs_set_verbosity(struct class
+ 
+ 	return -EINVAL;
+ }
+-static CLASS_ATTR(verbosity, S_IRUSR | S_IWUSR,
+-		  blktap_sysfs_show_verbosity, blktap_sysfs_set_verbosity);
++static CLASS_ATTR_RW(verbosity);
+ 
+ static ssize_t
+-blktap_sysfs_show_devices(struct class *class, struct class_attribute *attr,
+-			  char *buf)
++devices_show(struct class *class, struct class_attribute *attr, char *buf)
+ {
+ 	int i, ret;
+ 	struct blktap *tap;
+@@ -420,7 +417,7 @@ blktap_sysfs_show_devices(struct class *
+ 
+ 	return ret;
+ }
+-static CLASS_ATTR(devices, S_IRUSR, blktap_sysfs_show_devices, NULL);
++static CLASS_ATTR_RO(devices);
+ 
+ void
+ blktap_sysfs_free(void)
+--- a/drivers/xen/core/evtchn.c
++++ b/drivers/xen/core/evtchn.c
+@@ -291,6 +291,32 @@ void __init init_IRQ(void)
+ /* Xen will never allocate port zero for any purpose. */
+ #define VALID_EVTCHN(chn)	((chn) != 0)
+ 
++void xen_rebind_evtchn_to_cpu(evtchn_port_t chn, unsigned int cpu)
++{
++	int irq;
++	bool masked;
++	struct evtchn_bind_vcpu ebv = { .port = chn, .vcpu = cpu };
++
++	if (!VALID_EVTCHN(chn) || (irq = evtchn_to_irq[chn]) < 0)
++		return;
++
++	switch (type_from_irq(irq)) {
++	case IRQT_LOCAL_PORT:
++	case IRQT_CALLER_PORT:
++		break;
++	default:
++		return;
++	}
++
++	masked = sync_test_and_set_bit(chn,
++				       HYPERVISOR_shared_info->evtchn_mask);
++	if (!HYPERVISOR_event_channel_op(EVTCHNOP_bind_vcpu, &ebv))
++		_bind_evtchn_to_cpu(chn, cpu, NULL, NULL);
++	if (!masked)
++		unmask_evtchn(chn);
++}
++EXPORT_SYMBOL_GPL(xen_rebind_evtchn_to_cpu);
++
+ /*
+  * Force a proper event-channel callback from Xen after clearing the
+  * callback mask. We do this in a very simple manner, by making a call
+@@ -1323,6 +1349,8 @@ static const struct irq_domain_ops xen_i
+ };
+ #endif
+ 
++void irq_force_complete_move(struct irq_desc *desc) {}
++
+ int __init arch_early_irq_init(void)
+ {
+ 	unsigned int i;
+--- a/drivers/xen/core/smpboot.c
++++ b/drivers/xen/core/smpboot.c
+@@ -244,7 +244,7 @@ static void cpu_initialize_context(unsig
+ #else /* __x86_64__ */
+ 	ctxt.syscall_callback_eip  = (unsigned long)entry_SYSCALL_64;
+ 
+-	ctxt.ctrlreg[3] = xen_pfn_to_cr3(virt_to_mfn(init_level4_pgt));
++	ctxt.ctrlreg[3] = xen_pfn_to_cr3(virt_to_mfn(init_top_pgt));
+ 
+ 	ctxt.gs_base_kernel = per_cpu_offset(cpu);
+ #endif
+--- a/drivers/xen/scsiback/scsiback.c
++++ b/drivers/xen/scsiback/scsiback.c
+@@ -206,7 +206,7 @@ static void scsiback_print_status(char *
+ }
+ 
+ 
+-static void scsiback_cmd_done(struct request *req, int uptodate)
++static void scsiback_cmd_done(struct request *req, blk_status_t status)
+ {
+ 	pending_req_t *pending_req = req->end_io_data;
+ 	unsigned char *sense_buffer;
+@@ -444,7 +444,6 @@ int scsiback_cmd_exec(pending_req_t *pen
+ 		return err;
+ 	}
+ 
+-	scsi_req_init(rq);
+ 	scsi_req(rq)->cmd_len = cmd_len;
+ 	memcpy(scsi_req(rq)->cmd, pending_req->cmnd, cmd_len);
+ 
+--- a/drivers/xen/xenbus/xenbus_comms.c
++++ b/drivers/xen/xenbus/xenbus_comms.c
+@@ -331,17 +331,7 @@ static int process_msg(void)
+ 		mutex_lock(&xb_write_mutex);
+ 		list_for_each_entry(req, &xs_reply_list, list) {
+ 			if (req->msg.req_id == state.msg.req_id) {
+-				if (req->state == xb_req_state_wait_reply) {
+-					req->msg.type = state.msg.type;
+-					req->msg.len = state.msg.len;
+-					req->body = state.body;
+-					req->state = xb_req_state_got_reply;
+-					list_del(&req->list);
+-					req->cb(req);
+-				} else {
+-					list_del(&req->list);
+-					kfree(req);
+-				}
++				list_del(&req->list);
+ 				err = 0;
+ 				break;
+ 			}
+@@ -349,6 +339,15 @@ static int process_msg(void)
+ 		mutex_unlock(&xb_write_mutex);
+ 		if (err)
+ 			goto out;
++
++		if (req->state == xb_req_state_wait_reply) {
++			req->msg.type = state.msg.type;
++			req->msg.len = state.msg.len;
++			req->body = state.body;
++			req->state = xb_req_state_got_reply;
++			req->cb(req);
++		} else
++			kfree(req);
+ 	}
+ 
+ 	mutex_unlock(&xs_response_mutex);
+--- a/drivers/xen/xenoprof/xenoprofile.c
++++ b/drivers/xen/xenoprof/xenoprofile.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include <linux/init.h>
++#include <linux/mm.h>
+ #include <linux/notifier.h>
+ #include <linux/smp.h>
+ #include <linux/oprofile.h>
+--- a/include/xen/balloon.h
++++ b/include/xen/balloon.h
+@@ -95,4 +95,12 @@ static inline int register_xen_selfballo
+ }
+ #endif
+ 
++#ifdef CONFIG_XEN_BALLOON
++void xen_balloon_init(void);
++#else
++static inline void xen_balloon_init(void)
++{
++}
++#endif
++
+ #endif /* __XEN_BALLOON_H__ */
+--- a/include/xen/evtchn.h
++++ b/include/xen/evtchn.h
+@@ -62,6 +62,7 @@ struct irq_cfg {
+ struct irq_cfg *alloc_irq_and_cfg_at(unsigned int at, int node);
+ static inline int evtchn_make_refcounted(unsigned int evtchn) { return 0; }
+ extern struct irq_domain *xen_irq_domain;
++void xen_rebind_evtchn_to_cpu(evtchn_port_t chn, unsigned int cpu);
+ #endif
+ 
+ /*
+--- a/include/xen/interface/version.h
++++ b/include/xen/interface/version.h
+@@ -96,6 +96,11 @@ typedef struct xen_feature_info xen_feat
+ 
+ #define XENVER_commandline 9
+ typedef char xen_commandline_t[1024];
++#if defined(CONFIG_PARAVIRT_XEN) && !defined(HAVE_XEN_PLATFORM_COMPAT_H)
++struct xen_commandline {
++	char buf[1024];
++};
++#endif
+ 
+ /*
+  * Return value is the number of bytes written, or XEN_Exx on error.
