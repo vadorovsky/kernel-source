@@ -1,0 +1,426 @@
+From: jbeulich@suse.com
+Subject: netback: backport from SLE12 SP1's xen3-patch-3.7
+Patch-mainline: Never, SUSE-Xen specific
+References: bsc#1056504
+
+This is a preparatory step for "netback: coalesce (guest) RX SKBs as needed".
+
+--- a/drivers/xen/netback/netback.c
++++ b/drivers/xen/netback/netback.c
+@@ -36,6 +36,7 @@
+ 
+ #include "common.h"
+ #include <linux/if_vlan.h>
++#include <linux/pfn.h>
+ #include <net/tcp.h>
+ #include <xen/balloon.h>
+ #include <xen/evtchn.h>
+@@ -48,9 +49,16 @@
+ struct netbk_rx_meta {
+ 	skb_frag_t frag;
+ 	u16 id;
+-	u8 copy:1;
++	u8 copy:2;
++	u8 tail:1;
+ };
+ 
++struct netbk_rx_cb {
++	unsigned int nr_frags;
++	unsigned int nr_slots;
++};
++#define netbk_rx_cb(skb) ((struct netbk_rx_cb *)skb->cb)
++
+ struct netbk_tx_cb {
+ 	u16 copy_slots;
+ 	u16 pending_idx[1 + XEN_NETIF_NR_SLOTS_MIN];
+@@ -301,14 +309,15 @@ static struct sk_buff *netbk_copy_skb(st
+ 	return NULL;
+ }
+ 
+-static inline int netbk_max_required_rx_slots(netif_t *netif)
++static inline unsigned int netbk_max_required_rx_slots(const netif_t *netif)
+ {
+-	if (netif->can_sg || netif->gso)
+-		return MAX_SKB_FRAGS + 2; /* header + extra_info + frags */
+-	return 1; /* all in one */
++	return netif->can_sg || netif->gso
++	       ? max_t(unsigned int, XEN_NETIF_NR_SLOTS_MIN,
++		       MAX_SKB_FRAGS + 2/* header + extra_info + frags */)
++	       : 1; /* all in one */
+ }
+ 
+-static inline int netbk_queue_full(netif_t *netif)
++static inline bool netbk_queue_full(const netif_t *netif)
+ {
+ 	RING_IDX peek   = netif->rx_req_cons_peek;
+ 	RING_IDX needed = netbk_max_required_rx_slots(netif);
+@@ -324,6 +333,24 @@ static void tx_queue_callback(unsigned l
+ 		netif_wake_queue(netif->dev);
+ }
+ 
++static unsigned int netbk_count_slots(const struct skb_shared_info *shinfo,
++				      bool copying)
++{
++	unsigned int i, slots;
++
++	for (slots = i = 0; i < shinfo->nr_frags; ++i) {
++		const skb_frag_t *frag = shinfo->frags + i;
++		unsigned int len = skb_frag_size(frag), offs;
++
++		if (!len)
++			continue;
++		offs = copying ? 0 : offset_in_page(frag->page_offset);
++		slots += PFN_UP(offs + len);
++	}
++
++	return slots;
++}
++
+ int netif_be_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	netif_t *netif = netdev_priv(dev);
+@@ -352,8 +379,11 @@ int netif_be_start_xmit(struct sk_buff *
+ 		skb = nskb;
+ 	}
+ 
+-	netif->rx_req_cons_peek += skb_shinfo(skb)->nr_frags + 1 +
+-				   !!skb_is_gso(skb);
++	netbk_rx_cb(skb)->nr_frags = skb_shinfo(skb)->nr_frags;
++	netbk_rx_cb(skb)->nr_slots = 1 + !!skb_is_gso(skb) +
++				     netbk_count_slots(skb_shinfo(skb),
++						       netif->copying_receiver);
++	netif->rx_req_cons_peek += netbk_rx_cb(skb)->nr_slots;
+ 	netif_get(netif);
+ 
+ 	if (netbk_can_queue(dev) && netbk_queue_full(netif)) {
+@@ -420,10 +450,11 @@ struct netrx_pending_operations {
+ 
+ /* Set up the grant operations for this fragment.  If it's a flipping
+    interface, we also set up the unmap request from here. */
+-static u16 netbk_gop_frag(netif_t *netif, struct netbk_rx_meta *meta,
+-			  int i, struct netrx_pending_operations *npo,
+-			  struct page *page, unsigned long size,
+-			  unsigned long offset)
++static void netbk_gop_frag(netif_t *netif, struct netbk_rx_meta *meta,
++			   unsigned int i,
++			   struct netrx_pending_operations *npo,
++			   struct page *page, unsigned int size,
++			   unsigned int offset)
+ {
+ 	mmu_update_t *mmu;
+ 	gnttab_transfer_t *gop;
+@@ -439,7 +470,7 @@ static u16 netbk_gop_frag(netif_t *netif
+ 	if (netif->copying_receiver) {
+ 		/* The fragment needs to be copied rather than
+ 		   flipped. */
+-		meta->copy = 1;
++		meta->copy++;
+ 		copy_gop = npo->copy + npo->copy_prod++;
+ 		copy_gop->flags = GNTCOPY_dest_gref;
+ 		if (idx > -1) {
+@@ -453,11 +484,10 @@ static u16 netbk_gop_frag(netif_t *netif
+ 		}
+ 		copy_gop->source.offset = offset;
+ 		copy_gop->dest.domid = netif->domid;
+-		copy_gop->dest.offset = 0;
++		copy_gop->dest.offset = i ? meta->frag.size : 0;
+ 		copy_gop->dest.u.ref = req->gref;
+ 		copy_gop->len = size;
+ 	} else {
+-		meta->copy = 0;
+ 		if (!xen_feature(XENFEAT_auto_translated_physmap)) {
+ 			new_mfn = alloc_mfn();
+ 
+@@ -485,30 +515,70 @@ static u16 netbk_gop_frag(netif_t *netif
+ 		gop->domid = netif->domid;
+ 		gop->ref = req->gref;
+ 	}
+-	return req->id;
++	meta->id = req->id;
+ }
+ 
+-static void netbk_gop_skb(struct sk_buff *skb,
+-			  struct netrx_pending_operations *npo)
++static unsigned int netbk_gop_skb(struct sk_buff *skb,
++				  struct netrx_pending_operations *npo)
+ {
+ 	netif_t *netif = netdev_priv(skb->dev);
+-	int nr_frags = skb_shinfo(skb)->nr_frags;
+-	int i;
+-	int extra;
++	unsigned int i, n, nr_frags = netbk_rx_cb(skb)->nr_frags;
+ 	struct netbk_rx_meta *head_meta, *meta;
+ 
+ 	head_meta = npo->meta + npo->meta_prod++;
+ 	head_meta->frag.page_offset = skb_shinfo(skb)->gso_type;
+ 	head_meta->frag.size = skb_shinfo(skb)->gso_size;
+-	extra = !!head_meta->frag.size + 1;
++	head_meta->copy = 0;
++	n = !!head_meta->frag.size + 1;
++
++	for (i = 0; i < nr_frags; i++, n++) {
++		const skb_frag_t *frag = skb_shinfo(skb)->frags + i;
++		unsigned int offset = frag->page_offset;
++		unsigned int len = skb_frag_size(frag);
++		struct page *frag_page = skb_frag_page(frag);
++		struct page *page = frag_page + PFN_DOWN(offset);
+ 
+-	for (i = 0; i < nr_frags; i++) {
+-		meta = npo->meta + npo->meta_prod++;
+-		meta->frag = skb_shinfo(skb)->frags[i];
+-		meta->id = netbk_gop_frag(netif, meta, i + extra, npo,
+-					  skb_frag_page(&meta->frag),
+-					  skb_frag_size(&meta->frag),
+-					  meta->frag.page_offset);
++		if (!len)
++			continue;
++		for (meta = NULL, offset &= ~PAGE_MASK; len; ) {
++			unsigned int bytes = PAGE_SIZE - offset;
++
++			if (bytes > len)
++				bytes = len;
++			/*
++			 * Try to reduce the number of slots needed (at the
++			 * expense of more copy operations), so that frontends
++			 * only coping with the minimum slot count required to
++			 * be supported have a better chance of receiving this
++			 * packet.
++			 */
++			else if (meta && meta->copy &&
++				 (bytes > PAGE_SIZE - meta->frag.size) &&
++				 (offset_in_page(len) + meta->frag.size <=
++				  PAGE_SIZE))
++				bytes = PAGE_SIZE - meta->frag.size;
++			if (!meta || !meta->copy ||
++			    bytes > PAGE_SIZE - meta->frag.size) {
++				if (meta)
++					n++;
++				meta = npo->meta + npo->meta_prod++;
++				__skb_frag_set_page(&meta->frag, frag_page);
++				frag_page = NULL;
++				meta->frag.page_offset = offset;
++				meta->frag.size = 0;
++				meta->copy = 0;
++				meta->tail = 0;
++			}
++			netbk_gop_frag(netif, meta, n, npo, page, bytes,
++				       offset);
++			meta->frag.size += bytes;
++			len -= bytes;
++			if ((offset += bytes) == PAGE_SIZE) {
++				++page;
++				offset = 0;
++			}
++		}
++		meta->tail = 1;
+ 	}
+ 
+ 	/*
+@@ -516,20 +586,26 @@ static void netbk_gop_skb(struct sk_buff
+ 	 * until we're done. We know that the head doesn't cross a page
+ 	 * boundary because such packets get copied in netif_be_start_xmit.
+ 	 */
+-	head_meta->id = netbk_gop_frag(netif, head_meta, 0, npo,
+-				       virt_to_page(skb->data),
+-				       skb_headlen(skb),
+-				       offset_in_page(skb->data));
++	netbk_gop_frag(netif, head_meta, 0, npo, virt_to_page(skb->data),
++		       skb_headlen(skb), offset_in_page(skb->data));
++	head_meta->tail = 1;
+ 
+-	netif->rx.req_cons += nr_frags + extra;
++	netif->rx.req_cons += n;
++	return n;
+ }
+ 
+ static inline void netbk_free_pages(int nr_frags, struct netbk_rx_meta *meta)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < nr_frags; i++)
+-		put_page(skb_frag_page(&meta[i].frag));
++	for (i = 0; i < nr_frags; meta++) {
++		struct page *page = skb_frag_page(&meta->frag);
++
++		if (page) {
++			put_page(page);
++			i++;
++		}
++	}
+ }
+ 
+ /* This is a twin to netbk_gop_skb.  Assume that netbk_gop_skb was
+@@ -544,18 +620,23 @@ static int netbk_check_gop(unsigned int
+ 	gnttab_copy_t     *copy_op;
+ 	int status = XEN_NETIF_RSP_OKAY;
+ 	int i;
++	const struct netbk_rx_meta *meta = npo->meta + npo->meta_cons;
+ 
+-	for (i = 0; i <= nr_frags; i++) {
+-		if (npo->meta[npo->meta_cons + i].copy) {
+-			copy_op = npo->copy + npo->copy_cons++;
+-			if (unlikely(copy_op->status == GNTST_eagain))
+-				gnttab_check_GNTST_eagain_while(GNTTABOP_copy, copy_op);
+-			if (unlikely(copy_op->status != GNTST_okay)) {
+-				netdev_dbg(netif->dev,
+-					   "Bad status %d from copy to DOM%d.\n",
+-					   copy_op->status, netif->domid);
+-				status = XEN_NETIF_RSP_ERROR;
+-			}
++	for (i = 0; i <= nr_frags; i += meta++->tail) {
++		unsigned int copy = meta->copy;
++
++		if (copy) {
++			do {
++				copy_op = npo->copy + npo->copy_cons++;
++				if (unlikely(copy_op->status == GNTST_eagain))
++					gnttab_check_GNTST_eagain_while(GNTTABOP_copy, copy_op);
++				if (unlikely(copy_op->status != GNTST_okay)) {
++					netdev_dbg(netif->dev,
++						   "Bad status %d from copy to DOM%d.\n",
++						   copy_op->status, netif->domid);
++					status = XEN_NETIF_RSP_ERROR;
++				}
++			} while (--copy);
+ 		} else {
+ 			if (!xen_feature(XENFEAT_auto_translated_physmap)) {
+ 				mcl = npo->mcl + npo->mcl_cons++;
+@@ -583,23 +664,22 @@ static int netbk_check_gop(unsigned int
+ 	return status;
+ }
+ 
+-static void netbk_add_frag_responses(netif_t *netif, int status,
+-				     struct netbk_rx_meta *meta, int nr_frags)
++static unsigned int netbk_add_frag_responses(netif_t *netif, int status,
++					     const struct netbk_rx_meta *meta,
++					     unsigned int nr_frags)
+ {
+-	int i;
+-	unsigned long offset;
++	unsigned int i, n;
+ 
+-	for (i = 0; i < nr_frags; i++) {
+-		int id = meta[i].id;
+-		int flags = (i == nr_frags - 1) ? 0 : XEN_NETRXF_more_data;
++	for (n = i = 0; i < nr_frags; meta++, n++) {
++		int flags = (meta->tail && ++i == nr_frags)
++			    ? 0 : XEN_NETRXF_more_data;
+ 
+-		if (meta[i].copy)
+-			offset = 0;
+-		else
+-			offset = meta[i].frag.page_offset;
+-		make_rx_response(netif, id, status, offset,
+-				 meta[i].frag.size, flags);
++		make_rx_response(netif, meta->id, status,
++				 meta->copy ? 0 : meta->frag.page_offset,
++				 meta->frag.size, flags);
+ 	}
++
++	return n;
+ }
+ 
+ static void net_rx_action(unsigned long unused)
+@@ -624,7 +704,7 @@ static void net_rx_action(unsigned long
+ 	static multicall_entry_t rx_mcl[NET_RX_RING_SIZE+3];
+ 	static mmu_update_t rx_mmu[NET_RX_RING_SIZE];
+ 	static gnttab_transfer_t grant_trans_op[NET_RX_RING_SIZE];
+-	static gnttab_copy_t grant_copy_op[NET_RX_RING_SIZE];
++	static gnttab_copy_t grant_copy_op[2 * NET_RX_RING_SIZE];
+ 	static unsigned char rx_notify[NR_IRQS];
+ 	static u16 notify_list[NET_RX_RING_SIZE];
+ 	static struct netbk_rx_meta meta[NET_RX_RING_SIZE];
+@@ -636,17 +716,24 @@ static void net_rx_action(unsigned long
+ 		mcl: rx_mcl,
+ 		meta: meta};
+ 
++	BUILD_BUG_ON(sizeof(skb->cb) < sizeof(struct netbk_rx_cb));
++
+ 	skb_queue_head_init(&rxq);
+ 
+ 	count = 0;
+ 
+ 	while ((skb = skb_dequeue(&rx_queue)) != NULL) {
+-		nr_frags = skb_shinfo(skb)->nr_frags;
+-		*(int *)skb->cb = nr_frags;
++		nr_frags = netbk_rx_cb(skb)->nr_slots;
++
++		/* Filled the batch queue? */
++		if (count + nr_frags > NET_RX_RING_SIZE) {
++			skb_queue_head(&rx_queue, skb);
++			break;
++		}
+ 
+ 		if (!xen_feature(XENFEAT_auto_translated_physmap) &&
+ 		    !((netif_t *)netdev_priv(skb->dev))->copying_receiver &&
+-		    check_mfn(nr_frags + 1)) {
++		    check_mfn(nr_frags)) {
+ 			/* Memory squeeze? Back off for an arbitrary while. */
+ 			if ( net_ratelimit() )
+ 				netdev_warn(skb->dev, "memory squeeze\n");
+@@ -655,15 +742,9 @@ static void net_rx_action(unsigned long
+ 			break;
+ 		}
+ 
+-		netbk_gop_skb(skb, &npo);
+-
+-		count += nr_frags + 1;
++		count += netbk_gop_skb(skb, &npo);
+ 
+ 		__skb_queue_tail(&rxq, skb);
+-
+-		/* Filled the batch queue? */
+-		if (count + MAX_SKB_FRAGS >= NET_RX_RING_SIZE)
+-			break;
+ 	}
+ 
+ 	BUG_ON(npo.meta_prod > ARRAY_SIZE(meta));
+@@ -706,7 +787,7 @@ static void net_rx_action(unsigned long
+ 	BUG_ON(npo.mmu_mcl && npo.mcl[npo.mmu_mcl].result != 0);
+ 
+ 	while ((skb = __skb_dequeue(&rxq)) != NULL) {
+-		nr_frags = *(int *)skb->cb;
++		nr_frags = netbk_rx_cb(skb)->nr_frags;
+ 
+ 		netif = netdev_priv(skb->dev);
+ 
+@@ -768,9 +849,9 @@ static void net_rx_action(unsigned long
+ 			gso->flags = 0;
+ 		}
+ 
+-		netbk_add_frag_responses(netif, status,
+-					 meta + npo.meta_cons + 1,
+-					 nr_frags);
++		nr_frags = netbk_add_frag_responses(netif, status,
++						    meta + npo.meta_cons + 1,
++						    nr_frags);
+ 
+ 		RING_PUSH_RESPONSES_AND_CHECK_NOTIFY(&netif->rx, ret);
+ 		irq = netif->irq;
+@@ -1217,9 +1298,10 @@ void netbk_get_requests(netif_t *netif,
+ 		frag_set_pending_idx(&frags[i], pending_idx);
+ 	}
+ 
+-	if ((void *)gop->map > (void *)gop->copy && net_ratelimit())
+-		netdev_warn(netif->dev, "Grant op overrun (%p > %p)\n",
+-			    gop->map, gop->copy);
++	if ((void *)gop->map > (void *)gop->copy)
++		net_warn_ratelimited("%s: Grant op overrun (%p > %p)\n",
++				     netdev_name(netif->dev),
++				     gop->map, gop->copy);
+ }
+ 
+ static int netbk_tx_check_gop(struct sk_buff *skb,
+@@ -1318,9 +1400,9 @@ static int netbk_tx_check_gop(struct sk_
+ 
+ 	gop->map = mop;
+ 	gop->copy = cop;
+-	if ((void *)mop > (void *)cop && net_ratelimit())
+-		netdev_warn(netif->dev, "Grant op check overrun (%p > %p)\n",
+-			    mop, cop);
++	if ((void *)mop > (void *)cop)
++		net_warn_ratelimited("%s: Grant op check overrun (%p > %p)\n",
++				     netdev_name(netif->dev), mop, cop);
+ 	return err;
+ }
+ 

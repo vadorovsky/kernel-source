@@ -1,0 +1,177 @@
+From: jbeulich@suse.com
+Subject: netback: backport from SLE12 SP1's xen3-patch-3.2
+Patch-mainline: Never, SUSE-Xen specific
+References: bsc#1056504
+
+This is a preparatory step for "netback: coalesce (guest) RX SKBs as needed".
+
+--- a/drivers/xen/netback/netback.c
++++ b/drivers/xen/netback/netback.c
+@@ -78,15 +78,18 @@ static struct timer_list netbk_tx_pendin
+ 
+ #define MAX_PENDING_REQS (1U << CONFIG_XEN_NETDEV_TX_SHIFT)
+ 
++/* Discriminate from any valid pending_idx value. */
++#define INVALID_PENDING_IDX 0xffff
++
+ static struct sk_buff_head rx_queue;
+ 
+ static struct page **mmap_pages;
+-static inline unsigned long idx_to_pfn(unsigned int idx)
++static inline unsigned long idx_to_pfn(u16 idx)
+ {
+ 	return page_to_pfn(mmap_pages[idx]);
+ }
+ 
+-static inline unsigned long idx_to_kaddr(unsigned int idx)
++static inline unsigned long idx_to_kaddr(u16 idx)
+ {
+ 	return (unsigned long)pfn_to_kaddr(idx_to_pfn(idx));
+ }
+@@ -110,6 +113,16 @@ static inline int netif_page_index(struc
+ 	return idx;
+ }
+ 
++static u16 frag_get_pending_idx(const skb_frag_t *frag)
++{
++	return (u16)frag->page_offset;
++}
++
++static void frag_set_pending_idx(skb_frag_t *frag, u16 pending_idx)
++{
++	frag->page_offset = pending_idx;
++}
++
+ /*
+  * This is the amount of packet we copy rather than map, so that the
+  * guest can't fiddle with the contents of the headers while we do
+@@ -247,9 +260,7 @@ static struct sk_buff *netbk_copy_skb(st
+ 		ret = skb_copy_bits(skb, offset, page_address(page), copy);
+ 		BUG_ON(ret);
+ 
+-		ninfo->frags[ninfo->nr_frags].page = page;
+-		ninfo->frags[ninfo->nr_frags].page_offset = 0;
+-		ninfo->frags[ninfo->nr_frags].size = copy;
++		__skb_fill_page_desc(nskb, ninfo->nr_frags, page, 0, copy);
+ 		ninfo->nr_frags++;
+ 
+ 		offset += copy;
+@@ -479,8 +490,8 @@ static void netbk_gop_skb(struct sk_buff
+ 		meta = npo->meta + npo->meta_prod++;
+ 		meta->frag = skb_shinfo(skb)->frags[i];
+ 		meta->id = netbk_gop_frag(netif, meta, i + extra, npo,
+-					  meta->frag.page,
+-					  meta->frag.size,
++					  skb_frag_page(&meta->frag),
++					  skb_frag_size(&meta->frag),
+ 					  meta->frag.page_offset);
+ 	}
+ 
+@@ -502,7 +513,7 @@ static inline void netbk_free_pages(int
+ 	int i;
+ 
+ 	for (i = 0; i < nr_frags; i++)
+-		put_page(meta[i].frag.page);
++		put_page(skb_frag_page(&meta[i].frag));
+ }
+ 
+ /* This is a twin to netbk_gop_skb.  Assume that netbk_gop_skb was
+@@ -1102,11 +1113,11 @@ static gnttab_map_grant_ref_t *netbk_get
+ {
+ 	struct skb_shared_info *shinfo = skb_shinfo(skb);
+ 	skb_frag_t *frags = shinfo->frags;
+-	unsigned long pending_idx = *((u16 *)skb->data);
++	u16 pending_idx = *(u16 *)skb->data;
+ 	int i, start;
+ 
+ 	/* Skip first skb fragment if it is on same page as header fragment. */
+-	start = ((unsigned long)shinfo->frags[0].page == pending_idx);
++	start = (frag_get_pending_idx(frags) == pending_idx);
+ 
+ 	for (i = start; i < shinfo->nr_frags; i++, txp++) {
+ 		pending_idx = pending_ring[MASK_PEND_IDX(pending_cons++)];
+@@ -1118,7 +1129,7 @@ static gnttab_map_grant_ref_t *netbk_get
+ 		memcpy(&pending_tx_info[pending_idx].req, txp, sizeof(*txp));
+ 		netif_get(netif);
+ 		pending_tx_info[pending_idx].netif = netif;
+-		frags[i].page = (void *)pending_idx;
++		frag_set_pending_idx(&frags[i], pending_idx);
+ 	}
+ 
+ 	return mop;
+@@ -1128,7 +1139,7 @@ static int netbk_tx_check_mop(struct sk_
+ 			       gnttab_map_grant_ref_t **mopp)
+ {
+ 	gnttab_map_grant_ref_t *mop = *mopp;
+-	int pending_idx = *((u16 *)skb->data);
++	u16 pending_idx = *(u16 *)skb->data;
+ 	netif_t *netif = pending_tx_info[pending_idx].netif;
+ 	netif_tx_request_t *txp;
+ 	struct skb_shared_info *shinfo = skb_shinfo(skb);
+@@ -1149,12 +1160,12 @@ static int netbk_tx_check_mop(struct sk_
+ 	}
+ 
+ 	/* Skip first skb fragment if it is on same page as header fragment. */
+-	start = ((unsigned long)shinfo->frags[0].page == pending_idx);
++	start = (frag_get_pending_idx(shinfo->frags) == pending_idx);
+ 
+ 	for (i = start; i < nr_frags; i++) {
+ 		int j, newerr;
+ 
+-		pending_idx = (unsigned long)shinfo->frags[i].page;
++		pending_idx = frag_get_pending_idx(&shinfo->frags[i]);
+ 
+ 		/* Check error status: if okay then remember grant handle. */
+ 		newerr = (++mop)->status;
+@@ -1182,7 +1193,7 @@ static int netbk_tx_check_mop(struct sk_
+ 		pending_idx = *((u16 *)skb->data);
+ 		netif_idx_release(pending_idx);
+ 		for (j = start; j < i; j++) {
+-			pending_idx = (unsigned long)shinfo->frags[j].page;
++			pending_idx = frag_get_pending_idx(&shinfo->frags[j]);
+ 			netif_idx_release(pending_idx);
+ 		}
+ 
+@@ -1201,20 +1212,16 @@ static void netbk_fill_frags(struct sk_b
+ 	int i;
+ 
+ 	for (i = 0; i < nr_frags; i++) {
+-		skb_frag_t *frag = shinfo->frags + i;
+ 		netif_tx_request_t *txp;
+-		unsigned long pending_idx;
+-
+-		pending_idx = (unsigned long)frag->page;
++		u16 pending_idx = frag_get_pending_idx(shinfo->frags + i);
+ 
+ 		pending_inuse[pending_idx].alloc_time = jiffies;
+ 		list_add_tail(&pending_inuse[pending_idx].list,
+ 			      &pending_inuse_head);
+ 
+ 		txp = &pending_tx_info[pending_idx].req;
+-		frag->page = mmap_pages[pending_idx];
+-		frag->size = txp->size;
+-		frag->page_offset = txp->offset;
++		__skb_fill_page_desc(skb, i, mmap_pages[pending_idx],
++				     txp->offset, txp->size);
+ 
+ 		skb->len += txp->size;
+ 		skb->data_len += txp->size;
+@@ -1448,14 +1455,11 @@ static void net_tx_action(unsigned long
+ 		__skb_put(skb, data_len);
+ 
+ 		skb_shinfo(skb)->nr_frags = ret;
+-		if (data_len < txreq.size) {
++		if (data_len < txreq.size)
+ 			skb_shinfo(skb)->nr_frags++;
+-			skb_shinfo(skb)->frags[0].page =
+-				(void *)(unsigned long)pending_idx;
+-		} else {
+-			/* Discriminate from any valid pending_idx value. */
+-			skb_shinfo(skb)->frags[0].page = (void *)~0UL;
+-		}
++		else
++			pending_idx = INVALID_PENDING_IDX;
++		frag_set_pending_idx(skb_shinfo(skb)->frags, pending_idx);
+ 
+ 		__skb_queue_tail(&tx_queue, skb);
+ 
