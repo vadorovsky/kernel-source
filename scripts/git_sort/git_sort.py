@@ -30,6 +30,7 @@ class RepoURL(object):
 
     def __init__(self, url):
         k_org_prefixes = [
+            "http://git.kernel.org/pub/scm/linux/kernel/git/",
             "https://git.kernel.org/pub/scm/linux/kernel/git/",
             "https://kernel.googlesource.com/pub/scm/linux/kernel/git/",
         ]
@@ -117,6 +118,7 @@ remotes = (
     Head(RepoURL("tip/tip.git")),
     Head(RepoURL("shli/md.git")),
     Head(RepoURL("mkp/scsi.git")),
+    Head(RepoURL("dhowells/linux-fs.git")),
     Head(RepoURL("next/linux-next.git")),
 )
 
@@ -159,7 +161,7 @@ class SortIndex(object):
         for head in remotes:
             for remote_name, remote_url in repo_remotes:
                 if head.repo_url == remote_url:
-                    rev = "%s/%s" % (remote_name, head.rev,)
+                    rev = "remotes/%s/%s" % (remote_name, head.rev,)
                     try:
                         commit = self.repo.revparse_single(rev)
                     except KeyError:
@@ -263,7 +265,8 @@ class SortIndex(object):
                 if "heads" in cache:
                     del cache["heads"]
         else:
-            history = {key[0] : log for key, log in c_history.items()}
+            history = collections.OrderedDict(
+                [(key[0], log,) for key, log in c_history.items()])
         cache.close()
 
         return history
