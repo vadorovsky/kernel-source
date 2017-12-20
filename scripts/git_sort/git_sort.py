@@ -151,6 +151,8 @@ remotes = (
     Head(RepoURL("torvalds/linux.git")),
     Head(RepoURL("davem/net.git")),
     Head(RepoURL("davem/net-next.git")),
+    Head(RepoURL("rdma/rdma.git"), "for-rc"),
+    Head(RepoURL("rdma/rdma.git"), "for-next"),
     Head(RepoURL("dledford/rdma.git"), "k.o/for-next"),
     Head(RepoURL("jejb/scsi.git"), "for-next"),
     Head(RepoURL("bp/bp.git"), "for-next"),
@@ -161,6 +163,7 @@ remotes = (
     Head(RepoURL("shli/md.git"), "for-next"),
     Head(RepoURL("dhowells/linux-fs.git"), "keys-uefi"),
     Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.15"),
+    Head(RepoURL("git://git.infradead.org/nvme.git"), "nvme-4.16"),
     Head(RepoURL("tytso/ext4.git"), "dev"),
     Head(RepoURL("s390/linux.git"), "for-linus"),
     Head(RepoURL("tj/libata.git"), "for-next"),
@@ -168,6 +171,13 @@ remotes = (
     Head(RepoURL("git://people.freedesktop.org/~airlied/linux"), "drm-next"),
     Head(RepoURL("gregkh/tty.git"), "tty-next"),
     Head(RepoURL("jj/linux-apparmor.git"), "v4.8-aa2.8-out-of-tree"),
+    Head(RepoURL("pablo/nf.git")),
+    Head(RepoURL("pablo/nf-next.git")),
+    Head(RepoURL("horms/ipvs.git")),
+    Head(RepoURL("horms/ipvs-next.git")),
+    Head(RepoURL("klassert/ipsec.git")),
+    Head(RepoURL("klassert/ipsec-next.git")),
+    Head(RepoURL("mkp/scsi.git"), "4.15/scsi-fixes"),
 )
 
 
