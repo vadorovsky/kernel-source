@@ -1,0 +1,397 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: s390: add ppa to system call and program check path
+References: bsc#1068032
+Patch-mainline: Not yet, under development
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+---
+ arch/s390/include/asm/processor.h |    1 
+ arch/s390/kernel/alternative.c    |   13 ++++++
+ arch/s390/kernel/entry.S          |   73 +++++++++++++++++++++++++++---------
+ arch/s390/kernel/entry64.S        |   76 ++++++++++++++++++++++++++++++--------
+ arch/s390/kernel/ipl.c            |    1 
+ arch/s390/kernel/smp.c            |    2 +
+ arch/s390/kernel/vmlinux.lds.S    |    3 +
+ 7 files changed, 136 insertions(+), 33 deletions(-)
+
+--- a/arch/s390/include/asm/processor.h
++++ b/arch/s390/include/asm/processor.h
+@@ -34,6 +34,7 @@ static inline void get_cpu_id(struct cpu
+ 
+ extern void s390_adjust_jiffies(void);
+ extern int get_cpu_capability(unsigned int *);
++extern void __bpon(void);
+ 
+ /*
+  * User space process size: 2GB for 31 bit, 4TB or 8PT for 64 bit.
+--- a/arch/s390/kernel/alternative.c
++++ b/arch/s390/kernel/alternative.c
+@@ -14,6 +14,19 @@ static int __init disable_alternative_in
+ 
+ early_param("noaltinstr", disable_alternative_instructions);
+ 
++extern struct alt_instr __alt_nobp[], __alt_nobp_end[];
++static int __init nobp_setup(char *str)
++{
++	bool enabled;
++	int rc;
++
++	rc = strtobool(str, &enabled);
++	if (!rc && enabled)
++		apply_alternatives(__alt_nobp, __alt_nobp_end);
++	return rc;
++}
++__setup("nobp=", nobp_setup);
++
+ struct brcl_insn {
+ 	u16 opc;
+ 	s32 disp;
+--- a/arch/s390/kernel/entry.S
++++ b/arch/s390/kernel/entry.S
+@@ -172,24 +172,47 @@ STACK_SIZE  = 1 << STACK_SHIFT
+ 	stm	%r0,%r11,SP_R0(%r15)	# store gprs %r0-%r11 to kernel stack
+ 	.endm
+ 
+-	.macro	RESTORE_ALL psworg,sync
+-	mvc	\psworg(8),SP_PSW(%r15) # move user PSW to lowcore
+-	.if !\sync
+-	ni	\psworg+1,0xfd		# clear wait state bit
+-	.endif
+-	lm	%r0,%r15,SP_R0(%r15)	# load gprs 0-15 of user
+-	stpt	__LC_EXIT_TIMER
+-	lpsw	\psworg			# back to caller
+-	.endm
+-
+ 	.macro REENABLE_IRQS
+ 	mvc	__SF_EMPTY(1,%r15),SP_PSW(%r15)
+ 	ni	__SF_EMPTY(%r15),0xbf
+ 	ssm	__SF_EMPTY(%r15)
+ 	.endm
+ 
++	.macro BPOFF
++	.pushsection .altinstr_replacement, "ax"
++660:	.long	0xb2e8c000
++	.popsection
++661:	.long	0x47000000
++	.pushsection .altnobp, "a"
++        .long 661b - .
++	.long 660b - .
++	.word 82
++	.byte 4
++	.byte 4
++	.popsection
++	.endm
++
++	.macro BPON
++	.pushsection .altinstr_replacement, "ax"
++662:	.long	0xb2e8d000
++	.popsection
++663:	.long	0x47000000
++	.pushsection .altnobp, "a"
++        .long 663b - .
++	.long 662b - .
++	.word 82
++	.byte 4
++	.byte 4
++	.popsection
++	.endm
++
+ 	.section .kprobes.text, "ax"
+ 
++ENTRY(__bpon)
++	.globl __bpon
++	BPON
++	br	%r14
++
+ /*
+  * Scheduler resume function, called by switch_to
+  *  gpr2 = (task_struct *) prev
+@@ -229,6 +252,7 @@ system_call:
+ 	stpt	__LC_SYNC_ENTER_TIMER
+ sysc_saveall:
+ 	SAVE_ALL_SVC __LC_SVC_OLD_PSW,__LC_SAVE_AREA
++	BPOFF
+ 	CREATE_STACK_FRAME __LC_SAVE_AREA
+ 	mvc	SP_PSW(8,%r15),__LC_SVC_OLD_PSW
+ 	mvc	SP_ILC(4,%r15),__LC_SVC_ILC
+@@ -264,7 +288,11 @@ sysc_tif:
+ 	tm	__TI_flags+3(%r12),_TIF_WORK_SVC
+ 	bnz	BASED(sysc_work)  # there is work to do (signals etc.)
+ sysc_restore:
+-	RESTORE_ALL __LC_RETURN_PSW,1
++	mvc	__LC_RETURN_PSW(8),SP_PSW(%r15)
++	lm	%r0,%r15,SP_R0(%r15)
++	BPON
++	stpt	__LC_EXIT_TIMER
++	lpsw	__LC_RETURN_PSW
+ sysc_done:
+ 
+ #
+@@ -454,6 +482,7 @@ pgm_check_handler:
+  * for LPSW?).
+  */
+ 	stpt	__LC_SYNC_ENTER_TIMER
++	BPOFF
+ 	SAVE_ALL_BASE __LC_SAVE_AREA
+ 	tm	__LC_PGM_INT_CODE+1,0x80 # check whether we got a per exception
+ 	bnz	BASED(pgm_per)		# got per exception -> special case
+@@ -569,6 +598,7 @@ kernel_per:
+ io_int_handler:
+ 	stck	__LC_INT_CLOCK
+ 	stpt	__LC_ASYNC_ENTER_TIMER
++	BPOFF
+ 	SAVE_ALL_ASYNC __LC_IO_OLD_PSW,__LC_SAVE_AREA+16
+ 	CREATE_STACK_FRAME __LC_SAVE_AREA+16
+ 	mvc	SP_PSW(8,%r15),0(%r12)	# move user PSW to stack
+@@ -590,7 +620,15 @@ io_tif:
+ 	tm	__TI_flags+3(%r12),_TIF_WORK_INT
+ 	bnz	BASED(io_work)		# there is work to do (signals etc.)
+ io_restore:
+-	RESTORE_ALL __LC_RETURN_PSW,0
++	mvc	__LC_RETURN_PSW(8),SP_PSW(%r15)
++	ni	__LC_RETURN_PSW+1,0xfd
++	tm	SP_PSW+1(%r15),0x01	# interrupting from user ?
++	bno	BASED(io_exit_kernel)
++	BPON
++io_exit_kernel:
++	lm	%r0,%r15,SP_R0(%r15)
++	stpt	__LC_EXIT_TIMER
++	lpsw	__LC_RETURN_PSW
+ io_done:
+ 
+ #
+@@ -707,6 +745,7 @@ io_notify_resume:
+ ext_int_handler:
+ 	stck	__LC_INT_CLOCK
+ 	stpt	__LC_ASYNC_ENTER_TIMER
++	BPOFF
+ 	SAVE_ALL_ASYNC __LC_EXT_OLD_PSW,__LC_SAVE_AREA+16
+ 	CREATE_STACK_FRAME __LC_SAVE_AREA+16
+ 	mvc	SP_PSW(8,%r15),0(%r12)	# move user PSW to stack
+@@ -734,6 +773,7 @@ __critical_end:
+ 	.globl mcck_int_handler
+ mcck_int_handler:
+ 	stck	__LC_MCCK_CLOCK
++	BPOFF
+ 	spt	__LC_CPU_TIMER_SAVE_AREA	# revalidate cpu timer
+ 	lm	%r0,%r15,__LC_GPREGS_SAVE_AREA	# revalidate gprs
+ 	SAVE_ALL_BASE __LC_SAVE_AREA+32
+@@ -803,15 +843,12 @@ mcck_no_vtime:
+ mcck_return:
+ 	mvc	__LC_RETURN_MCCK_PSW(8),SP_PSW(%r15) # move return PSW
+ 	ni	__LC_RETURN_MCCK_PSW+1,0xfd # clear wait state bit
++	lm	%r0,%r15,SP_R0(%r15)	# load gprs 0-15
+ 	tm	__LC_RETURN_MCCK_PSW+1,0x01 # returning to user ?
+ 	bno	BASED(0f)
+-	lm	%r0,%r15,SP_R0(%r15)	# load gprs 0-15
++	BPON
+ 	stpt	__LC_EXIT_TIMER
+-	lpsw	__LC_RETURN_MCCK_PSW	# back to caller
+-0:	lm	%r0,%r15,SP_R0(%r15)	# load gprs 0-15
+-	lpsw	__LC_RETURN_MCCK_PSW	# back to caller
+-
+-	RESTORE_ALL __LC_RETURN_MCCK_PSW,0
++0:	lpsw	__LC_RETURN_MCCK_PSW
+ 
+ /*
+  * Restart interruption handler, kick starter for additional CPUs
+--- a/arch/s390/kernel/entry64.S
++++ b/arch/s390/kernel/entry64.S
+@@ -184,19 +184,6 @@ _TIF_EXIT_SIE = (_TIF_SIGPENDING | _TIF_
+ 	stmg	%r0,%r10,SP_R0(%r15)	# store gprs %r0-%r10 to kernel stack
+ 	.endm
+ 
+-	.macro	RESTORE_ALL psworg,sync
+-	mvc	\psworg(16),SP_PSW(%r15) # move user PSW to lowcore
+-	.if !\sync
+-	ni	\psworg+1,0xfd		# clear wait state bit
+-	.endif
+-	lg	%r14,__LC_VDSO_PER_CPU
+-	lmg	%r0,%r13,SP_R0(%r15)	# load gprs 0-13 of user
+-	stpt	__LC_EXIT_TIMER
+-	mvc	__VDSO_ECTG_BASE(16,%r14),__LC_EXIT_TIMER
+-	lmg	%r14,%r15,SP_R14(%r15)	# load grps 14-15 of user
+-	lpswe	\psworg			# back to caller
+-	.endm
+-
+ 	.macro	LAST_BREAK
+ 	srag	%r10,%r11,23
+ 	jz	0f
+@@ -210,8 +197,41 @@ _TIF_EXIT_SIE = (_TIF_SIGPENDING | _TIF_
+ 	ssm	__SF_EMPTY(%r15)
+ 	.endm
+ 
++	.macro BPOFF
++	.pushsection .altinstr_replacement, "ax"
++660:	.long	0xb2e8c000
++	.popsection
++661:	.long	0x47000000
++	.pushsection .altnobp, "a"
++        .long 661b - .
++	.long 660b - .
++	.word 82
++	.byte 4
++	.byte 4
++	.popsection
++	.endm
++
++	.macro BPON
++	.pushsection .altinstr_replacement, "ax"
++662:	.long	0xb2e8d000
++	.popsection
++663:	.long	0x47000000
++	.pushsection .altnobp, "a"
++        .long 663b - .
++	.long 662b - .
++	.word 82
++	.byte 4
++	.byte 4
++	.popsection
++	.endm
++
+ 	.section .kprobes.text, "ax"
+ 
++ENTRY(__bpon)
++	.globl __bpon
++	BPON
++	br	%r14
++
+ /*
+  * Scheduler resume function, called by switch_to
+  *  gpr2 = (task_struct *) prev
+@@ -250,6 +270,7 @@ system_call:
+ 	stpt	__LC_SYNC_ENTER_TIMER
+ sysc_saveall:
+ 	SAVE_ALL_SVC __LC_SVC_OLD_PSW,__LC_SAVE_AREA
++	BPOFF
+ 	CREATE_STACK_FRAME __LC_SAVE_AREA
+ 	mvc	SP_PSW(16,%r15),__LC_SVC_OLD_PSW
+ 	mvc	SP_ILC(4,%r15),__LC_SVC_ILC
+@@ -292,7 +313,14 @@ sysc_tif:
+ 	tm	__TI_flags+7(%r12),_TIF_WORK_SVC
+ 	jnz	sysc_work	# there is work to do (signals etc.)
+ sysc_restore:
+-	RESTORE_ALL __LC_RETURN_PSW,1
++	mvc	__LC_RETURN_PSW(16),SP_PSW(%r15)
++	lg	%r14,__LC_VDSO_PER_CPU
++	lmg	%r0,%r13,SP_R0(%r15)
++	BPON
++	stpt	__LC_EXIT_TIMER
++	mvc	__VDSO_ECTG_BASE(16,%r14),__LC_EXIT_TIMER
++	lmg	%r14,%r15,SP_R14(%r15)
++	lpswe	__LC_RETURN_PSW
+ sysc_done:
+ 
+ #
+@@ -471,6 +499,7 @@ pgm_check_handler:
+  * for LPSW?).
+  */
+ 	stpt	__LC_SYNC_ENTER_TIMER
++	BPOFF
+ 	tm	__LC_PGM_INT_CODE+1,0x80 # check whether we got a per exception
+ 	jnz	pgm_per 		 # got per exception -> special case
+ 	SAVE_ALL_PGM __LC_PGM_OLD_PSW,__LC_SAVE_AREA
+@@ -598,6 +627,7 @@ kernel_per:
+ io_int_handler:
+ 	stck	__LC_INT_CLOCK
+ 	stpt	__LC_ASYNC_ENTER_TIMER
++	BPOFF
+ 	SAVE_ALL_ASYNC __LC_IO_OLD_PSW,__LC_SAVE_AREA+40
+ 	CREATE_STACK_FRAME __LC_SAVE_AREA+40
+ 	mvc	SP_PSW(16,%r15),0(%r12)	# move user PSW to stack
+@@ -620,7 +650,18 @@ io_tif:
+ 	tm	__TI_flags+7(%r12),_TIF_WORK_INT
+ 	jnz	io_work 		# there is work to do (signals etc.)
+ io_restore:
+-	RESTORE_ALL __LC_RETURN_PSW,0
++	mvc	__LC_RETURN_PSW(16),SP_PSW(%r15)
++	ni	__LC_RETURN_PSW+1,0xfd
++	lg	%r14,__LC_VDSO_PER_CPU
++	lmg	%r0,%r13,SP_R0(%r15)
++	tm	SP_PSW+1(%r15),0x01	# returning to user ?
++	jno	io_exit_kernel
++	BPON
++	stpt	__LC_EXIT_TIMER
++	mvc	__VDSO_ECTG_BASE(16,%r14),__LC_EXIT_TIMER
++io_exit_kernel:
++	lmg	%r14,%r15,SP_R14(%r15)
++	lpswe	__LC_RETURN_PSW
+ io_done:
+ 
+ #
+@@ -733,6 +774,7 @@ io_notify_resume:
+ ext_int_handler:
+ 	stck	__LC_INT_CLOCK
+ 	stpt	__LC_ASYNC_ENTER_TIMER
++	BPOFF
+ 	SAVE_ALL_ASYNC __LC_EXT_OLD_PSW,__LC_SAVE_AREA+40
+ 	CREATE_STACK_FRAME __LC_SAVE_AREA+40
+ 	mvc	SP_PSW(16,%r15),0(%r12)	# move user PSW to stack
+@@ -763,6 +805,7 @@ __critical_end:
+ 	.globl mcck_int_handler
+ mcck_int_handler:
+ 	stck	__LC_MCCK_CLOCK
++	BPOFF
+ 	la	%r1,4095		# revalidate r1
+ 	spt	__LC_CPU_TIMER_SAVE_AREA-4095(%r1)	# revalidate cpu timer
+ 	lmg	%r0,%r15,__LC_GPREGS_SAVE_AREA-4095(%r1)# revalidate gprs
+@@ -838,6 +881,7 @@ mcck_return:
+ 	lmg	%r0,%r15,SP_R0(%r15)	# load gprs 0-15
+ 	tm	__LC_RETURN_MCCK_PSW+1,0x01 # returning to user ?
+ 	jno	0f
++	BPON
+ 	stpt	__LC_EXIT_TIMER
+ 0:	lpswe	__LC_RETURN_MCCK_PSW	# back to caller
+ mcck_done:
+@@ -1100,8 +1144,10 @@ sie_loop:
+ 	jnz	sie_exit
+ 	lg	%r14,__SF_EMPTY(%r15)		# get control block pointer
+ 	SPP	__SF_EMPTY(%r15)		# set guest id
++	BPON
+ 	sie	0(%r14)
+ sie_done:
++	BPOFF
+ 	SPP	__LC_CMF_HPP			# set host id
+ 	lg	%r14,__LC_THREAD_INFO		# pointer thread_info struct
+ 	.globl sie_exit
+--- a/arch/s390/kernel/ipl.c
++++ b/arch/s390/kernel/ipl.c
+@@ -562,6 +562,7 @@ out:
+ 
+ static void __ipl_run(void *unused)
+ {
++	__bpon();
+ 	diag308(DIAG308_IPL, NULL);
+ 	if (MACHINE_IS_VM)
+ 		__cpcmd("IPL", NULL, 0, NULL);
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@ -130,6 +130,7 @@ void smp_switch_to_ipl_cpu(void (*func)(
+ 	struct pt_regs *regs;
+ 	unsigned long sp;
+ 
++	__bpon();
+ 	if (smp_processor_id() == 0)
+ 		func(data);
+ 	__load_psw_mask(PSW_BASE_BITS | PSW_DEFAULT_KEY);
+@@ -784,6 +785,7 @@ void __cpu_die(unsigned int cpu)
+ void __noreturn cpu_die(void)
+ {
+ 	idle_task_exit();
++	__bpon();
+ 	while (sigp(smp_processor_id(), sigp_stop) == sigp_busy)
+ 		cpu_relax();
+ 	for (;;);
+--- a/arch/s390/kernel/vmlinux.lds.S
++++ b/arch/s390/kernel/vmlinux.lds.S
+@@ -78,6 +78,9 @@ SECTIONS
+ 		__alt_instructions = .;
+ 		*(.altinstructions)
+ 		__alt_instructions_end = .;
++		__alt_nobp = .;
++		*(.altnobp)
++		__alt_nobp_end = . ;
+ 	}
+ 
+ 	/*

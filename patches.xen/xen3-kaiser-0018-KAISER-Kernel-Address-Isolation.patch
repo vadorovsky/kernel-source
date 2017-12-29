@@ -1,0 +1,509 @@
+From 2622b8382cf1aa97ec9cf6d194f1389585f029b2 Mon Sep 17 00:00:00 2001
+From: Hugh Dickins <hughd@google.com>
+Date: Mon, 11 Dec 2017 17:59:50 -0800
+Subject: [PATCH 18/19] xen/KAISER: Kernel Address Isolation
+Patch-mainline: Never, SUSE-specific
+
+This patch introduces our implementation of KAISER (Kernel Address
+Isolation to have Side-channels Efficiently Removed), a kernel isolation
+technique to close hardware side channels on kernel address information.
+
+More information about the original patch can be found at:
+https://github.com/IAIK/KAISER
+http://marc.info/?l=linux-kernel&m=149390087310405&w=2
+
+Daniel Gruss <daniel.gruss@iaik.tugraz.at>
+Richard Fellner <richard.fellner@student.tugraz.at>
+Michael Schwarz <michael.schwarz@iaik.tugraz.at>
+<clementine.maurice@iaik.tugraz.at>
+<moritz.lipp@iaik.tugraz.at>
+
+That original was then developed further by
+Dave Hansen <dave.hansen@intel.com>
+Hugh Dickins <hughd@google.com>
+then others after this snapshot.
+
+This combined patch for 3.2.96 was derived from hughd's patches below
+for 3.18.72, in 2017-12-04's kaiser-3.18.72.tar; except for the last,
+which was sent in 2017-12-09's nokaiser-3.18.72.tar.  They have been
+combined in order to minimize the effort of rebasing: most of the
+patches in the 3.18.72 series were small fixes and cleanups and
+enhancements to three large patches.  About the only new work in this
+backport is a simple reimplementation of kaiser_remove_mapping():
+since mm/pageattr.c changed a lot between 3.2 and 3.18, and the
+mods there for Kaiser never seemed necessary.
+
+Backported to 3.0 (11-SP4 variant of it) by Jiri kosina.
+
+KAISER: Kernel Address Isolation
+kaiser: merged update
+kaiser: do not set _PAGE_NX on pgd_none
+kaiser: stack map PAGE_SIZE at THREAD_SIZE-PAGE_SIZE
+kaiser: fix build and FIXME in alloc_ldt_struct()
+kaiser: KAISER depends on SMP
+kaiser: fix regs to do_nmi() ifndef CONFIG_KAISER
+kaiser: fix perf crashes
+kaiser: ENOMEM if kaiser_pagetable_walk() NULL
+kaiser: tidied up asm/kaiser.h somewhat
+kaiser: tidied up kaiser_add/remove_mapping slightly
+kaiser: kaiser_remove_mapping() move along the pgd
+kaiser: align addition to x86/mm/Makefile
+kaiser: cleanups while trying for gold link
+kaiser: name that 0x1000 KAISER_SHADOW_PGD_OFFSET
+kaiser: delete KAISER_REAL_SWITCH option
+kaiser: vmstat show NR_KAISERTABLE as nr_overhead
+kaiser: enhanced by kernel and user PCIDs
+kaiser: load_new_mm_cr3() let SWITCH_USER_CR3 flush user
+kaiser: PCID 0 for kernel and 128 for user
+kaiser: x86_cr3_pcid_noflush and x86_cr3_pcid_user
+kaiser: paranoid_entry pass cr3 need to paranoid_exit
+kaiser: _pgd_alloc() without __GFP_REPEAT to avoid stalls
+kaiser: fix unlikely error in alloc_ldt_struct()
+kaiser: drop is_atomic arg to kaiser_pagetable_walk()
+kaiser: extend maping to sched+kprobes+entry sections [jkosina@suse.cz]
+kaiser: port entry code to reentrant NMI support [jkosina@suse.cz]
+kaiser: remove !paravirt dependency [jkosina@suse.cz]
+
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+
+Automatically created from "patches.kaiser/kaiser-0018-KAISER-Kernel-Address-Isolation.patch" by xen-port-patches.py
+
+--- a/arch/x86/include/mach-xen/asm/desc.h
++++ b/arch/x86/include/mach-xen/asm/desc.h
+@@ -42,7 +42,7 @@ struct gdt_page {
+ 	struct desc_struct gdt[GDT_ENTRIES];
+ } __attribute__((aligned(PAGE_SIZE)));
+ 
+-DECLARE_PER_CPU_PAGE_ALIGNED(struct gdt_page, gdt_page);
++DECLARE_PER_CPU_PAGE_ALIGNED_USER_MAPPED(struct gdt_page, gdt_page);
+ 
+ static inline struct desc_struct *get_cpu_gdt_table(unsigned int cpu)
+ {
+--- a/arch/x86/include/mach-xen/asm/pgtable_64.h
++++ b/arch/x86/include/mach-xen/asm/pgtable_64.h
+@@ -102,9 +102,36 @@ static inline void xen_pud_clear(pud_t *
+ 
+ #define __user_pgd(pgd) ((pgd) + PTRS_PER_PGD)
+ 
++#ifdef CONFIG_KAISER
++extern pgd_t kaiser_set_shadow_pgd(pgd_t *pgdp, pgd_t pgd);
++
++static inline pgd_t *xen_get_shadow_pgd(pgd_t *pgdp)
++{
++	return (pgd_t *)((unsigned long)pgdp | (unsigned long)PAGE_SIZE);
++}
++
++static inline pgd_t *xen_get_normal_pgd(pgd_t *pgdp)
++{
++	return (pgd_t *)((unsigned long)pgdp & ~(unsigned long)PAGE_SIZE);
++}
++#else
++static inline pgd_t kaiser_set_shadow_pgd(pgd_t *pgdp, pgd_t pgd)
++{
++	return pgd;
++}
++static inline pgd_t *xen_get_shadow_pgd(pgd_t *pgdp)
++{
++	return NULL;
++}
++static inline pgd_t *xen_get_normal_pgd(pgd_t *pgdp)
++{
++	return pgdp;
++}
++#endif /* CONFIG_KAISER */
++
+ static inline void xen_set_pgd(pgd_t *pgdp, pgd_t pgd)
+ {
+-	xen_l4_entry_update(pgdp, pgd);
++	xen_l4_entry_update(pgdp, kaiser_set_shadow_pgd(pgdp, pgd));
+ }
+ 
+ static inline void xen_pgd_clear(pgd_t *pgd)
+--- a/arch/x86/include/mach-xen/asm/pgtable.h
++++ b/arch/x86/include/mach-xen/asm/pgtable.h
+@@ -580,7 +580,18 @@ static inline pud_t *pud_offset(pgd_t *p
+ 
+ static inline int pgd_bad(pgd_t pgd)
+ {
+-	return (pgd_flags(pgd) & ~_PAGE_USER) != _KERNPG_TABLE;
++	pgdval_t ignore_flags = _PAGE_USER;
++	/*
++	 * We set NX on KAISER pgds that map userspace memory so
++	 * that userspace can not meaningfully use the kernel
++	 * page table by accident; it will fault on the first
++	 * instruction it tries to run.  See xen_set_pgd().
++	 */
++#ifdef CONFIG_KAISER
++	ignore_flags |= _PAGE_NX;
++#endif
++
++	return (pgd_flags(pgd) & ~ignore_flags) != _KERNPG_TABLE;
+ }
+ 
+ static inline int pgd_none(pgd_t pgd)
+@@ -811,6 +822,12 @@ static inline void pmdp_set_wrprotect(st
+ static inline void clone_pgd_range(pgd_t *dst, pgd_t *src, int count)
+ {
+        memcpy(dst, src, count * sizeof(pgd_t));
++#ifdef CONFIG_KAISER
++	/* Clone the shadow pgd part as well */
++	memcpy(xen_get_shadow_pgd(dst),
++	       xen_get_shadow_pgd(src),
++	       count * sizeof(pgd_t));
++#endif
+ }
+ 
+ #define PTE_SHIFT ilog2(PTRS_PER_PTE)
+--- a/arch/x86/include/mach-xen/asm/pgtable_types.h
++++ b/arch/x86/include/mach-xen/asm/pgtable_types.h
+@@ -39,7 +39,11 @@
+ #define _PAGE_ACCESSED	(_AT(pteval_t, 1) << _PAGE_BIT_ACCESSED)
+ #define _PAGE_DIRTY	(_AT(pteval_t, 1) << _PAGE_BIT_DIRTY)
+ #define _PAGE_PSE	(_AT(pteval_t, 1) << _PAGE_BIT_PSE)
++#ifdef CONFIG_KAISER
++#define _PAGE_GLOBAL	(_AT(pteval_t, 0))
++#else
+ #define _PAGE_GLOBAL	(_AT(pteval_t, 1) << _PAGE_BIT_GLOBAL)
++#endif
+ #define _PAGE_UNUSED1	(_AT(pteval_t, 1) << _PAGE_BIT_UNUSED1)
+ #define _PAGE_IOMAP	(_AT(pteval_t, 1) << _PAGE_BIT_IOMAP)
+ #define _PAGE_PAT	(_AT(pteval_t, 1) << _PAGE_BIT_PAT)
+@@ -62,7 +66,7 @@
+ #endif
+ 
+ #define _PAGE_FILE	(_AT(pteval_t, 1) << _PAGE_BIT_FILE)
+-#define _PAGE_PROTNONE	(_AT(pteval_t, 1) << _PAGE_BIT_PROTNONE)
++#define _PAGE_PROTNONE  (_AT(pteval_t, 1) << _PAGE_BIT_PROTNONE)
+ 
+ #ifndef __ASSEMBLY__
+ #if defined(CONFIG_X86_64) && CONFIG_XEN_COMPAT <= 0x030002
+@@ -82,6 +86,33 @@ extern unsigned int __kernel_page_user;
+ 			 _PAGE_SPECIAL | _PAGE_ACCESSED | _PAGE_DIRTY)
+ #define _HPAGE_CHG_MASK (_PAGE_CHG_MASK | _PAGE_PSE)
+ 
++/* The ASID is the lower 12 bits of CR3 */
++#define X86_CR3_PCID_ASID_MASK  (_AC((1<<12)-1,UL))
++
++/* Mask for all the PCID-related bits in CR3: */
++#define X86_CR3_PCID_MASK       (X86_CR3_PCID_NOFLUSH | X86_CR3_PCID_ASID_MASK)
++#define X86_CR3_PCID_ASID_KERN  (_AC(0x0,UL))
++
++#if defined(CONFIG_KAISER) && defined(CONFIG_X86_64)
++/* Let X86_CR3_PCID_ASID_USER be usable for the X86_CR3_PCID_NOFLUSH bit */
++#define X86_CR3_PCID_ASID_USER	(_AC(0x80,UL))
++
++#define X86_CR3_PCID_KERN_FLUSH		(X86_CR3_PCID_ASID_KERN)
++#define X86_CR3_PCID_USER_FLUSH		(X86_CR3_PCID_ASID_USER)
++#define X86_CR3_PCID_KERN_NOFLUSH	(X86_CR3_PCID_NOFLUSH | X86_CR3_PCID_ASID_KERN)
++#define X86_CR3_PCID_USER_NOFLUSH	(X86_CR3_PCID_NOFLUSH | X86_CR3_PCID_ASID_USER)
++#else
++#define X86_CR3_PCID_ASID_USER  (_AC(0x0,UL))
++/*
++ * PCIDs are unsupported on 32-bit and none of these bits can be
++ * set in CR3:
++ */
++#define X86_CR3_PCID_KERN_FLUSH		(0)
++#define X86_CR3_PCID_USER_FLUSH		(0)
++#define X86_CR3_PCID_KERN_NOFLUSH	(0)
++#define X86_CR3_PCID_USER_NOFLUSH	(0)
++#endif
++
+ /*
+  * PAT settings are part of the hypervisor interface, which sets the
+  * MSR to 0x050100070406 (i.e. WB, WT, UC-, UC, WC, WP [, UC, UC]).
+--- a/arch/x86/include/mach-xen/asm/processor.h
++++ b/arch/x86/include/mach-xen/asm/processor.h
+@@ -283,7 +283,7 @@ struct tss_struct {
+ 
+ } ____cacheline_aligned;
+ 
+-DECLARE_PER_CPU_SHARED_ALIGNED(struct tss_struct, init_tss);
++DECLARE_PER_CPU_SHARED_ALIGNED_USER_MAPPED(struct tss_struct, init_tss);
+ 
+ /*
+  * Save the original ist values for checking stack pointers during debugging
+--- a/arch/x86/include/mach-xen/asm/tlbflush.h
++++ b/arch/x86/include/mach-xen/asm/tlbflush.h
+@@ -8,6 +8,22 @@
+ #include <asm/system.h>
+ #include <asm/smp.h>
+ 
++/*
++ * Declare a couple of kaiser interfaces here for convenience,
++ * to avoid the need for asm/kaiser.h in unexpected places.
++ */
++#ifdef CONFIG_KAISER
++extern void kaiser_setup_pcid(void);
++extern void kaiser_flush_tlb_on_return_to_user(void);
++#else
++static inline void kaiser_setup_pcid(void)
++{
++}
++static inline void kaiser_flush_tlb_on_return_to_user(void)
++{
++}
++#endif
++
+ #define __flush_tlb() xen_tlb_flush()
+ #define __flush_tlb_global() xen_tlb_flush()
+ #define __flush_tlb_single(addr) xen_invlpg(addr)
+--- a/arch/x86/kernel/cpu/common-xen.c
++++ b/arch/x86/kernel/cpu/common-xen.c
+@@ -92,7 +92,7 @@ static const struct cpu_dev __cpuinitcon
+ 
+ static const struct cpu_dev *this_cpu __cpuinitdata = &default_cpu;
+ 
+-DEFINE_PER_CPU_PAGE_ALIGNED(struct gdt_page, gdt_page) = { .gdt = {
++DEFINE_PER_CPU_PAGE_ALIGNED_USER_MAPPED(struct gdt_page, gdt_page) = { .gdt = {
+ #ifdef CONFIG_X86_64
+ 	/*
+ 	 * We need valid kernel segments for data and code in long mode too
+@@ -307,6 +307,19 @@ static void setup_pcid(struct cpuinfo_x8
+ 			 * SDM says that it can't be enabled in 32-bit mode.
+ 			 */
+ 			set_in_cr4(X86_CR4_PCIDE);
++			/*
++			 * INVPCID has two "groups" of types:
++			 * 1/2: Invalidate an individual address
++			 * 3/4: Invalidate all contexts
++			 *
++			 * 1/2 take a PCID, but 3/4 do not.  So, 3/4
++			 * ignore the PCID argument in the descriptor.
++			 * But, we have to be careful not to call 1/2
++			 * with an actual non-zero PCID in them before
++			 * we do the above set_in_cr4().
++			 */
++			if (cpu_has(c, X86_FEATURE_INVPCID))
++				set_cpu_cap(c, X86_FEATURE_INVPCID_SINGLE);
+ 		}
+ #else
+ 		/*
+@@ -630,6 +643,7 @@ void __cpuinit cpu_detect(struct cpuinfo
+ 			c->x86_cache_alignment = c->x86_clflush_size;
+ 		}
+ 	}
++	kaiser_setup_pcid();
+ }
+ 
+ void __cpuinit get_cpu_cap(struct cpuinfo_x86 *c)
+@@ -1158,7 +1172,7 @@ static const unsigned int exception_stac
+ 	  [DEBUG_STACK - 1]			= DEBUG_STKSZ
+ };
+ 
+-static DEFINE_PER_CPU_PAGE_ALIGNED(char, exception_stacks
++DEFINE_PER_CPU_PAGE_ALIGNED_USER_MAPPED(char, exception_stacks
+ 	[(N_EXCEPTION_STACKS - 1) * EXCEPTION_STKSZ + DEBUG_STKSZ]);
+ #endif
+ 
+--- a/arch/x86/kernel/entry_64-xen.S
++++ b/arch/x86/kernel/entry_64-xen.S
+@@ -57,6 +57,7 @@
+ #include <asm/ftrace.h>
+ #include <asm/percpu.h>
+ #include <asm/pgtable_types.h>
++#include <asm/kaiser.h>
+ #include <xen/interface/xen.h>
+ #include <xen/interface/features.h>
+ 
+@@ -354,6 +355,7 @@ ENTRY(save_args)
+ 	testl $3, CS(%rdi)
+ 	je 1f
+ 	SWAPGS
++	SWITCH_KERNEL_CR3
+ 	/*
+ 	 * irq_count is used to check if a CPU is already on an interrupt stack
+ 	 * or not. While this is essentially redundant with preempt_count it is
+@@ -394,6 +396,12 @@ END(save_rest)
+ #ifndef CONFIG_XEN
+ /* save complete stack frame */
+ 	.pushsection .kprobes.text, "ax"
++/*
++ * Return: ebx=0: needs swapgs but not SWITCH_USER_CR3 in paranoid_exit
++ *         ebx=1: needs neither swapgs nor SWITCH_USER_CR3 in paranoid_exit
++ *         ebx=2: needs both swapgs and SWITCH_USER_CR3 in paranoid_exit
++ *         ebx=3: needs SWITCH_USER_CR3 but not swapgs in paranoid_exit
++ */
+ ENTRY(save_paranoid)
+ 	XCPT_FRAME offset=ORIG_RAX-R15+8
+ 	cld
+@@ -419,7 +427,25 @@ ENTRY(save_paranoid)
+ 	js 1f	/* negative -> in kernel */
+ 	SWAPGS
+ 	xorl %ebx,%ebx
+-1:	ret
++1:
++#ifdef CONFIG_KAISER
++	/*
++	 * We might have come in between a swapgs and a SWITCH_KERNEL_CR3
++	 * on entry, or between a SWITCH_USER_CR3 and a swapgs on exit.
++	 * Do a conditional SWITCH_KERNEL_CR3: this could safely be done
++	 * unconditionally, but we need to find out whether the reverse
++	 * should be done on return (conveyed to paranoid_exit in %ebx).
++	 */
++	movq	%cr3, %rax
++	testl	$KAISER_SHADOW_PGD_OFFSET, %eax
++	jz	2f
++	orl	$2, %ebx
++	andq	$(~(X86_CR3_PCID_ASID_MASK | KAISER_SHADOW_PGD_OFFSET)), %rax
++	orq	x86_cr3_pcid_noflush, %rax
++	movq	%rax, %cr3
++2:
++#endif
++	ret
+ 	CFI_ENDPROC
+ END(save_paranoid)
+ 	.popsection
+@@ -1138,30 +1164,40 @@ paranoidzeroentry machine_check *machine
+ 	 * is fundamentally NMI-unsafe. (we cannot change the soft and
+ 	 * hard flags at once, atomically)
+ 	 */
+-
+-	/* ebx:	no swapgs flag */
++/*
++ * On entry: ebx=0: needs swapgs but not SWITCH_USER_CR3
++ *           ebx=1: needs neither swapgs nor SWITCH_USER_CR3
++ *           ebx=2: needs both swapgs and SWITCH_USER_CR3
++ *           ebx=3: needs SWITCH_USER_CR3 but not swapgs
++ */
+ ENTRY(paranoid_exit)
+ 	DEFAULT_FRAME
+ 	DISABLE_INTERRUPTS(CLBR_NONE)
+ 	TRACE_IRQS_OFF
+-	testl %ebx,%ebx				/* swapgs needed? */
+-	jnz paranoid_restore
+-	testl $3,CS(%rsp)
+-	jnz   paranoid_userspace
+-paranoid_swapgs:
++	movq	%rbx, %r12		/* paranoid_userspace uses %ebx */
++	testl	$3, CS(%rsp)
++	jnz	paranoid_userspace
++paranoid_kernel:
++	movq	%r12, %rbx		/* restore after paranoid_userspace */
+ 	TRACE_IRQS_IRETQ 0
++#ifdef CONFIG_KAISER
++	testl	$2, %ebx		/* SWITCH_USER_CR3 needed? */
++	jz	paranoid_exit_no_switch
++	SWITCH_USER_CR3
++paranoid_exit_no_switch:
++#endif
++	testl	$1, %ebx		/* swapgs needed? */
++	jnz	paranoid_exit_no_swapgs
+ 	SWAPGS_UNSAFE_STACK
++paranoid_exit_no_swapgs:
+ 	RESTORE_ALL 8
+-	jmp irq_return
+-paranoid_restore:
+-	TRACE_IRQS_IRETQ 0
+-	RESTORE_ALL 8
+-	jmp irq_return
++	jmp	irq_return
++
+ paranoid_userspace:
+ 	GET_THREAD_INFO(%rcx)
+ 	movl TI_flags(%rcx),%ebx
+ 	andl $_TIF_WORK_MASK,%ebx
+-	jz paranoid_swapgs
++	jz paranoid_kernel
+ 	movq %rsp,%rdi			/* &pt_regs */
+ 	call sync_regs
+ 	movq %rax,%rsp			/* switch stack for scheduling */
+@@ -1211,6 +1247,13 @@ ENTRY(error_entry)
+ 	movq %r14, R14+8(%rsp)
+ 	movq %r15, R15+8(%rsp)
+ #ifndef CONFIG_XEN
++	/*
++	 * error_entry() always returns with a kernel gsbase and
++	 * CR3.  We must also have a kernel CR3/gsbase before
++	 * calling TRACE_IRQS_*.  Just unconditionally switch to
++	 * the kernel CR3 here.
++	 */
++	SWITCH_KERNEL_CR3
+ 	xorl %ebx,%ebx
+ 	testl $3,CS+8(%rsp)
+ 	je error_kernelspace
+--- a/arch/x86/kernel/ldt-xen.c
++++ b/arch/x86/kernel/ldt-xen.c
+@@ -15,6 +15,7 @@
+ #include <linux/slab.h>
+ #include <linux/vmalloc.h>
+ #include <linux/uaccess.h>
++#include <linux/kaiser.h>
+ 
+ #include <asm/system.h>
+ #include <asm/ldt.h>
+@@ -34,11 +35,21 @@ static void flush_ldt(void *current_mm)
+ 	set_ldt(ldt->entries, ldt->size);
+ }
+ 
++static void __free_ldt_struct(struct ldt_struct *ldt)
++{
++	if (ldt->size * LDT_ENTRY_SIZE > PAGE_SIZE)
++		vfree(ldt->entries);
++	else
++		free_page((unsigned long)ldt->entries);
++	kfree(ldt);
++}
++
+ /* The caller must call finalize_ldt_struct on the result. LDT starts zeroed. */
+ static struct ldt_struct *alloc_ldt_struct(int size)
+ {
+ 	struct ldt_struct *new_ldt;
+ 	int alloc_size;
++	int ret;
+ 
+ 	if (size > LDT_ENTRIES)
+ 		return NULL;
+@@ -65,7 +76,14 @@ static struct ldt_struct *alloc_ldt_stru
+ 		kfree(new_ldt);
+ 		return NULL;
+ 	}
++
++	ret = kaiser_add_mapping((unsigned long)new_ldt->entries, alloc_size,
++				 __PAGE_KERNEL);
+ 	new_ldt->size = size;
++	if (ret) {
++		__free_ldt_struct(new_ldt);
++		return NULL;
++	}
+ 	return new_ldt;
+ }
+ 
+@@ -96,13 +114,11 @@ static void free_ldt_struct(struct ldt_s
+ 	if (likely(!ldt))
+ 		return;
+ 
++	kaiser_remove_mapping((unsigned long)ldt->entries,
++			      ldt->size * LDT_ENTRY_SIZE);
+ 	make_pages_writable(ldt->entries, PFN_UP(ldt->size * LDT_ENTRY_SIZE),
+ 			    XENFEAT_writable_descriptor_tables);
+-	if (ldt->size * LDT_ENTRY_SIZE > PAGE_SIZE)
+-		vfree(ldt->entries);
+-	else
+-		free_page((unsigned long)ldt->entries);
+-	kfree(ldt);
++	__free_ldt_struct(ldt);
+ }
+ 
+ /*
+--- a/arch/x86/mm/pgtable-xen.c
++++ b/arch/x86/mm/pgtable-xen.c
+@@ -9,7 +9,7 @@
+ #include <asm/hypervisor.h>
+ #include <asm/mmu_context.h>
+ 
+-#define PGALLOC_GFP GFP_KERNEL | __GFP_NOTRACK | __GFP_REPEAT | __GFP_ZERO
++#define PGALLOC_GFP (GFP_KERNEL | __GFP_NOTRACK | __GFP_REPEAT | __GFP_ZERO)
+ 
+ #ifdef CONFIG_HIGHPTE
+ #define PGALLOC_USER_GFP __GFP_HIGHMEM
+--- a/security/Kconfig
++++ b/security/Kconfig
+@@ -99,7 +99,7 @@ config SECURITY
+ config KAISER
+ 	bool "Remove the kernel mapping in user mode"
+ 	default y
+-	depends on X86_64 && SMP
++	depends on X86_64 && SMP && !XEN
+ 	help
+ 	  This enforces a strict kernel and user space isolation, in order
+ 	  to close hardware side channels on kernel address information.
