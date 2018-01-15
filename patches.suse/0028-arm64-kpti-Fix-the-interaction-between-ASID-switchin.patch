@@ -1,0 +1,258 @@
+From 1cd4d287af976166cbc54a219978258a17a96df6 Mon Sep 17 00:00:00 2001
+From: Catalin Marinas <catalin.marinas@arm.com>
+Date: Fri, 12 Jan 2018 12:30:43 +0000
+Subject: [PATCH 28/28] arm64: kpti: Fix the interaction between ASID switching
+ and software PAN
+
+Patch-mainline: Submitted, https://marc.info/?l=linux-arm-kernel&m=151576029908809
+References: bsc#1068032
+
+With ARM64_SW_TTBR0_PAN enabled, the exception entry code checks the
+active ASID to decide whether user access was enabled (non-zero ASID)
+when the exception was taken. On return from exception, if user access
+was previously disabled, it re-instates TTBR0_EL1 from the per-thread
+saved value (updated in switch_mm() or efi_set_pgd()).
+
+Commit 7655abb95386 ("arm64: mm: Move ASID from TTBR0 to TTBR1") makes a
+TTBR0_EL1 + ASID switching non-atomic. Subsequently, commit 27a921e75711
+("arm64: mm: Fix and re-enable ARM64_SW_TTBR0_PAN") changes the
+__uaccess_ttbr0_disable() function and asm macro to first write the
+reserved TTBR0_EL1 followed by the ASID=0 update in TTBR1_EL1. If an
+exception occurs between these two, the exception return code will
+re-instate a valid TTBR0_EL1. Similar scenario can happen in
+cpu_switch_mm() between setting the reserved TTBR0_EL1 and the ASID
+update in cpu_do_switch_mm().
+
+This patch reverts the entry.S check for ASID == 0 to TTBR0_EL1 and
+disables the interrupts around the TTBR0_EL1 and ASID switching code in
+__uaccess_ttbr0_disable(). It also ensures that, when returning from the
+EFI runtime services, efi_set_pgd() doesn't leave a non-zero ASID in
+TTBR1_EL1.
+
+As a safety measure, __uaccess_ttbr0_enable() always masks out any
+existing non-zero ASID TTBR1_EL1 before writing in the new ASID.
+
+Fixes: 27a921e75711 ("arm64: mm: Fix and re-enable ARM64_SW_TTBR0_PAN")
+Cc: Will Deacon <will.deacon@arm.com>
+Cc: James Morse <james.morse@arm.com>
+Reported-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Co-developed-by: Marc Zyngier <marc.zyngier@arm.com>
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Mian Yousaf Kaukab <yousaf.kaukab@suse.com>
+---
+ arch/arm64/include/asm/asm-uaccess.h | 12 +++++++-----
+ arch/arm64/include/asm/efi.h         |  2 +-
+ arch/arm64/include/asm/uaccess.h     |  7 +++++--
+ arch/arm64/kernel/entry.S            |  2 +-
+ arch/arm64/lib/clear_user.S          |  2 +-
+ arch/arm64/lib/copy_from_user.S      |  2 +-
+ arch/arm64/lib/copy_in_user.S        |  2 +-
+ arch/arm64/lib/copy_to_user.S        |  2 +-
+ arch/arm64/mm/cache.S                |  2 +-
+ arch/arm64/mm/proc.S                 |  3 +++
+ arch/arm64/xen/hypercall.S           |  2 +-
+ 11 files changed, 23 insertions(+), 15 deletions(-)
+
+diff --git a/arch/arm64/include/asm/asm-uaccess.h b/arch/arm64/include/asm/asm-uaccess.h
+index e8327fa7953c..1c568fd2863c 100644
+--- a/arch/arm64/include/asm/asm-uaccess.h
++++ b/arch/arm64/include/asm/asm-uaccess.h
+@@ -13,11 +13,11 @@
+ #ifdef CONFIG_ARM64_SW_TTBR0_PAN
+ 	.macro	__uaccess_ttbr0_disable, tmp1
+ 	mrs	\tmp1, ttbr1_el1		// swapper_pg_dir
++	bic	\tmp1, \tmp1, #TTBR_ASID_MASK
+ 	add	\tmp1, \tmp1, #SWAPPER_DIR_SIZE	// reserved_ttbr0 at the end of swapper_pg_dir
+ 	msr	ttbr0_el1, \tmp1		// set reserved TTBR0_EL1
+ 	isb
+ 	sub	\tmp1, \tmp1, #SWAPPER_DIR_SIZE
+-	bic	\tmp1, \tmp1, #TTBR_ASID_MASK
+ 	msr	ttbr1_el1, \tmp1		// set reserved ASID
+ 	isb
+ 	.endm
+@@ -34,9 +34,11 @@
+ 	isb
+ 	.endm
+ 
+-	.macro	uaccess_ttbr0_disable, tmp1
++	.macro	uaccess_ttbr0_disable, tmp1, tmp2
+ alternative_if_not ARM64_HAS_PAN
++	save_and_disable_irq \tmp2		// avoid preemption
+ 	__uaccess_ttbr0_disable \tmp1
++	restore_irq \tmp2
+ alternative_else_nop_endif
+ 	.endm
+ 
+@@ -48,7 +50,7 @@ alternative_if_not ARM64_HAS_PAN
+ alternative_else_nop_endif
+ 	.endm
+ #else
+-	.macro	uaccess_ttbr0_disable, tmp1
++	.macro	uaccess_ttbr0_disable, tmp1, tmp2
+ 	.endm
+ 
+ 	.macro	uaccess_ttbr0_enable, tmp1, tmp2, tmp3
+@@ -58,8 +60,8 @@ alternative_else_nop_endif
+ /*
+  * These macros are no-ops when UAO is present.
+  */
+-	.macro	uaccess_disable_not_uao, tmp1
+-	uaccess_ttbr0_disable \tmp1
++	.macro	uaccess_disable_not_uao, tmp1, tmp2
++	uaccess_ttbr0_disable \tmp1, \tmp2
+ alternative_if ARM64_ALT_PAN_NOT_UAO
+ 	SET_PSTATE_PAN(1)
+ alternative_else_nop_endif
+diff --git a/arch/arm64/include/asm/efi.h b/arch/arm64/include/asm/efi.h
+index e23abd0ffeda..bc1668972102 100644
+--- a/arch/arm64/include/asm/efi.h
++++ b/arch/arm64/include/asm/efi.h
+@@ -94,7 +94,7 @@ static inline void efi_set_pgd(struct mm_struct *mm)
+ 			 * until uaccess_enable(). Restore the current
+ 			 * thread's saved ttbr0 corresponding to its active_mm
+ 			 */
+-			cpu_set_reserved_ttbr0();
++			uaccess_ttbr0_disable();
+ 			update_saved_ttbr0(current, current->active_mm);
+ 		}
+ 	}
+diff --git a/arch/arm64/include/asm/uaccess.h b/arch/arm64/include/asm/uaccess.h
+index 4b1dee67b216..8ef50591a714 100644
+--- a/arch/arm64/include/asm/uaccess.h
++++ b/arch/arm64/include/asm/uaccess.h
+@@ -140,16 +140,18 @@ static inline void set_fs(mm_segment_t fs)
+ #ifdef CONFIG_ARM64_SW_TTBR0_PAN
+ static inline void __uaccess_ttbr0_disable(void)
+ {
+-	unsigned long ttbr;
++	unsigned long flags, ttbr;
+ 
++	local_irq_save(flags);
+ 	ttbr = read_sysreg(ttbr1_el1);
++	ttbr &= ~TTBR_ASID_MASK;
+ 	/* reserved_ttbr0 placed at the end of swapper_pg_dir */
+ 	write_sysreg(ttbr + SWAPPER_DIR_SIZE, ttbr0_el1);
+ 	isb();
+ 	/* Set reserved ASID */
+-	ttbr &= ~TTBR_ASID_MASK;
+ 	write_sysreg(ttbr, ttbr1_el1);
+ 	isb();
++	local_irq_restore(flags);
+ }
+ 
+ static inline void __uaccess_ttbr0_enable(void)
+@@ -166,6 +168,7 @@ static inline void __uaccess_ttbr0_enable(void)
+ 
+ 	/* Restore active ASID */
+ 	ttbr1 = read_sysreg(ttbr1_el1);
++	ttbr1 &= ~TTBR_ASID_MASK;		/* safety measure */
+ 	ttbr1 |= ttbr0 & TTBR_ASID_MASK;
+ 	write_sysreg(ttbr1, ttbr1_el1);
+ 	isb();
+diff --git a/arch/arm64/kernel/entry.S b/arch/arm64/kernel/entry.S
+index 3eac2d3925c6..a342fc21f015 100644
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@ -146,7 +146,7 @@ alternative_if ARM64_HAS_PAN
+ alternative_else_nop_endif
+ 
+ 	.if	\el != 0
+-	mrs	x21, ttbr1_el1
++	mrs	x21, ttbr0_el1
+ 	tst	x21, #TTBR_ASID_MASK		// Check for the reserved ASID
+ 	orr	x23, x23, #PSR_PAN_BIT		// Set the emulated PAN in the saved SPSR
+ 	b.eq	1f				// TTBR0 access already disabled
+diff --git a/arch/arm64/lib/clear_user.S b/arch/arm64/lib/clear_user.S
+index 8f9c4641e706..3d69a8d41fa5 100644
+--- a/arch/arm64/lib/clear_user.S
++++ b/arch/arm64/lib/clear_user.S
+@@ -50,7 +50,7 @@ uao_user_alternative 9f, strh, sttrh, wzr, x0, 2
+ 	b.mi	5f
+ uao_user_alternative 9f, strb, sttrb, wzr, x0, 0
+ 5:	mov	x0, #0
+-	uaccess_disable_not_uao x2
++	uaccess_disable_not_uao x2, x3
+ 	ret
+ ENDPROC(__clear_user)
+ 
+diff --git a/arch/arm64/lib/copy_from_user.S b/arch/arm64/lib/copy_from_user.S
+index bb947d385e51..bcb616631326 100644
+--- a/arch/arm64/lib/copy_from_user.S
++++ b/arch/arm64/lib/copy_from_user.S
+@@ -67,7 +67,7 @@ ENTRY(__copy_from_user)
+ 	uaccess_enable_not_uao x3, x4, x5
+ 	add	end, x0, x2
+ #include "copy_template.S"
+-	uaccess_disable_not_uao x3
++	uaccess_disable_not_uao x3, x4
+ 	mov	x0, #0				// Nothing to copy
+ 	ret
+ ENDPROC(__copy_from_user)
+diff --git a/arch/arm64/lib/copy_in_user.S b/arch/arm64/lib/copy_in_user.S
+index e7222f14b846..0049e34771a7 100644
+--- a/arch/arm64/lib/copy_in_user.S
++++ b/arch/arm64/lib/copy_in_user.S
+@@ -68,7 +68,7 @@ ENTRY(__copy_in_user)
+ 	uaccess_enable_not_uao x3, x4, x5
+ 	add	end, x0, x2
+ #include "copy_template.S"
+-	uaccess_disable_not_uao x3
++	uaccess_disable_not_uao x3, x4
+ 	mov	x0, #0
+ 	ret
+ ENDPROC(__copy_in_user)
+diff --git a/arch/arm64/lib/copy_to_user.S b/arch/arm64/lib/copy_to_user.S
+index 527e737b1a0e..b128bbe0c6b9 100644
+--- a/arch/arm64/lib/copy_to_user.S
++++ b/arch/arm64/lib/copy_to_user.S
+@@ -66,7 +66,7 @@ ENTRY(__copy_to_user)
+ 	uaccess_enable_not_uao x3, x4, x5
+ 	add	end, x0, x2
+ #include "copy_template.S"
+-	uaccess_disable_not_uao x3
++	uaccess_disable_not_uao x3, x4
+ 	mov	x0, #0
+ 	ret
+ ENDPROC(__copy_to_user)
+diff --git a/arch/arm64/mm/cache.S b/arch/arm64/mm/cache.S
+index a3dfc221b356..ba539c159fd2 100644
+--- a/arch/arm64/mm/cache.S
++++ b/arch/arm64/mm/cache.S
+@@ -72,7 +72,7 @@ USER(9f, ic	ivau, x4	)		// invalidate I line PoU
+ 	isb
+ 	mov	x0, #0
+ 1:
+-	uaccess_ttbr0_disable x1
++	uaccess_ttbr0_disable x1, x2
+ 	ret
+ 9:
+ 	mov	x0, #-EFAULT
+diff --git a/arch/arm64/mm/proc.S b/arch/arm64/mm/proc.S
+index 0f56441900d6..dbb8bf52f554 100644
+--- a/arch/arm64/mm/proc.S
++++ b/arch/arm64/mm/proc.S
+@@ -133,6 +133,9 @@ ENDPROC(cpu_do_resume)
+ ENTRY(cpu_do_switch_mm)
+ 	mrs	x2, ttbr1_el1
+ 	mmid	x1, x1				// get mm->context.id
++#ifdef CONFIG_ARM64_SW_TTBR0_PAN
++	bfi	x0, x1, #48, #16		// set the ASID field in TTBR0
++#endif
+ 	bfi	x2, x1, #48, #16		// set the ASID
+ 	msr	ttbr1_el1, x2			// in TTBR1 (since TCR.A1 is set)
+ 	isb
+diff --git a/arch/arm64/xen/hypercall.S b/arch/arm64/xen/hypercall.S
+index 1198853e777e..47e49d6b2ca6 100644
+--- a/arch/arm64/xen/hypercall.S
++++ b/arch/arm64/xen/hypercall.S
+@@ -104,6 +104,6 @@ ENTRY(privcmd_call)
+ 	/*
+ 	 * Disable userspace access from kernel once the hyp call completed.
+ 	 */
+-	uaccess_ttbr0_disable x6
++	uaccess_ttbr0_disable x6, x7
+ 	ret
+ ENDPROC(privcmd_call);
+-- 
+2.11.0
+
