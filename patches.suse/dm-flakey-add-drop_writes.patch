@@ -1,0 +1,200 @@
+From: Mike Snitzer <snitzer@redhat.com>
+Subject: dm flakey: add drop_writes
+Git-commit: b26f5e3d7127487e934758c1fbe05d683b082cb0
+Patch-mainline: v3.1-rc1
+References: bsc#1080372
+
+Add 'drop_writes' option to drop writes silently while the
+device is 'down'.  Reads are not touched.
+
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Alasdair G Kergon <agk@redhat.com>
+Acked-by: Jeff Mahoney <jeffm@suse.com>
+---
+ Documentation/device-mapper/dm-flakey.txt | 29 +++++++++++---
+ drivers/md/dm-flakey.c                    | 63 +++++++++++++++++++++++++++----
+ 2 files changed, 78 insertions(+), 14 deletions(-)
+
+diff --git a/Documentation/device-mapper/dm-flakey.txt b/Documentation/device-mapper/dm-flakey.txt
+index c8efdfd19a65..1b66c868ee7e 100644
+--- a/Documentation/device-mapper/dm-flakey.txt
++++ b/Documentation/device-mapper/dm-flakey.txt
+@@ -1,17 +1,34 @@
+ dm-flakey
+ =========
+ 
+-This target is the same as the linear target except that it returns I/O
+-errors periodically.  It's been found useful in simulating failing
+-devices for testing purposes.
++This target is the same as the linear target except that it exhibits
++unreliable behaviour periodically.  It's been found useful in simulating
++failing devices for testing purposes.
+ 
+ Starting from the time the table is loaded, the device is available for
+-<up interval> seconds, then returns errors for <down interval> seconds,
+-and then this cycle repeats.
++<up interval> seconds, then exhibits unreliable behaviour for <down
++interval> seconds, and then this cycle repeats.
+ 
+-Parameters: <dev path> <offset> <up interval> <down interval>
++Also, consider using this in combination with the dm-delay target too,
++which can delay reads and writes and/or send them to different
++underlying devices.
++
++Table parameters
++----------------
++  <dev path> <offset> <up interval> <down interval> \
++    [<num_features> [<feature arguments>]]
++
++Mandatory parameters:
+     <dev path>: Full pathname to the underlying block-device, or a
+                 "major:minor" device-number.
+     <offset>: Starting sector within the device.
+     <up interval>: Number of seconds device is available.
+     <down interval>: Number of seconds device returns errors.
++
++Optional feature parameters:
++  If no feature parameters are present, during the periods of
++  unreliability, all I/O returns errors.
++
++  drop_writes:
++	All write I/O is silently ignored.
++	Read I/O is handled correctly.
+diff --git a/drivers/md/dm-flakey.c b/drivers/md/dm-flakey.c
+index dd963dc3ca08..e7c4c2a64f4b 100644
+--- a/drivers/md/dm-flakey.c
++++ b/drivers/md/dm-flakey.c
+@@ -25,16 +25,22 @@ struct flakey_c {
+ 	sector_t start;
+ 	unsigned up_interval;
+ 	unsigned down_interval;
++	unsigned long flags;
+ };
+ 
+-static int parse_features(struct dm_arg_set *as, struct dm_target *ti)
++enum feature_flag_bits {
++	DROP_WRITES
++};
++
++static int parse_features(struct dm_arg_set *as, struct flakey_c *fc,
++			  struct dm_target *ti)
+ {
+ 	int r;
+ 	unsigned argc;
+ 	const char *arg_name;
+ 
+ 	static struct dm_arg _args[] = {
+-		{0, 0, "Invalid number of feature args"},
++		{0, 1, "Invalid number of feature args"},
+ 	};
+ 
+ 	/* No feature arguments supplied. */
+@@ -49,6 +55,18 @@ static int parse_features(struct dm_arg_set *as, struct dm_target *ti)
+ 		arg_name = dm_shift_arg(as);
+ 		argc--;
+ 
++		/*
++		 * drop_writes
++		 */
++		if (!strcasecmp(arg_name, "drop_writes")) {
++			if (test_and_set_bit(DROP_WRITES, &fc->flags)) {
++				ti->error = "Feature drop_writes duplicated";
++				return -EINVAL;
++			}
++
++			continue;
++		}
++
+ 		ti->error = "Unrecognised flakey feature requested";
+ 		r = -EINVAL;
+ 	}
+@@ -59,6 +77,9 @@ static int parse_features(struct dm_arg_set *as, struct dm_target *ti)
+ /*
+  * Construct a flakey mapping:
+  * <dev_path> <offset> <up interval> <down interval> [<#feature args> [<arg>]*]
++ *
++ *   Feature args:
++ *     [drop_writes]
+  */
+ static int flakey_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ {
+@@ -81,7 +102,7 @@ static int flakey_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 		return -EINVAL;
+ 	}
+ 
+-	fc = kmalloc(sizeof(*fc), GFP_KERNEL);
++	fc = kzalloc(sizeof(*fc), GFP_KERNEL);
+ 	if (!fc) {
+ 		ti->error = "Cannot allocate linear context";
+ 		return -ENOMEM;
+@@ -114,7 +135,7 @@ static int flakey_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 		goto bad;
+ 	}
+ 
+-	r = parse_features(&as, ti);
++	r = parse_features(&as, fc, ti);
+ 	if (r)
+ 		goto bad;
+ 
+@@ -162,12 +183,31 @@ static int flakey_map(struct dm_target *ti, struct bio *bio,
+ {
+ 	struct flakey_c *fc = ti->private;
+ 	unsigned elapsed;
++	unsigned rw;
+ 
+ 	/* Are we alive ? */
+ 	elapsed = (jiffies - fc->start_time) / HZ;
+-	if (elapsed % (fc->up_interval + fc->down_interval) >= fc->up_interval)
++	if (elapsed % (fc->up_interval + fc->down_interval) >= fc->up_interval) {
++		rw = bio_data_dir(bio);
++
++		/*
++		 * Drop writes.  Map reads as normal.
++		 */
++		if (test_bit(DROP_WRITES, &fc->flags)) {
++			if (rw == WRITE) {
++				bio_endio(bio, 0);
++				return DM_MAPIO_SUBMITTED;
++			}
++			goto map_bio;
++		}
++
++		/*
++		 * Default setting errors all I/O.
++		 */
+ 		return -EIO;
++	}
+ 
++map_bio:
+ 	flakey_map_bio(ti, bio);
+ 
+ 	return DM_MAPIO_REMAPPED;
+@@ -176,7 +216,9 @@ static int flakey_map(struct dm_target *ti, struct bio *bio,
+ static int flakey_status(struct dm_target *ti, status_type_t type,
+ 			 unsigned status_flags, char *result, unsigned maxlen)
+ {
++	unsigned sz = 0;
+ 	struct flakey_c *fc = ti->private;
++	unsigned drop_writes;
+ 
+ 	switch (type) {
+ 	case STATUSTYPE_INFO:
+@@ -184,9 +226,14 @@ static int flakey_status(struct dm_target *ti, status_type_t type,
+ 		break;
+ 
+ 	case STATUSTYPE_TABLE:
+-		snprintf(result, maxlen, "%s %llu %u %u", fc->dev->name,
+-			 (unsigned long long)fc->start, fc->up_interval,
+-			 fc->down_interval);
++		DMEMIT("%s %llu %u %u ", fc->dev->name,
++		       (unsigned long long)fc->start, fc->up_interval,
++		       fc->down_interval);
++
++		drop_writes = test_bit(DROP_WRITES, &fc->flags);
++		DMEMIT("%u ", drop_writes);
++		if (drop_writes)
++			DMEMIT("drop_writes ");
+ 		break;
+ 	}
+ 	return 0;
+
