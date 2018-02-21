@@ -1,0 +1,373 @@
+From: Christoph Hellwig <hch@lst.de>
+Date: Wed, 16 Aug 2017 16:14:47 +0200
+Subject: nvme: remove nvme_revalidate_ns
+Patch-mainline: v4.14-rc1
+Git-commit: cdbff4f26bd9fab11bfac22097f836892a5c3612
+References: bsc#1079313
+
+The function is used in two places, and the shared code for those will
+diverge later in this series.
+
+Instead factor out a new helper to get the ids for a namespace, simplify
+the calling conventions for nvme_identify_ns and just open code the
+sequence.
+
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Keith Busch <keith.busch@intel.com>
+Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/nvme/host/core.c |  100 ++++++++++++++++++++++++-----------------------
+ drivers/nvme/host/nvme.h |    3 -
+ drivers/nvme/host/scsi.c |   51 ++++++++++++++---------
+ 3 files changed, 84 insertions(+), 70 deletions(-)
+
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -604,7 +604,8 @@ int nvme_identify_ctrl(struct nvme_ctrl
+ 	return error;
+ }
+ 
+-static int nvme_identify_ns_descs(struct nvme_ns *ns, unsigned nsid)
++static int nvme_identify_ns_descs(struct nvme_ctrl *ctrl, unsigned nsid,
++		u8 *eui64, u8 *nguid, u8 *uuid)
+ {
+ 	struct nvme_command c = { };
+ 	int status;
+@@ -620,7 +621,7 @@ static int nvme_identify_ns_descs(struct
+ 	if (!data)
+ 		return -ENOMEM;
+ 
+-	status = nvme_submit_sync_cmd(ns->ctrl->admin_q, &c, data,
++	status = nvme_submit_sync_cmd(ctrl->admin_q, &c, data,
+ 				      NVME_IDENTIFY_DATA_SIZE);
+ 	if (status)
+ 		goto free_data;
+@@ -634,33 +635,33 @@ static int nvme_identify_ns_descs(struct
+ 		switch (cur->nidt) {
+ 		case NVME_NIDT_EUI64:
+ 			if (cur->nidl != NVME_NIDT_EUI64_LEN) {
+-				dev_warn(ns->ctrl->device,
++				dev_warn(ctrl->device,
+ 					 "ctrl returned bogus length: %d for NVME_NIDT_EUI64\n",
+ 					 cur->nidl);
+ 				goto free_data;
+ 			}
+ 			len = NVME_NIDT_EUI64_LEN;
+-			memcpy(ns->eui, data + pos + sizeof(*cur), len);
++			memcpy(eui64, data + pos + sizeof(*cur), len);
+ 			break;
+ 		case NVME_NIDT_NGUID:
+ 			if (cur->nidl != NVME_NIDT_NGUID_LEN) {
+-				dev_warn(ns->ctrl->device,
++				dev_warn(ctrl->device,
+ 					 "ctrl returned bogus length: %d for NVME_NIDT_NGUID\n",
+ 					 cur->nidl);
+ 				goto free_data;
+ 			}
+ 			len = NVME_NIDT_NGUID_LEN;
+-			memcpy(ns->nguid, data + pos + sizeof(*cur), len);
++			memcpy(nguid, data + pos + sizeof(*cur), len);
+ 			break;
+ 		case NVME_NIDT_UUID:
+ 			if (cur->nidl != NVME_NIDT_UUID_LEN) {
+-				dev_warn(ns->ctrl->device,
++				dev_warn(ctrl->device,
+ 					 "ctrl returned bogus length: %d for NVME_NIDT_UUID\n",
+ 					 cur->nidl);
+ 				goto free_data;
+ 			}
+ 			len = NVME_NIDT_UUID_LEN;
+-			memcpy(&ns->uuid, data + pos + sizeof(*cur), len);
++			memcpy(&uuid, data + pos + sizeof(*cur), len);
+ 			break;
+ 		default:
+ 			/* Skip unnkown types */
+@@ -685,9 +686,10 @@ static int nvme_identify_ns_list(struct
+ 	return nvme_submit_sync_cmd(dev->admin_q, &c, ns_list, 0x1000);
+ }
+ 
+-int nvme_identify_ns(struct nvme_ctrl *dev, unsigned nsid,
+-		struct nvme_id_ns **id)
++struct nvme_id_ns *nvme_identify_ns(struct nvme_ctrl *ctrl,
++		unsigned nsid)
+ {
++	struct nvme_id_ns *id;
+ 	struct nvme_command c = { };
+ 	int error;
+ 
+@@ -696,15 +698,18 @@ int nvme_identify_ns(struct nvme_ctrl *d
+ 	c.identify.nsid = cpu_to_le32(nsid);
+ 	c.identify.cns = NVME_ID_CNS_NS;
+ 
+-	*id = kmalloc(sizeof(struct nvme_id_ns), GFP_KERNEL);
+-	if (!*id)
+-		return -ENOMEM;
++	id = kmalloc(sizeof(*id), GFP_KERNEL);
++	if (!id)
++		return NULL;
++
++	error = nvme_submit_sync_cmd(ctrl->admin_q, &c, id, sizeof(*id));
++	if (error) {
++		dev_warn(ctrl->device, "Identify namespace failed\n");
++		kfree(id);
++		return NULL;
++	}
+ 
+-	error = nvme_submit_sync_cmd(dev->admin_q, &c, *id,
+-			sizeof(struct nvme_id_ns));
+-	if (error)
+-		kfree(*id);
+-	return error;
++	return id;
+ }
+ 
+ int nvme_get_features(struct nvme_ctrl *dev, unsigned fid, unsigned nsid,
+@@ -997,32 +1002,21 @@ static void nvme_config_discard(struct n
+ 	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, ns->queue);
+ }
+ 
+-static int nvme_revalidate_ns(struct nvme_ns *ns, struct nvme_id_ns **id)
++static void nvme_report_ns_ids(struct nvme_ctrl *ctrl, unsigned int nsid,
++	       struct nvme_id_ns *id, u8 *eui64, u8 *nguid, u8 *uuid)
+ {
+-	if (nvme_identify_ns(ns->ctrl, ns->ns_id, id)) {
+-		dev_warn(disk_to_dev(ns->disk), "%s: Identify failure\n",
+-				__func__);
+-		return -ENODEV;
+-	}
+-	if ((*id)->ncap == 0) {
+-		kfree(*id);
+-		return -ENODEV;
+-	}
+-
+-	if (ns->ctrl->vs >= NVME_VS(1, 1, 0))
+-		memcpy(ns->eui, (*id)->eui64, sizeof(ns->eui));
+-	if (ns->ctrl->vs >= NVME_VS(1, 2, 0))
+-		memcpy(ns->nguid, (*id)->nguid, sizeof(ns->nguid));
+-	if (ns->ctrl->vs >= NVME_VS(1, 3, 0)) {
++	if (ctrl->vs >= NVME_VS(1, 1, 0))
++		memcpy(eui64, id->eui64, sizeof(id->eui64));
++	if (ctrl->vs >= NVME_VS(1, 2, 0))
++		memcpy(nguid, id->nguid, sizeof(id->nguid));
++	if (ctrl->vs >= NVME_VS(1, 3, 0)) {
+ 		 /* Don't treat error as fatal we potentially
+ 		  * already have a NGUID or EUI-64
+ 		  */
+-		if (nvme_identify_ns_descs(ns, ns->ns_id))
+-			dev_warn(ns->ctrl->device,
++		if (nvme_identify_ns_descs(ctrl, nsid, eui64, nguid, uuid))
++			dev_warn(ctrl->device,
+ 				 "%s: Identify Descriptors failed\n", __func__);
+ 	}
+-
+-	return 0;
+ }
+ 
+ static void __nvme_revalidate_disk(struct gendisk *disk, struct nvme_id_ns *id)
+@@ -1074,22 +1068,28 @@ static void __nvme_revalidate_disk(struc
+ static int nvme_revalidate_disk(struct gendisk *disk)
+ {
+ 	struct nvme_ns *ns = disk->private_data;
+-	struct nvme_id_ns *id = NULL;
+-	int ret;
++	struct nvme_ctrl *ctrl = ns->ctrl;
++	struct nvme_id_ns *id;
++	int ret = 0;
+ 
+ 	if (test_bit(NVME_NS_DEAD, &ns->flags)) {
+ 		set_capacity(disk, 0);
+ 		return -ENODEV;
+ 	}
+ 
+-	ret = nvme_revalidate_ns(ns, &id);
+-	if (ret)
+-		return ret;
++	id = nvme_identify_ns(ctrl, ns->ns_id);
++	if (!id)
++		return -ENODEV;
+ 
+-	__nvme_revalidate_disk(disk, id);
+-	kfree(id);
++	if (id->ncap == 0) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 
+-	return 0;
++	nvme_report_ns_ids(ctrl, ns->ns_id, id, ns->eui, ns->nguid, ns->uuid);
++out:
++	kfree(id);
++	return ret;
+ }
+ 
+ static char nvme_pr_type(enum pr_type type)
+@@ -1831,9 +1831,15 @@ static void nvme_alloc_ns(struct nvme_ct
+ 
+ 	sprintf(disk_name, "nvme%dn%d", ctrl->instance, ns->instance);
+ 
+-	if (nvme_revalidate_ns(ns, &id))
++	id = nvme_identify_ns(ctrl, nsid);
++	if (!id)
+ 		goto out_free_queue;
+ 
++	if (id->ncap == 0)
++		goto out_free_id;
++
++	nvme_report_ns_ids(ctrl, ns->ns_id, id, ns->eui, ns->nguid, ns->uuid);
++
+ 	if (nvme_nvm_ns_supported(ns, id)) {
+ 		if (nvme_nvm_register(ns->queue, disk_name)) {
+ 			dev_warn(ctrl->dev,
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -287,8 +287,7 @@ int __nvme_submit_user_cmd(struct reques
+ 		void __user *meta_buffer, unsigned meta_len, u32 meta_seed,
+ 		u32 *result, unsigned timeout);
+ int nvme_identify_ctrl(struct nvme_ctrl *dev, struct nvme_id_ctrl **id);
+-int nvme_identify_ns(struct nvme_ctrl *dev, unsigned nsid,
+-		struct nvme_id_ns **id);
++struct nvme_id_ns *nvme_identify_ns(struct nvme_ctrl *dev, unsigned nsid);
+ int nvme_get_log_page(struct nvme_ctrl *dev, struct nvme_smart_log **log);
+ int nvme_get_features(struct nvme_ctrl *dev, unsigned fid, unsigned nsid,
+ 		      void *buffer, size_t buflen, u32 *result);
+--- a/drivers/nvme/host/scsi.c
++++ b/drivers/nvme/host/scsi.c
+@@ -518,7 +518,6 @@ static int nvme_trans_standard_inquiry_p
+ 	struct nvme_ctrl *ctrl = ns->ctrl;
+ 	struct nvme_id_ns *id_ns;
+ 	int res;
+-	int nvme_sc;
+ 	int xfer_len;
+ 	u8 resp_data_format = 0x02;
+ 	u8 protect;
+@@ -526,8 +525,10 @@ static int nvme_trans_standard_inquiry_p
+ 	u8 fw_offset = sizeof(ctrl->firmware_rev);
+ 
+ 	/* nvme ns identify - use DPS value for PROTECT field */
+-	nvme_sc = nvme_identify_ns(ctrl, ns->ns_id, &id_ns);
+-	res = nvme_trans_status_code(hdr, nvme_sc);
++	id_ns = nvme_identify_ns(ctrl, ns->ns_id);
++	if (!id_ns)
++		return -ENODEV;
++	res = nvme_trans_status_code(hdr, 0);
+ 	if (res)
+ 		return res;
+ 
+@@ -594,12 +595,14 @@ static int nvme_fill_device_id_eui64(str
+ 		u8 *inq_response, int alloc_len)
+ {
+ 	struct nvme_id_ns *id_ns;
+-	int nvme_sc, res;
++	int res;
+ 	size_t len;
+ 	void *eui;
+ 
+-	nvme_sc = nvme_identify_ns(ns->ctrl, ns->ns_id, &id_ns);
+-	res = nvme_trans_status_code(hdr, nvme_sc);
++	id_ns = nvme_identify_ns(ns->ctrl, ns->ns_id);
++	if (!id_ns)
++		return -ENODEV;
++	res = nvme_trans_status_code(hdr, 0);
+ 	if (res)
+ 		return res;
+ 
+@@ -710,8 +713,10 @@ static int nvme_trans_ext_inq_page(struc
+ 	if (inq_response == NULL)
+ 		return -ENOMEM;
+ 
+-	nvme_sc = nvme_identify_ns(ctrl, ns->ns_id, &id_ns);
+-	res = nvme_trans_status_code(hdr, nvme_sc);
++	id_ns = nvme_identify_ns(ctrl, ns->ns_id);
++	if (!id_ns)
++		return -ENODEV;
++	res = nvme_trans_status_code(hdr, 0);
+ 	if (res)
+ 		goto out_free_inq;
+ 
+@@ -967,7 +972,6 @@ static int nvme_trans_fill_blk_desc(stru
+ 				    u8 *resp, int len, u8 llbaa)
+ {
+ 	int res;
+-	int nvme_sc;
+ 	struct nvme_id_ns *id_ns;
+ 	u8 flbas;
+ 	u32 lba_length;
+@@ -977,8 +981,10 @@ static int nvme_trans_fill_blk_desc(stru
+ 	else if (llbaa > 0 && len < MODE_PAGE_LLBAA_BLK_DES_LEN)
+ 		return -EINVAL;
+ 
+-	nvme_sc = nvme_identify_ns(ns->ctrl, ns->ns_id, &id_ns);
+-	res = nvme_trans_status_code(hdr, nvme_sc);
++	id_ns = nvme_identify_ns(ns->ctrl, ns->ns_id);
++	if (!id_ns)
++		return -ENODEV;
++	res = nvme_trans_status_code(hdr, 0);
+ 	if (res)
+ 		return res;
+ 
+@@ -1425,7 +1431,6 @@ static int nvme_trans_fmt_set_blk_size_c
+ 					     struct sg_io_hdr *hdr)
+ {
+ 	int res = 0;
+-	int nvme_sc;
+ 	u8 flbas;
+ 
+ 	/*
+@@ -1438,8 +1443,10 @@ static int nvme_trans_fmt_set_blk_size_c
+ 	if (ns->mode_select_num_blocks == 0 || ns->mode_select_block_len == 0) {
+ 		struct nvme_id_ns *id_ns;
+ 
+-		nvme_sc = nvme_identify_ns(ns->ctrl, ns->ns_id, &id_ns);
+-		res = nvme_trans_status_code(hdr, nvme_sc);
++		id_ns = nvme_identify_ns(ns->ctrl, ns->ns_id);
++		if (!id_ns)
++			return -ENODEV;
++		res = nvme_trans_status_code(hdr, 0);
+ 		if (res)
+ 			return res;
+ 
+@@ -1520,8 +1527,7 @@ static int nvme_trans_fmt_get_parm_heade
+ static int nvme_trans_fmt_send_cmd(struct nvme_ns *ns, struct sg_io_hdr *hdr,
+ 				   u8 prot_info)
+ {
+-	int res;
+-	int nvme_sc;
++	int res, nvme_sc;
+ 	struct nvme_id_ns *id_ns;
+ 	u8 i;
+ 	u8 nlbaf;
+@@ -1530,8 +1536,10 @@ static int nvme_trans_fmt_send_cmd(struc
+ 	struct nvme_command c;
+ 
+ 	/* Loop thru LBAF's in id_ns to match reqd lbaf, put in cdw10 */
+-	nvme_sc = nvme_identify_ns(ns->ctrl, ns->ns_id, &id_ns);
+-	res = nvme_trans_status_code(hdr, nvme_sc);
++	id_ns = nvme_identify_ns(ns->ctrl, ns->ns_id);
++	if (!id_ns)
++		return -ENODEV;
++	res = nvme_trans_status_code(hdr, 0);
+ 	if (res)
+ 		return res;
+ 
+@@ -1986,7 +1994,6 @@ static int nvme_trans_read_capacity(stru
+ 							u8 *cmd, u8 cdb16)
+ {
+ 	int res;
+-	int nvme_sc;
+ 	u32 alloc_len;
+ 	u32 resp_size;
+ 	u32 xfer_len;
+@@ -2001,8 +2008,10 @@ static int nvme_trans_read_capacity(stru
+ 		resp_size = READ_CAP_10_RESP_SIZE;
+ 	}
+ 
+-	nvme_sc = nvme_identify_ns(ns->ctrl, ns->ns_id, &id_ns);
+-	res = nvme_trans_status_code(hdr, nvme_sc);
++	id_ns = nvme_identify_ns(ns->ctrl, ns->ns_id);
++	if (!id_ns)
++		return -ENODEV;
++	res = nvme_trans_status_code(hdr, 0);
+ 	if (res)
+ 		return res;	
+ 
