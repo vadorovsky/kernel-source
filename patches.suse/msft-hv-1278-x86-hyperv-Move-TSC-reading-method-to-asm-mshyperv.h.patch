@@ -1,0 +1,140 @@
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Fri, 3 Mar 2017 14:21:41 +0100
+Patch-mainline: v4.12-rc1
+Subject: x86/hyperv: Move TSC reading method to asm/mshyperv.h
+Git-commit: 0733379b512ce36ba0b10942f9597b74f579f063
+References: fate#315887, bsc#1082632
+
+As a preparation to making Hyper-V TSC page suitable for vDSO move
+the TSC page reading logic to asm/mshyperv.h. While on it, do the
+following:
+
+- Document the reading algorithm.
+- Simplify the code a bit.
+- Add explicit READ_ONCE() to not rely on 'volatile'.
+- Add explicit barriers to prevent re-ordering (we need to read sequence
+  strictly before and after)
+- Use mul_u64_u64_shr() instead of assembly, gcc generates a single 'mul'
+  instruction on x86_64 anyway.
+
+[ tglx: Simplified the loop ]
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Cc: Stephen Hemminger <sthemmin@microsoft.com>
+Cc: Haiyang Zhang <haiyangz@microsoft.com>
+Cc: Dexuan Cui <decui@microsoft.com>
+Cc: Andy Lutomirski <luto@amacapital.net>
+Cc: devel@linuxdriverproject.org
+Cc: "K. Y. Srinivasan" <kys@microsoft.com>
+Cc: virtualization@lists.linux-foundation.org
+Link: http://lkml.kernel.org/r/20170303132142.25595-3-vkuznets@redhat.com
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Olaf Hering <ohering@suse.de>
+---
+ arch/x86/hyperv/hv_init.c       | 36 ++++----------------------------
+ arch/x86/include/asm/mshyperv.h | 46 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+), 32 deletions(-)
+
+diff --git a/arch/x86/hyperv/hv_init.c b/arch/x86/hyperv/hv_init.c
+--- a/arch/x86/hyperv/hv_init.c
++++ b/arch/x86/hyperv/hv_init.c
+@@ -38,39 +38,11 @@ struct ms_hyperv_tsc_page *hv_get_tsc_page(void)
+ 
+ static u64 read_hv_clock_tsc(struct clocksource *arg)
+ {
+-	u64 current_tick;
++	u64 current_tick = hv_read_tsc_page(tsc_pg);
++
++	if (current_tick == U64_MAX)
++		rdmsrl(HV_X64_MSR_TIME_REF_COUNT, current_tick);
+ 
+-	if (tsc_pg->tsc_sequence != 0) {
+-		/*
+-		 * Use the tsc page to compute the value.
+-		 */
+-
+-		while (1) {
+-			u64 tmp;
+-			u32 sequence = tsc_pg->tsc_sequence;
+-			u64 cur_tsc;
+-			u64 scale = tsc_pg->tsc_scale;
+-			s64 offset = tsc_pg->tsc_offset;
+-
+-			rdtscll(cur_tsc);
+-			/* current_tick = ((cur_tsc *scale) >> 64) + offset */
+-			asm("mulq %3"
+-				: "=d" (current_tick), "=a" (tmp)
+-				: "a" (cur_tsc), "r" (scale));
+-
+-			current_tick += offset;
+-			if (tsc_pg->tsc_sequence == sequence)
+-				return current_tick;
+-
+-			if (tsc_pg->tsc_sequence != 0)
+-				continue;
+-			/*
+-			 * Fallback using MSR method.
+-			 */
+-			break;
+-		}
+-	}
+-	rdmsrl(HV_X64_MSR_TIME_REF_COUNT, current_tick);
+ 	return current_tick;
+ }
+ 
+diff --git a/arch/x86/include/asm/mshyperv.h b/arch/x86/include/asm/mshyperv.h
+--- a/arch/x86/include/asm/mshyperv.h
++++ b/arch/x86/include/asm/mshyperv.h
+@@ -178,6 +178,52 @@ void hyperv_cleanup(void);
+ #endif
+ #ifdef CONFIG_HYPERV_TSCPAGE
+ struct ms_hyperv_tsc_page *hv_get_tsc_page(void);
++static inline u64 hv_read_tsc_page(const struct ms_hyperv_tsc_page *tsc_pg)
++{
++	u64 scale, offset, cur_tsc;
++	u32 sequence;
++
++	/*
++	 * The protocol for reading Hyper-V TSC page is specified in Hypervisor
++	 * Top-Level Functional Specification ver. 3.0 and above. To get the
++	 * reference time we must do the following:
++	 * - READ ReferenceTscSequence
++	 *   A special '0' value indicates the time source is unreliable and we
++	 *   need to use something else. The currently published specification
++	 *   versions (up to 4.0b) contain a mistake and wrongly claim '-1'
++	 *   instead of '0' as the special value, see commit c35b82ef0294.
++	 * - ReferenceTime =
++	 *        ((RDTSC() * ReferenceTscScale) >> 64) + ReferenceTscOffset
++	 * - READ ReferenceTscSequence again. In case its value has changed
++	 *   since our first reading we need to discard ReferenceTime and repeat
++	 *   the whole sequence as the hypervisor was updating the page in
++	 *   between.
++	 */
++	do {
++		sequence = READ_ONCE(tsc_pg->tsc_sequence);
++		if (!sequence)
++			return U64_MAX;
++		/*
++		 * Make sure we read sequence before we read other values from
++		 * TSC page.
++		 */
++		smp_rmb();
++
++		scale = READ_ONCE(tsc_pg->tsc_scale);
++		offset = READ_ONCE(tsc_pg->tsc_offset);
++		cur_tsc = rdtsc_ordered();
++
++		/*
++		 * Make sure we read sequence after we read all other values
++		 * from TSC page.
++		 */
++		smp_rmb();
++
++	} while (READ_ONCE(tsc_pg->tsc_sequence) != sequence);
++
++	return mul_u64_u64_shr(cur_tsc, scale, 64) + offset;
++}
++
+ #else
+ static inline struct ms_hyperv_tsc_page *hv_get_tsc_page(void)
+ {
