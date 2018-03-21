@@ -10,3 +10,5 @@ OBS_PROJECT_S390=openSUSE:Factory:zSystems
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
 BUGZILLA_PRODUCT="openSUSE Tumbleweed"
+# Check the sorted patches section of series.conf
+SORT_SERIES=yes
