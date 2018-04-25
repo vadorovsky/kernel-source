@@ -1,0 +1,135 @@
+From: Petr Mladek <pmladek@suse.com>
+Date: Mon, 16 Apr 2018 13:36:47 +0200
+Subject: livepatch: Allow to call a custom callback when freeing shadow
+ variables
+Git-commit: 3b2c77d000fe9f7d02e9e726e00dccf9f92b256f
+Patch-mainline: v4.17-rc2
+References: bsc#1082299 fate#313296
+
+We might need to do some actions before the shadow variable is freed.
+For example, we might need to remove it from a list or free some data
+that it points to.
+
+This is already possible now. The user can get the shadow variable
+by kgr_shadow_get(), do the necessary actions, and then call
+kgr_shadow_free().
+
+This patch allows to do it a more elegant way. The user could implement
+the needed actions in a callback that is passed to kgr_shadow_free()
+as a parameter. The callback usually does reverse operations to
+the constructor callback that can be called by kgr_shadow_*alloc().
+
+It is especially useful for kgr_shadow_free_all(). There we need to do
+these extra actions for each found shadow variable with the given ID.
+
+Note that the memory used by the shadow variable itself is still released
+later by rcu callback. It is needed to protect internal structures that
+keep all shadow variables. But the destructor is called immediately.
+The shadow variable must not be access anyway after kgr_shadow_free()
+is called. The user is responsible to protect this any suitable way.
+
+Be aware that the destructor is called under kgr_shadow_lock. It is
+the same as for the contructor in kgr_shadow_alloc().
+
+Signed-off-by: Petr Mladek <pmladek@suse.com>
+Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+[ mb: backport to SLE12:
+ - strip documentation and samples
+ - s/kgr_/kgr_/ plus other necessary changes
+]
+Acked-by: Miroslav Benes <mbenes@suse.cz>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+---
+ include/linux/kgraft.h |    5 +++--
+ kernel/kgraft_shadow.c |   26 ++++++++++++++++++--------
+ 2 files changed, 21 insertions(+), 10 deletions(-)
+
+--- a/include/linux/kgraft.h
++++ b/include/linux/kgraft.h
+@@ -151,6 +151,7 @@ static inline void kgr_mark_task_in_prog
+ typedef int (*kgr_shadow_ctor_t)(void *obj,
+ 				 void *shadow_data,
+ 				 void *ctor_data);
++typedef void (*kgr_shadow_dtor_t)(void *obj, void *shadow_data);
+ 
+ extern void *kgr_shadow_get(void *obj, unsigned long id);
+ void *kgr_shadow_alloc(void *obj, unsigned long id,
+@@ -159,8 +160,8 @@ void *kgr_shadow_alloc(void *obj, unsign
+ void *kgr_shadow_get_or_alloc(void *obj, unsigned long id,
+ 			      size_t size, gfp_t gfp_flags,
+ 			      kgr_shadow_ctor_t ctor, void *ctor_data);
+-extern void kgr_shadow_free(void *obj, unsigned long id);
+-extern void kgr_shadow_free_all(unsigned long id);
++void kgr_shadow_free(void *obj, unsigned long id, kgr_shadow_dtor_t dtor);
++void kgr_shadow_free_all(unsigned long id, kgr_shadow_dtor_t dtor);
+ 
+ #endif /* IS_ENABLED(CONFIG_KGRAFT) */
+ 
+--- a/kernel/kgraft_shadow.c
++++ b/kernel/kgraft_shadow.c
+@@ -243,15 +243,26 @@ void *kgr_shadow_get_or_alloc(void *obj,
+ }
+ EXPORT_SYMBOL_GPL(kgr_shadow_get_or_alloc);
+ 
++static void kgr_shadow_free_struct(struct kgr_shadow *shadow,
++				   kgr_shadow_dtor_t dtor)
++{
++	hash_del_rcu(&shadow->node);
++	if (dtor)
++		dtor(shadow->obj, shadow->data);
++	kfree_rcu(shadow, rcu_head);
++}
++
+ /**
+  * kgr_shadow_free() - detach and free a <obj, id> shadow variable
+  * @obj:	pointer to parent object
+  * @id:		data identifier
++ * @dtor:	custom callback that can be used to unregister the variable
++ *		and/or free data that the shadow variable points to (optional)
+  *
+  * This function releases the memory for this <obj, id> shadow variable
+  * instance, callers should stop referencing it accordingly.
+  */
+-void kgr_shadow_free(void *obj, unsigned long id)
++void kgr_shadow_free(void *obj, unsigned long id, kgr_shadow_dtor_t dtor)
+ {
+ 	struct kgr_shadow *shadow;
+ 	unsigned long flags;
+@@ -263,8 +274,7 @@ void kgr_shadow_free(void *obj, unsigned
+ 			       (unsigned long)obj) {
+ 
+ 		if (kgr_shadow_match(shadow, obj, id)) {
+-			hash_del_rcu(&shadow->node);
+-			kfree_rcu(shadow, rcu_head);
++			kgr_shadow_free_struct(shadow, dtor);
+ 			break;
+ 		}
+ 	}
+@@ -276,11 +286,13 @@ EXPORT_SYMBOL_GPL(kgr_shadow_free);
+ /**
+  * kgr_shadow_free_all() - detach and free all <*, id> shadow variables
+  * @id:		data identifier
++ * @dtor:	custom callback that can be used to unregister the variable
++ *		and/or free data that the shadow variable points to (optional)
+  *
+  * This function releases the memory for all <*, id> shadow variable
+  * instances, callers should stop referencing them accordingly.
+  */
+-void kgr_shadow_free_all(unsigned long id)
++void kgr_shadow_free_all(unsigned long id, kgr_shadow_dtor_t dtor)
+ {
+ 	struct kgr_shadow *shadow;
+ 	unsigned long flags;
+@@ -290,10 +302,8 @@ void kgr_shadow_free_all(unsigned long i
+ 
+ 	/* Delete all <*, id> from hash */
+ 	hash_for_each(kgr_shadow_hash, i, shadow, node) {
+-		if (kgr_shadow_match(shadow, shadow->obj, id)) {
+-			hash_del_rcu(&shadow->node);
+-			kfree_rcu(shadow, rcu_head);
+-		}
++		if (kgr_shadow_match(shadow, shadow->obj, id))
++			kgr_shadow_free_struct(shadow, dtor);
+ 	}
+ 
+ 	spin_unlock_irqrestore(&kgr_shadow_lock, flags);
