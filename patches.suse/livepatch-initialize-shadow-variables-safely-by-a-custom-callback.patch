@@ -1,0 +1,216 @@
+From: Petr Mladek <pmladek@suse.com>
+Date: Mon, 16 Apr 2018 13:36:46 +0200
+Subject: livepatch: Initialize shadow variables safely by a custom callback
+Git-commit: e91c2518a5d22a07642f35d85f39001ad379dae4
+Patch-mainline: v4.17-rc2
+References: bsc#1082299 fate#313296
+
+The existing API allows to pass a sample data to initialize the shadow
+data. It works well when the data are position independent. But it fails
+miserably when we need to set a pointer to the shadow structure itself.
+
+Unfortunately, we might need to initialize the pointer surprisingly
+often because of struct list_head. It is even worse because the list
+might be hidden in other common structures, for example, struct mutex,
+struct wait_queue_head.
+
+For example, this was needed to fix races in ALSA sequencer. It required
+to add mutex into struct snd_seq_client. See commit b3defb791b26ea06
+("ALSA: seq: Make ioctls race-free") and commit d15d662e89fc667b9
+("ALSA: seq: Fix racy pool initializations")
+
+This patch makes the API more safe. A custom constructor function and data
+are passed to kgr_shadow_*alloc() functions instead of the sample data.
+
+Note that ctor_data are no longer a template for shadow->data. It might
+point to any data that might be necessary when the constructor is called.
+
+Also note that the constructor is called under kgr_shadow_lock. It is
+an internal spin_lock that synchronizes alloc() vs. get() operations,
+see kgr_shadow_get_or_alloc(). On one hand, this adds a risk of ABBA
+deadlocks. On the other hand, it allows to do some operations safely.
+For example, we could add the new structure into an existing list.
+This must be done only once when the structure is allocated.
+
+Reported-by: Nicolai Stange <nstange@suse.de>
+Signed-off-by: Petr Mladek <pmladek@suse.com>
+Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+[ mb: backport to SLE12:
+ - strip documentation and samples
+ - s/klp_/kgr_/ plus other necessary changes
+]
+Acked-by: Miroslav Benes <mbenes@suse.cz>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+---
+ include/linux/kgraft.h |   13 +++++--
+ kernel/kgraft_shadow.c |   84 +++++++++++++++++++++++++++++++------------------
+ 2 files changed, 63 insertions(+), 34 deletions(-)
+
+--- a/include/linux/kgraft.h
++++ b/include/linux/kgraft.h
+@@ -139,12 +139,17 @@ extern void kgr_patch_dir_del(struct kgr
+ extern int kgr_add_files(void);
+ extern void kgr_remove_files(void);
+ 
++typedef int (*kgr_shadow_ctor_t)(void *obj,
++				 void *shadow_data,
++				 void *ctor_data);
+ 
+ extern void *kgr_shadow_get(void *obj, unsigned long id);
+-extern void *kgr_shadow_alloc(void *obj, unsigned long id, void *data,
+-			      size_t size, gfp_t gfp_flags);
+-extern void *kgr_shadow_get_or_alloc(void *obj, unsigned long id, void *data,
+-				     size_t size, gfp_t gfp_flags);
++void *kgr_shadow_alloc(void *obj, unsigned long id,
++		       size_t size, gfp_t gfp_flags,
++		       kgr_shadow_ctor_t ctor, void *ctor_data);
++void *kgr_shadow_get_or_alloc(void *obj, unsigned long id,
++			      size_t size, gfp_t gfp_flags,
++			      kgr_shadow_ctor_t ctor, void *ctor_data);
+ extern void kgr_shadow_free(void *obj, unsigned long id);
+ extern void kgr_shadow_free_all(unsigned long id);
+ 
+--- a/kernel/kgraft_shadow.c
++++ b/kernel/kgraft_shadow.c
+@@ -113,8 +113,10 @@ void *kgr_shadow_get(void *obj, unsigned
+ }
+ EXPORT_SYMBOL_GPL(kgr_shadow_get);
+ 
+-static void *__kgr_shadow_get_or_alloc(void *obj, unsigned long id, void *data,
+-		       size_t size, gfp_t gfp_flags, bool warn_on_exist)
++static void *__kgr_shadow_get_or_alloc(void *obj, unsigned long id,
++				       size_t size, gfp_t gfp_flags,
++				       kgr_shadow_ctor_t ctor, void *ctor_data,
++				       bool warn_on_exist)
+ {
+ 	struct kgr_shadow *new_shadow;
+ 	void *shadow_data;
+@@ -125,18 +127,15 @@ static void *__kgr_shadow_get_or_alloc(v
+ 	if (shadow_data)
+ 		goto exists;
+ 
+-	/* Allocate a new shadow variable for use inside the lock below */
++	/*
++	 * Allocate a new shadow variable.  Fill it with zeroes by default.
++	 * More complex setting can be done by @ctor function.  But it is
++	 * called only when the buffer is really used (under kgr_shadow_lock).
++	 */
+ 	new_shadow = kzalloc(size + sizeof(*new_shadow), gfp_flags);
+ 	if (!new_shadow)
+ 		return NULL;
+ 
+-	new_shadow->obj = obj;
+-	new_shadow->id = id;
+-
+-	/* Initialize the shadow variable if data provided */
+-	if (data)
+-		memcpy(new_shadow->data, data, size);
+-
+ 	/* Look for <obj, id> again under the lock */
+ 	spin_lock_irqsave(&kgr_shadow_lock, flags);
+ 	shadow_data = kgr_shadow_get(obj, id);
+@@ -150,6 +149,22 @@ static void *__kgr_shadow_get_or_alloc(v
+ 		goto exists;
+ 	}
+ 
++	new_shadow->obj = obj;
++	new_shadow->id = id;
++
++	if (ctor) {
++		int err;
++
++		err = ctor(obj, new_shadow->data, ctor_data);
++		if (err) {
++			spin_unlock_irqrestore(&kgr_shadow_lock, flags);
++			kfree(new_shadow);
++			pr_err("Failed to construct shadow variable <%p, %lx> (%d)\n",
++			       obj, id, err);
++			return NULL;
++		}
++	}
++
+ 	/* No <obj, id> found, so attach the newly allocated one */
+ 	hash_add_rcu(kgr_shadow_hash, &new_shadow->node,
+ 		     (unsigned long)new_shadow->obj);
+@@ -170,26 +185,32 @@ exists:
+  * kgr_shadow_alloc() - allocate and add a new shadow variable
+  * @obj:	pointer to parent object
+  * @id:		data identifier
+- * @data:	pointer to data to attach to parent
+  * @size:	size of attached data
+  * @gfp_flags:	GFP mask for allocation
++ * @ctor:	custom constructor to initialize the shadow data (optional)
++ * @ctor_data:	pointer to any data needed by @ctor (optional)
+  *
+- * Allocates @size bytes for new shadow variable data using @gfp_flags
+- * and copies @size bytes from @data into the new shadow variable's own
+- * data space.  If @data is NULL, @size bytes are still allocated, but
+- * no copy is performed.  The new shadow variable is then added to the
+- * global hashtable.
+- *
+- * If an existing <obj, id> shadow variable can be found, this routine
+- * will issue a WARN, exit early and return NULL.
++ * Allocates @size bytes for new shadow variable data using @gfp_flags.
++ * The data are zeroed by default.  They are further initialized by @ctor
++ * function if it is not NULL.  The new shadow variable is then added
++ * to the global hashtable.
++ *
++ * If an existing <obj, id> shadow variable can be found, this routine will
++ * issue a WARN, exit early and return NULL.
++ *
++ * This function guarantees that the constructor function is called only when
++ * the variable did not exist before.  The cost is that @ctor is called
++ * in atomic context under a spin lock.
+  *
+  * Return: the shadow variable data element, NULL on duplicate or
+  * failure.
+  */
+-void *kgr_shadow_alloc(void *obj, unsigned long id, void *data,
+-		       size_t size, gfp_t gfp_flags)
++void *kgr_shadow_alloc(void *obj, unsigned long id,
++		       size_t size, gfp_t gfp_flags,
++		       kgr_shadow_ctor_t ctor, void *ctor_data)
+ {
+-	return __kgr_shadow_get_or_alloc(obj, id, data, size, gfp_flags, true);
++	return __kgr_shadow_get_or_alloc(obj, id, size, gfp_flags,
++					 ctor, ctor_data, true);
+ }
+ EXPORT_SYMBOL_GPL(kgr_shadow_alloc);
+ 
+@@ -197,25 +218,28 @@ EXPORT_SYMBOL_GPL(kgr_shadow_alloc);
+  * kgr_shadow_get_or_alloc() - get existing or allocate a new shadow variable
+  * @obj:	pointer to parent object
+  * @id:		data identifier
+- * @data:	pointer to data to attach to parent
+  * @size:	size of attached data
+  * @gfp_flags:	GFP mask for allocation
++ * @ctor:	custom constructor to initialize the shadow data (optional)
++ * @ctor_data:	pointer to any data needed by @ctor (optional)
+  *
+  * Returns a pointer to existing shadow data if an <obj, id> shadow
+  * variable is already present.  Otherwise, it creates a new shadow
+  * variable like kgr_shadow_alloc().
+  *
+- * This function guarantees that only one shadow variable exists with
+- * the given @id for the given @obj.  It also guarantees that the shadow
+- * variable will be initialized by the given @data only when it did not
+- * exist before.
++ * This function guarantees that only one shadow variable exists with the given
++ * @id for the given @obj.  It also guarantees that the constructor function
++ * will be called only when the variable did not exist before.  The cost is
++ * that @ctor is called in atomic context under a spin lock.
+  *
+  * Return: the shadow variable data element, NULL on failure.
+  */
+-void *kgr_shadow_get_or_alloc(void *obj, unsigned long id, void *data,
+-			       size_t size, gfp_t gfp_flags)
++void *kgr_shadow_get_or_alloc(void *obj, unsigned long id,
++			      size_t size, gfp_t gfp_flags,
++			      kgr_shadow_ctor_t ctor, void *ctor_data)
+ {
+-	return __kgr_shadow_get_or_alloc(obj, id, data, size, gfp_flags, false);
++	return __kgr_shadow_get_or_alloc(obj, id, size, gfp_flags,
++					 ctor, ctor_data, false);
+ }
+ EXPORT_SYMBOL_GPL(kgr_shadow_get_or_alloc);
+ 
