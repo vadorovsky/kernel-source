@@ -1,0 +1,602 @@
+From: Jiri Slaby <jslaby@suse.cz>
+Subject: x86-non-upstream-eager-fpu
+Patch-mainline: never, SUSE specific
+References: bnc#1087086 CVE-2018-3665
+
+This is a mixture of upstream commits:
+304bceda6a18ae0b0240b8aac9a6bdf8ce2d2469
+5d2bd7009f306c82afddd1ca4d9763ad8473c216
+4f81cbafcce2c603db7865e9d0e461f7947d77d4
+58122bf1d856a4ea9581d62a07c557d997d46a19
+
+It is supposed to add the eager-fpu and make it the default.
+
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+---
+ arch/x86/include/asm/cpufeature.h |    1 
+ arch/x86/include/asm/i387.h       |  113 ++++++++++++++++++++++++++++++--------
+ arch/x86/include/asm/xsave.h      |    1 
+ arch/x86/kernel/cpu/bugs.c        |    7 ++
+ arch/x86/kernel/cpu/common.c      |    4 -
+ arch/x86/kernel/i387.c            |   13 +---
+ arch/x86/kernel/process.c         |   12 ++--
+ arch/x86/kernel/process_32.c      |    5 -
+ arch/x86/kernel/process_64.c      |    5 -
+ arch/x86/kernel/traps.c           |    4 +
+ arch/x86/kernel/xsave.c           |   75 ++++++++++++++++++++-----
+ 11 files changed, 178 insertions(+), 62 deletions(-)
+
+--- a/arch/x86/include/asm/cpufeature.h
++++ b/arch/x86/include/asm/cpufeature.h
+@@ -97,6 +97,7 @@
+ #define X86_FEATURE_EXTD_APICID	(3*32+26) /* has extended APICID (8 bits) */
+ #define X86_FEATURE_AMD_DCM     (3*32+27) /* multi-node processor */
+ #define X86_FEATURE_APERFMPERF	(3*32+28) /* APERFMPERF */
++#define X86_FEATURE_EAGER_FPU	(3*32+29) /* "eagerfpu" Non lazy FPU restore */
+ 
+ /* Intel-defined CPU features, CPUID level 0x00000001 (ecx), word 4 */
+ #define X86_FEATURE_XMM3	(4*32+ 0) /* "pni" SSE-3 */
+--- a/arch/x86/include/asm/i387.h
++++ b/arch/x86/include/asm/i387.h
+@@ -27,10 +27,12 @@
+ 
+ extern unsigned int sig_xstate_size;
+ extern void fpu_init(void);
++extern void eager_fpu_init(void);
+ extern void mxcsr_feature_mask_init(void);
+ extern int init_fpu(struct task_struct *child);
+ extern void math_state_restore(void);
+ extern int dump_fpu(struct pt_regs *, struct user_i387_struct *);
++void fpu__init_parse_early_param(void);
+ 
+ extern user_regset_active_fn fpregs_active, xfpregs_active;
+ extern user_regset_get_fn fpregs_get, xfpregs_get, fpregs_soft_get,
+@@ -62,6 +64,11 @@ static inline void finit_soft_fpu(struct
+ 
+ #define X87_FSW_ES (1 << 7)	/* Exception Summary */
+ 
++static __always_inline __pure bool use_eager_fpu(void)
++{
++	return static_cpu_has(X86_FEATURE_EAGER_FPU);
++}
++
+ static __always_inline __pure bool use_xsaveopt(void)
+ {
+ 	return static_cpu_has(X86_FEATURE_XSAVEOPT);
+@@ -77,6 +84,14 @@ static __always_inline __pure bool use_f
+         return static_cpu_has(X86_FEATURE_FXSR);
+ }
+ 
++static inline void fx_finit(struct i387_fxsave_struct *fx)
++{
++	memset(fx, 0, xstate_size);
++	fx->cwd = 0x37f;
++	if (cpu_has_xmm)
++		fx->mxcsr = MXCSR_DEFAULT;
++}
++
+ extern void __sanitize_i387_state(struct task_struct *);
+ 
+ static inline void sanitize_i387_state(struct task_struct *tsk)
+@@ -313,15 +328,52 @@ static inline void __thread_set_has_fpu(
+ static inline void __thread_fpu_end(struct task_struct *tsk)
+ {
+ 	__thread_clear_has_fpu(tsk);
+-	stts();
++	if (!use_eager_fpu())
++		stts();
+ }
+ 
+ static inline void __thread_fpu_begin(struct task_struct *tsk)
+ {
+-	clts();
++	if (!use_eager_fpu())
++		clts();
+ 	__thread_set_has_fpu(tsk);
+ }
+ 
++static inline void __clear_fpu(struct task_struct *tsk)
++{
++	if (__thread_has_fpu(tsk)) {
++		/* Ignore delayed exceptions from user space */
++		asm volatile("1: fwait\n"
++			     "2:\n"
++			     _ASM_EXTABLE(1b, 2b));
++		__thread_fpu_end(tsk);
++	}
++}
++
++static inline void drop_fpu(struct task_struct *tsk)
++{
++	/*
++	 * Forget coprocessor state..
++	 */
++	preempt_disable();
++	tsk->fpu_counter = 0;
++	__clear_fpu(tsk);
++	clear_used_math();
++	preempt_enable();
++}
++
++static inline void drop_init_fpu(struct task_struct *tsk)
++{
++	if (!use_eager_fpu())
++		drop_fpu(tsk);
++	else {
++		if (use_xsave())
++			xrstor_state(init_xstate_buf, -1);
++		else
++			fxrstor_checking(&init_xstate_buf->i387);
++	}
++}
++
+ /*
+  * FPU state switching for scheduling.
+  *
+@@ -352,7 +404,8 @@ static inline fpu_switch_t switch_fpu_pr
+ {
+ 	fpu_switch_t fpu;
+ 
+-	fpu.preload = tsk_used_math(new) && new->fpu_counter > 5;
++	fpu.preload = tsk_used_math(new) && (use_eager_fpu() ||
++			new->fpu_counter > 5);
+ 	if (__thread_has_fpu(old)) {
+ 		if (__save_init_fpu(old))
+ 			fpu_lazy_state_intact(old);
+@@ -363,12 +416,12 @@ static inline fpu_switch_t switch_fpu_pr
+ 		if (fpu.preload) {
+ 			__thread_set_has_fpu(new);
+ 			prefetch(new->thread.fpu.state);
+-		} else
++		} else if (!use_eager_fpu())
+ 			stts();
+ 	} else {
+ 		old->fpu_counter = 0;
+ 		if (fpu.preload) {
+-			if (fpu_lazy_restore(new))
++			if (!use_eager_fpu() && fpu_lazy_restore(new))
+ 				fpu.preload = 0;
+ 			else
+ 				prefetch(new->thread.fpu.state);
+@@ -388,7 +441,7 @@ static inline void switch_fpu_finish(str
+ {
+ 	if (fpu.preload) {
+ 		if (unlikely(restore_fpu_checking(new)))
+-			__thread_fpu_end(new);
++			drop_init_fpu(new);
+ 	}
+ }
+ 
+@@ -398,17 +451,6 @@ static inline void switch_fpu_finish(str
+ extern int save_i387_xstate(void __user *buf);
+ extern int restore_i387_xstate(void __user *buf);
+ 
+-static inline void __clear_fpu(struct task_struct *tsk)
+-{
+-	if (__thread_has_fpu(tsk)) {
+-		/* Ignore delayed exceptions from user space */
+-		asm volatile("1: fwait\n"
+-			     "2:\n"
+-			     _ASM_EXTABLE(1b, 2b));
+-		__thread_fpu_end(tsk);
+-	}
+-}
+-
+ /*
+  * Were we in an interrupt that interrupted kernel mode?
+  *
+@@ -420,6 +462,9 @@ static inline void __clear_fpu(struct ta
+  */
+ static inline bool interrupted_kernel_fpu_idle(void)
+ {
++	if (use_eager_fpu())
++		return 0;
++
+ 	return !__thread_has_fpu(current) &&
+ 		(read_cr0() & X86_CR0_TS);
+ }
+@@ -462,13 +507,16 @@ static inline void kernel_fpu_begin(void
+ 		__save_init_fpu(me);
+ 		__thread_clear_has_fpu(me);
+ 		/* We do 'stts()' in kernel_fpu_end() */
+-	} else
++	} else if (!use_eager_fpu())
+ 		clts();
+ }
+ 
+ static inline void kernel_fpu_end(void)
+ {
+-	stts();
++	if (use_eager_fpu())
++		math_state_restore();
++	else
++		stts();
+ 	preempt_enable();
+ }
+ 
+@@ -542,12 +590,26 @@ static inline void user_fpu_begin(void)
+ 	preempt_enable();
+ }
+ 
++static inline void __save_fpu(struct task_struct *tsk)
++{
++	if (use_xsave())
++		xsave_state(&tsk->thread.fpu.state->xsave, -1);
++	else
++		fpu_fxsave(&tsk->thread.fpu);
++}
++
+ /*
+  * These disable preemption on their own and are safe
+  */
+ static inline void save_init_fpu(struct task_struct *tsk)
+ {
+ 	WARN_ON_ONCE(!__thread_has_fpu(tsk));
++
++	if (use_eager_fpu()) {
++		__save_fpu(tsk);
++		return;
++	}
++
+ 	preempt_disable();
+ 	__save_init_fpu(tsk);
+ 	__thread_fpu_end(tsk);
+@@ -626,9 +688,18 @@ static inline void fpu_free(struct fpu *
+ 	}
+ }
+ 
+-static inline void fpu_copy(struct fpu *dst, struct fpu *src)
++static inline void fpu_copy(struct task_struct *dst, struct task_struct *src)
+ {
+-	memcpy(dst->state, src->state, xstate_size);
++	if (use_eager_fpu()) {
++		memset(&dst->thread.fpu.state->xsave, 0, xstate_size);
++		__save_fpu(dst);
++	} else {
++		struct fpu *dfpu = &dst->thread.fpu;
++		struct fpu *sfpu = &src->thread.fpu;
++
++		unlazy_fpu(src);
++		memcpy(dfpu->state, sfpu->state, xstate_size);
++	}
+ }
+ 
+ extern void fpu_finit(struct fpu *fpu);
+--- a/arch/x86/include/asm/xsave.h
++++ b/arch/x86/include/asm/xsave.h
+@@ -34,6 +34,7 @@
+ extern unsigned int xstate_size;
+ extern u64 pcntxt_mask;
+ extern u64 xstate_fx_sw_bytes[USER_XSTATE_FX_SW_WORDS];
++extern struct xsave_struct *init_xstate_buf;
+ 
+ extern void xsave_init(void);
+ extern void update_regset_xstate_info(unsigned int size, u64 xstate_mask);
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -165,10 +165,15 @@ void __init check_bugs(void)
+ 	print_cpu_info(&boot_cpu_data);
+ #endif
+ 	check_config();
+-	check_fpu();
+ 	check_hlt();
+ 	check_popad();
+ 	init_utsname()->machine[1] =
+ 		'0' + (boot_cpu_data.x86 > 6 ? 6 : boot_cpu_data.x86);
+ 	alternative_instructions();
++
++	/*
++	 * kernel_fpu_begin/end() in check_fpu() relies on the patched
++	 * alternative instructions.
++	 */
++	check_fpu();
+ }
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -680,6 +680,8 @@ static void __init early_identify_cpu(st
+ 	filter_cpuid_features(c, false);
+ 
+ 	setup_smep(c);
++
++	fpu__init_parse_early_param();
+ }
+ 
+ void __init early_cpu_init(void)
+@@ -1226,7 +1228,6 @@ void __cpuinit cpu_init(void)
+ 	dbg_restore_debug_regs();
+ 
+ 	fpu_init();
+-	xsave_init();
+ 
+ 	raw_local_save_flags(kernel_eflags);
+ 
+@@ -1281,6 +1282,5 @@ void __cpuinit cpu_init(void)
+ 	dbg_restore_debug_regs();
+ 
+ 	fpu_init();
+-	xsave_init();
+ }
+ #endif
+--- a/arch/x86/kernel/i387.c
++++ b/arch/x86/kernel/i387.c
+@@ -48,7 +48,6 @@ void __cpuinit mxcsr_feature_mask_init(v
+ {
+ 	unsigned long mask = 0;
+ 
+-	clts();
+ 	if (cpu_has_fxsr) {
+ 		memset(&fx_scratch, 0, sizeof(struct i387_fxsave_struct));
+ 		asm volatile("fxsave %0" : "+m" (fx_scratch));
+@@ -57,7 +56,6 @@ void __cpuinit mxcsr_feature_mask_init(v
+ 			mask = 0x0000ffbf;
+ 	}
+ 	mxcsr_feature_mask &= mask;
+-	stts();
+ }
+ 
+ static void __cpuinit init_thread_xstate(void)
+@@ -112,8 +110,8 @@ void __cpuinit fpu_init(void)
+ 
+ 	mxcsr_feature_mask_init();
+ 	/* clean state in init */
+-	current_thread_info()->status = 0;
+-	clear_used_math();
++	xsave_init();
++	eager_fpu_init();
+ }
+ 
+ void fpu_finit(struct fpu *fpu)
+@@ -124,12 +122,7 @@ void fpu_finit(struct fpu *fpu)
+ 	}
+ 
+ 	if (cpu_has_fxsr) {
+-		struct i387_fxsave_struct *fx = &fpu->state->fxsave;
+-
+-		memset(fx, 0, xstate_size);
+-		fx->cwd = 0x37f;
+-		if (cpu_has_xmm)
+-			fx->mxcsr = MXCSR_DEFAULT;
++		fx_finit(&fpu->state->fxsave);
+ 	} else {
+ 		struct i387_fsave_struct *fp = &fpu->state->fsave;
+ 		memset(fp, 0, xstate_size);
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -36,7 +36,7 @@ int arch_dup_task_struct(struct task_str
+ 		ret = fpu_alloc(&dst->thread.fpu);
+ 		if (ret)
+ 			return ret;
+-		fpu_copy(&dst->thread.fpu, &src->thread.fpu);
++		fpu_copy(dst, src);
+ 	}
+ 	return 0;
+ }
+@@ -125,9 +125,13 @@ void flush_thread(void)
+ 	/*
+ 	 * Forget coprocessor state..
+ 	 */
+-	tsk->fpu_counter = 0;
+-	clear_fpu(tsk);
+-	clear_used_math();
++	drop_init_fpu(tsk);
++	/*
++	 * Free the FPU state for non xsave platforms. They get reallocated
++	 * lazily at the first use.
++	 */
++	if (!use_eager_fpu())
++		free_thread_xstate(tsk);
+ }
+ 
+ static void hard_disable_TSC(void)
+--- a/arch/x86/kernel/process_32.c
++++ b/arch/x86/kernel/process_32.c
+@@ -185,7 +185,6 @@ void release_thread(struct task_struct *
+  */
+ void prepare_to_copy(struct task_struct *tsk)
+ {
+-	unlazy_fpu(tsk);
+ }
+ 
+ int copy_thread(unsigned long clone_flags, unsigned long sp,
+@@ -251,10 +250,6 @@ start_thread(struct pt_regs *regs, unsig
+ 	regs->cs		= __USER_CS;
+ 	regs->ip		= new_ip;
+ 	regs->sp		= new_sp;
+-	/*
+-	 * Free the old FP and other extended state
+-	 */
+-	free_thread_xstate(current);
+ }
+ EXPORT_SYMBOL_GPL(start_thread);
+ 
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -249,7 +249,6 @@ static inline u32 read_32bit_tls(struct
+  */
+ void prepare_to_copy(struct task_struct *tsk)
+ {
+-	unlazy_fpu(tsk);
+ }
+ 
+ int copy_thread(unsigned long clone_flags, unsigned long sp,
+@@ -338,10 +337,6 @@ start_thread_common(struct pt_regs *regs
+ 	regs->cs		= _cs;
+ 	regs->ss		= _ss;
+ 	regs->flags		= X86_EFLAGS_IF;
+-	/*
+-	 * Free the old FP and other extended state
+-	 */
+-	free_thread_xstate(current);
+ }
+ 
+ void
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -746,11 +746,12 @@ void math_state_restore(void)
+ 	}
+ 
+ 	__thread_fpu_begin(tsk);
++
+ 	/*
+ 	 * Paranoid restore. send a SIGSEGV if we fail to restore the state.
+ 	 */
+ 	if (unlikely(restore_fpu_checking(tsk))) {
+-		__thread_fpu_end(tsk);
++		drop_init_fpu(tsk);
+ 		force_sig(SIGSEGV, tsk);
+ 		return;
+ 	}
+@@ -762,6 +763,7 @@ EXPORT_SYMBOL_GPL(math_state_restore);
+ dotraplinkage void __kprobes
+ do_device_not_available(struct pt_regs *regs, long error_code)
+ {
++	BUG_ON(use_eager_fpu());
+ #ifdef CONFIG_MATH_EMULATION
+ 	if (read_cr0() & X86_CR0_EM) {
+ 		struct math_emu_info info = { };
+--- a/arch/x86/kernel/xsave.c
++++ b/arch/x86/kernel/xsave.c
+@@ -6,6 +6,7 @@
+ #include <linux/bootmem.h>
+ #include <linux/compat.h>
+ #include <asm/i387.h>
++#include <asm/setup.h>
+ #ifdef CONFIG_IA32_EMULATION
+ #include <asm/sigcontext32.h>
+ #endif
+@@ -19,7 +20,7 @@ u64 pcntxt_mask;
+ /*
+  * Represents init state for the supported extended state.
+  */
+-static struct xsave_struct *init_xstate_buf;
++struct xsave_struct *init_xstate_buf;
+ 
+ struct _fpx_sw_bytes fx_sw_reserved;
+ #ifdef CONFIG_IA32_EMULATION
+@@ -182,7 +183,7 @@ int save_i387_xstate(void __user *buf)
+ 			return -1;
+ 	}
+ 
+-	clear_used_math(); /* trigger finit */
++	drop_init_fpu(tsk);	/* trigger finit */
+ 
+ 	if (use_xsave()) {
+ 		struct _fpstate __user *fx = buf;
+@@ -276,9 +277,7 @@ int restore_i387_xstate(void __user *buf
+ 	int err = 0;
+ 
+ 	if (!buf) {
+-		if (used_math())
+-			goto clear;
+-		return 0;
++		goto clear;
+ 	} else
+ 		if (!access_ok(VERIFY_READ, buf, sig_xstate_size))
+ 			return -EACCES;
+@@ -301,8 +300,7 @@ int restore_i387_xstate(void __user *buf
+ 		 * user buffer, clear the fpu state.
+ 		 */
+ clear:
+-		clear_fpu(tsk);
+-		clear_used_math();
++		drop_init_fpu(tsk);
+ 	}
+ 	return err;
+ }
+@@ -380,9 +378,8 @@ static void __init setup_xstate_features
+ /*
+  * setup the xstate image representing the init state
+  */
+-static void __init setup_xstate_init(void)
++static void __init setup_init_fpu_buf(void)
+ {
+-	setup_xstate_features();
+ 
+ 	/*
+ 	 * Setup init_xstate_buf to represent the init state of
+@@ -390,9 +387,13 @@ static void __init setup_xstate_init(voi
+ 	 */
+ 	init_xstate_buf = alloc_bootmem_align(xstate_size,
+ 					      __alignof__(struct xsave_struct));
+-	init_xstate_buf->i387.mxcsr = MXCSR_DEFAULT;
++	fx_finit(&init_xstate_buf->i387);
++
++	if (!cpu_has_xsave)
++		return;
++
++	setup_xstate_features();
+ 
+-	clts();
+ 	/*
+ 	 * Init all the features state with header_bv being 0x0
+ 	 */
+@@ -402,7 +403,19 @@ static void __init setup_xstate_init(voi
+ 	 * of any feature which is not represented by all zero's.
+ 	 */
+ 	xsave_state(init_xstate_buf, -1);
+-	stts();
++}
++
++void __init fpu__init_parse_early_param(void)
++{
++	enum { ENABLE, DISABLE } eagerfpu = ENABLE;
++
++	if (strnstr(boot_command_line, "eagerfpu=off", COMMAND_LINE_SIZE))
++		eagerfpu = DISABLE;
++
++	if (eagerfpu == ENABLE)
++		setup_force_cpu_cap(X86_FEATURE_EAGER_FPU);
++
++	printk(KERN_INFO "x86/fpu: Using '%s' FPU context switches.\n", eagerfpu == ENABLE ? "eager" : "lazy");
+ }
+ 
+ /*
+@@ -442,7 +455,7 @@ static void __init xstate_enable_boot_cp
+ 	update_regset_xstate_info(xstate_size, pcntxt_mask);
+ 	prepare_fx_sw_frame();
+ 
+-	setup_xstate_init();
++	setup_init_fpu_buf();
+ 
+ 	printk(KERN_INFO "xsave/xrstor: enabled xstate_bv 0x%llx, "
+ 	       "cntxt size 0x%x\n",
+@@ -468,3 +481,39 @@ void __cpuinit xsave_init(void)
+ 	next_func = xstate_enable;
+ 	this_func();
+ }
++
++static inline void __init eager_fpu_init_bp(void)
++{
++	current->thread.fpu.state =
++	    alloc_bootmem_align(xstate_size, __alignof__(struct xsave_struct));
++	if (!init_xstate_buf)
++		setup_init_fpu_buf();
++}
++
++void __cpuinit eager_fpu_init(void)
++{
++       static __refdata void (*boot_func)(void) = eager_fpu_init_bp;
++
++       clear_used_math();
++       current_thread_info()->status = 0;
++       if (!boot_cpu_has(X86_FEATURE_EAGER_FPU)) {
++               stts();
++               return;
++       }
++
++       if (boot_func) {
++               boot_func();
++               boot_func = NULL;
++       }
++
++       /*
++        * This is same as math_state_restore(). But use_xsave() is
++        * not yet patched to use math_state_restore().
++        */
++       init_fpu(current);
++       __thread_fpu_begin(current);
++       if (cpu_has_xsave)
++               xrstor_state(init_xstate_buf, -1);
++       else
++               fxrstor_checking(&init_xstate_buf->i387);
++}
