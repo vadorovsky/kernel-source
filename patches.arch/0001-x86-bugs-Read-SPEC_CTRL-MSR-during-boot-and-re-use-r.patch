@@ -1,0 +1,170 @@
+From b41fd8fa359b42b225164210a097a5ca92330820 Mon Sep 17 00:00:00 2001
+From: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Date: Mon, 7 May 2018 15:01:15 +0200
+Subject: x86/bugs: Read SPEC_CTRL MSR during boot and re-use
+ reserved bits
+Patch-mainline: not yet, queued in subsystem tree
+References: bsc#1087082 CVE-2018-3639
+
+The 336996-Speculative-Execution-Side-Channel-Mitigations.pdf refers to all
+the other bits as reserved. The Intel SDM glossary defines reserved as
+implementation specific - aka unknown.
+
+As such at bootup this must be taken it into account and proper masking for
+the bits in use applied.
+
+A copy of this document is available at
+https://bugzilla.kernel.org/show_bug.cgi?id=199511
+
+[ tglx: Made x86_spec_ctrl_base __ro_after_init ]
+
+Suggested-by: Jon Masters <jcm@redhat.com>
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ arch/x86/include/asm/cpufeature.h    |  1 +
+ arch/x86/include/asm/msr-index.h     |  5 +++++
+ arch/x86/include/asm/nospec-branch.h | 11 +++++++++++
+ arch/x86/include/asm/spec_ctrl.h     |  8 ++++----
+ arch/x86/kernel/cpu/bugs.c           | 26 ++++++++++++++++++++++++++
+ arch/x86/kernel/cpu/scattered.c      |  1 +
+ arch/x86/kernel/cpu/spec_ctrl.c      |  1 +
+ 7 files changed, 49 insertions(+), 4 deletions(-)
+
+--- a/arch/x86/include/asm/cpufeature.h
++++ b/arch/x86/include/asm/cpufeature.h
+@@ -183,6 +183,7 @@
+ #define X86_FEATURE_INVPCID_SINGLE (7*32+ 8) /* Effectively INVPCID && CR4.PCIDE=1 */
+ #define X86_FEATURE_RSB_CTXSW	( 7*32+19) /* Fill RSB on context switches */
+ #define X86_FEATURE_SPEC_CTRL	( 7*32+20) /* Control Speculation Control */
++#define X86_FEATURE_IBRS	( 7*32+21) /* "" Indirect Branch Restricted Speculation */
+ 
+ #define X86_FEATURE_RETPOLINE	( 7*32+29) /* Generic Retpoline mitigation for Spectre variant 2 */
+ #define X86_FEATURE_RETPOLINE_AMD ( 7*32+30) /* AMD Retpoline mitigation for Spectre variant 2 */
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -33,6 +33,11 @@
+ 
+ /* Intel MSRs. Some also available on other CPUs */
+ #define MSR_IA32_SPEC_CTRL		0x00000048
++#define SPEC_CTRL_IBRS                  (1 << 0)   /* Indirect Branch Restricted Speculation */
++#define SPEC_CTRL_STIBP                 (1 << 1)   /* Single Thread Indirect Branch Predictors */
++#define SPEC_CTRL_RDS_SHIFT             2          /* Reduced Data Speculation bit */
++#define SPEC_CTRL_RDS                   (1 << SPEC_CTRL_RDS_SHIFT)   /* Reduced Data Speculation */
++
+ #define MSR_IA32_PRED_CMD		0x00000049
+ 
+ #define MSR_IA32_PERFCTR0		0x000000c1
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -171,6 +171,17 @@ enum spectre_v2_mitigation {
+ };
+ 
+ /*
++ * The Intel specification for the SPEC_CTRL MSR requires that we
++ * preserve any already set reserved bits at boot time (e.g. for
++ * future additions that this kernel is not currently aware of).
++ * We then set any additional mitigation bits that we want
++ * ourselves and always use this as the base for SPEC_CTRL.
++ * We also use this when handling guest entry/exit as below.
++ */
++extern void x86_spec_ctrl_set(u64);
++extern u64 x86_spec_ctrl_get_default(void);
++
++/*
+  * On VMEXIT we must ensure that no RSB predictions learned in the guest
+  * can be followed in the host, by overwriting the RSB completely. Both
+  * retpoline and IBRS mitigations for Spectre v2 need this; only on future
+--- a/arch/x86/include/asm/spec_ctrl.h
++++ b/arch/x86/include/asm/spec_ctrl.h
+@@ -10,8 +10,8 @@
+ 
+ .macro __ENABLE_IBRS_CLOBBER
+ 	movl $MSR_IA32_SPEC_CTRL, %ecx
+-	xorl %edx, %edx
+-	movl $FEATURE_ENABLE_IBRS, %eax
++	rdmsr
++	orl $FEATURE_ENABLE_IBRS, %eax
+ 	wrmsr
+ .endm
+ 
+@@ -66,8 +66,8 @@
+ 	pushq %rcx
+ 	pushq %rdx
+ 	movl $MSR_IA32_SPEC_CTRL, %ecx
+-	xorl %edx, %edx
+-	xorl %eax, %eax
++	rdmsr
++	andl $(~FEATURE_ENABLE_IBRS), %eax
+ 	wrmsr
+ 	popq %rdx
+ 	popq %rcx
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -164,6 +164,12 @@ static void __init check_config(void)
+ 
+ static void __init spectre_v2_select_mitigation(void);
+ 
++/*
++ * Our boot-time value of the SPEC_CTRL MSR. We read it once so that any
++ * writes to SPEC_CTRL contain whatever reserved bits have been set.
++ */
++static u64 x86_spec_ctrl_base;
++
+ void __init check_bugs(void)
+ {
+ #ifdef CONFIG_X86_32
+@@ -181,6 +187,13 @@ void __init check_bugs(void)
+ 	print_cpu_info(&boot_cpu_data);
+ #endif
+ 
++	/*
++	 * Read the SPEC_CTRL MSR to account for reserved bits which may
++	 * have unknown values.
++	 */
++	if (boot_cpu_has(X86_FEATURE_IBRS))
++		rdmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
++
+ 	/* Select the proper spectre mitigation before patching alternatives */
+ 	spectre_v2_select_mitigation();
+ 
+@@ -455,3 +468,16 @@ ssize_t cpu_show_spectre_v2(struct devic
+ 		return sprintf(buf, "%s\n", spectre_v2_strings[spectre_v2_enabled]);
+ }
+ #endif
++
++void x86_spec_ctrl_set(u64 val)
++{
++	wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base | val);
++}
++EXPORT_SYMBOL_GPL(x86_spec_ctrl_set);
++
++u64 x86_spec_ctrl_get_default(void)
++{
++       return x86_spec_ctrl_base;
++}
++EXPORT_SYMBOL_GPL(x86_spec_ctrl_get_default);
++
+--- a/arch/x86/kernel/cpu/scattered.c
++++ b/arch/x86/kernel/cpu/scattered.c
+@@ -42,6 +42,7 @@ void __cpuinit init_scattered_cpuid_feat
+ 		{ X86_FEATURE_XSAVEOPT,		CR_EAX,	0, 0x0000000d, 1 },
+ 		{ X86_FEATURE_CPB,		CR_EDX, 9, 0x80000007, 0 },
+ 		{ X86_FEATURE_IBPB,		CR_EBX,12, 0x80000008, 0 },
++		{ X86_FEATURE_IBRS,		CR_EBX,14, 0x80000008, 0 },
+ 		{ X86_FEATURE_NPT,		CR_EDX, 0, 0x8000000a, 0 },
+ 		{ X86_FEATURE_LBRV,		CR_EDX, 1, 0x8000000a, 0 },
+ 		{ X86_FEATURE_SVML,		CR_EDX, 2, 0x8000000a, 0 },
+--- a/arch/x86/kernel/cpu/spec_ctrl.c
++++ b/arch/x86/kernel/cpu/spec_ctrl.c
+@@ -79,6 +79,7 @@ void x86_spec_check(void)
+ 		ibpb_state = 1;
+ 
+ 		setup_force_cpu_cap(X86_FEATURE_SPEC_CTRL);
++		setup_force_cpu_cap(X86_FEATURE_IBRS);
+ 	}
+ 
+ 	if (boot_cpu_data.x86_vendor == X86_VENDOR_AMD) {

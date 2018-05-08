@@ -1,0 +1,158 @@
+From 591798997929b007a6120f1be397877b6ae53847 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Thu, 3 May 2018 22:09:15 +0200
+Subject: prctl: Add force disable speculation
+Patch-mainline: not yet, queued in subsystem tree
+References: bsc#1087082 CVE-2018-3639
+
+For certain use cases it is desired to enforce mitigations so they cannot
+be undone afterwards. That's important for loader stubs which want to
+prevent a child from disabling the mitigation again. Will also be used for
+seccomp(). The extra state preserving of the prctl state for SSB is a
+preparatory step for EBPF dymanic speculation control.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ arch/x86/kernel/cpu/bugs.c | 53 +++++++++++++++++++++++++++++-----------------
+ include/linux/prctl.h      |  1 +
+ include/linux/sched.h      | 28 ++++++++++++++++++++++++
+ 3 files changed, 63 insertions(+), 19 deletions(-)
+
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -611,21 +611,37 @@ static void ssb_select_mitigation()
+ 
+ static int ssb_prctl_set(struct task_struct *task, unsigned long ctrl)
+ {
+-	bool rds = !!test_tsk_thread_flag(task, TIF_RDS);
++	bool update;
+ 
+ 	if (ssb_mode != SPEC_STORE_BYPASS_PRCTL)
+ 		return -ENXIO;
+ 
+-	if (ctrl == PR_SPEC_ENABLE)
+-		clear_tsk_thread_flag(task, TIF_RDS);
+-	else
+-		set_tsk_thread_flag(task, TIF_RDS);
++	switch (ctrl) {
++	case PR_SPEC_ENABLE:
++		/* If speculation is force disabled, enable is not allowed */
++		if (task_spec_ssb_force_disable(task))
++			return -EPERM;
++		task_clear_spec_ssb_disable(task);
++		update = test_and_clear_tsk_thread_flag(task, TIF_RDS);
++		break;
++	case PR_SPEC_DISABLE:
++		task_set_spec_ssb_disable(task);
++		update = !test_and_set_tsk_thread_flag(task, TIF_RDS);
++		break;
++	case PR_SPEC_FORCE_DISABLE:
++		task_set_spec_ssb_disable(task);
++		task_set_spec_ssb_force_disable(task);
++		update = !test_and_set_tsk_thread_flag(task, TIF_RDS);
++		break;
++	default:
++		return -ERANGE;
++	}
+ 
+ 	/*
+ 	 * If being set on non-current task, delay setting the CPU
+ 	 * mitigation until it is next scheduled.
+ 	 */
+-	if (task == current && rds != !!test_tsk_thread_flag(task, TIF_RDS))
++	if (task == current && update)
+ 		speculative_store_bypass_update();
+ 
+ 	return 0;
+@@ -634,25 +650,24 @@ static int ssb_prctl_set(struct task_str
+ static int ssb_prctl_get(struct task_struct *task)
+ {
+ 	switch (ssb_mode) {
+-		case SPEC_STORE_BYPASS_DISABLE:
+-			return PR_SPEC_DISABLE;
+-		case SPEC_STORE_BYPASS_PRCTL:
+-			if (test_tsk_thread_flag(task, TIF_RDS))
+-				return PR_SPEC_PRCTL | PR_SPEC_DISABLE;
+-			return PR_SPEC_PRCTL | PR_SPEC_ENABLE;
+-		default:
+-			if (x86_bug_spec_store_bypass)
+-				return PR_SPEC_ENABLE;
+-			return PR_SPEC_NOT_AFFECTED;
++	case SPEC_STORE_BYPASS_DISABLE:
++		return PR_SPEC_DISABLE;
++	case SPEC_STORE_BYPASS_PRCTL:
++		if (task_spec_ssb_force_disable(task))
++			return PR_SPEC_PRCTL | PR_SPEC_FORCE_DISABLE;
++		if (task_spec_ssb_disable(task))
++			return PR_SPEC_PRCTL | PR_SPEC_DISABLE;
++		return PR_SPEC_PRCTL | PR_SPEC_ENABLE;
++	default:
++		if (x86_bug_spec_store_bypass)
++			return PR_SPEC_ENABLE;
++		return PR_SPEC_NOT_AFFECTED;
+ 	}
+ }
+ 
+ int arch_prctl_spec_ctrl_set(struct task_struct *task, unsigned long which,
+ 			     unsigned long ctrl)
+ {
+-	if (ctrl != PR_SPEC_ENABLE && ctrl != PR_SPEC_DISABLE)
+-		return -ERANGE;
+-
+ 	switch (which) {
+ 		case PR_SPEC_STORE_BYPASS:
+ 			return ssb_prctl_set(task, ctrl);
+--- a/include/linux/prctl.h
++++ b/include/linux/prctl.h
+@@ -130,5 +130,6 @@
+ # define PR_SPEC_PRCTL				(1UL << 0)
+ # define PR_SPEC_ENABLE				(1UL << 1)
+ # define PR_SPEC_DISABLE			(1UL << 2)
++# define PR_SPEC_FORCE_DISABLE			(1UL << 3)
+ 
+ #endif /* _LINUX_PRCTL_H */
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1383,6 +1383,9 @@ struct task_struct {
+ 	unsigned sched_reset_on_fork:1;
+ 	unsigned sched_contributes_to_load:1;
+ 
++	unsigned ssb_disable:1;
++	unsigned ssb_force_disable:1;
++
+ 	pid_t pid;
+ 	pid_t tgid;
+ 
+@@ -1662,6 +1665,31 @@ struct task_struct {
+ /* Future-safe accessor for struct task_struct's cpus_allowed. */
+ #define tsk_cpus_allowed(tsk) (&(tsk)->cpus_allowed)
+ 
++static inline bool task_spec_ssb_disable(struct task_struct *p)
++{
++	return (p->ssb_disable == 1);
++}
++
++static inline void task_set_spec_ssb_disable(struct task_struct *p)
++{
++	p->ssb_disable = 1;
++}
++
++static inline void task_clear_spec_ssb_disable(struct task_struct *p)
++{
++	p->ssb_disable = 0;
++}
++
++static inline bool task_spec_ssb_force_disable(struct task_struct *p)
++{
++	return (p->ssb_force_disable == 1);
++}
++
++static inline void task_set_spec_ssb_force_disable(struct task_struct *p)
++{
++	p->ssb_force_disable = 1;
++}
++
+ /*
+  * Priority of a process goes from 0..MAX_PRIO-1, valid RT
+  * priority is 0..MAX_RT_PRIO-1, and SCHED_NORMAL/SCHED_BATCH
