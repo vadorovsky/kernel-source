@@ -1,0 +1,137 @@
+From c197be39bae74291d7bbb05dbba67ddecfe60a65 Mon Sep 17 00:00:00 2001
+From: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Date: Wed, 25 Apr 2018 22:04:19 -0400
+Subject: x86/bugs, KVM: Support the combination of guest and
+ host IBRS
+Patch-mainline: not yet, queued in subsystem tree
+References: bsc#1087082 CVE-2018-3639
+
+A guest may modify the SPEC_CTRL MSR from the value used by the
+kernel. Since the kernel doesn't use IBRS, this means a value of zero is
+what is needed in the host.
+
+But the 336996-Speculative-Execution-Side-Channel-Mitigations.pdf refers to
+the other bits as reserved so the kernel should respect the boot time
+SPEC_CTRL value and use that.
+
+This allows to deal with future extensions to the SPEC_CTRL interface if
+any at all.
+
+Note: This uses wrmsrl() instead of native_wrmsl(). I does not make any
+difference as paravirt will over-write the callq *0xfff.. with the wrmsrl
+assembler code.
+
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Reviewed-by: Borislav Petkov <bp@suse.de>
+Reviewed-by: Ingo Molnar <mingo@kernel.org>
+Acked-by: Joerg Roedel <jroedel@suse.de>
+---
+ arch/x86/include/asm/nospec-branch.h | 10 ++++++++++
+ arch/x86/kernel/cpu/bugs.c           | 17 +++++++++++++++++
+ arch/x86/kvm/svm.c                   | 11 ++++-------
+ arch/x86/kvm/vmx.c                   |  6 ++++--
+ 4 files changed, 35 insertions(+), 9 deletions(-)
+
+diff --git a/arch/x86/include/asm/nospec-branch.h b/arch/x86/include/asm/nospec-branch.h
+index bd73d11b..08352002 100644
+--- a/arch/x86/include/asm/nospec-branch.h
++++ b/arch/x86/include/asm/nospec-branch.h
+@@ -182,6 +182,16 @@ extern void x86_spec_ctrl_set(u64);
+ extern u64 x86_spec_ctrl_get_default(void);
+ 
+ /*
++ * On VMENTER we must preserve whatever view of the SPEC_CTRL MSR
++ * the guest has, while on VMEXIT we restore the host view. This
++ * would be easier if SPEC_CTRL were architecturally maskable or
++ * shadowable for guests but this is not (currently) the case.
++ * Takes the guest view of SPEC_CTRL MSR as a parameter.
++ */
++extern void x86_spec_ctrl_set_guest(u64);
++extern void x86_spec_ctrl_restore_host(u64);
++
++/*
+  * On VMEXIT we must ensure that no RSB predictions learned in the guest
+  * can be followed in the host, by overwriting the RSB completely. Both
+  * retpoline and IBRS mitigations for Spectre v2 need this; only on future
+diff --git a/arch/x86/kernel/cpu/bugs.c b/arch/x86/kernel/cpu/bugs.c
+index 76c75a41..f17827c8 100644
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@ -487,3 +487,20 @@ u64 x86_spec_ctrl_get_default(void)
+ }
+ EXPORT_SYMBOL_GPL(x86_spec_ctrl_get_default);
+ 
++void x86_spec_ctrl_set_guest(u64 guest_spec_ctrl)
++{
++	if (!boot_cpu_has(X86_FEATURE_IBRS))
++		return;
++	if (x86_spec_ctrl_base != guest_spec_ctrl)
++		wrmsrl(MSR_IA32_SPEC_CTRL, guest_spec_ctrl);
++}
++EXPORT_SYMBOL_GPL(x86_spec_ctrl_set_guest);
++
++void x86_spec_ctrl_restore_host(u64 guest_spec_ctrl)
++{
++	if (!boot_cpu_has(X86_FEATURE_IBRS))
++		return;
++	if (x86_spec_ctrl_base != guest_spec_ctrl)
++		wrmsrl(MSR_IA32_SPEC_CTRL, x86_spec_ctrl_base);
++}
++EXPORT_SYMBOL_GPL(x86_spec_ctrl_restore_host);
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index ffcee9fd..8334c318 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -3831,8 +3831,8 @@ static void svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 
+ 	local_irq_enable();
+ 
+-	if (x86_ibrs_enabled() && (svm->spec_ctrl != FEATURE_ENABLE_IBRS))
+-		wrmsrl(MSR_IA32_SPEC_CTRL, svm->spec_ctrl);
++	if (x86_ibrs_enabled())
++		x86_spec_ctrl_set_guest(svm->spec_ctrl);
+ 
+ 	asm volatile (
+ 		"push %%"R"bp; \n\t"
+@@ -3921,11 +3921,8 @@ static void svm_vcpu_run(struct kvm_vcpu *vcpu)
+ #endif
+ 		);
+ 
+-	if (x86_ibrs_enabled()) {
+-		rdmsrl(MSR_IA32_SPEC_CTRL, svm->spec_ctrl);
+-		if (svm->spec_ctrl != FEATURE_ENABLE_IBRS)
+-			wrmsrl(MSR_IA32_SPEC_CTRL, FEATURE_ENABLE_IBRS);
+-	}
++	if (x86_ibrs_enabled())
++		x86_spec_ctrl_restore_host(svm->spec_ctrl);
+ 
+ 	/* Eliminate branch target predictions from guest mode */
+ 	vmexit_fill_RSB();
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index bc71608f..f009a13e 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -6749,8 +6749,7 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 		vmx_set_interrupt_shadow(vcpu, 0);
+ 
+ 	if (x86_ibrs_enabled())
+-		add_atomic_switch_msr(vmx, MSR_IA32_SPEC_CTRL,
+-				      vmx->spec_ctrl, FEATURE_ENABLE_IBRS);
++		x86_spec_ctrl_set_guest(vmx->spec_ctrl);
+ 
+ 	vmx->__launched = vmx->loaded_vmcs->launched;
+ 	asm(
+@@ -6852,6 +6851,9 @@ static void __noclone vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ #endif
+ 	      );
+ 
++	if (x86_ibrs_enabled())
++		x86_spec_ctrl_restore_host(vmx->spec_ctrl);
++
+ 	/* Eliminate branch target predictions from guest mode */
+ 	vmexit_fill_RSB();
+ 
+-- 
+2.12.3
+
