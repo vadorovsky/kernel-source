@@ -1,0 +1,198 @@
+From 301a178a23c085751a27836d507cc9aea9c6c79a Mon Sep 17 00:00:00 2001
+From: Davidlohr Bueso <dbueso@suse.de>
+Date: Thu, 10 May 2018 07:58:27 -0700
+Subject: [PATCH] kvm: Introduce nopvspin kernel parameter
+Patch-mainline: never, SUSE specific
+References: bsc#1056427
+
+This adds a is a SLE12-SP2 specific feature to disable paravirtual
+spinlocks in favor of the bare metal behavior under specific 1:1
+cpu to vcpu mappings.
+
+Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+
+---
+ Documentation/kernel-parameters.txt |  4 ++++
+ arch/x86/include/asm/qspinlock.h    | 11 ++++++++++-
+ arch/x86/kernel/kvm.c               | 28 ++++++++++++++++++++++++++++
+ arch/x86/kernel/paravirt.c          |  8 ++++++++
+ arch/x86/kernel/smpboot.c           |  2 ++
+ include/linux/jump_label.h          |  6 ++++++
+ 6 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
+index db50556ecf60..5cca21a8a8af 100644
+--- a/Documentation/kernel-parameters.txt
++++ b/Documentation/kernel-parameters.txt
+@@ -1840,6 +1840,10 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
+ 			feature (tagged TLBs) on capable Intel chips.
+ 			Default is 1 (enabled)
+ 
++	kvm_nopvspin	[X86,KVM]
++			Disables the paravirtualized spinlock slowpath
++			optimizations for KVM.
++
+ 	l2cr=		[PPC]
+ 
+ 	l3cr=		[PPC]
+diff --git a/arch/x86/include/asm/qspinlock.h b/arch/x86/include/asm/qspinlock.h
+index eaba08076030..651386b8eb8d 100644
+--- a/arch/x86/include/asm/qspinlock.h
++++ b/arch/x86/include/asm/qspinlock.h
+@@ -1,6 +1,7 @@
+ #ifndef _ASM_X86_QSPINLOCK_H
+ #define _ASM_X86_QSPINLOCK_H
+ 
++#include <linux/jump_label.h>
+ #include <asm/cpufeature.h>
+ #include <asm-generic/qspinlock_types.h>
+ #include <asm/paravirt.h>
+@@ -40,10 +41,14 @@ static inline void queued_spin_unlock(struct qspinlock *lock)
+ #endif
+ 
+ #ifdef CONFIG_PARAVIRT
++DECLARE_STATIC_KEY_TRUE(virt_spin_lock_key);
++
++void native_pv_lock_init(void) __init;
++
+ #define virt_spin_lock virt_spin_lock
+ static inline bool virt_spin_lock(struct qspinlock *lock)
+ {
+-	if (!static_cpu_has(X86_FEATURE_HYPERVISOR))
++	if (!static_branch_likely(&virt_spin_lock_key))
+ 		return false;
+ 
+ 	/*
+@@ -59,6 +64,10 @@ static inline bool virt_spin_lock(struct qspinlock *lock)
+ 
+ 	return true;
+ }
++#else
++static inline void native_pv_lock_init(void)
++{
++}
+ #endif /* CONFIG_PARAVIRT */
+ 
+ #include <asm-generic/qspinlock.h>
+diff --git a/arch/x86/kernel/kvm.c b/arch/x86/kernel/kvm.c
+index 32187f8a49b4..8301c6046401 100644
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@ -49,6 +49,22 @@
+ 
+ static int kvmapf = 1;
+ 
++/*
++ * SLE12-SP2-specific.
++ *
++ * Allow disabling of PV spinlock in kernel command line (kernel param).
++ * Similar idea to what Xen does. Upstream, however, uses a different
++ * approach such that hypervisor admins can pass the VM_HINTS_DEDICATED
++ * via qemu.
++ */
++static bool kvm_pvspin = true;
++static __init int kvm_parse_nopvspin(char *arg)
++{
++	kvm_pvspin = false;
++	return 0;
++}
++early_param("kvm_nopvspin", kvm_parse_nopvspin);
++
+ static int parse_no_kvmapf(char *arg)
+ {
+         kvmapf = 0;
+@@ -427,6 +443,13 @@ void kvm_disable_steal_time(void)
+ }
+ 
+ #ifdef CONFIG_SMP
++static void __init kvm_smp_prepare_cpus(unsigned int max_cpus)
++{
++	native_smp_prepare_cpus(max_cpus);
++	if (!kvm_pvspin)
++		static_branch_disable(&virt_spin_lock_key);
++}
++
+ static void __init kvm_smp_prepare_boot_cpu(void)
+ {
+ 	kvm_guest_cpu_init();
+@@ -504,6 +527,7 @@ void __init kvm_guest_init(void)
+ 		kvm_setup_vsyscall_timeinfo();
+ 
+ #ifdef CONFIG_SMP
++	smp_ops.smp_prepare_cpus = kvm_smp_prepare_cpus;
+ 	smp_ops.smp_prepare_boot_cpu = kvm_smp_prepare_boot_cpu;
+ 	register_cpu_notifier(&kvm_cpu_notifier);
+ #else
+@@ -864,6 +888,10 @@ void __init kvm_spinlock_init(void)
+ 	/* Does host kernel support KVM_FEATURE_PV_UNHALT? */
+ 	if (!kvm_para_has_feature(KVM_FEATURE_PV_UNHALT))
+ 		return;
++	if (!kvm_pvspin) {
++		printk(KERN_INFO "KVM: disabled paravirtual spinlock\n");
++		return;
++	}
+ 
+ #ifdef CONFIG_QUEUED_SPINLOCKS
+ 	__pv_init_lock_hash();
+diff --git a/arch/x86/kernel/paravirt.c b/arch/x86/kernel/paravirt.c
+index f534a0e3af53..0369feebe357 100644
+--- a/arch/x86/kernel/paravirt.c
++++ b/arch/x86/kernel/paravirt.c
+@@ -124,6 +124,14 @@ unsigned paravirt_patch_jmp(void *insnbuf, const void *target,
+ 	return 5;
+ }
+ 
++DEFINE_STATIC_KEY_TRUE(virt_spin_lock_key);
++
++void __init native_pv_lock_init(void)
++{
++	if (!static_cpu_has(X86_FEATURE_HYPERVISOR))
++		static_branch_disable(&virt_spin_lock_key);
++}
++
+ /* Neat trick to map patch type back to the call within the
+  * corresponding structure. */
+ static void *get_call_destination(u8 type)
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index 04e8117961be..700f8024b926 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -75,6 +75,7 @@
+ #include <asm/i8259.h>
+ #include <asm/realmode.h>
+ #include <asm/misc.h>
++#include <asm/qspinlock.h>
+ #include <asm/spec_ctrl.h>
+ 
+ /* Number of siblings per CPU package */
+@@ -1242,6 +1243,7 @@ void __init native_smp_prepare_boot_cpu(void)
+ 	/* already set me in cpu_online_mask in boot_cpu_init() */
+ 	cpumask_set_cpu(me, cpu_callout_mask);
+ 	cpu_set_state_online(me);
++	native_pv_lock_init();
+ }
+ 
+ void __init native_smp_cpus_done(unsigned int max_cpus)
+diff --git a/include/linux/jump_label.h b/include/linux/jump_label.h
+index a196daef9094..2dce0bbc7f64 100644
+--- a/include/linux/jump_label.h
++++ b/include/linux/jump_label.h
+@@ -269,9 +269,15 @@ struct static_key_false {
+ #define DEFINE_STATIC_KEY_TRUE(name)	\
+ 	struct static_key_true name = STATIC_KEY_TRUE_INIT
+ 
++#define DECLARE_STATIC_KEY_TRUE(name)  \
++	extern struct static_key_true name
++
+ #define DEFINE_STATIC_KEY_FALSE(name)	\
+ 	struct static_key_false name = STATIC_KEY_FALSE_INIT
+ 
++#define DECLARE_STATIC_KEY_FALSE(name)  \
++	extern struct static_key_false name
++
+ #define DEFINE_STATIC_KEY_ARRAY_TRUE(name, count)		\
+ 	struct static_key_true name[count] = {			\
+ 		[0 ... (count) - 1] = STATIC_KEY_TRUE_INIT,	\
+-- 
+2.13.6
+
