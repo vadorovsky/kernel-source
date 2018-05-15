@@ -1,0 +1,693 @@
+From: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Subject: s390: introduce execute-trampolines for branches
+Patch-mainline: v4.16-rc1
+Git-commit: f19fbd5ed642dc31c809596412dab1ed56f2f156
+References: bnc#1089386, LTC#166572
+
+Description:  kernel: expoline defense against the spectre attack
+Symptom:      None
+Problem:      The spectre attack may be used to read restricted kernel
+              data from user space.
+Solution:     Provide execute trampolines for indirect branches
+Reproduction: None
+
+Upstream-Description:
+
+              s390: introduce execute-trampolines for branches
+
+              Add CONFIG_EXPOLINE to enable the use of the new -mindirect-branch= and
+              -mfunction_return= compiler options to create a kernel fortified against
+              the specte v2 attack.
+
+              With CONFIG_EXPOLINE=y all indirect branches will be issued with an
+              execute type instruction. For z10 or newer the EXRL instruction will
+              be used, for older machines the EX instruction. The typical indirect
+              call
+
+              	basr	%r14,%r1
+
+              is replaced with a PC relative call to a new thunk
+
+              	brasl	%r14,__s390x_indirect_jump_r1
+
+              The thunk contains the EXRL/EX instruction to the indirect branch
+
+              __s390x_indirect_jump_r1:
+              	exrl	0,0f
+              	j	.
+              0:	br	%r1
+
+              The detour via the execute type instruction has a performance impact.
+              To get rid of the detour the new kernel parameter "nospectre_v2" and
+              "spectre_v2=[on,off,auto]" can be used. If the parameter is specified
+              the kernel and module code will be patched at runtime.
+
+              Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+
+
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ arch/s390/Kconfig                     |   29 +++++++++
+ arch/s390/Makefile                    |   10 +++
+ arch/s390/include/asm/lowcore.h       |    8 +-
+ arch/s390/include/asm/nospec-branch.h |   18 +++++
+ arch/s390/kernel/Makefile             |    3 
+ arch/s390/kernel/entry64.S            |  106 ++++++++++++++++++++++++++-------
+ arch/s390/kernel/module.c             |   65 +++++++++++++++++---
+ arch/s390/kernel/nospec-branch.c      |  109 ++++++++++++++++++++++++++++++++++
+ arch/s390/kernel/setup.c              |    5 +
+ arch/s390/kernel/smp.c                |    1 
+ arch/s390/kernel/vmlinux.lds.S        |   14 ++++
+ drivers/s390/char/Makefile            |    2 
+ 12 files changed, 338 insertions(+), 32 deletions(-)
+
+--- a/arch/s390/Kconfig
++++ b/arch/s390/Kconfig
+@@ -711,6 +711,35 @@ config KERNEL_NOBP
+ 
+ 	  If unsure, say N.
+ 
++config EXPOLINE
++	def_bool n
++	prompt "Avoid speculative indirect branches in the kernel"
++	depends on 64BIT
++	help
++	  Compile the kernel with the expoline compiler options to guard
++	  against kernel-to-user data leaks by avoiding speculative indirect
++	  branches.
++	  Requires a compiler with -mindirect-branch=thunk support for full
++	  protection. The kernel may run slower.
++
++	  If unsure, say N.
++
++choice
++	prompt "Expoline default"
++	depends on EXPOLINE
++	default EXPOLINE_FULL
++
++config EXPOLINE_OFF
++	bool "spectre_v2=off"
++
++config EXPOLINE_MEDIUM
++	bool "spectre_v2=auto"
++
++config EXPOLINE_FULL
++	bool "spectre_v2=on"
++
++endchoice
++
+ endmenu
+ 
+ menu "Power Management"
+--- a/arch/s390/Makefile
++++ b/arch/s390/Makefile
+@@ -85,6 +85,16 @@ ifeq ($(call cc-option-yn,-mwarn-dynamic
+ cflags-$(CONFIG_WARN_DYNAMIC_STACK) += -mwarn-dynamicstack
+ endif
+ 
++ifdef CONFIG_EXPOLINE
++  ifeq ($(call cc-option-yn,$(CC_FLAGS_MARCH) -mindirect-branch=thunk),y)
++    CC_FLAGS_EXPOLINE := -mindirect-branch=thunk
++    CC_FLAGS_EXPOLINE += -mfunction-return=thunk
++    CC_FLAGS_EXPOLINE += -mindirect-branch-table
++    export CC_FLAGS_EXPOLINE
++    cflags-y += $(CC_FLAGS_EXPOLINE)
++  endif
++endif
++
+ KBUILD_CFLAGS	+= -mbackchain -msoft-float $(cflags-y)
+ KBUILD_CFLAGS	+= -pipe -fno-strength-reduce -Wno-sign-compare
+ KBUILD_AFLAGS	+= $(aflags-y)
+--- a/arch/s390/include/asm/lowcore.h
++++ b/arch/s390/include/asm/lowcore.h
+@@ -289,11 +289,15 @@ struct _lowcore {
+ 
+ #ifndef __GENKSYMS__
+ 	__u32	spinlock_lockval;		/* 0x0400 */
+-	__u8	pad_0x0404[0x0e00-0x0404];	/* 0x0404 */
++	__u8	pad_0x0404[0x0500-0x0404];	/* 0x0404 */
+ #else
+-	__u8	pad_0x0400[0x0e00-0x0400];	/* 0x0400 */
++	__u8	pad_0x0400[0x0500-0x0400];	/* 0x0400 */
+ #endif
+ 
++	/* br %r1 trampoline */
++	__u16	br_r1_trampoline;		/* 0x0500 */
++	__u8	pad_0x0502[0x0e00-0x0502];	/* 0x0502 */
++
+ 	/*
+ 	 * 0xe00 contains the address of the IPL Parameter Information
+ 	 * block. Dump tools need IPIB for IPL after dump.
+--- /dev/null
++++ b/arch/s390/include/asm/nospec-branch.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_S390_EXPOLINE_H
++#define _ASM_S390_EXPOLINE_H
++
++#ifndef __ASSEMBLY__
++
++#include <linux/types.h>
++
++extern int nospec_call_disable;
++extern int nospec_return_disable;
++
++void nospec_init_branches(void);
++void nospec_call_revert(s32 *start, s32 *end);
++void nospec_return_revert(s32 *start, s32 *end);
++
++#endif /* __ASSEMBLY__ */
++
++#endif /* _ASM_S390_EXPOLINE_H */
+--- a/arch/s390/kernel/Makefile
++++ b/arch/s390/kernel/Makefile
+@@ -31,6 +31,9 @@ obj-y	+= $(if $(CONFIG_64BIT),reipl64.o,
+ extra-y				+= head.o init_task.o vmlinux.lds
+ extra-y				+= $(if $(CONFIG_64BIT),head64.o,head31.o)
+ 
++obj-$(CONFIG_EXPOLINE)		+= nospec-branch.o
++CFLAGS_REMOVE_expoline.o	+= $(CC_FLAGS_EXPOLINE)
++
+ obj-$(CONFIG_MODULES)		+= s390_ksyms.o module.o
+ obj-$(CONFIG_SMP)		+= smp.o topology.o
+ obj-$(CONFIG_SMP)		+= $(if $(CONFIG_64BIT),switch_cpu64.o, \
+--- a/arch/s390/kernel/entry64.S
++++ b/arch/s390/kernel/entry64.S
+@@ -160,6 +160,7 @@ _TIF_EXIT_SIE = (_TIF_SIGPENDING | _TIF_
+ 	clc	\psworg+8(8),BASED(.Lcritical_start)
+ 	jl	0f
+ 	brasl	%r14,cleanup_critical
++	larl	%r13,cleanup_critical
+ 	tm	1(%r12),0x01		# retest problem state after cleanup
+ 	jnz	1f
+ 0:	lg	%r14,__LC_ASYNC_STACK	# are we already on the async. stack ?
+@@ -259,12 +260,74 @@ _TIF_EXIT_SIE = (_TIF_SIGPENDING | _TIF_
+ 	.popsection
+ 	.endm
+ 
++#ifdef CONFIG_EXPOLINE
++
++	.macro GEN_BR_THUNK name,reg,tmp
++	.section .text.\name,"axG",@progbits,\name,comdat
++	.globl \name
++	.hidden \name
++	.type \name,@function
++\name:
++	.cfi_startproc
++#ifdef CONFIG_HAVE_MARCH_Z10_FEATURES
++	exrl	0,0f
++#else
++	larl	\tmp,0f
++	ex	0,0(\tmp)
++#endif
++	j	.
++0:	br	\reg
++	.cfi_endproc
++	.endm
++
++	GEN_BR_THUNK __s390x_indirect_jump_r1use_r9,%r9,%r1
++	GEN_BR_THUNK __s390x_indirect_jump_r1use_r14,%r14,%r1
++	GEN_BR_THUNK __s390x_indirect_jump_r13use_r14,%r14,%r13
++
++	.macro BASR_R14_R9
++0:	brasl	%r14,__s390x_indirect_jump_r1use_r9
++	.pushsection .s390_indirect_branches,"a",@progbits
++	.long	0b-.
++	.popsection
++	.endm
++
++	.macro BR_R1USE_R14
++0:	jg	__s390x_indirect_jump_r1use_r14
++	.pushsection .s390_indirect_branches,"a",@progbits
++	.long	0b-.
++	.popsection
++	.endm
++
++	.macro BR_R13USE_R14
++0:	jg	__s390x_indirect_jump_r13use_r14
++	.pushsection .s390_indirect_branches,"a",@progbits
++	.long	0b-.
++	.popsection
++	.endm
++
++#else	/* CONFIG_EXPOLINE */
++
++	.macro BASR_R14_R9
++	basr	%r14,%r9
++	.endm
++
++	.macro BR_R1USE_R14
++	br	%r14
++	.endm
++
++	.macro BR_R13USE_R14
++	br	%r14
++	.endm
++
++#endif /* CONFIG_EXPOLINE */
++
++
+ 	.section .kprobes.text, "ax"
+ 
+ ENTRY(__bpon)
+ 	.globl __bpon
+ 	BPON
+-	br	%r14
++	BR_R1USE_R14
+ 
+ /*
+  * Scheduler resume function, called by switch_to
+@@ -291,7 +354,7 @@ __switch_to:
+ 	stg	%r5,__LC_THREAD_INFO		# store thread info of next
+ 	aghi	%r5,STACK_SIZE			# end of kernel stack of next
+ 	stg	%r5,__LC_KERNEL_STACK		# store end of kernel stack
+-	br	%r14
++	BR_R1USE_R14
+ 
+ __critical_start:
+ /*
+@@ -339,9 +402,9 @@ sysc_noemu:
+ #endif
+ 	tm	__TI_flags+6(%r12),_TIF_SYSCALL
+ 	mvc	SP_ARGS(8,%r15),SP_R7(%r15)
+-	lgf	%r8,0(%r7,%r10) # load address of system call routine
++	lgf	%r9,0(%r7,%r10) # load address of system call routine
+ 	jnz	sysc_tracesys
+-	basr	%r14,%r8	# call sys_xxxx
++	BASR_R14_R9				# call sys_xxxx
+ 	stg	%r2,SP_R2(%r15) # store return value (change R2 on stack)
+ 
+ sysc_return:
+@@ -456,12 +519,12 @@ sysc_tracesys:
+ 	clgr	%r0,%r2
+ 	jnh	sysc_tracenogo
+ 	sllg	%r7,%r2,2		# svc number *4
+-	lgf	%r8,0(%r7,%r10)
++	lgf	%r9,0(%r7,%r10)
+ sysc_tracego:
+ 	lmg	%r3,%r6,SP_R3(%r15)
+ 	mvc	SP_ARGS(8,%r15),SP_R7(%r15)
+ 	lg	%r2,SP_ORIG_R2(%r15)
+-	basr	%r14,%r8		# call sys_xxx
++	BASR_R14_R9			# call sys_xxx
+ 	stg	%r2,SP_R2(%r15)		# store return value
+ sysc_tracenogo:
+ 	tm	__TI_flags+6(%r12),_TIF_SYSCALL
+@@ -500,12 +563,13 @@ kernel_execve:
+ 	lgr	%r5,%r12
+ 	brasl	%r14,do_execve
+ 	ltgfr	%r2,%r2
+-	je	0f
++	je	kernel_execve_ok
+ 	aghi	%r15,SP_SIZE
+ 	lmg	%r12,%r15,96(%r15)
+-	br	%r14
++	BR_R1USE_R14
+ 	# execve succeeded.
+-0:	stnsm	__SF_EMPTY(%r15),0xfc	# disable interrupts
++kernel_execve_ok:
++	stnsm	__SF_EMPTY(%r15),0xfc	# disable interrupts
+ 	lg	%r15,__LC_KERNEL_STACK	# load ksp
+ 	aghi	%r15,-SP_SIZE		# make room for registers & psw
+ 	larl	%r13,cleanup_critical
+@@ -576,9 +640,9 @@ pgm_no_vtime:
+ 	ngr	%r8,%r3
+ 	sll	%r8,3
+ 	larl	%r1,pgm_check_table
+-	lg	%r1,0(%r8,%r1)		# load address of handler routine
++	lg	%r9,0(%r8,%r1)		# load address of handler routine
+ 	la	%r2,SP_PTREGS(%r15)	# address of register-save area
+-	basr	%r14,%r1		# branch to interrupt-handler
++	BASR_R14_R9			# branch to interrupt-handler
+ pgm_exit:
+ 	LOCKDEP_SYS_EXIT
+ 	tm	SP_PSW+1(%r15),0x01	# returning to user ?
+@@ -644,9 +708,9 @@ pgm_no_vtime2:
+ 	je	pgm_exit2
+ 	sll	%r8,3
+ 	larl	%r1,pgm_check_table
+-	lg	%r1,0(%r8,%r1)		# load address of handler routine
++	lg	%r9,0(%r8,%r1)		# load address of handler routine
+ 	la	%r2,SP_PTREGS(%r15)	# address of register-save area
+-	basr	%r14,%r1		# branch to interrupt-handler
++	BASR_R14_R9			# branch to interrupt-handler
+ pgm_exit2:
+ 	LOCKDEP_SYS_EXIT
+ 	tm	SP_PSW+1(%r15),0x01	# returning to user ?
+@@ -940,6 +1004,7 @@ mcck_int_handler:
+ 	clc	__LC_MCK_OLD_PSW+8(8),BASED(.Lcritical_start)
+ 	jl	mcck_int_main
+ 	brasl	%r14,cleanup_critical
++	larl	%r13,cleanup_critical
+ mcck_int_main:
+ 	lg	%r14,__LC_PANIC_STACK	# are we already on the panic stack?
+ 	slgr	%r14,%r15
+@@ -1115,7 +1180,7 @@ cleanup_critical:
+ 	clc	8(8,%r12),BASED(cleanup_table_io_restore+8)
+ 	jl	cleanup_io_restore
+ 0:
+-	br	%r14
++	BR_R13USE_R14
+ 
+ cleanup_table_system_call:
+ 	.quad	system_call, sysc_do_svc
+@@ -1168,9 +1233,8 @@ cleanup_update:
+ 	jz	0f
+ 	stg	%r11,__TI_last_break(%r12)
+ 0:	mvc	__LC_RETURN_PSW+8(8),BASED(cleanup_table_system_call+8)
+-	BPENTER __TI_flags+6(%r12),_TIF_ISOLATE_BP>>8
+ 	la	%r12,__LC_RETURN_PSW
+-	br	%r14
++	BR_R13USE_R14
+ cleanup_system_call_insn:
+ 	.quad	sysc_saveall
+ 	.quad	system_call
+@@ -1182,7 +1246,7 @@ cleanup_sysc_tif:
+ 	mvc	__LC_RETURN_PSW(8),0(%r12)
+ 	mvc	__LC_RETURN_PSW+8(8),BASED(cleanup_table_sysc_tif)
+ 	la	%r12,__LC_RETURN_PSW
+-	br	%r14
++	BR_R13USE_R14
+ 
+ cleanup_sysc_restore:
+ 	clc	8(8,%r12),BASED(cleanup_sysc_restore_insn)
+@@ -1202,7 +1266,7 @@ cleanup_sysc_restore:
+ 	lmg	%r0,%r10,SP_R0(%r15)
+ 	lg	%r15,SP_R15(%r15)
+ 2:	la	%r12,__LC_RETURN_PSW
+-	br	%r14
++	BR_R13USE_R14
+ cleanup_sysc_restore_insn:
+ 	.quad	sysc_done - 4
+ 	.quad	sysc_done - 16
+@@ -1211,7 +1275,7 @@ cleanup_io_tif:
+ 	mvc	__LC_RETURN_PSW(8),0(%r12)
+ 	mvc	__LC_RETURN_PSW+8(8),BASED(cleanup_table_io_tif)
+ 	la	%r12,__LC_RETURN_PSW
+-	br	%r14
++	BR_R13USE_R14
+ 
+ cleanup_io_restore:
+ 	clc	8(8,%r12),BASED(cleanup_io_restore_insn)
+@@ -1224,7 +1288,7 @@ cleanup_io_restore:
+ 	lmg	%r0,%r10,SP_R0(%r15)
+ 	lg	%r15,SP_R15(%r15)
+ 1:	la	%r12,__LC_RETURN_PSW
+-	br	%r14
++	BR_R13USE_R14
+ cleanup_io_restore_insn:
+ 	.quad	io_done - 4
+ 	.quad	io_done - 16
+@@ -1288,7 +1352,7 @@ sie_fault:
+ 	stmg	%r0,%r13,0(%r14)		# save guest gprs 0-13
+ 	lmg	%r6,%r14,__SF_GPRS(%r15)	# restore kernel registers
+ 	lghi	%r2,-EFAULT
+-	br	%r14
++	BR_R1USE_R14
+ 
+ 	.align	8
+ .Lsie_loop:
+--- a/arch/s390/kernel/module.c
++++ b/arch/s390/kernel/module.c
+@@ -33,6 +33,7 @@
+ #include <linux/moduleloader.h>
+ #include <linux/bug.h>
+ #include <asm/alternative.h>
++#include <asm/nospec-branch.h>
+ 
+ #if 0
+ #define DEBUGP printk
+@@ -173,7 +174,13 @@ module_frob_arch_sections(Elf_Ehdr *hdr,
+ 	me->arch.got_offset = me->core_size;
+ 	me->core_size += me->arch.got_size;
+ 	me->arch.plt_offset = me->core_size;
+-	me->core_size += me->arch.plt_size;
++	if (me->arch.plt_size) {
++#ifdef CONFIG_EXPOLINE
++		if (!nospec_call_disable)
++			me->arch.plt_size += PLT_ENTRY_SIZE;
++#endif
++		me->core_size += me->arch.plt_size;
++	}
+ 	return 0;
+ }
+ 
+@@ -306,9 +313,21 @@ apply_rela(Elf_Rela *rela, Elf_Addr base
+ 			ip[1] = 0x100607f1;
+ 			ip[2] = val;
+ #else /* CONFIG_64BIT */
+-			ip[0] = 0x0d10e310; /* basr 1,0; lg 1,10(1); br 1 */
+-			ip[1] = 0x100a0004;
+-			ip[2] = 0x07f10000;
++			ip[0] = 0x0d10e310;	/* basr 1,0  */
++			ip[1] = 0x100a0004;	/* lg	1,10(1) */
++			ip[2] = 0x07f10000;	/* br %r1 */
++#ifdef CONFIG_EXPOLINE
++			if (!nospec_call_disable) {
++				unsigned int *ij;
++				ij = me->module_core +
++					me->arch.plt_offset +
++					me->arch.plt_size - PLT_ENTRY_SIZE;
++				ip[2] = 0xa7f40000 +	/* j __jump_r1 */
++					(unsigned int)(u16)
++					(((unsigned long) ij - 8 -
++					  (unsigned long) ip) / 2);
++			}
++#endif
+ 			ip[3] = (unsigned int) (val >> 32);
+ 			ip[4] = (unsigned int) val;
+ #endif /* CONFIG_64BIT */
+@@ -409,15 +428,43 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 		    struct module *me)
+ {
+ 	const Elf_Shdr *s;
+-	char *secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
++	char *secstrings, *secname;
++	void *aseg;
+ 
++#ifdef CONFIG_EXPOLINE
++	if (!nospec_call_disable && me->arch.plt_size) {
++		unsigned int *ij;
++
++		ij = me->module_core + me->arch.plt_offset +
++			me->arch.plt_size - PLT_ENTRY_SIZE;
++		if (test_facility(35)) {
++			ij[0] = 0xc6000000;	/* exrl	%r0,.+10	*/
++			ij[1] = 0x0005a7f4;	/* j	.		*/
++			ij[2] = 0x000007f1;	/* br	%r1		*/
++		} else {
++			ij[0] = 0x44000000 | (unsigned int)
++				offsetof(struct _lowcore, br_r1_trampoline);
++			ij[1] = 0xa7f40000;	/* j	.		*/
++		}
++	}
++#endif
++
++ 	secstrings = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+ 	for (s = sechdrs; s < sechdrs + hdr->e_shnum; s++) {
+-		if (!strcmp(".altinstructions", secstrings + s->sh_name)) {
+-			/* patch .altinstructions */
+-			void *aseg = (void *)s->sh_addr;
++		aseg = (void *) s->sh_addr;
++		secname = secstrings + s->sh_name;
+ 
++		if (!strcmp(".altinstructions", secname))
++			/* patch .altinstructions */
+ 			apply_alternatives(aseg, aseg + s->sh_size);
+-		}
++
++#ifdef CONFIG_EXPOLINE
++		if (!strcmp(".nospec_call_table", secname))
++			nospec_call_revert(aseg, aseg + s->sh_size);
++
++		if (!strcmp(".nospec_return_table", secname))
++			nospec_return_revert(aseg, aseg + s->sh_size);
++#endif
+ 	}
+ 
+ 	vfree(me->arch.syminfo);
+--- /dev/null
++++ b/arch/s390/kernel/nospec-branch.c
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/module.h>
++#include <linux/uaccess.h>
++#include <asm/nospec-branch.h>
++
++#ifdef CONFIG_EXPOLINE_OFF
++int nospec_call_disable = 1;
++#else
++int nospec_call_disable = 0;
++#endif
++#ifdef CONFIG_EXPOLINE_FULL
++int nospec_return_disable = 0;
++#else
++int nospec_return_disable = 1;
++#endif
++
++static int __init nospectre_v2_setup_early(char *str)
++{
++	nospec_call_disable = 1;
++	nospec_return_disable = 1;
++	return 0;
++}
++early_param("nospectre_v2", nospectre_v2_setup_early);
++
++static int __init spectre_v2_setup_early(char *str)
++{
++	if (str && !strncmp(str, "on", 2)) {
++		nospec_call_disable = 0;
++		nospec_return_disable = 0;
++	}
++	if (str && !strncmp(str, "off", 3)) {
++		nospec_call_disable = 1;
++		nospec_return_disable = 1;
++	}
++	if (str && !strncmp(str, "auto", 4)) {
++		nospec_call_disable = 0;
++		nospec_return_disable = 1;
++	}
++	return 0;
++}
++early_param("spectre_v2", spectre_v2_setup_early);
++
++static void __init_or_module __nospec_revert(s32 *start, s32 *end)
++{
++	enum { BRCL_EXPOLINE, BRASL_EXPOLINE } type;
++	u8 *instr, *thunk, *br;
++	u8 insnbuf[6];
++	s32 *epo;
++
++	/* Second part of the instruction replace is always a nop */
++	memcpy(insnbuf + 2, (char[]) { 0x47, 0x00, 0x00, 0x00 }, 4);
++	for (epo = start; epo < end; epo++) {
++		instr = (u8 *) epo + *epo;
++		if (instr[0] == 0xc0 && (instr[1] & 0x0f) == 0x04)
++			type = BRCL_EXPOLINE;	/* brcl instruction */
++		else if (instr[0] == 0xc0 && (instr[1] & 0x0f) == 0x05)
++			type = BRASL_EXPOLINE;	/* brasl instruction */
++		else
++			continue;
++		thunk = instr + (*(int *)(instr + 2)) * 2;
++		if (thunk[0] == 0xc6 && thunk[1] == 0x00)
++			/* exrl %r0,<target-br> */
++			br = thunk + (*(int *)(thunk + 2)) * 2;
++		else if (thunk[0] == 0xc0 && (thunk[1] & 0x0f) == 0x00 &&
++			 thunk[6] == 0x44 && thunk[7] == 0x00 &&
++			 (thunk[8] & 0x0f) == 0x00 && thunk[9] == 0x00 &&
++			 (thunk[1] & 0xf0) == (thunk[8] & 0xf0))
++			/* larl %rx,<target br> + ex %r0,0(%rx) */
++			br = thunk + (*(int *)(thunk + 2)) * 2;
++		else
++			continue;
++		if (br[0] != 0x07 || (br[1] & 0xf0) != 0xf0)
++			continue;
++		switch (type) {
++		case BRCL_EXPOLINE:
++			/* brcl to thunk, replace with br + nop */
++			insnbuf[0] = br[0];
++			insnbuf[1] = (instr[1] & 0xf0) | (br[1] & 0x0f);
++			break;
++		case BRASL_EXPOLINE:
++			/* brasl to thunk, replace with basr + nop */
++			insnbuf[0] = 0x0d;
++			insnbuf[1] = (instr[1] & 0xf0) | (br[1] & 0x0f);
++			break;
++		}
++
++		probe_kernel_write(instr, insnbuf, 6);
++	}
++}
++
++void __init_or_module nospec_call_revert(s32 *start, s32 *end)
++{
++	if (nospec_call_disable)
++		__nospec_revert(start, end);
++}
++
++void __init_or_module nospec_return_revert(s32 *start, s32 *end)
++{
++	if (nospec_return_disable)
++		__nospec_revert(start, end);
++}
++
++extern s32 __nospec_call_start[], __nospec_call_end[];
++extern s32 __nospec_return_start[], __nospec_return_end[];
++void __init nospec_init_branches(void)
++{
++	nospec_call_revert(__nospec_call_start, __nospec_call_end);
++	nospec_return_revert(__nospec_return_start, __nospec_return_end);
++}
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -48,6 +48,7 @@
+ #include <linux/compat.h>
+ 
+ #include <asm/alternative.h>
++#include <asm/nospec-branch.h>
+ #include <asm/ipl.h>
+ #include <asm/uaccess.h>
+ #include <asm/system.h>
+@@ -434,6 +435,7 @@ setup_lowcore(void)
+ #ifdef CONFIG_SMP
+ 	lc->spinlock_lockval = arch_spin_lockval(0);
+ #endif
++	lc->br_r1_trampoline = 0x07f1;	/* br %r1 */
+ 
+ 	set_prefix((u32)(unsigned long) lc);
+ 	lowcore_ptr[0] = lc;
+@@ -1119,6 +1121,9 @@ setup_arch(char **cmdline_p)
+ 	set_preferred_console();
+ 
+ 	apply_alternative_instructions();
++#ifdef CONFIG_EXPOLINE
++	nospec_init_branches();
++#endif
+ 
+ 	/* Setup zfcpdump support */
+ 	setup_zfcpdump(console_devno);
+--- a/arch/s390/kernel/smp.c
++++ b/arch/s390/kernel/smp.c
+@@ -705,6 +705,7 @@ int __cpuinit __cpu_up(unsigned int cpu)
+ 	cpu_lowcore->current_task = (unsigned long) idle;
+ 	cpu_lowcore->cpu_nr = cpu;
+ 	cpu_lowcore->spinlock_lockval = arch_spin_lockval(cpu);
++	cpu_lowcore->br_r1_trampoline = 0x07f1;	/* br %r1 */
+ 	cpu_lowcore->kernel_asce = S390_lowcore.kernel_asce;
+ 	cpu_lowcore->machine_flags = S390_lowcore.machine_flags;
+ 	cpu_lowcore->ftrace_func = S390_lowcore.ftrace_func;
+--- a/arch/s390/kernel/vmlinux.lds.S
++++ b/arch/s390/kernel/vmlinux.lds.S
+@@ -98,6 +98,20 @@ SECTIONS
+ 		EXIT_TEXT
+ 	}
+ 
++	/*
++	 * Table with the patch locations to undo expolines
++	*/
++	.nospec_call_table : {
++		__nospec_call_start = . ;
++		*(.s390_indirect*)
++		__nospec_call_end = . ;
++	}
++	.nospec_return_table : {
++		__nospec_return_start = . ;
++		*(.s390_return*)
++		__nospec_return_end = . ;
++	}
++
+ 	/* early.c uses stsi, which requires page aligned data. */
+ 	. = ALIGN(PAGE_SIZE);
+ 	INIT_DATA_SECTION(0x100)
+--- a/drivers/s390/char/Makefile
++++ b/drivers/s390/char/Makefile
+@@ -2,6 +2,8 @@
+ # S/390 character devices
+ #
+ 
++CFLAGS_REMOVE_sclp_early_core.o	+= $(CC_FLAGS_EXPOLINE)
++
+ obj-y += ctrlchar.o keyboard.o defkeymap.o sclp.o sclp_rw.o sclp_quiesce.o \
+ 	 sclp_cmd.o sclp_config.o sclp_cpi_sys.o sclp_ocf.o sclp_early.o
+ 
