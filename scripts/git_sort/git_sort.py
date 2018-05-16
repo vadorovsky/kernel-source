@@ -178,7 +178,6 @@ remotes = (
     Head(RepoURL("bp/bp.git"), "for-next"),
     Head(RepoURL("tiwai/sound.git")),
     Head(RepoURL("git://linuxtv.org/media_tree.git")),
-    Head(RepoURL("powerpc/linux.git"), "fixes"),
     Head(RepoURL("powerpc/linux.git"), "next"),
     Head(RepoURL("powerpc/linux.git"), "fixes"),
     Head(RepoURL("tip/tip.git")),
@@ -209,6 +208,7 @@ remotes = (
     Head(RepoURL("dhowells/linux-fs.git")),
     Head(RepoURL("herbert/cryptodev-2.6.git")),
     Head(RepoURL("helgaas/pci.git"), "next"),
+    Head(RepoURL("viro/vfs.git"), "for-linus"),
 )
 
 
