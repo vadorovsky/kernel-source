@@ -1,0 +1,117 @@
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Subject:  bpf: track entry to and exit from BFP code
+Patch-mainline: Not yet, work in progress
+References: bsc#1087082 CVE-2018-3639
+
+Now that we have hooks called when we enter/exit the BFP code, tracks
+when we enter/leave.  We "leave" lazily.  The first time we leave, we
+schedule some work to do the actual "leave" at some point in the future.
+This way, we do not thrash by enabling and disabling mitigations
+frequently.
+
+This means that the per-BPF-program overhead is hopefully just the
+cost of incrementing and decrementing a per-cpu variable.
+
+The per-cpu counter 'bpf_prog_active' looks superficially like a great
+mechanism to use.  However, it does not track active BPF programs.
+It appears to just be active when eprobe BPF handlers are running.
+
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+---
+ include/linux/filter.h |   11 +++++++++
+ net/core/filter.c      |   58 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 69 insertions(+)
+
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -348,12 +348,23 @@ struct sk_filter {
+ 	struct bpf_prog	*prog;
+ };
+ 
++DECLARE_PER_CPU(unsigned int, bpf_prog_ran);
++
+ static inline void bpf_enter_prog(const struct bpf_prog *fp)
+ {
++	int *count = &get_cpu_var(bpf_prog_ran);
++	(*count)++;
+ }
+ 
++extern void bpf_leave_prog_deferred(const struct bpf_prog *fp);
+ static inline void bpf_leave_prog(const struct bpf_prog *fp)
+ {
++	int *count = this_cpu_ptr(&bpf_prog_ran);
++	if (*count == 1)
++		bpf_leave_prog_deferred(fp);
++	else
++		(*count)--;
++	put_cpu_var(bpf_prog_ran);
+ }
+ 
+ #define BPF_PROG_RUN(filter, ctx)  ({				\
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -1999,3 +1999,61 @@ out:
+ 	release_sock(sk);
+ 	return ret;
+ }
++
++/*
++ * 0 when no BPF code has executed on the CPU.
++ * Incremented when running BPF code.
++ * When ==1, work will be scheduled.
++ * When >1, work will not be scheduled because work is already
++ * scheduled.
++ * When work is performed, count will be decremented from 1->0.
++ */
++DEFINE_PER_CPU(unsigned int, bpf_prog_ran);
++EXPORT_SYMBOL_GPL(bpf_prog_ran);
++static void bpf_done_on_this_cpu(struct work_struct *work)
++{
++	if (!this_cpu_dec_return(bpf_prog_ran))
++		return;
++
++	/*
++	 * This is unexpected.  The elevated refcount indicates
++	 * being in the *middle* of a BPF program, which should
++	 * be impossible.  They are executed inside
++	 * rcu_read_lock() where we can not sleep and where
++	 * preemption is disabled.
++	 */
++	WARN_ON_ONCE(1);
++}
++
++DEFINE_PER_CPU(struct delayed_work, bpf_prog_delayed_work);
++static __init int bpf_init_delayed_work(void)
++{
++	int i;
++
++	for_each_possible_cpu(i) {
++		struct delayed_work *w = &per_cpu(bpf_prog_delayed_work, i);
++
++		INIT_DELAYED_WORK(w, bpf_done_on_this_cpu);
++	}
++	return 0;
++}
++subsys_initcall(bpf_init_delayed_work);
++
++/*
++ * Must be called with preempt disabled
++ *
++ * The schedule_delayed_work_on() is relatively expensive.  So,
++ * this way, someone doing a bunch of repeated BPF calls will
++ * only pay the cost of scheduling work on the *first* BPF call.
++ * The subsequent calls only pay the cost of incrementing a
++ * per-cpu variable, which is cheap.
++ */
++void bpf_leave_prog_deferred(const struct bpf_prog *fp)
++{
++	int cpu = smp_processor_id();
++	struct delayed_work *w = &per_cpu(bpf_prog_delayed_work, cpu);
++	unsigned long delay_jiffies = msecs_to_jiffies(10);
++
++	schedule_delayed_work_on(cpu, w, delay_jiffies);
++}
++EXPORT_SYMBOL_GPL(bpf_leave_prog_deferred);
