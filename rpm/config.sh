@@ -5,3 +5,4 @@ VARIANT=
 # buildservice projects to build the kernel against
 OBS_PROJECT=SUSE:SLE-11:SP4
 IBS_PROJECT=SUSE:SLE-11-SP4:Update
+BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 11 SP4 (SLES 11 SP4)"
