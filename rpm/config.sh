@@ -6,6 +6,6 @@ VARIANT=
 OBS_PROJECT=openSUSE:Leap:15.0:Update
 # Bugzilla info
 BUGZILLA_SERVER="apibugzilla.suse.com"
-BUGZILLA_PRODUCT="openSUSE Tumbleweed"
+BUGZILLA_PRODUCT="SUSE Linux Enterprise Server 15"
 # Check the sorted patches section of series.conf
 SORT_SERIES=yes
