@@ -1,0 +1,212 @@
+From: Jiri Slaby <jslaby@suse.cz>
+Subject: xen: x86-non-upstream-eager-fpu
+Patch-mainline: Never, SUSE-Xen specific
+References: bnc#1087086 CVE-2018-3665
+
+This is a mixture of upstream commits:
+304bceda6a18ae0b0240b8aac9a6bdf8ce2d2469
+5d2bd7009f306c82afddd1ca4d9763ad8473c216
+4f81cbafcce2c603db7865e9d0e461f7947d77d4
+58122bf1d856a4ea9581d62a07c557d997d46a19
+
+It is supposed to add the eager-fpu and make it the default.
+
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+Automatically created from "extra/x86-non-upstream-eager-fpu.patch" by xen-port-patches.py
+
+--- a/arch/x86/include/mach-xen/asm/i387.h
++++ b/arch/x86/include/mach-xen/asm/i387.h
+@@ -6,14 +6,18 @@
+ #undef switch_fpu_prepare
+ 
+ #ifndef __ASSEMBLY__
+-static inline void xen_thread_fpu_begin(struct task_struct *tsk,
++static inline bool xen_thread_fpu_begin(struct task_struct *tsk,
+ 					multicall_entry_t *mcl)
+ {
+-	if (mcl) {
++	bool switching = !use_eager_fpu() && mcl;
++
++	if (switching) {
+ 		mcl->op = __HYPERVISOR_fpu_taskswitch;
+ 		mcl->args[0] = 0;
+ 	}
+ 	__thread_set_has_fpu(tsk);
++
++	return switching;
+ }
+ 
+ static inline fpu_switch_t xen_switch_fpu_prepare(struct task_struct *old,
+@@ -22,7 +26,8 @@ static inline fpu_switch_t xen_switch_fp
+ {
+ 	fpu_switch_t fpu;
+ 
+-	fpu.preload = tsk_used_math(new) && new->fpu_counter > 5;
++	fpu.preload = tsk_used_math(new) && (use_eager_fpu() ||
++			new->fpu_counter > 5);
+ 	if (__thread_has_fpu(old)) {
+ 		if (!__save_init_fpu(old))
+ 			fpu_lazy_state_intact(old);
+@@ -33,7 +38,7 @@ static inline fpu_switch_t xen_switch_fp
+ 		if (fpu.preload) {
+ 			__thread_set_has_fpu(new);
+ 			prefetch(new->thread.fpu.state);
+-		} else {
++		} else if (!use_eager_fpu()) {
+ 			(*mcl)->op = __HYPERVISOR_fpu_taskswitch;
+ 			(*mcl)++->args[0] = 1;
+ 		}
+@@ -41,11 +46,12 @@ static inline fpu_switch_t xen_switch_fp
+ 		old->fpu_counter = 0;
+ 		if (fpu.preload) {
+ 			new->fpu_counter++;
+-			if (fpu_lazy_restore(new))
++			if (!use_eager_fpu() && fpu_lazy_restore(new))
+ 				fpu.preload = 0;
+ 			else
+ 				prefetch(new->thread.fpu.state);
+-			xen_thread_fpu_begin(new, (*mcl)++);
++			if (xen_thread_fpu_begin(new, *mcl))
++				++*mcl;
+ 		}
+ 	}
+ 	return fpu;
+--- a/arch/x86/kernel/cpu/common-xen.c
++++ b/arch/x86/kernel/cpu/common-xen.c
+@@ -729,6 +729,8 @@ static void __init early_identify_cpu(st
+ 	filter_cpuid_features(c, false);
+ 
+ 	setup_smep(c);
++
++	fpu__init_parse_early_param();
+ }
+ 
+ void __init early_cpu_init(void)
+@@ -1328,7 +1330,6 @@ void __cpuinit cpu_init(void)
+ 	dbg_restore_debug_regs();
+ 
+ 	fpu_init();
+-	xsave_init();
+ 
+ #ifndef CONFIG_XEN
+ 	raw_local_save_flags(kernel_eflags);
+@@ -1393,6 +1394,5 @@ void __cpuinit cpu_init(void)
+ 	dbg_restore_debug_regs();
+ 
+ 	fpu_init();
+-	xsave_init();
+ }
+ #endif
+--- a/arch/x86/kernel/process-xen.c
++++ b/arch/x86/kernel/process-xen.c
+@@ -37,7 +37,7 @@ int arch_dup_task_struct(struct task_str
+ 		ret = fpu_alloc(&dst->thread.fpu);
+ 		if (ret)
+ 			return ret;
+-		fpu_copy(&dst->thread.fpu, &src->thread.fpu);
++		fpu_copy(dst, src);
+ 	}
+ 	return 0;
+ }
+@@ -127,9 +127,13 @@ void flush_thread(void)
+ 	/*
+ 	 * Forget coprocessor state..
+ 	 */
+-	tsk->fpu_counter = 0;
+-	clear_fpu(tsk);
+-	clear_used_math();
++	drop_init_fpu(tsk);
++	/*
++	 * Free the FPU state for non xsave platforms. They get reallocated
++	 * lazily at the first use.
++	 */
++	if (!use_eager_fpu())
++		free_thread_xstate(tsk);
+ }
+ 
+ static void hard_disable_TSC(void)
+--- a/arch/x86/kernel/process_32-xen.c
++++ b/arch/x86/kernel/process_32-xen.c
+@@ -188,7 +188,6 @@ void release_thread(struct task_struct *
+  */
+ void prepare_to_copy(struct task_struct *tsk)
+ {
+-	unlazy_fpu(tsk);
+ }
+ 
+ int copy_thread(unsigned long clone_flags, unsigned long sp,
+@@ -260,10 +259,6 @@ start_thread(struct pt_regs *regs, unsig
+ 	regs->cs		= __USER_CS;
+ 	regs->ip		= new_ip;
+ 	regs->sp		= new_sp;
+-	/*
+-	 * Free the old FP and other extended state
+-	 */
+-	free_thread_xstate(current);
+ }
+ EXPORT_SYMBOL_GPL(start_thread);
+ 
+--- a/arch/x86/kernel/process_64-xen.c
++++ b/arch/x86/kernel/process_64-xen.c
+@@ -259,7 +259,6 @@ static inline u32 read_32bit_tls(struct
+  */
+ void prepare_to_copy(struct task_struct *tsk)
+ {
+-	unlazy_fpu(tsk);
+ }
+ 
+ int copy_thread(unsigned long clone_flags, unsigned long sp,
+@@ -348,10 +347,6 @@ start_thread_common(struct pt_regs *regs
+ 	regs->cs		= _cs;
+ 	regs->ss		= _ss;
+ 	regs->flags		= X86_EFLAGS_IF;
+-	/*
+-	 * Free the old FP and other extended state
+-	 */
+-	free_thread_xstate(current);
+ }
+ 
+ void
+--- a/arch/x86/kernel/traps-xen.c
++++ b/arch/x86/kernel/traps-xen.c
+@@ -743,11 +743,12 @@ void math_state_restore(void)
+ 	}
+ 
+ 	xen_thread_fpu_begin(tsk, NULL);
++
+ 	/*
+ 	 * Paranoid restore. send a SIGSEGV if we fail to restore the state.
+ 	 */
+ 	if (unlikely(restore_fpu_checking(tsk))) {
+-		__thread_fpu_end(tsk);
++		drop_init_fpu(tsk);
+ 		force_sig(SIGSEGV, tsk);
+ 		return;
+ 	}
+@@ -754,10 +755,12 @@ void math_state_restore(void)
+ 
+ 	tsk->fpu_counter++;
+ }
++EXPORT_SYMBOL_GPL(math_state_restore);
+ 
+ dotraplinkage void __kprobes
+ do_device_not_available(struct pt_regs *regs, long error_code)
+ {
++	BUG_ON(use_eager_fpu());
+ #ifdef CONFIG_MATH_EMULATION
+ 	if (read_cr0() & X86_CR0_EM) {
+ 		struct math_emu_info info = { };
+--- a/arch/x86/kernel/xsave.c
++++ b/arch/x86/kernel/xsave.c
+@@ -511,7 +511,11 @@ void __cpuinit eager_fpu_init(void)
+         * not yet patched to use math_state_restore().
+         */
+        init_fpu(current);
++#ifndef CONFIG_XEN
+        __thread_fpu_begin(current);
++#else
++       native_thread_fpu_begin(current);
++#endif
+        if (cpu_has_xsave)
+                xrstor_state(init_xstate_buf, -1);
+        else
