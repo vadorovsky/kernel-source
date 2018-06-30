@@ -1,8 +1,9 @@
 From: James Smart <jsmart2021@gmail.com>
-Date: Tue, 27 Mar 2018 16:36:02 -0700
-Subject: [PATCH v4] nvme: expand nvmf_check_if_ready checks
-References: bsc#1085058
-Patch-Mainline: submitted linux-nvme 2018/03/29
+Date: Thu, 12 Apr 2018 09:16:15 -0600
+Subject: [PATCH] nvme: expand nvmf_check_if_ready checks
+References: bsc#1098527
+Git-commit: bb06ec31452fb2da1594f88035c2ecea4e0652f4
+Patch-mainline: v4.17-rc1
 
 ** this patch has been adapted to SLES12SP3
 
@@ -24,27 +25,85 @@ queue-or-reject check is made to look for failfast or multipath ios and
 only fails the io if it is so marked. Otherwise, the io will be queued
 and wait for the controller state to resolve.
 
+Admin commands issued via ioctl share a live admin queue with commands
+from the transport for controller init. The ioctls could be intermixed
+with the initialization commands. It's possible for the ioctl cmd to
+be issued prior to the controller being enabled. To block this, the
+ioctl admin commands need to be distinguished from admin commands used
+for controller init. Added a USERCMD nvme_req(req)->rq_flags bit to
+reflect this division and set it on ioctls requests.  As the
+nvmf_check_if_ready() routine is called prior to nvme_setup_cmd(),
+ensure that commands allocated by the ioctl path (actually anything
+in core.c) preps the nvme_req(req) before starting the io. This will
+preserve the USERCMD flag during execution and/or retry.
+
 Signed-off-by: James Smart <james.smart@broadcom.com>
-Acked-by: Hannes Reinecke <hare@suse.com>
+Reviewed-by: Sagi Grimberg <sagi@grimberg.e>
+Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+Signed-off-by: Keith Busch <keith.busch@intel.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Hannes Reinecke <hare@suse.de>
 ---
-v2:
-  needed to set nvme status when rejecting io
-v3:
-  renamed qlive to queue_live and connectivity to is_connected
-  converted from inline routine to fabrics exported routine.
-v4:
-  missing a check on blk_rq_is_passthrough() as not all requests
-  have nvme_req(rq)->cmd set.
----
+ drivers/nvme/host/core.c    | 17 +++++++---
  drivers/nvme/host/fabrics.c | 77 +++++++++++++++++++++++++++++++++++++++++++++
  drivers/nvme/host/fabrics.h | 32 ++-----------------
  drivers/nvme/host/fc.c      | 12 ++-----
+ drivers/nvme/host/nvme.h    |  1 +
  drivers/nvme/host/rdma.c    | 14 ++-------
  drivers/nvme/target/loop.c  | 11 ++-----
- 5 files changed, 86 insertions(+), 60 deletions(-)
+ 7 files changed, 99 insertions(+), 65 deletions(-)
 
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index b69e81984cce..f3e6760845d9 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -246,6 +246,15 @@ static struct nvme_ns *nvme_get_ns_from_disk(struct gendisk *disk)
+ 	return NULL;
+ }
+ 
++static inline void nvme_clear_nvme_request(struct request *req)
++{
++	if (!(req->rq_flags & RQF_DONTPREP)) {
++		nvme_req(req)->retries = 0;
++		nvme_req(req)->flags = 0;
++		req->rq_flags |= RQF_DONTPREP;
++	}
++}
++
+ struct request *nvme_alloc_request(struct request_queue *q,
+ 		struct nvme_command *cmd, unsigned int flags, int qid)
+ {
+@@ -262,6 +271,7 @@ struct request *nvme_alloc_request(struct request_queue *q,
+ 
+ 	req->cmd_type = REQ_TYPE_DRV_PRIV;
+ 	req->cmd_flags |= REQ_FAILFAST_DRIVER;
++	nvme_clear_nvme_request(req);
+ 	nvme_req(req)->cmd = cmd;
+ 
+ 	return req;
+@@ -350,11 +360,7 @@ int nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
+ {
+ 	int ret = BLK_MQ_RQ_QUEUE_OK;
+ 
+-	if (!(req->rq_flags & RQF_DONTPREP)) {
+-		nvme_req(req)->retries = 0;
+-		nvme_req(req)->flags = 0;
+-		req->rq_flags |= RQF_DONTPREP;
+-	}
++	nvme_clear_nvme_request(req);
+ 
+ 	if (req->cmd_type == REQ_TYPE_DRV_PRIV)
+ 		memcpy(cmd, nvme_req(req)->cmd, sizeof(*cmd));
+@@ -433,6 +439,7 @@ int __nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd,
+ 		return PTR_ERR(req);
+ 
+ 	req->timeout = timeout ? timeout : ADMIN_TIMEOUT;
++	nvme_req(req)->flags |= NVME_REQ_USERCMD;
+ 
+ 	if (ubuffer && bufflen) {
+ 		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen,
 diff --git a/drivers/nvme/host/fabrics.c b/drivers/nvme/host/fabrics.c
-index 036db5bb182d..7ed4f34f3dfa 100644
+index 3a7c95044ee6..ad9067b3f237 100644
 --- a/drivers/nvme/host/fabrics.c
 +++ b/drivers/nvme/host/fabrics.c
 @@ -534,6 +534,83 @@ static struct nvmf_transport_ops *nvmf_lookup_transport(
@@ -79,8 +138,9 @@ index 036db5bb182d..7ed4f34f3dfa 100644
 +			 */
 +			goto reject_or_queue_io;
 +
-+		if (queue_live ||
-+		    (rq->cmd_type == REQ_TYPE_DRV_PRIV &&
++		if ((queue_live &&
++		     !(nvme_req(rq)->flags & NVME_REQ_USERCMD)) ||
++		    (!queue_live && rq->cmd_type == REQ_TYPE_DRV_PRIV &&
 +		     cmd->common.opcode == nvme_fabrics_command &&
 +		     cmd->fabrics.fctype == nvme_fabrics_type_connect))
 +			/*
@@ -96,7 +156,6 @@ index 036db5bb182d..7ed4f34f3dfa 100644
 +			return 0;
 +
 +		/*
-+		 * q isn't live to accept the command.
 +		 * fall-thru to the reject_or_queue_io clause
 +		 */
 +		break;
@@ -174,10 +233,10 @@ index 16e75a8bdd23..c2a164009da3 100644
  
  #endif /* _NVME_FABRICS_H */
 diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
-index c98173f83c1e..0ff346d4c0b4 100644
+index ed1614402ea2..bb5d29c925f7 100644
 --- a/drivers/nvme/host/fc.c
 +++ b/drivers/nvme/host/fc.c
-@@ -2321,14 +2321,6 @@ busy:
+@@ -2298,14 +2298,6 @@ nvme_fc_start_fcp_op(struct nvme_fc_ctrl *ctrl, struct nvme_fc_queue *queue,
  	return BLK_MQ_RQ_QUEUE_BUSY;
  }
  
@@ -192,7 +251,7 @@ index c98173f83c1e..0ff346d4c0b4 100644
  static int
  nvme_fc_queue_rq(struct blk_mq_hw_ctx *hctx,
  			const struct blk_mq_queue_data *bd)
-@@ -2344,7 +2336,9 @@ nvme_fc_queue_rq(struct blk_mq_hw_ctx *hctx,
+@@ -2321,7 +2313,9 @@ nvme_fc_queue_rq(struct blk_mq_hw_ctx *hctx,
  	u32 data_len;
  	int ret;
  
@@ -203,11 +262,23 @@ index c98173f83c1e..0ff346d4c0b4 100644
  	if (unlikely(ret))
  		return ret;
  
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 3803528b8a73..f171fedd8fa5 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -81,6 +81,7 @@ struct nvme_request {
+ 
+ enum {
+ 	NVME_REQ_CANCELLED		= (1 << 0),
++	NVME_REQ_USERCMD		= (1 << 1),
+ };
+ 
+ static inline struct nvme_request *nvme_req(struct request *req)
 diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
-index aa3a8a5e57ff..608b0b59dde8 100644
+index 4cc51fd8acd7..e13509970e24 100644
 --- a/drivers/nvme/host/rdma.c
 +++ b/drivers/nvme/host/rdma.c
-@@ -1441,17 +1441,6 @@ nvme_rdma_timeout(struct request *rq, bool reserved)
+@@ -1445,17 +1445,6 @@ nvme_rdma_timeout(struct request *rq, bool reserved)
  	return BLK_EH_HANDLED;
  }
  
@@ -225,7 +296,7 @@ index aa3a8a5e57ff..608b0b59dde8 100644
  static int nvme_rdma_queue_rq(struct blk_mq_hw_ctx *hctx,
  		const struct blk_mq_queue_data *bd)
  {
-@@ -1467,7 +1456,8 @@ static int nvme_rdma_queue_rq(struct blk_mq_hw_ctx *hctx,
+@@ -1471,7 +1460,8 @@ static int nvme_rdma_queue_rq(struct blk_mq_hw_ctx *hctx,
  
  	WARN_ON_ONCE(rq->tag < 0);
  
@@ -265,5 +336,5 @@ index 55cd87e40909..339079087da8 100644
  		return ret;
  
 -- 
-2.13.1
+2.12.3
 
