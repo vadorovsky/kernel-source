@@ -1,0 +1,156 @@
+From: Thomas Gleixner <tglx@linuxtronix.de>
+Subject: [PATCH] cpu/hotplug: Boot HT siblings at least once
+Patch-mainline: not yet, under development
+References: bsc#1089343 CVE-2018-3646
+
+Due to the way Machine Check Exceptions work on X86 hyperthreads it's
+required to boot up _all_ logical cores at least once in order to set the
+CR4.MCE bit.
+
+So instead of ignoring the sibling threads right away, let them boot up
+once so they can configure themself. After they came out of the initial
+boot stage check whether its a "secondary" sibling and cancel the operation
+which puts the CPU back into offline state.
+
+Reported-by: Dave Hansen <dave.hansen@intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Borislav Petkov <bp@suse.de>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Cc: Lai Jiangshan <jiangshanlai@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de> 
+Cc: lkml <linux-kernel@vger.kernel.org> 
+Link: http://lkml.kernel.org/r/20180629140611.033996006@linutronix.de
+Signed-off-by: Borislav Petkov <bp@suse.de>
+---
+ arch/x86/include/asm/smp.h |  1 +
+ arch/x86/kernel/smpboot.c  |  2 ++
+ include/linux/cpu.h        |  1 +
+ kernel/cpu.c               | 41 ++++++++++++++++++++++++++++++++++++++---
+ 4 files changed, 42 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/include/asm/smp.h b/arch/x86/include/asm/smp.h
+index e167eef821cb..14a58e42e9d4 100644
+--- a/arch/x86/include/asm/smp.h
++++ b/arch/x86/include/asm/smp.h
+@@ -160,6 +160,7 @@ void native_play_dead(void);
+ void play_dead_common(void);
+ void wbinvd_on_cpu(int cpu);
+ int wbinvd_on_all_cpus(void);
++bool cpu_smt_allowed(unsigned int cpu);
+ 
+ void native_send_call_func_ipi(const struct cpumask *mask);
+ void native_send_call_func_single_ipi(int cpu);
+diff --git a/arch/x86/kernel/smpboot.c b/arch/x86/kernel/smpboot.c
+index c753f6af58bb..c6f8e32a1bc1 100644
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -899,6 +899,8 @@ int __cpuinit native_cpu_up(unsigned int cpu)
+ 		touch_nmi_watchdog();
+ 	}
+ 
++	cpu_set_booted(cpu);
++
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/cpu.h b/include/linux/cpu.h
+index 66bd07f20938..a96f07c8f250 100644
+--- a/include/linux/cpu.h
++++ b/include/linux/cpu.h
+@@ -117,6 +117,7 @@ int cpu_up(unsigned int cpu);
+ void notify_cpu_starting(unsigned int cpu);
+ extern void cpu_maps_update_begin(void);
+ extern void cpu_maps_update_done(void);
++extern void cpu_set_booted(unsigned int cpu);
+ 
+ #else	/* CONFIG_SMP */
+ 
+diff --git a/kernel/cpu.c b/kernel/cpu.c
+index fc0c4d2c563a..1eb05dcaa0d4 100644
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -17,6 +17,18 @@
+ #include <linux/gfp.h>
+ #include <linux/suspend.h>
+ 
++/* hotplug state from future kernels */
++struct cpuhp_cpu_state {
++	bool		booted_once;
++};
++
++static DEFINE_PER_CPU(struct cpuhp_cpu_state, cpuhp_state) = { 0 };
++
++void cpu_set_booted(unsigned int cpu)
++{
++	per_cpu(cpuhp_state, cpu).booted_once = true;
++}
++
+ #ifdef CONFIG_SMP
+ /* Serializes the updates to cpu_online_mask, cpu_present_mask */
+ static DEFINE_MUTEX(cpu_add_remove_lock);
+@@ -319,11 +331,22 @@ static int __init smt_cmdline_disable(char *str)
+ }
+ early_param("nosmt", smt_cmdline_disable);
+ 
+-static inline bool cpu_smt_allowed(unsigned int cpu)
++bool cpu_smt_allowed(unsigned int cpu)
+ {
+-	return cpu_smt_control == CPU_SMT_ENABLED ||
+-		topology_is_primary_thread(cpu);
++	if (cpu_smt_control == CPU_SMT_ENABLED)
++		return true;
++
++	if (topology_is_primary_thread(cpu))
++		return true;
++
++	/*
++	 * X86 requires that the sibling threads are at least booted up
++	 * once to set the CR4.MCE bit so Machine Check Exceptions can be
++	 * handled and do not end up raising the CPU Internal Error line.
++	 */
++	return !per_cpu(cpuhp_state, cpu).booted_once;
+ }
++
+ #else
+ static inline bool cpu_smt_allowed(unsigned int cpu) { return true; }
+ #endif
+@@ -351,6 +374,7 @@ static int __cpuinit _cpu_up(unsigned int cpu, int tasks_frozen)
+ 	ret = __cpu_up(cpu);
+ 	if (ret != 0)
+ 		goto out_notify;
++
+ 	BUG_ON(!cpu_online(cpu));
+ 
+ 	/* Now call notifier in preparation. */
+@@ -411,6 +435,7 @@ int __cpuinit cpu_up(unsigned int cpu)
+ 		err = -EBUSY;
+ 		goto out;
+ 	}
++
+ 	if (!cpu_smt_allowed(cpu)) {
+ 		err = -EPERM;
+ 		goto out;
+@@ -418,6 +443,16 @@ int __cpuinit cpu_up(unsigned int cpu)
+ 
+ 	err = _cpu_up(cpu, 0);
+ 
++	/*
++	 * SMT soft disabling on x86 requires to bring the CPU out of the
++	 * BIOS 'wait for SIPI' state in order to set the CR4.MCE bit.  The
++	 * CPU marked itself as booted_once in native_cpu_up() so the
++	 * cpu_smt_allowed() check will now return false if this is not the
++	 * primary sibling.
++	 */
++	if (!cpu_smt_allowed(cpu))
++		cpu_down_maps_locked(cpu, 0);
++
+ out:
+ 	cpu_maps_update_done();
+ 	return err;
+-- 
+2.12.3
+
+SUSE Linux GmbH, GF: Felix Imendörffer, Jane Smithard, Graham Norton, HRB 21284 (AG Nürnberg)
+-- 
