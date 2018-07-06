@@ -1,0 +1,207 @@
+From 73a8594bdc5d88bdb125e458a4147669b8ff1cd1 Mon Sep 17 00:00:00 2001
+From: Andi Kleen <ak@linux.intel.com>
+Date: Fri, 27 Apr 2018 09:47:37 -0700
+Subject: [PATCH 3/8] xen: x86, l1tf: Protect PROT_NONE PTEs against speculation
+Patch-mainline: Never, SUSE-Xen specific
+References: bnc#1087081, CVE-2018-3620
+
+We also need to protect PTEs that are set to PROT_NONE against
+L1TF speculation attacks.
+
+This is important inside guests, because L1TF speculation
+bypasses physical page remapping. While the VM has its own
+migitations preventing leaking data from other VMs into
+the guest, this would still risk leaking the wrong page
+inside the current guest.
+
+This uses the same technique as Linus' swap entry patch:
+while an entry is is in PROTNONE state we invert the
+complete PFN part part of it. This ensures that the
+the highest bit will point to non existing memory.
+
+The invert is done by pte/pmd_modify and pfn/pmd/pud_pte for
+PROTNONE and pte/pmd/pud_pfn undo it.
+
+We assume that noone tries to touch the PFN part of
+a PTE without using these primitives.
+
+This doesn't handle the case that MMIO is on the top
+of the CPU physical memory. If such an MMIO region
+was exposed by an unpriviledged driver for mmap
+it would be possible to attack some real memory.
+However this situation is all rather unlikely.
+
+For 32bit non PAE we don't try inversion because
+there are really not enough bits to protect anything.
+
+Q: Why does the guest need to be protected when the
+HyperVisor already has L1TF mitigations?
+A: Here's an example:
+You have physical pages 1 2. They get mapped into a guest as
+GPA 1 -> PA 2
+GPA 2 -> PA 1
+through EPT.
+
+The L1TF speculation ignores the EPT remapping.
+
+Now the guest kernel maps GPA 1 to process A and GPA 2 to process B,
+and they belong to different users and should be isolated.
+
+A sets the GPA 1 PA 2 PTE to PROT_NONE to bypass the EPT remapping
+and gets read access to the underlying physical page. Which
+in this case points to PA 2, so it can read process B's data,
+if it happened to be in L1.
+
+So we broke isolation inside the guest.
+
+There's nothing the hypervisor can do about this. This
+mitigation has to be done in the guest.
+
+Signed-off-by: Andi Kleen <ak@linux.intel.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-By: Dave Hansen <dave.hansen@intel.com>
+Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+
+Automatically created from "patches.arch/x86-l1tf-04-protect-PROT_NONE-ptes.patch" by xen-port-patches.py
+
+--- a/arch/x86/include/mach-xen/asm/pgtable.h
++++ b/arch/x86/include/mach-xen/asm/pgtable.h
+@@ -16,6 +16,7 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++#include <linux/pfn.h>
+ #include <asm/x86_init.h>
+ #ifdef CONFIG_KAISER
+ extern int kaiser_enabled;
+@@ -129,6 +130,14 @@ static inline int pte_special(pte_t pte)
+ 	return pte_flags(pte) & _PAGE_SPECIAL;
+ }
+ 
++/* Entries that were set to PROT_NONE are inverted */
++
++static inline u64 protnone_mask(u64 val);
++
++#define __pte_mfn(_pte) ({ \
++	pteval_t val_ = (_pte).pte; \
++	((val_ ^ protnone_mask(val_)) & PTE_PFN_MASK) >> PAGE_SHIFT; \
++})
+ #define pte_mfn(_pte) ((_pte).pte_low & _PAGE_PRESENT ? \
+ 	__pte_mfn(_pte) : pfn_to_mfn(__pte_mfn(_pte)))
+ #define pte_pfn(_pte) ((_pte).pte_low & _PAGE_IOMAP ? max_mapnr : \
+@@ -140,12 +149,16 @@ static inline int pte_special(pte_t pte)
+ 
+ static inline unsigned long pmd_pfn(pmd_t pmd)
+ {
+-	return (pmd_val(pmd) & PTE_PFN_MASK) >> PAGE_SHIFT;
++	pmdval_t val = pmd_val(pmd);
++	val ^= protnone_mask(val);
++	return (val & PTE_PFN_MASK) >> PAGE_SHIFT;
+ }
+ 
+ static inline unsigned long pud_pfn(pud_t pud)
+ {
+-	return (pud_val(pud) & PTE_PFN_MASK) >> PAGE_SHIFT;
++	pudval_t val = pud_val(pud);
++	val ^= protnone_mask(val);
++	return (val & PTE_PFN_MASK) >> PAGE_SHIFT;
+ }
+ 
+ static inline int pmd_large(pmd_t pte)
+@@ -311,38 +324,47 @@ static inline pgprotval_t massage_pgprot
+ 
+ static inline pte_t pfn_pte(unsigned long page_nr, pgprot_t pgprot)
+ {
+-	return __pte(((phys_addr_t)page_nr << PAGE_SHIFT) |
+-		     massage_pgprot(pgprot));
++	phys_addr_t paddr = PFN_PHYS(page_nr);
++	paddr ^= protnone_mask(pgprot_val(pgprot));
++	paddr &= PTE_PFN_MASK;
++	return __pte(paddr | massage_pgprot(pgprot));
+ }
+ 
+ static inline pte_t pfn_pte_ma(phys_addr_t page_nr, pgprot_t pgprot)
+ {
+-	return __pte_ma((page_nr << PAGE_SHIFT) | massage_pgprot(pgprot));
++	phys_addr_t maddr = page_nr << PAGE_SHIFT;
++	maddr ^= protnone_mask(pgprot_val(pgprot));
++	maddr &= PTE_PFN_MASK;
++	return __pte_ma(maddr | massage_pgprot(pgprot));
+ }
+ 
+ static inline pmd_t pfn_pmd(unsigned long page_nr, pgprot_t pgprot)
+ {
+-	return __pmd(((phys_addr_t)page_nr << PAGE_SHIFT) |
+-		     massage_pgprot(pgprot));
++	phys_addr_t paddr = PFN_PHYS(page_nr);
++	paddr ^= protnone_mask(pgprot_val(pgprot));
++	paddr &= PMD_PAGE_MASK;
++	return __pmd(paddr | massage_pgprot(pgprot));
+ }
+ 
++static inline u64 flip_protnone_guard(u64 oldval, u64 val, u64 mask);
++
+ static inline pte_t pte_modify(pte_t pte, pgprot_t newprot)
+ {
+-	pteval_t val = pte_val(pte) & _PAGE_CHG_MASK;
++	pteval_t val = pte_val(pte) & _PAGE_CHG_MASK, oldval = val;
+ 
+ 	val |= massage_pgprot(newprot) & ~_PAGE_CHG_MASK;
+-
++	val = flip_protnone_guard(oldval, val, PTE_PFN_MASK);
+ 	return __pte(val);
+ }
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ static inline pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot)
+ {
+-	pmdval_t val = pmd_val(pmd);
++	pmdval_t val = pmd_val(pmd), oldval = val;
+ 
+ 	val &= _HPAGE_CHG_MASK;
+ 	val |= massage_pgprot(newprot) & ~_HPAGE_CHG_MASK;
+-
++	val = flip_protnone_guard(oldval, val, PMD_PAGE_MASK);
+ 	return __pmd(val);
+ }
+ #endif
+--- a/arch/x86/include/mach-xen/asm/pgtable-3level.h
++++ b/arch/x86/include/mach-xen/asm/pgtable-3level.h
+@@ -147,9 +147,6 @@ static inline pte_t xen_ptep_get_and_cle
+ #define xen_ptep_get_and_clear(xp, pte) xen_local_ptep_get_and_clear(xp, pte)
+ #endif
+ 
+-#define __pte_mfn(_pte) (((_pte).pte_low >> PAGE_SHIFT) | \
+-			 ((_pte).pte_high << (32-PAGE_SHIFT)))
+-
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ #ifdef CONFIG_SMP
+ union split_pmd {
+@@ -192,4 +189,6 @@ static inline pmd_t xen_pmdp_get_and_cle
+ #define __pte_to_swp_entry(pte)		((swp_entry_t){ (pte).pte_high })
+ #define __swp_entry_to_pte(x)		((pte_t){ { .pte_high = (x).val } })
+ 
++#include <asm/pgtable-invert.h>
++
+ #endif /* _ASM_X86_PGTABLE_3LEVEL_H */
+--- a/arch/x86/include/mach-xen/asm/pgtable_64.h
++++ b/arch/x86/include/mach-xen/asm/pgtable_64.h
+@@ -113,8 +113,6 @@ static inline void xen_pgd_clear(pgd_t *
+ 	xen_set_pgd(__user_pgd(pgd), xen_make_pgd(0));
+ }
+ 
+-#define __pte_mfn(_pte) (((_pte).pte & PTE_PFN_MASK) >> PAGE_SHIFT)
+-
+ extern void sync_global_pgds(unsigned long start, unsigned long end);
+ 
+ /*
+@@ -184,6 +182,8 @@ extern int kern_addr_valid(unsigned long
+ 
+ #define __HAVE_ARCH_PTE_SAME
+ 
++#include <asm/pgtable-invert.h>
++
+ #endif /* !__ASSEMBLY__ */
+ 
+ #endif /* _ASM_X86_PGTABLE_64_H */
