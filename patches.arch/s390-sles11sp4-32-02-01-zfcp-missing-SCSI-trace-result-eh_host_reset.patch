@@ -1,0 +1,279 @@
+From: Steffen Maier <maier@linux.ibm.com>
+Subject: scsi: zfcp: fix missing SCSI trace for result of eh_host_reset_handler
+Patch-mainline: v4.18-rc1
+Git-commit: df30781699f53e4fd4c494c6f7dd16e3d5c21d30
+References: bnc#1102087, LTC#168765
+
+Description:  zfcp: fix tracing regressions, part 3
+Symptom:      Cannot determine result of eh_host_reset_handler.
+
+              Cannot see if and when zfcp retries abort or task management
+              functions (LUN/target reset) while synchronizing scsi_eh and
+              zfcp-internal recovery.
+
+              Confusing zfcp ERP trace record if a SCSI device is deleted
+              during scsi_eh host reset.
+
+              Cannot determine that our terminate_rport_io callback was
+              invoked if it returned early.
+
+              Cannot determine that our terminate_rport_io callback was
+              invoked if a long fast_io_fail_tmo was configured (typically
+              longer than 12 seconds, e.g. 27 seconds).
+
+              Cannot determine if something wanted to enqueue zfcp recovery
+              for an object (adapter/port regular/unit) in ERP_FAILED state.
+
+              Cannot determine if something wanted to enqueue zfcp recovery
+              but no zfcp ERP thread was running.
+Problem:      v2.6.35 commit a1dbfddd02d2 ("[SCSI] zfcp: Pass return code
+              from fc_block_scsi_eh to scsi eh") introduced the first
+              return with something other than the previously hardcoded
+              single SUCCESS return path.
+
+              Due to zfcp_erp_wait() and fc_block_scsi_eh() time can pass
+              between the start of our eh callback and an actual send/recv
+              of an abort / TMF request.
+
+              If a SCSI device is deleted during scsi_eh host reset, we
+              cannot get a reference to the SCSI device anymore since
+              scsi_device_get returns !=0 by design. Assuming the recovery
+              of adapter and port(s) was successful,
+              zfcp_erp_strategy_followup_success() attempts to trigger a
+              LUN reset for the half-gone SCSI device. However,
+              zfcp_erp_setup_act() returns NULL as it cannot get the
+              reference. Hence, zfcp_erp_action_enqueue() takes an early
+              goto out and _NO_ recovery actually happens, but it writes a
+              confusing trace record which states that zfcp will do a LUN
+              recovery as "ERP need" is ZFCP_ERP_ACTION_REOPEN_LUN == 1 and
+              equals "ERP want".
+              Before v2.6.38 commit ae0904f60fab ("[SCSI] zfcp: Redesign of
+              the debug tracing for recovery actions.") we could detect
+              this case because the "erp_action" field in the trace was
+              NULL. The rework removed erp_action as argument and field
+              from the trace.
+
+              If we get an fc_rport in terminate_rport_io() for which we
+              cannot find a match within zfcp_get_port_by_wwpn(), the
+              latter can return NULL. v2.6.30 commit 70932935b61e ("[SCSI]
+              zfcp: Fix oops when port disappears") introduced an early
+              return without adding a trace record for this case.
+
+              After target cable pull: The ADISC for "link" test times out
+              after typically 4 seconds. The open port recovery times out
+              after typically 8 seconds, causing zfcp_port.status to
+              contain ERP_FAILED. zfcp_scsi_terminate_rport_io() tries to
+              enqueue forced port recovery, but due to ERP_FAILED this
+              resulted in a silent early return.
+
+              Trying to enqueue recovery for adapter / port regular / LUN
+              resulted in silent early returns.
+
+              Trying to enqueue recovery if no ERP thread was running
+              resulted in silent early returns.
+Solution:     Write trace record in zfcp area SCSI and re-use SCSI result
+              field to contain the return value of eh_host_reset_handler.
+
+              Add a trace before calling the two blocking functions
+              zfcp_erp_wait() and fc_block_scsi_eh().
+
+              Introduce an eyecatcher "flag" to mark the "ERP need" as 'not
+              needed' but still keep the information which erp_action type,
+              that zfcp_erp_required_act() had decided upon, is needed.
+              0xc_ is chosen to be visibly different from 0x0_ in "ERP
+              want".
+
+              Write trace record in zfcp area REC with "ERP need" none.
+
+              Write trace record in zfcp area REC with "ERP need" 0xe0.
+
+              zfcp_erp_action_enqueue() already had two early outs which
+              re-used the one zfcp_dbf_rec_trig() call. All ERP trigger
+              functions finally run through zfcp_erp_action_enqueue(). So
+              move the special handling for ZFCP_STATUS_COMMON_ERP_FAILED
+              into zfcp_erp_action_enqueue() and add another early out with
+              new trace marker for pseudo ERP need in this case. This
+              removes all early returns from all ERP trigger functions so
+              we always end up at zfcp_dbf_rec_trig().
+
+              Write trace record in zfcp area REC with "ERP need" 0xc0.
+Reproduction: If NPIV is not enabled with subchannel, ensure that your
+              subchannel is the only one active on the entire channel.
+              Set eh_deadline to a short enough time interval, e.g. 5
+              seconds (before FCP device online: scsi_mod.eh_deadline=5).
+              Enable RSCN suppression on the SAN switch port beyond the
+              first link, i.e. towards the storage target. Disable that
+              switch port. Send one SCSI command to the single path SCSI
+              disk of that port in the background (because it will block
+              for a while) e.g. via "dd if=/dev/sd... of=/dev/null
+              iflag=direct count=1 &". After <SCSI command timeout>
+              seconds, the command runs into the timeout. Due to the short
+              eh_deadline, the SCSI midlayer immediately performs SCSI host
+              reset. After the corresponding adapter recovery, the new
+              trace record "schrh_r" appears.
+
+              Difficult to reproduce as we need to have a SCSI command time
+              out once (abort) or twice (scsi_eh), and timely have to
+              prevent sending of the abort or TMF. Examples to prevent
+              sending is severe memory pressure, or zfcp-internal recovery
+              of the zfcp unit (e.g. write 0 to failed sysfs attribute) or
+              of the target port (depending on potentially escalated
+              scsi_eh scope) so the zfcp object is blocked.
+
+              Difficult to reproduce as we need to get into scsi_eh, fully
+              escalate to host reset, and something has to timely delete a
+              SCSI device of this Scsi_Host.
+
+              Disable auto port REscan with zfcp.no_auto_port_rescan=1. Let
+              always enabled zfcp auto port scan attach a target remote
+              port without attaching LUNs to it (zfcp.allow_lun_scan=0 and
+              no explicit zfcp unit_add). Use zfcp port_remove to remove
+              such target port again. After fast_io_fail_tmo or
+              dev_loss_tmo, the new trace record "sctrpin" can appear.
+
+              If NPIV is not enabled with subchannel, ensure that your
+              subchannel is the only one active on the entire channel.
+              Configure a large enough fast_io_fail_tmo, e.g. 27 seconds.
+              Pull cable at target side. Wait until fast_io_fail_tmo runs
+              out and with the fix a zfcp trace "sctrpi1" with "ERP need"
+              0xe0 must appear in the REC area. (for shared non-NPIV
+              subchannels, only the first subchannel, that happens to
+              complete the corresponding code path, ends up in this
+              particular case)
+
+              Difficult to reproduce as we need a "soft" recovery trigger
+              that does not clear ERP_FAILED (as opposed to e.g. failed
+              sysfs attribute).
+
+              No known reproduction.
+
+Upstream-Description:
+
+              scsi: zfcp: fix missing SCSI trace for result of eh_host_reset_handler
+
+              For problem determination we need to see whether and why we were successful
+              or not. This allows deduction of scsi_eh escalation.
+
+              Example trace record formatted with zfcpdbf from s390-tools:
+
+              Timestamp      : ...
+              Area           : SCSI
+              Subarea        : 00
+              Level          : 1
+              Exception      : -
+              CPU ID         : ..
+              Caller         : 0x...
+              Record ID      : 1
+              Tag            : schrh_r        SCSI host reset handler result
+              Request ID     : 0x0000000000000000                     none (invalid)
+              SCSI ID        : 0xffffffff                             none (invalid)
+              SCSI LUN       : 0xffffffff                             none (invalid)
+              SCSI LUN high  : 0xffffffff                             none (invalid)
+              SCSI result    : 0x00002002     field re-used for midlayer value: SUCCESS
+                                              or in other cases: 0x2009 == FAST_IO_FAIL
+              SCSI retries   : 0xff                                   none (invalid)
+              SCSI allowed   : 0xff                                   none (invalid)
+              SCSI scribble  : 0xffffffffffffffff                     none (invalid)
+              SCSI opcode    : ffffffff ffffffff ffffffff ffffffff    none (invalid)
+              FCP rsp inf cod: 0xff                                   none (invalid)
+              FCP rsp IU     : 00000000 00000000 00000000 00000000    none (invalid)
+                               00000000 00000000
+
+              v2.6.35 commit a1dbfddd02d2 ("[SCSI] zfcp: Pass return code from
+              fc_block_scsi_eh to scsi eh") introduced the first return with something
+              other than the previously hardcoded single SUCCESS return path.
+
+              Signed-off-by: Steffen Maier <maier@linux.ibm.com>
+              Fixes: a1dbfddd02d2 ("[SCSI] zfcp: Pass return code from fc_block_scsi_eh to scsi eh")
+              Cc: <stable@vger.kernel.org> #2.6.38+
+              Reviewed-by: Jens Remus <jremus@linux.ibm.com>
+              Reviewed-by: Benjamin Block <bblock@linux.ibm.com>
+              Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+
+
+Signed-off-by: Steffen Maier <maier@linux.ibm.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/s390/scsi/zfcp_dbf.c  |   39 +++++++++++++++++++++++++++++++++++++++
+ drivers/s390/scsi/zfcp_ext.h  |    2 ++
+ drivers/s390/scsi/zfcp_scsi.c |    7 ++++++-
+ 3 files changed, 47 insertions(+), 1 deletion(-)
+
+--- a/drivers/s390/scsi/zfcp_dbf.c
++++ b/drivers/s390/scsi/zfcp_dbf.c
+@@ -616,6 +616,45 @@ void zfcp_dbf_scsi(char *tag, int level,
+ 	spin_unlock_irqrestore(&dbf->scsi_lock, flags);
+ }
+ 
++/**
++ * zfcp_dbf_scsi_eh() - Trace event for special cases of scsi_eh callbacks.
++ * @tag: Identifier for event.
++ * @adapter: Pointer to zfcp adapter as context for this event.
++ * @scsi_id: SCSI ID/target to indicate scope of task management function (TMF).
++ * @ret: Return value of calling function.
++ *
++ * This SCSI trace variant does not depend on any of:
++ * scsi_cmnd, zfcp_fsf_req, scsi_device.
++ */
++void zfcp_dbf_scsi_eh(char *tag, struct zfcp_adapter *adapter,
++		      unsigned int scsi_id, int ret)
++{
++	struct zfcp_dbf *dbf = adapter->dbf;
++	struct zfcp_dbf_scsi *rec = &dbf->scsi_buf;
++	unsigned long flags;
++	static int const level = 1;
++
++	if (unlikely(level > adapter->dbf->scsi->level))
++		return;
++
++	spin_lock_irqsave(&dbf->scsi_lock, flags);
++	memset(rec, 0, sizeof(*rec));
++
++	memcpy(rec->tag, tag, ZFCP_DBF_TAG_LEN);
++	rec->id = ZFCP_DBF_SCSI_CMND;
++	rec->scsi_result = ret; /* re-use field, int is 4 bytes and fits */
++	rec->scsi_retries = ~0;
++	rec->scsi_allowed = ~0;
++	rec->fcp_rsp_info = ~0;
++	rec->scsi_id = scsi_id;
++	rec->scsi_lun = (u32)ZFCP_DBF_INVALID_LUN;
++	rec->host_scribble = ~0;
++	memset(rec->scsi_opcode, 0xff, ZFCP_DBF_SCSI_OPCODE);
++
++	debug_event(dbf->scsi, level, rec, sizeof(*rec));
++	spin_unlock_irqrestore(&dbf->scsi_lock, flags);
++}
++
+ static debug_info_t *zfcp_dbf_reg(const char *name, int size, int rec_size)
+ {
+ 	struct debug_info *d;
+--- a/drivers/s390/scsi/zfcp_ext.h
++++ b/drivers/s390/scsi/zfcp_ext.h
+@@ -66,6 +66,8 @@ extern void zfcp_dbf_san_res(char *, str
+ extern void zfcp_dbf_san_in_els(char *, struct zfcp_fsf_req *);
+ extern void zfcp_dbf_scsi(char *, int, struct scsi_cmnd *,
+ 			  struct zfcp_fsf_req *);
++extern void zfcp_dbf_scsi_eh(char *tag, struct zfcp_adapter *adapter,
++			     unsigned int scsi_id, int ret);
+ 
+ /* zfcp_erp.c */
+ extern void zfcp_erp_set_adapter_status(struct zfcp_adapter *, u32);
+--- a/drivers/s390/scsi/zfcp_scsi.c
++++ b/drivers/s390/scsi/zfcp_scsi.c
+@@ -342,10 +342,15 @@ static int zfcp_scsi_eh_host_reset_handl
+ {
+ 	struct zfcp_scsi_dev *zfcp_sdev = sdev_to_zfcp(scpnt->device);
+ 	struct zfcp_adapter *adapter = zfcp_sdev->port->adapter;
++	int ret = SUCCESS, fc_ret;
+ 
+ 	zfcp_erp_adapter_reopen(adapter, 0, "schrh_1");
+ 	zfcp_erp_wait(adapter);
+-	return fc_block_scsi_eh(scpnt);
++	fc_ret = fc_block_scsi_eh(scpnt);
++	if (fc_ret)
++		ret = fc_ret;
++	zfcp_dbf_scsi_eh("schrh_r", adapter, ~0, ret);
++	return ret;
+ }
+ 
+ struct scsi_transport_template *zfcp_scsi_transport_template;
