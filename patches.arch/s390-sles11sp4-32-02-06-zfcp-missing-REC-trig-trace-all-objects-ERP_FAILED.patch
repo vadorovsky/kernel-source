@@ -1,0 +1,330 @@
+From: Steffen Maier <maier@linux.ibm.com>
+Subject: scsi: zfcp: fix missing REC trigger trace for all objects in ERP_FAILED
+Patch-mainline: v4.18-rc1
+Git-commit: 8c3d20aada70042a39c6a6625be037c1472ca610
+References: bnc#1102087, LTC#168765
+
+Description:  zfcp: fix tracing regressions, part 3
+Symptom:      Cannot determine result of eh_host_reset_handler.
+
+              Cannot see if and when zfcp retries abort or task management
+              functions (LUN/target reset) while synchronizing scsi_eh and
+              zfcp-internal recovery.
+
+              Confusing zfcp ERP trace record if a SCSI device is deleted
+              during scsi_eh host reset.
+
+              Cannot determine that our terminate_rport_io callback was
+              invoked if it returned early.
+
+              Cannot determine that our terminate_rport_io callback was
+              invoked if a long fast_io_fail_tmo was configured (typically
+              longer than 12 seconds, e.g. 27 seconds).
+
+              Cannot determine if something wanted to enqueue zfcp recovery
+              for an object (adapter/port regular/unit) in ERP_FAILED state.
+
+              Cannot determine if something wanted to enqueue zfcp recovery
+              but no zfcp ERP thread was running.
+Problem:      v2.6.35 commit a1dbfddd02d2 ("[SCSI] zfcp: Pass return code
+              from fc_block_scsi_eh to scsi eh") introduced the first
+              return with something other than the previously hardcoded
+              single SUCCESS return path.
+
+              Due to zfcp_erp_wait() and fc_block_scsi_eh() time can pass
+              between the start of our eh callback and an actual send/recv
+              of an abort / TMF request.
+
+              If a SCSI device is deleted during scsi_eh host reset, we
+              cannot get a reference to the SCSI device anymore since
+              scsi_device_get returns !=0 by design. Assuming the recovery
+              of adapter and port(s) was successful,
+              zfcp_erp_strategy_followup_success() attempts to trigger a
+              LUN reset for the half-gone SCSI device. However,
+              zfcp_erp_setup_act() returns NULL as it cannot get the
+              reference. Hence, zfcp_erp_action_enqueue() takes an early
+              goto out and _NO_ recovery actually happens, but it writes a
+              confusing trace record which states that zfcp will do a LUN
+              recovery as "ERP need" is ZFCP_ERP_ACTION_REOPEN_LUN == 1 and
+              equals "ERP want".
+              Before v2.6.38 commit ae0904f60fab ("[SCSI] zfcp: Redesign of
+              the debug tracing for recovery actions.") we could detect
+              this case because the "erp_action" field in the trace was
+              NULL. The rework removed erp_action as argument and field
+              from the trace.
+
+              If we get an fc_rport in terminate_rport_io() for which we
+              cannot find a match within zfcp_get_port_by_wwpn(), the
+              latter can return NULL. v2.6.30 commit 70932935b61e ("[SCSI]
+              zfcp: Fix oops when port disappears") introduced an early
+              return without adding a trace record for this case.
+
+              After target cable pull: The ADISC for "link" test times out
+              after typically 4 seconds. The open port recovery times out
+              after typically 8 seconds, causing zfcp_port.status to
+              contain ERP_FAILED. zfcp_scsi_terminate_rport_io() tries to
+              enqueue forced port recovery, but due to ERP_FAILED this
+              resulted in a silent early return.
+
+              Trying to enqueue recovery for adapter / port regular / LUN
+              resulted in silent early returns.
+
+              Trying to enqueue recovery if no ERP thread was running
+              resulted in silent early returns.
+Solution:     Write trace record in zfcp area SCSI and re-use SCSI result
+              field to contain the return value of eh_host_reset_handler.
+
+              Add a trace before calling the two blocking functions
+              zfcp_erp_wait() and fc_block_scsi_eh().
+
+              Introduce an eyecatcher "flag" to mark the "ERP need" as 'not
+              needed' but still keep the information which erp_action type,
+              that zfcp_erp_required_act() had decided upon, is needed.
+              0xc_ is chosen to be visibly different from 0x0_ in "ERP
+              want".
+
+              Write trace record in zfcp area REC with "ERP need" none.
+
+              Write trace record in zfcp area REC with "ERP need" 0xe0.
+
+              zfcp_erp_action_enqueue() already had two early outs which
+              re-used the one zfcp_dbf_rec_trig() call. All ERP trigger
+              functions finally run through zfcp_erp_action_enqueue(). So
+              move the special handling for ZFCP_STATUS_COMMON_ERP_FAILED
+              into zfcp_erp_action_enqueue() and add another early out with
+              new trace marker for pseudo ERP need in this case. This
+              removes all early returns from all ERP trigger functions so
+              we always end up at zfcp_dbf_rec_trig().
+
+              Write trace record in zfcp area REC with "ERP need" 0xc0.
+Reproduction: If NPIV is not enabled with subchannel, ensure that your
+              subchannel is the only one active on the entire channel.
+              Set eh_deadline to a short enough time interval, e.g. 5
+              seconds (before FCP device online: scsi_mod.eh_deadline=5).
+              Enable RSCN suppression on the SAN switch port beyond the
+              first link, i.e. towards the storage target. Disable that
+              switch port. Send one SCSI command to the single path SCSI
+              disk of that port in the background (because it will block
+              for a while) e.g. via "dd if=/dev/sd... of=/dev/null
+              iflag=direct count=1 &". After <SCSI command timeout>
+              seconds, the command runs into the timeout. Due to the short
+              eh_deadline, the SCSI midlayer immediately performs SCSI host
+              reset. After the corresponding adapter recovery, the new
+              trace record "schrh_r" appears.
+
+              Difficult to reproduce as we need to have a SCSI command time
+              out once (abort) or twice (scsi_eh), and timely have to
+              prevent sending of the abort or TMF. Examples to prevent
+              sending is severe memory pressure, or zfcp-internal recovery
+              of the zfcp unit (e.g. write 0 to failed sysfs attribute) or
+              of the target port (depending on potentially escalated
+              scsi_eh scope) so the zfcp object is blocked.
+
+              Difficult to reproduce as we need to get into scsi_eh, fully
+              escalate to host reset, and something has to timely delete a
+              SCSI device of this Scsi_Host.
+
+              Disable auto port REscan with zfcp.no_auto_port_rescan=1. Let
+              always enabled zfcp auto port scan attach a target remote
+              port without attaching LUNs to it (zfcp.allow_lun_scan=0 and
+              no explicit zfcp unit_add). Use zfcp port_remove to remove
+              such target port again. After fast_io_fail_tmo or
+              dev_loss_tmo, the new trace record "sctrpin" can appear.
+
+              If NPIV is not enabled with subchannel, ensure that your
+              subchannel is the only one active on the entire channel.
+              Configure a large enough fast_io_fail_tmo, e.g. 27 seconds.
+              Pull cable at target side. Wait until fast_io_fail_tmo runs
+              out and with the fix a zfcp trace "sctrpi1" with "ERP need"
+              0xe0 must appear in the REC area. (for shared non-NPIV
+              subchannels, only the first subchannel, that happens to
+              complete the corresponding code path, ends up in this
+              particular case)
+
+              Difficult to reproduce as we need a "soft" recovery trigger
+              that does not clear ERP_FAILED (as opposed to e.g. failed
+              sysfs attribute).
+
+              No known reproduction.
+
+Upstream-Description:
+
+              scsi: zfcp: fix missing REC trigger trace for all objects in ERP_FAILED
+
+              That other commit introduced an inconsistency because it would trace on
+              ERP_FAILED for all callers of port forced reopen triggers (not just
+              terminate_rport_io), but it would not trace on ERP_FAILED for all callers of
+              other ERP triggers such as adapter, port regular, LUN.
+
+              Therefore, generalize that other commit. zfcp_erp_action_enqueue() already
+              had two early outs which re-used the one zfcp_dbf_rec_trig() call.  All ERP
+              trigger functions finally run through zfcp_erp_action_enqueue().  So move
+              the special handling for ZFCP_STATUS_COMMON_ERP_FAILED into
+              zfcp_erp_action_enqueue() and add another early out with new trace marker
+              for pseudo ERP need in this case. This removes all early returns from all
+              ERP trigger functions so we always end up at zfcp_dbf_rec_trig().
+
+              Example trace record formatted with zfcpdbf from s390-tools:
+
+              Timestamp      : ...
+              Area           : REC
+              Subarea        : 00
+              Level          : 1
+              Exception      : -
+              CPU ID         : ..
+              Caller         : 0x...
+              Record ID      : 1                      ZFCP_DBF_REC_TRIG
+              Tag            : .......
+              LUN            : 0x...
+              WWPN           : 0x...
+              D_ID           : 0x...
+              Adapter status : 0x...
+              Port status    : 0x...
+              LUN status     : 0x...
+              Ready count    : 0x...
+              Running count  : 0x...
+              ERP want       : 0x0.                   ZFCP_ERP_ACTION_REOPEN_...
+              ERP need       : 0xe0                   ZFCP_ERP_ACTION_FAILED
+
+              Signed-off-by: Steffen Maier <maier@linux.ibm.com>
+              Cc: <stable@vger.kernel.org> #2.6.38+
+              Reviewed-by: Benjamin Block <bblock@linux.ibm.com>
+              Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+
+
+Signed-off-by: Steffen Maier <maier@linux.ibm.com>
+Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+---
+ drivers/s390/scsi/zfcp_erp.c |   79 +++++++++++++++++++++++++++----------------
+ 1 file changed, 51 insertions(+), 28 deletions(-)
+
+--- a/drivers/s390/scsi/zfcp_erp.c
++++ b/drivers/s390/scsi/zfcp_erp.c
+@@ -142,6 +142,49 @@ static void zfcp_erp_action_dismiss_adap
+ 	}
+ }
+ 
++static int zfcp_erp_handle_failed(int want, struct zfcp_adapter *adapter,
++				  struct zfcp_port *port,
++				  struct scsi_device *sdev)
++{
++	int need = want;
++	struct zfcp_scsi_dev *zsdev;
++
++	switch (want) {
++	case ZFCP_ERP_ACTION_REOPEN_LUN:
++		zsdev = sdev_to_zfcp(sdev);
++		if (atomic_read(&zsdev->status) & ZFCP_STATUS_COMMON_ERP_FAILED)
++			need = 0;
++		break;
++	case ZFCP_ERP_ACTION_REOPEN_PORT_FORCED:
++		if (atomic_read(&port->status) & ZFCP_STATUS_COMMON_ERP_FAILED)
++			need = 0;
++		break;
++	case ZFCP_ERP_ACTION_REOPEN_PORT:
++		if (atomic_read(&port->status) &
++		    ZFCP_STATUS_COMMON_ERP_FAILED) {
++			need = 0;
++			/* ensure propagation of failed status to new devices */
++			zfcp_erp_set_port_status(
++				port, ZFCP_STATUS_COMMON_ERP_FAILED);
++		}
++		break;
++	case ZFCP_ERP_ACTION_REOPEN_ADAPTER:
++		if (atomic_read(&adapter->status) &
++		    ZFCP_STATUS_COMMON_ERP_FAILED) {
++			need = 0;
++			/* ensure propagation of failed status to new devices */
++			zfcp_erp_set_adapter_status(
++				adapter, ZFCP_STATUS_COMMON_ERP_FAILED);
++		}
++		break;
++	default:
++		need = 0;
++		break;
++	}
++
++	return need;
++}
++
+ static int zfcp_erp_required_act(int want, struct zfcp_adapter *adapter,
+ 				 struct zfcp_port *port,
+ 				 struct scsi_device *sdev)
+@@ -265,6 +308,12 @@ static int zfcp_erp_action_enqueue(int w
+ 	int retval = 1, need;
+ 	struct zfcp_erp_action *act;
+ 
++	need = zfcp_erp_handle_failed(want, adapter, port, sdev);
++	if (!need) {
++		need = ZFCP_ERP_ACTION_FAILED; /* marker for trace */
++		goto out;
++	}
++
+ 	if (!adapter->erp_thread)
+ 		return -EIO;
+ 
+@@ -313,12 +362,6 @@ static int _zfcp_erp_adapter_reopen(stru
+ 	zfcp_erp_adapter_block(adapter, clear_mask);
+ 	zfcp_scsi_schedule_rports_block(adapter);
+ 
+-	/* ensure propagation of failed status to new devices */
+-	if (atomic_read(&adapter->status) & ZFCP_STATUS_COMMON_ERP_FAILED) {
+-		zfcp_erp_set_adapter_status(adapter,
+-					    ZFCP_STATUS_COMMON_ERP_FAILED);
+-		return -EIO;
+-	}
+ 	return zfcp_erp_action_enqueue(ZFCP_ERP_ACTION_REOPEN_ADAPTER,
+ 				       adapter, NULL, NULL, id, 0);
+ }
+@@ -337,12 +380,8 @@ void zfcp_erp_adapter_reopen(struct zfcp
+ 	zfcp_scsi_schedule_rports_block(adapter);
+ 
+ 	write_lock_irqsave(&adapter->erp_lock, flags);
+-	if (atomic_read(&adapter->status) & ZFCP_STATUS_COMMON_ERP_FAILED)
+-		zfcp_erp_set_adapter_status(adapter,
+-					    ZFCP_STATUS_COMMON_ERP_FAILED);
+-	else
+-		zfcp_erp_action_enqueue(ZFCP_ERP_ACTION_REOPEN_ADAPTER, adapter,
+-					NULL, NULL, id, 0);
++	zfcp_erp_action_enqueue(ZFCP_ERP_ACTION_REOPEN_ADAPTER, adapter,
++				NULL, NULL, id, 0);
+ 	write_unlock_irqrestore(&adapter->erp_lock, flags);
+ }
+ 
+@@ -383,13 +422,6 @@ static void _zfcp_erp_port_forced_reopen
+ 	zfcp_erp_port_block(port, clear);
+ 	zfcp_scsi_schedule_rport_block(port);
+ 
+-	if (atomic_read(&port->status) & ZFCP_STATUS_COMMON_ERP_FAILED) {
+-		zfcp_dbf_rec_trig(id, port->adapter, port, NULL,
+-				  ZFCP_ERP_ACTION_REOPEN_PORT_FORCED,
+-				  ZFCP_ERP_ACTION_FAILED);
+-		return;
+-	}
+-
+ 	zfcp_erp_action_enqueue(ZFCP_ERP_ACTION_REOPEN_PORT_FORCED,
+ 				port->adapter, port, NULL, id, 0);
+ }
+@@ -415,12 +447,6 @@ static int _zfcp_erp_port_reopen(struct
+ 	zfcp_erp_port_block(port, clear);
+ 	zfcp_scsi_schedule_rport_block(port);
+ 
+-	if (atomic_read(&port->status) & ZFCP_STATUS_COMMON_ERP_FAILED) {
+-		/* ensure propagation of failed status to new devices */
+-		zfcp_erp_set_port_status(port, ZFCP_STATUS_COMMON_ERP_FAILED);
+-		return -EIO;
+-	}
+-
+ 	return zfcp_erp_action_enqueue(ZFCP_ERP_ACTION_REOPEN_PORT,
+ 				       port->adapter, port, NULL, id, 0);
+ }
+@@ -460,9 +486,6 @@ static void _zfcp_erp_lun_reopen(struct
+ 
+ 	zfcp_erp_lun_block(sdev, clear);
+ 
+-	if (atomic_read(&zfcp_sdev->status) & ZFCP_STATUS_COMMON_ERP_FAILED)
+-		return;
+-
+ 	zfcp_erp_action_enqueue(ZFCP_ERP_ACTION_REOPEN_LUN, adapter,
+ 				zfcp_sdev->port, sdev, id, act_status);
+ }
