@@ -1,0 +1,151 @@
+From c441e50d54c697c6b5e309efd9de3740972a6975 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Mon, 2 Jul 2018 13:07:14 +0200
+Subject: [PATCH 35/40] x86/KVM/VMX: Add L1D flush logic
+Patch-mainline: not yet, under discussion
+References: bsc#1089343 CVE-2018-3646
+
+commit c595ceee45707f00f64f61c54fb64ef0cc0b4e85 upstream
+
+Add the logic for flushing L1D on VMENTER. The flush depends on the static
+key being enabled and the new l1tf_flush_l1d flag being set.
+
+The flags is set:
+ - Always, if the flush module parameter is 'always'
+
+ - Conditionally at:
+   - Entry to vcpu_run(), i.e. after executing user space
+
+   - From the sched_in notifier, i.e. when switching to a vCPU thread.
+
+   - From vmexit handlers which are considered unsafe, i.e. where
+     sensitive data can be brought into L1D:
+
+     - The emulator, which could be a good target for other speculative
+       execution-based threats,
+
+     - The MMU, which can bring host page tables in the L1 cache.
+
+     - External interrupts
+
+     - Nested operations that require the MMU (see above). That is
+       vmptrld, vmptrst, vmclear,vmwrite,vmread.
+
+     - When handling invept,invvpid
+
+[ tglx: Split out from combo patch and reduced to a single flag ]
+
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+---
+ arch/x86/include/asm/kvm_host.h |    4 ++++
+ arch/x86/kvm/vmx.c              |   22 +++++++++++++++++++++-
+ arch/x86/kvm/x86.c              |    7 +++++++
+ 3 files changed, 32 insertions(+), 1 deletion(-)
+
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -614,6 +614,9 @@ struct kvm_vcpu_arch {
+ 
+ 	int pending_ioapic_eoi;
+ 	int pending_external_vector;
++
++	/* Flush the L1 Data cache for L1TF mitigation on VMENTER */
++	bool l1tf_flush_l1d;
+ };
+ 
+ struct kvm_lpage_info {
+@@ -769,6 +772,7 @@ struct kvm_vcpu_stat {
+ 	u32 signal_exits;
+ 	u32 irq_window_exits;
+ 	u32 nmi_window_exits;
++	u32 l1d_flush;
+ 	u32 halt_exits;
+ 	u32 halt_successful_poll;
+ 	u32 halt_attempted_poll;
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -8273,9 +8273,20 @@ static int vmx_handle_exit(struct kvm_vc
+ #define L1D_CACHE_ORDER 4
+ static void *vmx_l1d_flush_pages;
+ 
+-static void __maybe_unused vmx_l1d_flush(void)
++static void vmx_l1d_flush(struct kvm_vcpu *vcpu)
+ {
+ 	int size = PAGE_SIZE << L1D_CACHE_ORDER;
++	bool always;
++
++	/*
++	 * If the mitigation mode is 'flush always', keep the flush bit
++	 * set, otherwise clear it. It gets set again either from
++	 * vcpu_run() or from one of the unsafe VMEXIT handlers.
++	 */
++	always = vmentry_l1d_flush == VMENTER_L1D_FLUSH_ALWAYS;
++	vcpu->arch.l1tf_flush_l1d = always;
++
++	vcpu->stat.l1d_flush++;
+ 
+ 	if (static_cpu_has(X86_FEATURE_FLUSH_L1D)) {
+ 		wrmsrl(MSR_IA32_FLUSH_CMD, L1D_FLUSH);
+@@ -8736,6 +8747,12 @@ static void __noclone vmx_vcpu_run(struc
+ 	x86_spec_ctrl_set_guest(vmx->spec_ctrl, 0);
+ 
+ 	vmx->__launched = vmx->loaded_vmcs->launched;
++
++	if (static_branch_unlikely(&vmx_l1d_should_flush)) {
++		if (vcpu->arch.l1tf_flush_l1d)
++			vmx_l1d_flush(vcpu);
++	}
++
+ 	asm(
+ 		/* Store host registers */
+ 		"push %%" _ASM_DX "; push %%" _ASM_BP ";"
+@@ -10150,6 +10167,9 @@ static int nested_vmx_run(struct kvm_vcp
+ 		}
+ 	}
+ 
++	/* Hide L1D cache contents from the nested guest.  */
++	vmx->vcpu.arch.l1tf_flush_l1d = true;
++
+ 	/*
+ 	 * We're finally done with prerequisite checking, and can start with
+ 	 * the nested entry.
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4351,6 +4351,9 @@ static int kvm_write_guest_virt_helper(g
+ 	void *data = val;
+ 	int r = X86EMUL_CONTINUE;
+ 
++	/* kvm_write_guest_virt_system can pull in tons of pages. */
++	vcpu->arch.l1tf_flush_l1d = true;
++
+ 	while (bytes) {
+ 		gpa_t gpa =  vcpu->arch.walk_mmu->gva_to_gpa(vcpu, addr,
+ 							     access,
+@@ -5483,6 +5486,8 @@ int x86_emulate_instruction(struct kvm_v
+ 	bool writeback = true;
+ 	bool write_fault_to_spt = vcpu->arch.write_fault_to_shadow_pgtable;
+ 
++	vcpu->arch.l1tf_flush_l1d = true;
++
+ 	/*
+ 	 * Clear write_fault_to_shadow_pgtable here to ensure it is
+ 	 * never reused.
+@@ -6828,6 +6833,7 @@ static int vcpu_run(struct kvm_vcpu *vcp
+ 	struct kvm *kvm = vcpu->kvm;
+ 
+ 	vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
++	vcpu->arch.l1tf_flush_l1d = true;
+ 
+ 	for (;;) {
+ 		if (kvm_vcpu_running(vcpu)) {
+@@ -7790,6 +7796,7 @@ void kvm_arch_vcpu_uninit(struct kvm_vcp
+ 
+ void kvm_arch_sched_in(struct kvm_vcpu *vcpu, int cpu)
+ {
++	vcpu->arch.l1tf_flush_l1d = true;
+ 	kvm_x86_ops->sched_in(vcpu, cpu);
+ }
+ 

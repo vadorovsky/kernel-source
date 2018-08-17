@@ -1,0 +1,204 @@
+From: Thomas Gleixner <tglx@linuxtronix.de>
+Subject: [PATCH] cpu/hotplug: Boot HT siblings at least once
+Patch-mainline: not yet, under development
+References: bsc#1089343 CVE-2018-3646
+
+Due to the way Machine Check Exceptions work on X86 hyperthreads it's
+required to boot up _all_ logical cores at least once in order to set the
+CR4.MCE bit.
+
+So instead of ignoring the sibling threads right away, let them boot up
+once so they can configure themself. After they came out of the initial
+boot stage check whether its a "secondary" sibling and cancel the operation
+which puts the CPU back into offline state.
+
+[jkosina@suse.cz: 4.4 port; we have to bring hyperthreaded siblings down
+ much later, as the hotplug code in 4.4 has not been fully reworked yet,
+ and therefore it's safe to bring the CPUs down only after the hotplug_threads
+ have started running, otherwise we'll be waiting indefinitely for them to
+ complete while attempting to park them]
+
+Reported-by: Dave Hansen <dave.hansen@intel.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Cc: Borislav Petkov <bp@suse.de>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Cc: Lai Jiangshan <jiangshanlai@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: lkml <linux-kernel@vger.kernel.org>
+Link: http://lkml.kernel.org/r/20180629140611.033996006@linutronix.de
+Signed-off-by: Borislav Petkov <bp@suse.de>
+---
+ arch/x86/kernel/smpboot.c |    2 ++
+ include/linux/cpu.h       |    1 +
+ include/linux/smp.h       |    2 ++
+ init/main.c               |    2 ++
+ kernel/cpu.c              |   36 ++++++++++++++++++++++++++++++------
+ kernel/smp.c              |   23 +++++++++++++++++++++++
+ 6 files changed, 60 insertions(+), 6 deletions(-)
+
+--- a/arch/x86/kernel/smpboot.c
++++ b/arch/x86/kernel/smpboot.c
+@@ -1023,6 +1023,8 @@ int native_cpu_up(unsigned int cpu, stru
+ 
+ 	irq_unlock_sparse();
+ 
++	cpu_set_booted(cpu);
++
+ 	return 0;
+ }
+ 
+--- a/include/linux/cpu.h
++++ b/include/linux/cpu.h
+@@ -176,6 +176,7 @@ int cpu_up(unsigned int cpu);
+ void notify_cpu_starting(unsigned int cpu);
+ extern void cpu_maps_update_begin(void);
+ extern void cpu_maps_update_done(void);
++extern void cpu_set_booted(unsigned int cpu);
+ 
+ #define cpu_notifier_register_begin	cpu_maps_update_begin
+ #define cpu_notifier_register_done	cpu_maps_update_done
+--- a/include/linux/smp.h
++++ b/include/linux/smp.h
+@@ -119,6 +119,8 @@ void smp_prepare_boot_cpu(void);
+ extern unsigned int setup_max_cpus;
+ extern void __init setup_nr_cpu_ids(void);
+ extern void __init smp_init(void);
++extern void __init smp_smt_post_init(void);
++extern bool cpu_smt_allowed(unsigned int cpu);
+ 
+ #else /* !SMP */
+ 
+--- a/init/main.c
++++ b/init/main.c
+@@ -1039,6 +1039,8 @@ static noinline void __init kernel_init_
+ 		prepare_namespace();
+ 	}
+ 
++	smp_smt_post_init();
++
+ 	/*
+ 	 * Ok, we have completed the initial bootup, and
+ 	 * we're essentially up and running. Get rid of the
+--- a/kernel/cpu.c
++++ b/kernel/cpu.c
+@@ -26,6 +26,18 @@
+ 
+ #include "smpboot.h"
+ 
++/* hotplug state from future kernels */
++struct cpuhp_cpu_state {
++	bool		booted_once;
++};
++
++static DEFINE_PER_CPU(struct cpuhp_cpu_state, cpuhp_state) = { 0 };
++
++void cpu_set_booted(unsigned int cpu)
++{
++	per_cpu(cpuhp_state, cpu).booted_once = true;
++}
++
+ #ifdef CONFIG_SMP
+ /* Serializes the updates to cpu_online_mask, cpu_present_mask */
+ static DEFINE_MUTEX(cpu_add_remove_lock);
+@@ -434,7 +446,7 @@ out_release:
+ /*
+  * @target unused.
+  */
+-static int cpu_down_maps_locked(unsigned int cpu, enum cpuhp_state target)
++int cpu_down_maps_locked(unsigned int cpu, enum cpuhp_state target)
+ {
+ 	if (cpu_hotplug_disabled)
+ 		return -EBUSY;
+@@ -469,13 +481,24 @@ static int __init smt_cmdline_disable(ch
+ }
+ early_param("nosmt", smt_cmdline_disable);
+ 
+-static inline bool cpu_smt_allowed(unsigned int cpu)
++bool cpu_smt_allowed(unsigned int cpu)
+ {
+-	return cpu_smt_control == CPU_SMT_ENABLED ||
+-		topology_is_primary_thread(cpu);
++	if (cpu_smt_control == CPU_SMT_ENABLED)
++		return true;
++
++	if (topology_is_primary_thread(cpu))
++		return true;
++
++	/*
++	 * X86 requires that the sibling threads are at least booted up
++	 * once to set the CR4.MCE bit so Machine Check Exceptions can be
++	 * handled and do not end up raising the CPU Internal Error line.
++	 */
++	return !per_cpu(cpuhp_state, cpu).booted_once;
+ }
++
+ #else
+-static inline bool cpu_smt_allowed(unsigned int cpu) { return true; }
++bool cpu_smt_allowed(unsigned int cpu) { return true; }
+ #endif
+ 
+ /*
+@@ -548,6 +571,7 @@ static int _cpu_up(unsigned int cpu, int
+ 
+ 	if (ret != 0)
+ 		goto out_notify;
++
+ 	BUG_ON(!cpu_online(cpu));
+ 
+ 	/* Now call notifier in preparation. */
+@@ -585,13 +609,13 @@ int cpu_up(unsigned int cpu)
+ 		err = -EBUSY;
+ 		goto out;
+ 	}
++
+ 	if (!cpu_smt_allowed(cpu)) {
+ 		err = -EPERM;
+ 		goto out;
+ 	}
+ 
+ 	err = _cpu_up(cpu, 0);
+-
+ out:
+ 	cpu_maps_update_done();
+ 	return err;
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -562,6 +562,7 @@ void __weak smp_announce(void)
+ 	printk(KERN_INFO "Brought up %d CPUs\n", num_online_cpus());
+ }
+ 
++extern int cpu_down_maps_locked(unsigned int cpu, enum cpuhp_state target);
+ /* Called by boot processor to activate the rest. */
+ void __init smp_init(void)
+ {
+@@ -582,6 +583,28 @@ void __init smp_init(void)
+ 	smp_cpus_done(setup_max_cpus);
+ }
+ 
++void __init smp_smt_post_init(void)
++{
++	int cpu, disabled = 0;
++	/*
++	 * SMT soft disabling on x86 requires to bring the CPU out of the
++	 * BIOS 'wait for SIPI' state in order to set the CR4.MCE bit.  The
++	 * CPU marked itself as booted_once in native_cpu_up() so the
++	 * cpu_smt_allowed() check will now return false if this is not the
++	 * primary sibling.
++	 */
++	cpu_maps_update_begin();
++	for_each_online_cpu(cpu) {
++		if (!cpu_smt_allowed(cpu)) {
++			disabled++;
++			cpu_down_maps_locked(cpu, 0);
++		}
++	}
++	if (disabled)
++		pr_info("SMT: disabling %d threads\n", disabled);
++	cpu_maps_update_done();
++}
++
+ /*
+  * Call a function on all processors.  May be used during early boot while
+  * early_boot_irqs_disabled is set.  Use local_irq_save/restore() instead
